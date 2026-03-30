@@ -1,6 +1,7 @@
 import dagre from "dagre";
 
 import { DEFAULT_GRAPH_ENV_VARS, getGraphEnvVars } from "./graphEnv";
+import type { SavedNode } from "./savedNodes";
 import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition } from "./types";
 
 function slugify(value: string): string {
@@ -198,6 +199,77 @@ export function createNodeFromProvider(
   };
 }
 
+export function createNodeFromSaved(
+  graph: GraphDefinition,
+  saved: SavedNode,
+  position: GraphPosition,
+): GraphNode {
+  const id = uniqueNodeId(graph, saved.name);
+  return {
+    id,
+    kind: saved.kind,
+    category: saved.category,
+    label: saved.name,
+    description: saved.description || undefined,
+    provider_id: saved.provider_id,
+    provider_label: saved.provider_label,
+    position,
+    config: { ...saved.config },
+    model_provider_name: saved.model_provider_name,
+    prompt_name: saved.prompt_name,
+    tool_name: saved.tool_name,
+  };
+}
+
+export function createWireJunctionNode(graph: GraphDefinition, position: GraphPosition): GraphNode {
+  const id = uniqueNodeId(graph, "wire-junction");
+  return {
+    id,
+    kind: "data",
+    category: "data",
+    label: "Wire Point",
+    description: "Floating wire routing point.",
+    provider_id: "core.data",
+    provider_label: "Core Data Node",
+    position,
+    config: {
+      mode: "passthrough",
+      is_wire_junction: true,
+    },
+  };
+}
+
+export function isWireJunctionNode(node: GraphNode | null | undefined): boolean {
+  return Boolean(node && node.kind === "data" && node.config.is_wire_junction === true);
+}
+
+export const TOOL_SUCCESS_HANDLE_ID = "tool-success";
+export const TOOL_FAILURE_HANDLE_ID = "tool-failure";
+
+export function defaultToolFailureCondition(edgeId: string): GraphEdge["condition"] {
+  return {
+    id: `${edgeId}-condition`,
+    label: "On failure",
+    type: "result_has_error",
+    value: true,
+    path: null,
+  };
+}
+
+export function inferToolEdgeSourceHandle(edge: GraphEdge, sourceNode: GraphNode | null | undefined): string | null {
+  if (!sourceNode || sourceNode.kind !== "tool") {
+    return edge.source_handle_id ?? null;
+  }
+  if (edge.source_handle_id === TOOL_SUCCESS_HANDLE_ID || edge.source_handle_id === TOOL_FAILURE_HANDLE_ID) {
+    return edge.source_handle_id;
+  }
+  return edge.kind === "conditional" ? TOOL_FAILURE_HANDLE_ID : TOOL_SUCCESS_HANDLE_ID;
+}
+
+export function getToolSourceHandleAnchorRatio(handleId: string | null | undefined): number {
+  return handleId === TOOL_FAILURE_HANDLE_ID ? 0.68 : 0.4;
+}
+
 export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
   return {
     ...graph,
@@ -221,6 +293,7 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
     }),
     edges: graph.edges.map((edge) => ({
       ...edge,
+      waypoints: edge.waypoints?.map((waypoint) => ({ ...waypoint })),
       condition: edge.kind === "conditional" ? edge.condition ?? defaultConditionalCondition(edge.id) : null,
     })),
   };
@@ -261,7 +334,7 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
   }
 
   const g = new dagre.graphlib.Graph();
-  g.setGraph({ rankdir: "LR", nodesep: 60, ranksep: 120, marginx: 40, marginy: 40 });
+  g.setGraph({ rankdir: "LR", nodesep: 120, ranksep: 240, marginx: 96, marginy: 96 });
   g.setDefaultEdgeLabel(() => ({}));
 
   for (const node of graph.nodes) {

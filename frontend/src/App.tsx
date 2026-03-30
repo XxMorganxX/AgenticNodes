@@ -113,7 +113,7 @@ export default function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const sourceRef = useRef<EventSource | null>(null);
-  const executionBoxRef = useRef<HTMLElement | null>(null);
+  const executionBoxRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     Promise.all([fetchGraphs(), fetchEditorCatalog()])
@@ -281,14 +281,36 @@ export default function App() {
         <div className="mosaic-tile panel mosaic-title">
           <h1>Graph Agent Studio</h1>
           <p>Drag nodes into the canvas, wire edges, and launch your agent.</p>
-        </div>
-
-        <div className="mosaic-tile panel mosaic-run">
-          <button type="button" onClick={() => void handleRun()} disabled={!draftGraph || isRunning || isSaving}>
-            {isRunning ? "Running..." : "Run Graph"}
-          </button>
-          {activeRunId ? <code>Run ID: {activeRunId}</code> : null}
-          {error ? <p className="error-text">{error}</p> : null}
+          <div className="mosaic-title-actions">
+            <button type="button" className="secondary-button" onClick={handleCreateGraph}>
+              New Agent
+            </button>
+            <button type="button" className="secondary-button" onClick={() => void saveCurrentGraph()} disabled={!draftGraph || isSaving}>
+              {isSaving ? "Saving..." : "Save"}
+            </button>
+            <button type="button" className="secondary-button" onClick={history.undo} disabled={!history.canUndo} title="Undo (⌘Z)">
+              Undo
+            </button>
+            <button type="button" className="secondary-button" onClick={history.redo} disabled={!history.canRedo} title="Redo (⌘⇧Z)">
+              Redo
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => draftGraph && setDraftGraph(layoutGraphLR(draftGraph))}
+              disabled={!draftGraph || draftGraph.nodes.length === 0}
+            >
+              Auto Layout
+            </button>
+            <button
+              type="button"
+              className="danger-button"
+              onClick={() => void handleDeleteGraph()}
+              disabled={!draftGraph}
+            >
+              Delete
+            </button>
+          </div>
         </div>
 
         <div className="mosaic-tile panel mosaic-graph">
@@ -314,47 +336,23 @@ export default function App() {
           </label>
         </div>
 
-        <div className="mosaic-tile panel mosaic-input">
-          <label>
+        <div className="mosaic-tile panel mosaic-execution">
+          <label className="mosaic-execution-input">
             Input
-            <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={3} />
+            <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={4} />
           </label>
+          <div className="mosaic-execution-run">
+            <button type="button" onClick={() => void handleRun()} disabled={!draftGraph || isRunning || isSaving}>
+              {isRunning ? "Running..." : "Run Graph"}
+            </button>
+            {activeRunId ? <code>Run ID: {activeRunId}</code> : <p>Ready to launch the selected graph.</p>}
+            {error ? <p className="error-text">{error}</p> : null}
+          </div>
         </div>
 
         <div className="mosaic-tile panel mosaic-env">
           <h2>Environment</h2>
           <GraphEnvEditor graph={draftGraph} onGraphChange={setDraftGraph} />
-        </div>
-
-        <div className="mosaic-tile panel mosaic-actions">
-          <button type="button" className="secondary-button" onClick={handleCreateGraph}>
-            New Agent
-          </button>
-          <button type="button" className="secondary-button" onClick={() => void saveCurrentGraph()} disabled={!draftGraph || isSaving}>
-            {isSaving ? "Saving..." : "Save"}
-          </button>
-          <button type="button" className="secondary-button" onClick={history.undo} disabled={!history.canUndo} title="Undo (⌘Z)">
-            Undo
-          </button>
-          <button type="button" className="secondary-button" onClick={history.redo} disabled={!history.canRedo} title="Redo (⌘⇧Z)">
-            Redo
-          </button>
-          <button
-            type="button"
-            className="secondary-button"
-            onClick={() => draftGraph && setDraftGraph(layoutGraphLR(draftGraph))}
-            disabled={!draftGraph || draftGraph.nodes.length === 0}
-          >
-            Auto Layout
-          </button>
-          <button
-            type="button"
-            className="danger-button"
-            onClick={() => void handleDeleteGraph()}
-            disabled={!draftGraph}
-          >
-            Delete
-          </button>
         </div>
       </div>
 

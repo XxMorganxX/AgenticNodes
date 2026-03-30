@@ -1,7 +1,9 @@
 import { memo } from "react";
+import type { CSSProperties, MouseEvent as ReactMouseEvent } from "react";
 import { Handle, Position } from "reactflow";
 import type { NodeProps } from "reactflow";
 
+import { getToolSourceHandleAnchorRatio, isWireJunctionNode, TOOL_FAILURE_HANDLE_ID, TOOL_SUCCESS_HANDLE_ID } from "../lib/editor";
 import { buildNodeTooltip } from "../lib/nodeTooltip";
 import type { NodeTooltipData } from "../lib/nodeTooltip";
 import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "../lib/types";
@@ -12,11 +14,15 @@ export type GraphCanvasNodeData = {
   catalog: EditorCatalog | null;
   runState: RunState | null;
   kindColor: string;
-  status: "idle" | "active" | "completed" | "error";
+  status: "idle" | "active" | "success" | "failed" | "unreached";
+  isConnectionMagnetized?: boolean;
+  preview?: boolean;
   tooltipVisible: boolean;
   onToggleTooltip: (nodeId: string) => void;
   onOpenToolDetails: (nodeId: string) => void;
   onOpenProviderDetails: (nodeId: string) => void;
+  onHandlePointerDown: (nodeId: string, handleType: "source" | "target", handleId: string | null) => boolean;
+  onJunctionPointerDown: (nodeId: string, clientPosition: { x: number; y: number }) => void;
 };
 
 const KIND_LABELS: Record<string, string> = {
@@ -40,41 +46,123 @@ function GraphCanvasNodeComponent({
   data,
   selected,
 }: NodeProps<GraphCanvasNodeData>) {
-  const { node, graph, catalog, runState, kindColor, status, tooltipVisible, onToggleTooltip, onOpenToolDetails, onOpenProviderDetails } = data;
+  const {
+    node,
+    graph,
+    catalog,
+    runState,
+    kindColor,
+    status,
+    isConnectionMagnetized = false,
+    preview = false,
+    tooltipVisible,
+    onToggleTooltip,
+    onOpenToolDetails,
+    onOpenProviderDetails,
+    onHandlePointerDown,
+    onJunctionPointerDown,
+  } = data;
+  const isWireJunction = isWireJunctionNode(node);
+  const isToolNode = node.kind === "tool";
   let tooltip: NodeTooltipData = FALLBACK_TOOLTIP;
-  if (tooltipVisible) {
+  if (tooltipVisible && !preview && !isWireJunction) {
     try {
       tooltip = buildNodeTooltip(node, graph, catalog, runState);
     } catch {
       tooltip = FALLBACK_TOOLTIP;
     }
   }
-  const showTargetHandle = node.category !== "start";
-  const showSourceHandle = node.category !== "end";
+  const showTargetHandle = !preview && node.category !== "start";
+  const showSourceHandle = !preview && node.category !== "end";
+  const successHandleStyle = {
+    top: `${getToolSourceHandleAnchorRatio(TOOL_SUCCESS_HANDLE_ID) * 100}%`,
+  } satisfies CSSProperties;
+  const failureHandleStyle = {
+    top: `${getToolSourceHandleAnchorRatio(TOOL_FAILURE_HANDLE_ID) * 100}%`,
+  } satisfies CSSProperties;
   const iconLabel = KIND_LABELS[node.kind] ?? node.kind.slice(0, 2).toUpperCase();
   const subtitle =
     node.kind === "model"
       ? String(node.config.provider_name ?? node.model_provider_name ?? node.provider_label ?? node.provider_id)
       : node.provider_label ?? node.provider_id;
+  const nodeCardClassName = `graph-node-card graph-node-card--${status} ${isToolNode ? "graph-node-card--tool-outputs" : ""} ${
+    selected ? "is-selected" : ""
+  } ${tooltipVisible ? "is-tooltip-visible" : ""} ${preview ? "is-preview" : ""} ${isConnectionMagnetized ? "is-connection-magnetized" : ""}`;
+
+  const handlePortPointerDown = (
+    event: ReactMouseEvent<HTMLDivElement>,
+    handleType: "source" | "target",
+    handleId: string | null,
+  ) => {
+    const handled = onHandlePointerDown(node.id, handleType, handleId);
+    if (!handled) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+  };
+
+  if (isWireJunction) {
+    return (
+      <div
+        className={`graph-junction-node graph-junction-node--${status} ${selected ? "is-selected" : ""} ${isConnectionMagnetized ? "is-connection-magnetized" : ""}`}
+        tabIndex={preview ? -1 : 0}
+        aria-label="Wire junction"
+        onMouseDown={(event) => {
+          if (preview || event.button !== 0) {
+            return;
+          }
+          event.preventDefault();
+          event.stopPropagation();
+          onJunctionPointerDown(node.id, { x: event.clientX, y: event.clientY });
+        }}
+      >
+        {showTargetHandle ? (
+          <Handle
+            type="target"
+            position={Position.Left}
+            className={`graph-node-handle graph-node-handle-target graph-junction-handle ${isConnectionMagnetized ? "graph-node-handle-valid is-magnetized" : ""}`}
+            onMouseDownCapture={(event) => handlePortPointerDown(event, "target", null)}
+          />
+        ) : null}
+        {showSourceHandle ? (
+          <Handle
+            type="source"
+            position={Position.Right}
+            className="graph-node-handle graph-node-handle-source graph-junction-handle"
+            onMouseDownCapture={(event) => handlePortPointerDown(event, "source", null)}
+          />
+        ) : null}
+      </div>
+    );
+  }
 
   return (
     <div
-      className={`graph-node-card graph-node-card--${status} ${selected ? "is-selected" : ""} ${tooltipVisible ? "is-tooltip-visible" : ""}`}
+      className={nodeCardClassName}
       style={
         {
           "--node-kind-color": kindColor,
-        } as React.CSSProperties
+        } as CSSProperties
       }
-      tabIndex={0}
+      tabIndex={preview ? -1 : 0}
       aria-label={`${node.label} ${node.kind} node`}
       onContextMenu={(event) => {
+        if (preview) {
+          return;
+        }
         event.preventDefault();
         event.stopPropagation();
         onToggleTooltip(node.id);
       }}
     >
       {showTargetHandle ? (
-        <Handle type="target" position={Position.Left} className="graph-node-handle graph-node-handle-target" />
+        <Handle
+          type="target"
+          position={Position.Left}
+          className={`graph-node-handle graph-node-handle-target ${isConnectionMagnetized ? "graph-node-handle-valid is-magnetized" : ""}`}
+          onMouseDownCapture={(event) => handlePortPointerDown(event, "target", null)}
+        />
       ) : null}
       <div className="graph-node-card-inner">
         <div className="graph-node-header">
@@ -93,7 +181,7 @@ function GraphCanvasNodeComponent({
           <span className="graph-node-chip">{node.category}</span>
           <span className="graph-node-meta-text">{node.kind}</span>
         </div>
-        {node.kind === "tool" || node.kind === "model" ? (
+        {!preview && (node.kind === "tool" || node.kind === "model") ? (
           <div className="graph-node-card-actions">
             <button
               type="button"
@@ -113,47 +201,80 @@ function GraphCanvasNodeComponent({
           </div>
         ) : null}
       </div>
-      <div className="graph-node-tooltip" role="tooltip">
-        <div className="graph-node-tooltip-eyebrow">{tooltip.eyebrow}</div>
-        <strong className="graph-node-tooltip-title">{tooltip.title}</strong>
-        {tooltip.description ? <p className="graph-node-tooltip-description">{tooltip.description}</p> : null}
-        {tooltip.sections.map((section) => (
-          <section key={section.title} className="graph-node-tooltip-section">
-            <div className="graph-node-tooltip-section-title">{section.title}</div>
-            <div className="graph-node-tooltip-grid">
-              {section.rows.map((row) => (
-                <div key={`${section.title}-${row.label}`} className="graph-node-tooltip-row">
-                  <span className="graph-node-tooltip-label">{row.label}</span>
-                  <span className="graph-node-tooltip-value">{row.value}</span>
-                </div>
-              ))}
-            </div>
-          </section>
-        ))}
-        {tooltip.parameters.length > 0 ? (
-          <section className="graph-node-tooltip-section">
-            <div className="graph-node-tooltip-section-title">Parameters</div>
-            <div className="graph-node-parameter-list">
-              {tooltip.parameters.map((parameter) => (
-                <div key={parameter.name} className="graph-node-parameter">
-                  <div className="graph-node-parameter-header">
-                    <code>{parameter.name}</code>
-                    <span className="graph-node-parameter-type">{parameter.type}</span>
-                    {parameter.required ? <span className="graph-node-parameter-required">required</span> : null}
+      {!preview ? (
+        <div className="graph-node-tooltip" role="tooltip">
+          <div className="graph-node-tooltip-eyebrow">{tooltip.eyebrow}</div>
+          <strong className="graph-node-tooltip-title">{tooltip.title}</strong>
+          {tooltip.description ? <p className="graph-node-tooltip-description">{tooltip.description}</p> : null}
+          {tooltip.sections.map((section) => (
+            <section key={section.title} className="graph-node-tooltip-section">
+              <div className="graph-node-tooltip-section-title">{section.title}</div>
+              <div className="graph-node-tooltip-grid">
+                {section.rows.map((row) => (
+                  <div key={`${section.title}-${row.label}`} className="graph-node-tooltip-row">
+                    <span className="graph-node-tooltip-label">{row.label}</span>
+                    <span className="graph-node-tooltip-value">{row.value}</span>
                   </div>
-                  {parameter.description ? (
-                    <div className="graph-node-parameter-description">{parameter.description}</div>
-                  ) : null}
-                  {parameter.source ? <div className="graph-node-parameter-source">Source: {parameter.source}</div> : null}
-                </div>
-              ))}
-            </div>
-          </section>
-        ) : null}
-        {tooltip.emptyState ? <div className="graph-node-tooltip-empty">{tooltip.emptyState}</div> : null}
-      </div>
-      {showSourceHandle ? (
-        <Handle type="source" position={Position.Right} className="graph-node-handle graph-node-handle-source" />
+                ))}
+              </div>
+            </section>
+          ))}
+          {tooltip.parameters.length > 0 ? (
+            <section className="graph-node-tooltip-section">
+              <div className="graph-node-tooltip-section-title">Parameters</div>
+              <div className="graph-node-parameter-list">
+                {tooltip.parameters.map((parameter) => (
+                  <div key={parameter.name} className="graph-node-parameter">
+                    <div className="graph-node-parameter-header">
+                      <code>{parameter.name}</code>
+                      <span className="graph-node-parameter-type">{parameter.type}</span>
+                      {parameter.required ? <span className="graph-node-parameter-required">required</span> : null}
+                    </div>
+                    {parameter.description ? (
+                      <div className="graph-node-parameter-description">{parameter.description}</div>
+                    ) : null}
+                    {parameter.source ? <div className="graph-node-parameter-source">Source: {parameter.source}</div> : null}
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
+          {tooltip.emptyState ? <div className="graph-node-tooltip-empty">{tooltip.emptyState}</div> : null}
+        </div>
+      ) : null}
+      {showSourceHandle && isToolNode ? (
+        <>
+          <div className="graph-node-output-port graph-node-output-port--success" style={successHandleStyle} aria-hidden="true">
+            <span className="graph-node-output-port-label">On Success</span>
+          </div>
+          <Handle
+            id={TOOL_SUCCESS_HANDLE_ID}
+            type="source"
+            position={Position.Right}
+            className="graph-node-handle graph-node-handle-source graph-node-handle-source--success"
+            style={successHandleStyle}
+            onMouseDownCapture={(event) => handlePortPointerDown(event, "source", TOOL_SUCCESS_HANDLE_ID)}
+          />
+          <div className="graph-node-output-port graph-node-output-port--failure" style={failureHandleStyle} aria-hidden="true">
+            <span className="graph-node-output-port-label">On Failure</span>
+          </div>
+          <Handle
+            id={TOOL_FAILURE_HANDLE_ID}
+            type="source"
+            position={Position.Right}
+            className="graph-node-handle graph-node-handle-source graph-node-handle-source--failure"
+            style={failureHandleStyle}
+            onMouseDownCapture={(event) => handlePortPointerDown(event, "source", TOOL_FAILURE_HANDLE_ID)}
+          />
+        </>
+      ) : null}
+      {showSourceHandle && !isToolNode ? (
+        <Handle
+          type="source"
+          position={Position.Right}
+          className="graph-node-handle graph-node-handle-source"
+          onMouseDownCapture={(event) => handlePortPointerDown(event, "source", null)}
+        />
       ) : null}
     </div>
   );

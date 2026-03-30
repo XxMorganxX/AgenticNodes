@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import type { SavedNode } from "../lib/savedNodes";
 import type { EditorCatalog, NodeProviderDefinition } from "../lib/types";
 
 type ProviderSummaryProps = {
@@ -8,6 +9,9 @@ type ProviderSummaryProps = {
   query?: string;
   onQueryChange?: (query: string) => void;
   onProviderClick?: (provider: NodeProviderDefinition) => void;
+  savedNodes?: SavedNode[];
+  onSavedNodeClick?: (saved: SavedNode) => void;
+  onDeleteSavedNode?: (id: string) => void;
 };
 
 const CATEGORY_DESCRIPTIONS: Record<string, string> = {
@@ -18,7 +22,7 @@ const CATEGORY_DESCRIPTIONS: Record<string, string> = {
   end: "End nodes terminate the run and shape the final output returned by the system.",
 };
 
-const CATEGORY_ORDER = ["all", "start", "api", "tool", "data", "end"] as const;
+const CATEGORY_ORDER = ["all", "saved", "start", "api", "tool", "data", "end"] as const;
 
 const QUICK_PICK_PROVIDER_IDS = ["core.input", "core.api", "tool.registry", "core.output"];
 
@@ -63,24 +67,41 @@ export function ProviderSummary({
   query = "",
   onQueryChange,
   onProviderClick,
+  savedNodes = [],
+  onSavedNodeClick,
+  onDeleteSavedNode,
 }: ProviderSummaryProps) {
   const [activeCategory, setActiveCategory] = useState<string>("all");
   const normalizedQuery = query.trim().toLowerCase();
   const allProviders = (catalog?.node_providers ?? []).filter((provider) => provider.category !== "provider");
-  const providers = allProviders.filter((provider) => {
-    if (!normalizedQuery) {
-      return activeCategory === "all" ? true : provider.category === activeCategory;
+  const isSavedCategory = activeCategory === "saved";
+  const providers = isSavedCategory
+    ? []
+    : allProviders.filter((provider) => {
+        if (!normalizedQuery) {
+          return activeCategory === "all" ? true : provider.category === activeCategory;
+        }
+        const haystack = [
+          provider.display_name,
+          provider.provider_id,
+          provider.node_kind,
+          provider.description,
+          provider.capabilities.join(" "),
+        ]
+          .join(" ")
+          .toLowerCase();
+        return haystack.includes(normalizedQuery) && (activeCategory === "all" ? true : provider.category === activeCategory);
+      });
+  const filteredSavedNodes = savedNodes.filter((saved) => {
+    if (isSavedCategory || activeCategory === "all") {
+      if (!normalizedQuery) return true;
+      const haystack = [saved.name, saved.kind, saved.category, saved.description, saved.provider_id].join(" ").toLowerCase();
+      return haystack.includes(normalizedQuery);
     }
-    const haystack = [
-      provider.display_name,
-      provider.provider_id,
-      provider.node_kind,
-      provider.description,
-      provider.capabilities.join(" "),
-    ]
-      .join(" ")
-      .toLowerCase();
-    return haystack.includes(normalizedQuery) && (activeCategory === "all" ? true : provider.category === activeCategory);
+    if (saved.category !== activeCategory) return false;
+    if (!normalizedQuery) return true;
+    const haystack = [saved.name, saved.kind, saved.category, saved.description, saved.provider_id].join(" ").toLowerCase();
+    return haystack.includes(normalizedQuery);
   });
   const quickPicks = QUICK_PICK_PROVIDER_IDS
     .map((providerId) => allProviders.find((provider) => provider.provider_id === providerId))
@@ -169,7 +190,110 @@ export function ProviderSummary({
             ) : null}
           </div>
         ) : null}
-        {providers.length === 0 ? (
+        {filteredSavedNodes.length > 0 ? (
+          <article className={`provider-group${variant === "drawer" ? " provider-group--drawer" : ""}`}>
+            <div className="provider-section-heading">
+              <strong>Saved Nodes</strong>
+              <span>Reuse your saved node configurations.</span>
+            </div>
+            <div className={`provider-list${variant === "drawer" ? " provider-list--tiles" : ""}`}>
+              {filteredSavedNodes.map((saved) => (
+                <section
+                  key={saved.id}
+                  className={`provider-item provider-item-draggable saved-node-item${variant === "drawer" ? " provider-item--drawer" : ""}`}
+                  draggable
+                  onDragStart={(event) => {
+                    event.dataTransfer.setData("application/graph-saved-node", JSON.stringify(saved));
+                    event.dataTransfer.effectAllowed = "copy";
+                  }}
+                  onClick={() => onSavedNodeClick?.(saved)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onSavedNodeClick?.(saved);
+                    }
+                  }}
+                  tabIndex={onSavedNodeClick ? 0 : -1}
+                  role={onSavedNodeClick ? "button" : undefined}
+                >
+                  {variant === "drawer" ? (
+                    <>
+                      <div className="provider-drawer-tile-top">
+                        <div className={`provider-visual-mark provider-visual-mark--${saved.kind}`}>
+                          <span>{KIND_GLYPHS[saved.kind] ?? saved.kind.slice(0, 2).toUpperCase()}</span>
+                        </div>
+                        <span className={`provider-kind-pill provider-kind-pill--${saved.kind}`}>
+                          {KIND_LABELS[saved.kind] ?? saved.kind.slice(0, 3).toUpperCase()}
+                        </span>
+                        <span className="saved-node-badge">Saved</span>
+                      </div>
+                      <div className="provider-item-header">
+                        <strong>{saved.name}</strong>
+                      </div>
+                      <p>{saved.description ? compactDescription(saved.description) + "." : `Saved ${saved.kind} node.`}</p>
+                      <div className="saved-node-actions">
+                        <span className="provider-action-hint">Add or drag</span>
+                        {onDeleteSavedNode ? (
+                          <button
+                            type="button"
+                            className="saved-node-delete"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onDeleteSavedNode(saved.id);
+                            }}
+                            aria-label={`Delete saved node ${saved.name}`}
+                            title="Remove from library"
+                          >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path d="M6 7h12M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M10 11v5M14 11v5M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12" />
+                            </svg>
+                          </button>
+                        ) : null}
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="provider-tile-top">
+                        <span className={`provider-kind-pill provider-kind-pill--${saved.kind}`}>
+                          {KIND_LABELS[saved.kind] ?? saved.kind.slice(0, 3).toUpperCase()}
+                        </span>
+                        <span className="saved-node-badge">Saved</span>
+                      </div>
+                      <div className="provider-item-header">
+                        <strong>{saved.name}</strong>
+                      </div>
+                      <p>{saved.description || `Saved ${saved.kind} node configuration.`}</p>
+                      <div className="saved-node-actions">
+                        {onSavedNodeClick ? <span className="provider-action-hint">Click to add or drag</span> : null}
+                        {onDeleteSavedNode ? (
+                          <button
+                            type="button"
+                            className="saved-node-delete"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onDeleteSavedNode(saved.id);
+                            }}
+                            aria-label={`Delete saved node ${saved.name}`}
+                            title="Remove from library"
+                          >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path d="M6 7h12M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M10 11v5M14 11v5M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12" />
+                            </svg>
+                          </button>
+                        ) : null}
+                      </div>
+                    </>
+                  )}
+                </section>
+              ))}
+            </div>
+          </article>
+        ) : isSavedCategory ? (
+          <div className="empty-panel">
+            {normalizedQuery ? "No saved nodes match the current search." : "No saved nodes yet. Save a node from the inspector to reuse it here."}
+          </div>
+        ) : null}
+        {isSavedCategory ? null : providers.length === 0 && filteredSavedNodes.length === 0 ? (
           <div className="empty-panel">
             {normalizedQuery ? "No nodes match the current search." : "No node definitions available."}
           </div>

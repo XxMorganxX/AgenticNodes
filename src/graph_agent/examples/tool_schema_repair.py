@@ -75,6 +75,16 @@ def build_example_services() -> RuntimeServices:
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="core.data",
+            display_name="Core Data Node",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Applies deterministic passthrough or template transforms between execution steps.",
+            capabilities=["passthrough transforms", "template transforms", "wire routing junctions"],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.output",
             display_name="Core Output Node",
             category=NodeCategory.END,

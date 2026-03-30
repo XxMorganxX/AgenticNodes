@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
 from graph_agent.providers.base import ModelProvider, ModelMessage, ModelRequest
@@ -171,6 +171,7 @@ class Edge:
     label: str = ""
     kind: str = "standard"
     priority: int = 100
+    waypoints: list[dict[str, float]] = field(default_factory=list)
     condition: Condition | None = None
 
     def is_match(self, state: RunState, result: NodeExecutionResult) -> bool:
@@ -188,12 +189,24 @@ class Edge:
             "label": self.label,
             "kind": self.kind,
             "priority": self.priority,
+            "waypoints": self.waypoints,
             "condition": None if self.condition is None else self.condition.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> Edge:
         condition = payload.get("condition")
+        raw_waypoints = payload.get("waypoints", [])
+        waypoints = []
+        if isinstance(raw_waypoints, Sequence) and not isinstance(raw_waypoints, (str, bytes)):
+            for waypoint in raw_waypoints:
+                if isinstance(waypoint, Mapping):
+                    waypoints.append(
+                        {
+                            "x": float(waypoint.get("x", 0)),
+                            "y": float(waypoint.get("y", 0)),
+                        }
+                    )
         return cls(
             id=str(payload["id"]),
             source_id=str(payload["source_id"]),
@@ -201,6 +214,7 @@ class Edge:
             label=str(payload.get("label", "")),
             kind=str(payload.get("kind", "standard")),
             priority=int(payload.get("priority", 100)),
+            waypoints=waypoints,
             condition=Condition.from_dict(condition) if isinstance(condition, Mapping) else None,
         )
 

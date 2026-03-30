@@ -1,5 +1,6 @@
 import type { ChangeEvent } from "react";
 
+import { isWireJunctionNode } from "../lib/editor";
 import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, NodeProviderDefinition } from "../lib/types";
 
 type GraphInspectorProps = {
@@ -9,6 +10,7 @@ type GraphInspectorProps = {
   selectedEdgeId: string | null;
   onGraphChange: (graph: GraphDefinition) => void;
   onOpenProviderDetails?: (nodeId: string) => void;
+  onSaveNode?: (node: GraphNode) => void;
 };
 
 function updateNode(graph: GraphDefinition, nodeId: string, updater: (node: GraphNode) => GraphNode): GraphDefinition {
@@ -46,6 +48,7 @@ export function GraphInspector({
   selectedEdgeId,
   onGraphChange,
   onOpenProviderDetails,
+  onSaveNode,
 }: GraphInspectorProps) {
   if (!graph) {
     return (
@@ -62,6 +65,57 @@ export function GraphInspector({
   const selectedEdge = selectedEdgeId ? graph.edges.find((edge) => edge.id === selectedEdgeId) ?? null : null;
 
   if (selectedNode) {
+    if (isWireJunctionNode(selectedNode)) {
+      return (
+        <section className="panel inspector-panel">
+          <div className="panel-header">
+            <h2>Wire Point</h2>
+            <p>This floating junction anchors a routed wire segment and can be dragged to reshape the path.</p>
+          </div>
+          <div className="inspector-body">
+            <label>
+              Node ID
+              <input value={selectedNode.id} readOnly />
+            </label>
+            <label>
+              Position X
+              <input
+                type="number"
+                value={selectedNode.position.x}
+                onChange={(event) =>
+                  onGraphChange(
+                    updateNode(graph, selectedNode.id, (node) => ({
+                      ...node,
+                      position: { ...node.position, x: Number(event.target.value) },
+                    })),
+                  )
+                }
+              />
+            </label>
+            <label>
+              Position Y
+              <input
+                type="number"
+                value={selectedNode.position.y}
+                onChange={(event) =>
+                  onGraphChange(
+                    updateNode(graph, selectedNode.id, (node) => ({
+                      ...node,
+                      position: { ...node.position, y: Number(event.target.value) },
+                    })),
+                  )
+                }
+              />
+            </label>
+            <div className="inspector-meta">
+              <span>Kind: floating junction</span>
+              <span>Purpose: wire routing</span>
+            </div>
+          </div>
+        </section>
+      );
+    }
+
     const contract = catalog?.contracts[selectedNode.category];
     const allowedTools = Array.isArray(selectedNode.config.allowed_tool_names)
       ? (selectedNode.config.allowed_tool_names as string[])
@@ -452,6 +506,22 @@ export function GraphInspector({
                 />
               </label>
             </>
+          ) : null}
+          {onSaveNode ? (
+            <div className="inspector-save-section">
+              <button
+                type="button"
+                className="secondary-button inspector-save-button"
+                onClick={() => onSaveNode(selectedNode)}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" />
+                  <path d="M17 21v-8H7v8M7 3v5h8" />
+                </svg>
+                Save to Library
+              </button>
+              <span className="inspector-save-hint">Save this node's configuration for reuse in the Add menu.</span>
+            </div>
           ) : null}
         </div>
       </section>

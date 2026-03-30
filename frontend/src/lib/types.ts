@@ -32,9 +32,11 @@ export type GraphEdge = {
   id: string;
   source_id: string;
   target_id: string;
+  source_handle_id?: string | null;
   label: string;
   kind: string;
   priority: number;
+  waypoints?: GraphPosition[];
   condition?: GraphEdgeCondition | null;
 };
 
