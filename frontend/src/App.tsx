@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { AgentRunSwimlanes } from "./components/AgentRunSwimlanes";
+import { EnvironmentRunSummary } from "./components/EnvironmentRunSummary";
 import { GraphCanvas } from "./components/GraphCanvas";
 import { GraphEnvEditor } from "./components/GraphEnvEditor";
 import {
@@ -13,16 +15,22 @@ import {
   startRun,
   updateGraph,
 } from "./lib/api";
-import { createBlankGraph, layoutGraphLR, normalizeGraph } from "./lib/editor";
-import type { EditorCatalog, GraphDefinition, RunState, RuntimeEvent } from "./lib/types";
+import { createBlankGraph, layoutGraphDocument, layoutGraphLR, normalizeGraphDocument } from "./lib/editor";
+import { filterEventsForAgent, getCanvasGraph, getDefaultAgentId, getSelectedRunId, getSelectedRunState, isTestEnvironment, updateSelectedAgentGraph } from "./lib/graphDocuments";
+import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedEventGroups, buildFocusedRunSummary } from "./lib/runVisualization";
+import type { EditorCatalog, GraphDefinition, GraphDocument, RunState, RuntimeEvent } from "./lib/types";
 import { useGraphHistory } from "./lib/useGraphHistory";
 
 const DEFAULT_INPUT = "Find graph-agent references for a schema repair workflow.";
+const DEFAULT_TEST_ENVIRONMENT_ID = "test-environment";
 
-function applyEvent(previous: RunState | null, event: RuntimeEvent, graphId: string, input: string): RunState {
-  const next: RunState = previous ?? {
-    run_id: event.run_id,
+function createEmptyRunState(runId: string, graphId: string, input: string): RunState {
+  return {
+    run_id: runId,
     graph_id: graphId,
+    agent_id: null,
+    agent_name: null,
+    parent_run_id: null,
     current_node_id: null,
     status: "queued",
     started_at: null,
@@ -35,9 +43,15 @@ function applyEvent(previous: RunState | null, event: RuntimeEvent, graphId: str
     event_history: [],
     final_output: null,
     terminal_error: null,
+    agent_runs: {},
   };
+}
 
-  next.event_history = [...next.event_history, event];
+function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState {
+  const next: RunState = {
+    ...previous,
+    event_history: [...previous.event_history, event],
+  };
 
   if (event.event_type === "run.started") {
     next.status = "running";
@@ -90,18 +104,56 @@ function applyEvent(previous: RunState | null, event: RuntimeEvent, graphId: str
   if (event.event_type === "run.failed") {
     next.status = "failed";
     next.ended_at = event.timestamp;
-    next.terminal_error = event.payload.error as Record<string, unknown>;
+    next.terminal_error = (event.payload.error ?? null) as Record<string, unknown> | null;
+    if ("final_output" in event.payload) {
+      next.final_output = event.payload.final_output;
+    }
   }
 
-  return { ...next };
+  return next;
+}
+
+function applyEvent(previous: RunState | null, event: RuntimeEvent, graphId: string, input: string): RunState {
+  const next = previous ?? createEmptyRunState(event.run_id, graphId, input);
+  if (event.agent_id) {
+    const agentId = event.agent_id;
+    const payload = event.payload as { child_run_id?: string; agent_name?: string };
+    const priorAgentRun =
+      next.agent_runs?.[agentId] ??
+      {
+        ...createEmptyRunState(payload.child_run_id ?? `${event.run_id}:${agentId}`, graphId, input),
+        agent_id: agentId,
+        agent_name: payload.agent_name ?? agentId,
+        parent_run_id: event.run_id,
+      };
+    const normalizedEvent: RuntimeEvent = {
+      ...event,
+      event_type: event.event_type.replace(/^agent\./, ""),
+      run_id: priorAgentRun.run_id,
+    };
+    return {
+      ...next,
+      status: next.status === "queued" ? "running" : next.status,
+      event_history: [...next.event_history, event],
+      agent_runs: {
+        ...(next.agent_runs ?? {}),
+        [agentId]: applySingleRunEvent(priorAgentRun, normalizedEvent),
+      },
+    };
+  }
+  return applySingleRunEvent(next, event);
+}
+
+function pickDefaultGraphId(graphs: GraphDocument[]): string {
+  return graphs.find((graph) => graph.graph_id === DEFAULT_TEST_ENVIRONMENT_ID)?.graph_id ?? graphs[0]?.graph_id ?? "";
 }
 
 export default function App() {
-  const [graphs, setGraphs] = useState<GraphDefinition[]>([]);
+  const [graphs, setGraphs] = useState<GraphDocument[]>([]);
   const [selectedGraphId, setSelectedGraphId] = useState<string>("");
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const history = useGraphHistory();
-  const draftGraph = history.graph;
-  const setDraftGraph = history.set;
+  const { graph: draftGraph, set: setDraftGraph, setQuiet: setDraftGraphQuiet, reset: resetHistory } = history;
   const [catalog, setCatalog] = useState<EditorCatalog | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
@@ -115,21 +167,41 @@ export default function App() {
   const sourceRef = useRef<EventSource | null>(null);
   const executionBoxRef = useRef<HTMLDivElement | null>(null);
 
+  const canvasGraph = useMemo(() => getCanvasGraph(draftGraph, selectedAgentId), [draftGraph, selectedAgentId]);
+  const selectedRunState = useMemo(() => getSelectedRunState(runState, selectedAgentId), [runState, selectedAgentId]);
+  const selectedRunId = useMemo(() => getSelectedRunId(runState, activeRunId, selectedAgentId), [runState, activeRunId, selectedAgentId]);
+  const filteredEvents = useMemo(() => filterEventsForAgent(events, selectedAgentId), [events, selectedAgentId]);
+  const persistedGraphIds = useMemo(() => new Set(graphs.map((graph) => graph.graph_id)), [graphs]);
+  const isEnvironment = isTestEnvironment(draftGraph);
+  const environmentRunSummary = useMemo(
+    () => buildEnvironmentRunSummary(draftGraph, runState, selectedAgentId),
+    [draftGraph, runState, selectedAgentId],
+  );
+  const agentRunLanes = useMemo(() => buildAgentRunLanes(draftGraph, runState, events), [draftGraph, runState, events]);
+  const focusedRunSummary = useMemo(
+    () => buildFocusedRunSummary(canvasGraph, selectedRunState, filteredEvents),
+    [canvasGraph, selectedRunState, filteredEvents],
+  );
+  const focusedEventGroups = useMemo(
+    () => buildFocusedEventGroups(canvasGraph, filteredEvents),
+    [canvasGraph, filteredEvents],
+  );
+
   useEffect(() => {
     Promise.all([fetchGraphs(), fetchEditorCatalog()])
       .then(([loadedGraphs, loadedCatalog]) => {
         setGraphs(loadedGraphs);
         setCatalog(loadedCatalog);
         if (loadedGraphs.length > 0) {
-          setSelectedGraphId(loadedGraphs[0].graph_id);
+          setSelectedGraphId(pickDefaultGraphId(loadedGraphs));
         } else {
-          history.reset(createBlankGraph());
+          resetHistory(createBlankGraph());
         }
       })
       .catch((loadError: Error) => {
         setError(loadError.message);
       });
-  }, []);
+  }, [resetHistory]);
 
   useEffect(() => {
     return () => {
@@ -143,14 +215,19 @@ export default function App() {
     }
     fetchGraph(selectedGraphId)
       .then((graph) => {
-        history.reset(layoutGraphLR(graph));
+        const nextGraph = layoutGraphDocument(graph);
+        resetHistory(nextGraph);
+        setSelectedAgentId(getDefaultAgentId(nextGraph));
         setSelectedNodeId(null);
         setSelectedEdgeId(null);
       })
       .catch((loadError: Error) => setError(loadError.message));
-  }, [selectedGraphId]);
+  }, [resetHistory, selectedGraphId]);
 
-  const persistedGraphIds = useMemo(() => new Set(graphs.map((graph) => graph.graph_id)), [graphs]);
+  useEffect(() => {
+    setSelectedNodeId(null);
+    setSelectedEdgeId(null);
+  }, [selectedAgentId]);
 
   async function refreshGraphs(nextSelectedGraphId?: string) {
     const loadedGraphs = await fetchGraphs();
@@ -159,24 +236,28 @@ export default function App() {
       setSelectedGraphId(nextSelectedGraphId);
     } else if (loadedGraphs.length === 0) {
       setSelectedGraphId("");
-      history.reset(createBlankGraph());
+      resetHistory(createBlankGraph());
+      setSelectedAgentId(null);
     }
   }
 
-  async function saveCurrentGraph(): Promise<GraphDefinition | null> {
+  async function saveCurrentGraph(): Promise<GraphDocument | null> {
     if (!draftGraph) {
       return null;
     }
     setIsSaving(true);
     setError(null);
     try {
-      const normalized = normalizeGraph(draftGraph);
+      const normalized = normalizeGraphDocument(draftGraph);
       const savedGraph =
         selectedGraphId && persistedGraphIds.has(selectedGraphId)
           ? await updateGraph(selectedGraphId, normalized)
           : await createGraph(normalized);
       await refreshGraphs(savedGraph.graph_id);
       setDraftGraph(savedGraph);
+      if (isTestEnvironment(savedGraph)) {
+        setSelectedAgentId((current) => current ?? getDefaultAgentId(savedGraph));
+      }
       return savedGraph;
     } catch (saveError) {
       const message = saveError instanceof Error ? saveError.message : "Unable to save graph.";
@@ -190,7 +271,8 @@ export default function App() {
   function handleCreateGraph() {
     sourceRef.current?.close();
     setSelectedGraphId("");
-    history.reset(createBlankGraph());
+    setSelectedAgentId(null);
+    resetHistory(createBlankGraph());
     setSelectedNodeId(null);
     setSelectedEdgeId(null);
     setActiveRunId(null);
@@ -209,10 +291,11 @@ export default function App() {
       const loadedGraphs = await fetchGraphs();
       setGraphs(loadedGraphs);
       if (loadedGraphs.length > 0) {
-        setSelectedGraphId(loadedGraphs[0].graph_id);
+        setSelectedGraphId(pickDefaultGraphId(loadedGraphs));
       } else {
         setSelectedGraphId("");
-        history.reset(createBlankGraph());
+        setSelectedAgentId(null);
+        resetHistory(createBlankGraph());
       }
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
@@ -251,7 +334,7 @@ export default function App() {
         setEvents((previous) => [...previous, event]);
         setRunState((previous) => applyEvent(previous, event, savedGraph.graph_id, input));
 
-        if (event.event_type === "run.completed" || event.event_type === "run.failed") {
+        if (!event.agent_id && (event.event_type === "run.completed" || event.event_type === "run.failed")) {
           source.close();
           fetchRun(runId)
             .then((state) => setRunState(state))
@@ -275,99 +358,124 @@ export default function App() {
     executionBoxRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
+  function handleCanvasGraphChange(nextGraph: GraphDefinition) {
+    if (!canvasGraph || !draftGraph) {
+      return;
+    }
+    setDraftGraph(updateSelectedAgentGraph(draftGraph, selectedAgentId, nextGraph));
+  }
+
+  function handleCanvasGraphDrag(nextGraph: GraphDefinition) {
+    if (!canvasGraph || !draftGraph) {
+      return;
+    }
+    setDraftGraphQuiet(updateSelectedAgentGraph(draftGraph, selectedAgentId, nextGraph));
+  }
+
   return (
     <main className="app-shell">
-      <div ref={executionBoxRef} className="hero-mosaic">
-        <div className="mosaic-tile panel mosaic-title">
-          <h1>Graph Agent Studio</h1>
-          <p>Drag nodes into the canvas, wire edges, and launch your agent.</p>
-          <div className="mosaic-title-actions">
-            <button type="button" className="secondary-button" onClick={handleCreateGraph}>
-              New Agent
-            </button>
-            <button type="button" className="secondary-button" onClick={() => void saveCurrentGraph()} disabled={!draftGraph || isSaving}>
-              {isSaving ? "Saving..." : "Save"}
-            </button>
-            <button type="button" className="secondary-button" onClick={history.undo} disabled={!history.canUndo} title="Undo (⌘Z)">
-              Undo
-            </button>
-            <button type="button" className="secondary-button" onClick={history.redo} disabled={!history.canRedo} title="Redo (⌘⇧Z)">
-              Redo
-            </button>
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={() => draftGraph && setDraftGraph(layoutGraphLR(draftGraph))}
-              disabled={!draftGraph || draftGraph.nodes.length === 0}
-            >
-              Auto Layout
-            </button>
-            <button
-              type="button"
-              className="danger-button"
-              onClick={() => void handleDeleteGraph()}
-              disabled={!draftGraph}
-            >
-              Delete
-            </button>
+      <div ref={executionBoxRef} className="hero-section">
+        <div className="hero-mosaic">
+          <div className="mosaic-tile panel mosaic-title">
+            <h1>Graph Agent Studio</h1>
+            <p>{isEnvironment ? "Compose a test environment with isolated agents and drill into each run." : "Drag nodes into the canvas, wire edges, and launch your agent."}</p>
+            <div className="mosaic-title-actions">
+              <button type="button" className="secondary-button" onClick={handleCreateGraph}>
+                New Agent
+              </button>
+              <button type="button" className="secondary-button" onClick={() => void saveCurrentGraph()} disabled={!draftGraph || isSaving}>
+                {isSaving ? "Saving..." : "Save"}
+              </button>
+              <button type="button" className="secondary-button" onClick={history.undo} disabled={!history.canUndo} title="Undo (⌘Z)">
+                Undo
+              </button>
+              <button type="button" className="secondary-button" onClick={history.redo} disabled={!history.canRedo} title="Redo (⌘⇧Z)">
+                Redo
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => canvasGraph && handleCanvasGraphChange(layoutGraphLR(canvasGraph))}
+                disabled={!canvasGraph || canvasGraph.nodes.length === 0}
+              >
+                Auto Layout
+              </button>
+              <button type="button" className="danger-button" onClick={() => void handleDeleteGraph()} disabled={!draftGraph}>
+                Delete
+              </button>
+            </div>
+          </div>
+
+          <div className="mosaic-tile panel mosaic-graph">
+            <label>
+              Graph
+              <select
+                value={selectedGraphId || "__draft__"}
+                onChange={(event) => {
+                  if (event.target.value === "__draft__") {
+                    handleCreateGraph();
+                    return;
+                  }
+                  setSelectedGraphId(event.target.value);
+                }}
+              >
+                {!selectedGraphId ? <option value="__draft__">Unsaved Draft</option> : null}
+                {graphs.map((graph) => (
+                  <option key={graph.graph_id} value={graph.graph_id}>
+                    {graph.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div className="mosaic-tile panel mosaic-execution">
+            <label className="mosaic-execution-input">
+              Input
+              <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={4} />
+            </label>
+            <div className="mosaic-execution-run">
+              <button type="button" onClick={() => void handleRun()} disabled={!draftGraph || isRunning || isSaving}>
+                {isRunning ? "Running..." : isEnvironment ? "Run Environment" : "Run Graph"}
+              </button>
+              {selectedRunId ? <code>Run ID: {selectedRunId}</code> : <p>Ready to launch the selected graph.</p>}
+              {error ? <p className="error-text">{error}</p> : null}
+            </div>
+          </div>
+
+          <div className="mosaic-tile panel mosaic-env">
+            <h2>Environment</h2>
+            <GraphEnvEditor graph={draftGraph} onGraphChange={setDraftGraph} />
           </div>
         </div>
 
-        <div className="mosaic-tile panel mosaic-graph">
-          <label>
-            Graph
-            <select
-              value={selectedGraphId || "__draft__"}
-              onChange={(event) => {
-                if (event.target.value === "__draft__") {
-                  handleCreateGraph();
-                  return;
-                }
-                setSelectedGraphId(event.target.value);
-              }}
-            >
-              {!selectedGraphId ? <option value="__draft__">Unsaved Draft</option> : null}
-              {graphs.map((graph) => (
-                <option key={graph.graph_id} value={graph.graph_id}>
-                  {graph.name}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-
-        <div className="mosaic-tile panel mosaic-execution">
-          <label className="mosaic-execution-input">
-            Input
-            <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={4} />
-          </label>
-          <div className="mosaic-execution-run">
-            <button type="button" onClick={() => void handleRun()} disabled={!draftGraph || isRunning || isSaving}>
-              {isRunning ? "Running..." : "Run Graph"}
-            </button>
-            {activeRunId ? <code>Run ID: {activeRunId}</code> : <p>Ready to launch the selected graph.</p>}
-            {error ? <p className="error-text">{error}</p> : null}
-          </div>
-        </div>
-
-        <div className="mosaic-tile panel mosaic-env">
-          <h2>Environment</h2>
-          <GraphEnvEditor graph={draftGraph} onGraphChange={setDraftGraph} />
-        </div>
+        {environmentRunSummary ? <EnvironmentRunSummary summary={environmentRunSummary} /> : null}
       </div>
 
       <section className="content-grid">
         <GraphCanvas
-          graph={draftGraph}
-          runState={runState}
-          events={events}
-          activeRunId={activeRunId}
+          graph={canvasGraph}
+          runState={selectedRunState}
+          events={filteredEvents}
+          activeRunId={selectedRunId}
           isRunning={isRunning}
+          runButtonLabel={isEnvironment ? "Run Environment" : "Run Graph"}
+          focusedAgentName={isEnvironment ? (environmentRunSummary?.focusedAgentName ?? null) : null}
+          focusedAgentStatus={isEnvironment ? (selectedRunState?.status ?? "idle") : null}
+          environmentAgents={isEnvironment ? agentRunLanes : []}
+          selectedAgentId={selectedAgentId}
+          onSelectAgent={(agentId) => {
+            setSelectedAgentId(agentId);
+            setSelectedNodeId(null);
+            setSelectedEdgeId(null);
+          }}
+          runSummary={focusedRunSummary}
+          eventGroups={focusedEventGroups}
           catalog={catalog}
           selectedNodeId={selectedNodeId}
           selectedEdgeId={selectedEdgeId}
-          onGraphChange={setDraftGraph}
-          onGraphDrag={history.setQuiet}
+          onGraphChange={handleCanvasGraphChange}
+          onGraphDrag={handleCanvasGraphDrag}
           onRunGraph={() => void handleRun()}
           onScrollToTop={scrollToExecutionBox}
           onSelectionChange={(nodeId, edgeId) => {
@@ -376,6 +484,19 @@ export default function App() {
           }}
         />
       </section>
+
+      {isTestEnvironment(draftGraph) ? (
+        <AgentRunSwimlanes
+          lanes={agentRunLanes}
+          selectedAgentId={selectedAgentId}
+          onSelectAgent={(agentId) => setSelectedAgentId(agentId)}
+          onSelectNode={(agentId, nodeId) => {
+            setSelectedAgentId(agentId);
+            setSelectedNodeId(nodeId);
+            setSelectedEdgeId(null);
+          }}
+        />
+      ) : null}
     </main>
   );
 }

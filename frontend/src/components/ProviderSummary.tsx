@@ -16,7 +16,7 @@ type ProviderSummaryProps = {
 };
 
 const CATEGORY_DESCRIPTIONS: Record<string, string> = {
-  start: "Start nodes are entry points that inject outside signals, requests, or webhook payloads into a graph run.",
+  start: "Start nodes are entry points that inject run-button input or external events such as Discord messages into a graph run.",
   api: "API nodes call external or provider-backed services such as LLM endpoints while keeping a stable graph role.",
   tool: "Tool nodes perform structured actions with validated inputs and routable success or failure results.",
   data: "Data nodes gather, transform, or enrich deterministic context inside the graph.",
@@ -25,7 +25,7 @@ const CATEGORY_DESCRIPTIONS: Record<string, string> = {
 
 const CATEGORY_ORDER = ["all", "saved", "start", "api", "tool", "data", "end"] as const;
 
-const QUICK_PICK_PROVIDER_IDS = ["core.input", "core.api", "tool.registry", "core.output"];
+const QUICK_PICK_PROVIDER_IDS = ["start.manual_run", "start.discord_message", "core.api", "tool.registry", "core.output"];
 
 const KIND_LABELS: Record<string, string> = {
   input: "IN",
@@ -74,7 +74,9 @@ export function ProviderSummary({
 }: ProviderSummaryProps) {
   const [activeCategory, setActiveCategory] = useState<string>("all");
   const normalizedQuery = query.trim().toLowerCase();
-  const allProviders = (catalog?.node_providers ?? []).filter((provider) => provider.category !== "provider");
+  const allProviders = (catalog?.node_providers ?? []).filter(
+    (provider) => provider.category !== "provider" && provider.provider_id !== "core.input",
+  );
   const isSavedCategory = activeCategory === "saved";
   const providers = isSavedCategory
     ? []

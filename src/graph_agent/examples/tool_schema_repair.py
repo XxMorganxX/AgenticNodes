@@ -16,12 +16,32 @@ def build_example_services() -> RuntimeServices:
     node_providers = NodeProviderRegistry()
     node_providers.register(
         NodeProviderDefinition(
-            provider_id="core.input",
-            display_name="Core Input Node",
+            provider_id="start.manual_run",
+            display_name="Run Button Start",
             category=NodeCategory.START,
             node_kind="input",
-            description="Captures the starting payload for a graph run.",
-            capabilities=["accepts external input"],
+            description="Starts a graph when the editor Run button is clicked and captures that payload.",
+            capabilities=["run button trigger", "accepts external input"],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="start.discord_message",
+            display_name="Discord Message Start",
+            category=NodeCategory.START,
+            node_kind="input",
+            description="Starts a graph from an incoming Discord channel message handled by the configured bot.",
+            capabilities=["discord channel trigger", "bot event listener", "message payload capture"],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="core.input",
+            display_name="Core Input Node (Legacy)",
+            category=NodeCategory.START,
+            node_kind="input",
+            description="Legacy alias for the manual run start node kept for backward compatibility.",
+            capabilities=["legacy alias", "run button trigger"],
         )
     )
     node_providers.register(
@@ -134,8 +154,8 @@ def build_example_graph_payload() -> dict[str, object]:
                 "kind": "input",
                 "category": "start",
                 "label": "Start Input",
-                "provider_id": "core.input",
-                "provider_label": "Core Input Node",
+                "provider_id": "start.manual_run",
+                "provider_label": "Run Button Start",
                 "description": "Captures the starting payload for a graph run.",
                 "position": {"x": 120, "y": 120},
                 "config": {

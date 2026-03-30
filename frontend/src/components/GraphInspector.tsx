@@ -140,6 +140,10 @@ export function GraphInspector({
     const availableModelProviders = modelProviders(catalog);
     const selectedProviderName = String(selectedNode.config.provider_name ?? selectedNode.model_provider_name ?? "mock");
     const isClaudeCodeProvider = selectedProviderName === "claude_code";
+    const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
+    const isManualStartNode =
+      selectedNode.kind === "input" &&
+      (selectedNode.provider_id === "start.manual_run" || selectedNode.provider_id === "core.input");
 
     return (
       <section className="panel inspector-panel">
@@ -214,6 +218,101 @@ export function GraphInspector({
               <span>Accepts: {contract.accepted_inputs.join(", ")}</span>
               <span>Produces: {contract.produced_outputs.join(", ")}</span>
             </div>
+          ) : null}
+          {selectedNode.kind === "input" ? (
+            <>
+              <label>
+                Start Trigger
+                <input value={isDiscordStartNode ? "discord_message" : "manual_run"} readOnly />
+              </label>
+              {isManualStartNode ? (
+                <div className="contract-card">
+                  <strong>Manual Run Start</strong>
+                  <span>This node is triggered by clicking Run in the editor.</span>
+                  <span>Payload source: input payload passed to the run request.</span>
+                </div>
+              ) : null}
+              {isDiscordStartNode ? (
+                <>
+                  <label>
+                    Discord Bot Token Env Var
+                    <input
+                      value={String(selectedNode.config.discord_bot_token_env_var ?? "{DISCORD_BOT_TOKEN}")}
+                      placeholder="{DISCORD_BOT_TOKEN}"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              trigger_mode: "discord_message",
+                              discord_bot_token_env_var: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Discord Channel ID
+                    <input
+                      value={String(selectedNode.config.discord_channel_id ?? "")}
+                      placeholder="123456789012345678"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              trigger_mode: "discord_message",
+                              discord_channel_id: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label className="checkbox-option">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selectedNode.config.ignore_bot_messages ?? true)}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              trigger_mode: "discord_message",
+                              ignore_bot_messages: event.target.checked,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                    <span>Ignore bot-authored messages</span>
+                  </label>
+                  <label className="checkbox-option">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selectedNode.config.ignore_self_messages ?? true)}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              trigger_mode: "discord_message",
+                              ignore_self_messages: event.target.checked,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                    <span>Ignore this bot's own messages</span>
+                  </label>
+                </>
+              ) : null}
+            </>
           ) : null}
           {selectedNode.kind === "model" ? (
             <>

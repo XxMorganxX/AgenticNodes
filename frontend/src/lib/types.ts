@@ -45,12 +45,37 @@ export type GraphDefinition = {
   name: string;
   description: string;
   version: string;
+  graph_type?: "graph" | "test_environment";
   start_node_id: string;
   env_vars?: Record<string, string>;
   nodes: GraphNode[];
   edges: GraphEdge[];
   node_providers?: NodeProviderDefinition[];
 };
+
+export type AgentDefinition = {
+  agent_id: string;
+  name: string;
+  description: string;
+  version: string;
+  start_node_id: string;
+  env_vars?: Record<string, string>;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+};
+
+export type TestEnvironmentDefinition = {
+  graph_id: string;
+  name: string;
+  description: string;
+  version: string;
+  graph_type: "test_environment" | "graph";
+  env_vars?: Record<string, string>;
+  agents: AgentDefinition[];
+  node_providers?: NodeProviderDefinition[];
+};
+
+export type GraphDocument = GraphDefinition | TestEnvironmentDefinition;
 
 export type NodeProviderDefinition = {
   provider_id: string;
@@ -92,12 +117,17 @@ export type RuntimeEvent = {
   summary: string;
   payload: Record<string, unknown>;
   run_id: string;
+  agent_id?: string | null;
+  parent_run_id?: string | null;
   timestamp: string;
 };
 
 export type RunState = {
   run_id: string;
   graph_id: string;
+  agent_id?: string | null;
+  agent_name?: string | null;
+  parent_run_id?: string | null;
   current_node_id: string | null;
   status: string;
   started_at: string | null;
@@ -110,8 +140,9 @@ export type RunState = {
   event_history: RuntimeEvent[];
   final_output: unknown;
   terminal_error: Record<string, unknown> | null;
+  agent_runs?: Record<string, RunState>;
 };
 
-export function cloneGraphDefinition(graph: GraphDefinition): GraphDefinition {
-  return JSON.parse(JSON.stringify(graph)) as GraphDefinition;
+export function cloneGraphDefinition<T extends GraphDocument>(graph: T): T {
+  return JSON.parse(JSON.stringify(graph)) as T;
 }

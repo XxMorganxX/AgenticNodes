@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from graph_agent.runtime.core import GraphDefinition, GraphValidationError, RuntimeServices
+from graph_agent.runtime.core import GraphValidationError, RuntimeServices
+from graph_agent.runtime.documents import load_graph_document
 from graph_agent.runtime.node_providers import DEFAULT_CATEGORY_CONTRACTS, list_connection_rules
 
 
@@ -31,16 +32,18 @@ class GraphStore:
 
     def create_graph(self, graph_payload: dict[str, Any]) -> dict[str, Any]:
         self._validate_graph_payload(graph_payload)
+        normalized_graph = load_graph_document(graph_payload).to_dict()
         payload = self._load_user_all()
         existing_ids = set(self._merged_graphs())
-        if graph_payload["graph_id"] in existing_ids:
-            raise ValueError(f"Graph '{graph_payload['graph_id']}' already exists.")
-        payload["graphs"].append(graph_payload)
+        if normalized_graph["graph_id"] in existing_ids:
+            raise ValueError(f"Graph '{normalized_graph['graph_id']}' already exists.")
+        payload["graphs"].append(normalized_graph)
         self._save_user_all(payload)
-        return graph_payload
+        return normalized_graph
 
     def update_graph(self, graph_id: str, graph_payload: dict[str, Any]) -> dict[str, Any]:
         self._validate_graph_payload(graph_payload)
+        normalized_graph = load_graph_document(graph_payload).to_dict()
         if graph_id not in self._merged_graphs():
             raise KeyError(graph_id)
 
@@ -48,16 +51,16 @@ class GraphStore:
         updated = False
         for index, graph in enumerate(payload["graphs"]):
             if graph["graph_id"] == graph_id:
-                payload["graphs"][index] = graph_payload
+                payload["graphs"][index] = normalized_graph
                 updated = True
                 break
 
         # Persist edits as user-local overrides so built-in sample graphs stay tracked.
         if not updated:
-            payload["graphs"].append(graph_payload)
+            payload["graphs"].append(normalized_graph)
 
         self._save_user_all(payload)
-        return graph_payload
+        return normalized_graph
 
     def delete_graph(self, graph_id: str) -> None:
         payload = self._load_user_all()
@@ -88,7 +91,7 @@ class GraphStore:
 
     def _validate_graph_payload(self, payload: dict[str, Any]) -> None:
         try:
-            graph = GraphDefinition.from_dict(payload)
+            graph = load_graph_document(payload)
             graph.validate_against_services(self.services)
         except (GraphValidationError, KeyError, TypeError, ValueError) as exc:
             raise ValueError(str(exc)) from exc
@@ -113,8 +116,8 @@ class GraphStore:
 
     def _merged_graphs(self) -> dict[str, dict[str, Any]]:
         merged = {
-            graph["graph_id"]: graph for graph in self._load_bundled_all()["graphs"]
+            graph["graph_id"]: load_graph_document(graph).to_dict() for graph in self._load_bundled_all()["graphs"]
         }
         for graph in self._load_user_all()["graphs"]:
-            merged[graph["graph_id"]] = graph
+            merged[graph["graph_id"]] = load_graph_document(graph).to_dict()
         return merged

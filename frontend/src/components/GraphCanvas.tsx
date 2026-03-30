@@ -5,6 +5,7 @@ import { Background, BackgroundVariant, ConnectionLineType, Controls, MarkerType
 import "reactflow/dist/style.css";
 
 import { EventTimeline } from "./EventTimeline";
+import { EnvironmentAgentMenu } from "./EnvironmentAgentMenu";
 import {
   buildOrthogonalPolylinePoints,
   buildPolylinePath,
@@ -36,6 +37,7 @@ import {
 import { logGraphDiagnostic, useGraphDiagnosticsEnabled, useRenderDiagnostics, warnGraphDiagnostic } from "../lib/dragDiagnostics";
 import { deleteSavedNode, getSavedNodes, saveNodeToLibrary } from "../lib/savedNodes";
 import type { SavedNode } from "../lib/savedNodes";
+import { formatRunStatusLabel, type AgentRunLane, type FocusedEventGroup, type FocusedRunSummary } from "../lib/runVisualization";
 import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition, RunState, RuntimeEvent } from "../lib/types";
 
 type GraphCanvasProps = {
@@ -44,6 +46,14 @@ type GraphCanvasProps = {
   events: RuntimeEvent[];
   activeRunId: string | null;
   isRunning: boolean;
+  runButtonLabel?: string;
+  focusedAgentName?: string | null;
+  focusedAgentStatus?: string | null;
+  environmentAgents?: AgentRunLane[];
+  selectedAgentId?: string | null;
+  onSelectAgent?: (agentId: string) => void;
+  runSummary?: FocusedRunSummary | null;
+  eventGroups?: FocusedEventGroup[];
   catalog: EditorCatalog | null;
   selectedNodeId: string | null;
   selectedEdgeId: string | null;
@@ -403,10 +413,10 @@ const PLACEMENT_UI_SELECTOR = ".graph-toolbar, .graph-quick-add, .graph-hotkey-g
 const QUICK_ADD_SLOTS: QuickAddSlot[] = [
   {
     hotkey: "1",
-    label: "Input",
-    description: "Create a start/input node.",
+    label: "Start",
+    description: "Create a run-triggered start node.",
     category: "start",
-    preferredProviderIds: ["core.input"],
+    preferredProviderIds: ["start.manual_run", "core.input"],
   },
   {
     hotkey: "2",
@@ -477,6 +487,14 @@ export function GraphCanvas({
   events,
   activeRunId,
   isRunning,
+  runButtonLabel = "Run Graph",
+  focusedAgentName = null,
+  focusedAgentStatus = null,
+  environmentAgents = [],
+  selectedAgentId = null,
+  onSelectAgent,
+  runSummary,
+  eventGroups = [],
   catalog,
   selectedNodeId,
   selectedEdgeId,
@@ -2749,19 +2767,41 @@ export function GraphCanvas({
     toolDetailsNodeId && graph ? graph.nodes.find((node) => node.id === toolDetailsNodeId && node.kind === "tool") ?? null : null;
   const providerDetailsNode =
     providerDetailsNodeId && graph ? graph.nodes.find((node) => node.id === providerDetailsNodeId && node.kind === "model") ?? null : null;
+  const [agentMenuOpen, setAgentMenuOpen] = useState(false);
 
   if (!graph) {
     return <div className="panel empty-panel">No graph selected.</div>;
   }
 
   return (
-    <div className="graph-shell panel">
+    <div
+      className="graph-shell panel"
+      onBlurCapture={(event) => {
+        if (!(event.currentTarget instanceof HTMLElement)) {
+          return;
+        }
+        const nextFocused = event.relatedTarget;
+        if (nextFocused instanceof Node && event.currentTarget.contains(nextFocused)) {
+          return;
+        }
+        setAgentMenuOpen(false);
+      }}
+    >
       <div className="graph-shell-header panel-header">
         <div>
           <h2>{graph.name}</h2>
           <p>
             Drag node cards into the canvas and use the inspector to configure prompts, providers, tools, and routing.
           </p>
+          {focusedAgentName ? (
+            <div className="graph-run-context">
+              <span className="graph-run-context-label">Focused agent</span>
+              <span className="graph-run-context-name">{focusedAgentName}</span>
+              <span className={`graph-run-context-status graph-run-context-status--${focusedAgentStatus ?? "idle"}`}>
+                {formatRunStatusLabel(focusedAgentStatus)}
+              </span>
+            </div>
+          ) : null}
           {editorMessage ? <p className="editor-message">{editorMessage}</p> : null}
         </div>
         <div className="graph-scroll-nav">
@@ -2774,6 +2814,18 @@ export function GraphCanvas({
         </div>
       </div>
       <div className="graph-workspace">
+        {environmentAgents.length > 0 ? (
+          <EnvironmentAgentMenu
+            agents={environmentAgents}
+            selectedAgentId={selectedAgentId}
+            open={agentMenuOpen}
+            onToggle={() => setAgentMenuOpen((previous) => !previous)}
+            onSelectAgent={(agentId) => {
+              onSelectAgent?.(agentId);
+              setAgentMenuOpen(false);
+            }}
+          />
+        ) : null}
         <div
           ref={canvasRef}
           className={`graph-canvas${drawerOpen ? " graph-canvas--drawer-open" : ""}${isProviderDragActive || isSavedNodeDragActive ? " is-drop-target" : ""}${isConnecting ? " is-connecting" : ""}${pendingPlacement ? " is-placing-node" : ""}${draftConnection ? " is-routing-wire" : ""}${junctionDrag ? " is-dragging-junction" : ""}${waypointDrag ? " is-dragging-waypoint" : ""}${isNodeDragActive ? " is-dragging-node" : ""}`}
@@ -3112,45 +3164,61 @@ export function GraphCanvas({
                   <section className="graph-run-launch">
                     <div className="graph-run-launch-copy">
                       <strong>Launch the current draft</strong>
-                      <span>Run the graph from this drawer and watch events stream below.</span>
+                      <span>
+                        {focusedAgentName
+                          ? `Run the environment and follow ${focusedAgentName} below.`
+                          : "Run the graph from this drawer and watch events stream below."}
+                      </span>
                     </div>
                     <button type="button" onClick={onRunGraph} disabled={isRunning}>
-                      {isRunning ? "Running..." : "Run Graph"}
+                      {isRunning ? "Running..." : runButtonLabel}
                     </button>
                   </section>
                   <section className="panel graph-run-summary">
                     <div className="panel-header">
-                      <h2>Run State</h2>
+                      <h2>{focusedAgentName ? `${focusedAgentName} Run` : "Run State"}</h2>
                       <p>{activeRunId ? `Latest run: ${activeRunId}` : "No active run."}</p>
                     </div>
                     <dl className="state-grid">
                       <div>
                         <dt>Status</dt>
-                        <dd>{runState?.status ?? "idle"}</dd>
+                        <dd>{runSummary?.status ?? runState?.status ?? "idle"}</dd>
                       </div>
                       <div>
                         <dt>Current Node</dt>
-                        <dd>{runState?.current_node_id ?? "n/a"}</dd>
+                        <dd>{runSummary?.currentNodeLabel ?? runState?.current_node_id ?? "n/a"}</dd>
                       </div>
                       <div>
-                        <dt>Visited Nodes</dt>
-                        <dd>{Object.keys(runState?.visit_counts ?? {}).length}</dd>
+                        <dt>Progress</dt>
+                        <dd>{`${runSummary?.completedNodes ?? Object.keys(runState?.visit_counts ?? {}).length}/${runSummary?.totalNodes ?? graph.nodes.length}`}</dd>
                       </div>
                       <div>
                         <dt>Transitions</dt>
-                        <dd>{runState?.transition_history.length ?? 0}</dd>
+                        <dd>{runSummary?.transitionCount ?? runState?.transition_history.length ?? 0}</dd>
+                      </div>
+                      <div>
+                        <dt>Retries</dt>
+                        <dd>{runSummary?.retryCount ?? 0}</dd>
+                      </div>
+                      <div>
+                        <dt>Errors</dt>
+                        <dd>{runSummary?.errorCount ?? Object.keys(runState?.node_errors ?? {}).length}</dd>
+                      </div>
+                      <div>
+                        <dt>Elapsed</dt>
+                        <dd>{runSummary?.elapsedLabel ?? "Not started"}</dd>
                       </div>
                     </dl>
                     <div className="json-block">
                       <strong>Final Output</strong>
-                      <pre>{JSON.stringify(runState?.final_output ?? null, null, 2)}</pre>
+                      <pre>{JSON.stringify(runSummary?.finalOutput ?? runState?.final_output ?? null, null, 2)}</pre>
                     </div>
                     <div className="json-block">
                       <strong>Errors</strong>
-                      <pre>{JSON.stringify(runState?.node_errors ?? {}, null, 2)}</pre>
+                      <pre>{JSON.stringify(runSummary?.nodeErrors ?? runState?.node_errors ?? {}, null, 2)}</pre>
                     </div>
                   </section>
-                  <EventTimeline events={events} embedded />
+                  <EventTimeline events={events} groups={eventGroups} embedded />
                 </div>
               ) : null}
             </div>

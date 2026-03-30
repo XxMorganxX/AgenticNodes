@@ -1,20 +1,20 @@
 import { useMemo, useState } from "react";
 
 import { getGraphEnvVars, STANDARD_GRAPH_ENV_FIELDS } from "../lib/graphEnv";
-import type { GraphDefinition } from "../lib/types";
+import type { GraphDocument } from "../lib/types";
 
 type GraphEnvEditorProps = {
-  graph: GraphDefinition | null;
-  onGraphChange: (graph: GraphDefinition) => void;
+  graph: GraphDocument | null;
+  onGraphChange: (graph: GraphDocument) => void;
 };
 
 const GRAPH_ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const STANDARD_GRAPH_ENV_KEYS: ReadonlySet<string> = new Set(STANDARD_GRAPH_ENV_FIELDS.map((field) => field.key));
 
 function updateGraphEnvVars(
-  graph: GraphDefinition,
+  graph: GraphDocument,
   updater: (envVars: Record<string, string>) => Record<string, string>,
-): GraphDefinition {
+): GraphDocument {
   return {
     ...graph,
     env_vars: updater(getGraphEnvVars(graph)),

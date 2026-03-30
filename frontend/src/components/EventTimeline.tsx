@@ -1,14 +1,31 @@
+import type { FocusedEventGroup } from "../lib/runVisualization";
 import type { RuntimeEvent } from "../lib/types";
 
 type EventTimelineProps = {
   events: RuntimeEvent[];
+  groups?: FocusedEventGroup[];
   embedded?: boolean;
 };
 
-export function EventTimeline({ events, embedded = false }: EventTimelineProps) {
+export function EventTimeline({ events, groups, embedded = false }: EventTimelineProps) {
   const content = (
     <div className="timeline">
-      {events.length === 0 ? (
+      {groups && groups.length > 0 ? (
+        groups.map((group) => (
+          <article key={group.id} className={`timeline-item timeline-item--group timeline-item--${group.tone}`}>
+            <div className="timeline-meta">
+              <span>{group.subtitle}</span>
+              <span>{group.startedAt ? new Date(group.startedAt).toLocaleTimeString() : "n/a"}</span>
+            </div>
+            <strong className="timeline-group-title">{group.title}</strong>
+            <div className="timeline-group-lines">
+              {group.lines.map((line, index) => (
+                <p key={`${group.id}-${index}`}>{line}</p>
+              ))}
+            </div>
+          </article>
+        ))
+      ) : events.length === 0 ? (
         <div className="empty-panel">Start a run to see live events.</div>
       ) : (
         events

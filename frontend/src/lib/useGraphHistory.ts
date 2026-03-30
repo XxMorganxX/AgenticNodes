@@ -1,30 +1,30 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { GraphDefinition } from "./types";
+import type { GraphDocument } from "./types";
 
 const MAX_HISTORY = 80;
 const NO_PENDING_QUIET_UPDATE = Symbol("NO_PENDING_QUIET_UPDATE");
 
 export type GraphHistory = {
-  graph: GraphDefinition | null;
+  graph: GraphDocument | null;
   /** Update graph and push previous state onto the undo stack. */
-  set: (next: GraphDefinition | null) => void;
+  set: (next: GraphDocument | null) => void;
   /** Update graph without recording history (use for intermediate drags). */
-  setQuiet: (next: GraphDefinition | null) => void;
+  setQuiet: (next: GraphDocument | null) => void;
   undo: () => void;
   redo: () => void;
   canUndo: boolean;
   canRedo: boolean;
-  reset: (next: GraphDefinition | null) => void;
+  reset: (next: GraphDocument | null) => void;
 };
 
-export function useGraphHistory(initial: GraphDefinition | null = null): GraphHistory {
-  const [graph, setGraph] = useState<GraphDefinition | null>(initial);
-  const undoStack = useRef<(GraphDefinition | null)[]>([]);
-  const redoStack = useRef<(GraphDefinition | null)[]>([]);
+export function useGraphHistory(initial: GraphDocument | null = null): GraphHistory {
+  const [graph, setGraph] = useState<GraphDocument | null>(initial);
+  const undoStack = useRef<(GraphDocument | null)[]>([]);
+  const redoStack = useRef<(GraphDocument | null)[]>([]);
   const [canUndo, setCanUndo] = useState(false);
   const [canRedo, setCanRedo] = useState(false);
-  const quietBaselineRef = useRef<GraphDefinition | null | typeof NO_PENDING_QUIET_UPDATE>(NO_PENDING_QUIET_UPDATE);
+  const quietBaselineRef = useRef<GraphDocument | null | typeof NO_PENDING_QUIET_UPDATE>(NO_PENDING_QUIET_UPDATE);
 
   const syncFlags = useCallback(() => {
     setCanUndo(undoStack.current.length > 0);
@@ -32,7 +32,7 @@ export function useGraphHistory(initial: GraphDefinition | null = null): GraphHi
   }, []);
 
   const set = useCallback(
-    (next: GraphDefinition | null) => {
+    (next: GraphDocument | null) => {
       setGraph((prev) => {
         const baseline = quietBaselineRef.current === NO_PENDING_QUIET_UPDATE ? prev : quietBaselineRef.current;
         quietBaselineRef.current = NO_PENDING_QUIET_UPDATE;
@@ -73,7 +73,7 @@ export function useGraphHistory(initial: GraphDefinition | null = null): GraphHi
     });
   }, [syncFlags]);
 
-  const setQuiet = useCallback((next: GraphDefinition | null) => {
+  const setQuiet = useCallback((next: GraphDocument | null) => {
     setGraph((prev) => {
       if (quietBaselineRef.current === NO_PENDING_QUIET_UPDATE) {
         quietBaselineRef.current = prev;
@@ -83,7 +83,7 @@ export function useGraphHistory(initial: GraphDefinition | null = null): GraphHi
   }, []);
 
   const reset = useCallback(
-    (next: GraphDefinition | null) => {
+    (next: GraphDocument | null) => {
       undoStack.current = [];
       redoStack.current = [];
       quietBaselineRef.current = NO_PENDING_QUIET_UPDATE;
@@ -115,5 +115,8 @@ export function useGraphHistory(initial: GraphDefinition | null = null): GraphHi
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [undo, redo]);
 
-  return { graph, set, setQuiet, undo, redo, canUndo, canRedo, reset };
+  return useMemo(
+    () => ({ graph, set, setQuiet, undo, redo, canUndo, canRedo, reset }),
+    [graph, set, setQuiet, undo, redo, canUndo, canRedo, reset],
+  );
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from queue import Queue
 from threading import Lock, Thread
 from typing import Any
@@ -8,19 +9,46 @@ from uuid import uuid4
 
 from graph_agent.api.graph_store import GraphStore
 from graph_agent.examples.tool_schema_repair import build_example_services
-from graph_agent.runtime.core import GraphDefinition
+from graph_agent.providers.discord import DiscordMessageEvent, DiscordTriggerService, normalize_discord_message_payload
+from graph_agent.runtime.core import GraphDefinition, resolve_graph_process_env, utc_now_iso
+from graph_agent.runtime.documents import AgentDefinition, TestEnvironmentDefinition, load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.serialization import serialize_run_state
 
 
+LOGGER = logging.getLogger(__name__)
+DISCORD_START_PROVIDER_ID = "start.discord_message"
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
+
+
 class GraphRunManager:
-    def __init__(self) -> None:
-        self._services = build_example_services()
-        self._store = GraphStore(self._services)
+    def __init__(
+        self,
+        *,
+        services: Any | None = None,
+        store: GraphStore | None = None,
+        discord_service: DiscordTriggerService | None = None,
+    ) -> None:
+        self._services = services or build_example_services()
+        self._store = store or GraphStore(self._services)
         self._lock = Lock()
         self._run_states: dict[str, dict[str, Any]] = {}
         self._event_backlog: dict[str, list[dict[str, Any]]] = {}
         self._subscribers: dict[str, list[Queue[str | None]]] = {}
+        self._discord_service = discord_service or DiscordTriggerService(self.handle_discord_message)
 
     def list_graphs(self) -> list[dict[str, Any]]:
         return [self._graph_payload(graph["graph_id"]) for graph in self._store.list_graphs()]
@@ -30,14 +58,17 @@ class GraphRunManager:
 
     def create_graph(self, graph_payload: dict[str, Any]) -> dict[str, Any]:
         graph = self._store.create_graph(graph_payload)
+        self._sync_discord_service()
         return self._decorate_graph(graph)
 
     def update_graph(self, graph_id: str, graph_payload: dict[str, Any]) -> dict[str, Any]:
         graph = self._store.update_graph(graph_id, graph_payload)
+        self._sync_discord_service()
         return self._decorate_graph(graph)
 
     def delete_graph(self, graph_id: str) -> None:
         self._store.delete_graph(graph_id)
+        self._sync_discord_service()
 
     def get_catalog(self) -> dict[str, Any]:
         return self._store.catalog()
@@ -49,43 +80,45 @@ class GraphRunManager:
             return self._run_states[run_id]
 
     def start_run(self, graph_id: str, input_payload: Any) -> str:
-        graph_payload = self._store.get_graph(graph_id)
-        graph = GraphDefinition.from_dict(graph_payload)
-        graph.validate_against_services(self._services)
+        document = load_graph_document(self._store.get_graph(graph_id))
+        document.validate_against_services(self._services)
         run_id = str(uuid4())
 
         with self._lock:
-            self._run_states[run_id] = {
-                "run_id": run_id,
-                "graph_id": graph_id,
-                "status": "queued",
-                "input_payload": input_payload,
-                "current_node_id": None,
-                "started_at": None,
-                "ended_at": None,
-                "node_outputs": {},
-                "node_errors": {},
-                "visit_counts": {},
-                "transition_history": [],
-                "event_history": [],
-                "final_output": None,
-                "terminal_error": None,
-            }
             self._event_backlog[run_id] = []
             self._subscribers.setdefault(run_id, [])
+            if document.is_multi_agent:
+                self._run_states[run_id] = self._build_environment_run_state(run_id, document, input_payload)
+            else:
+                default_agent = document.agents[0]
+                self._run_states[run_id] = self._build_run_state(
+                    run_id,
+                    graph_id,
+                    input_payload,
+                    agent_id=default_agent.agent_id,
+                    agent_name=default_agent.name,
+                )
 
-        runtime = GraphRuntime(
-            services=self._services,
-            max_steps=self._services.config["max_steps"],
-            max_visits_per_node=self._services.config["max_visits_per_node"],
-            event_listeners=[lambda event: self._record_event(run_id, event.to_dict())],
-        )
+        if document.is_multi_agent:
+            thread = Thread(
+                target=self._execute_environment_run,
+                args=(document, input_payload, run_id),
+                daemon=True,
+            )
+        else:
+            graph = document.as_graph()
+            runtime = GraphRuntime(
+                services=self._services,
+                max_steps=self._services.config["max_steps"],
+                max_visits_per_node=self._services.config["max_visits_per_node"],
+                event_listeners=[lambda event: self._record_event(run_id, event.to_dict())],
+            )
+            thread = Thread(
+                target=self._execute_run,
+                args=(runtime, graph, input_payload, run_id),
+                daemon=True,
+            )
 
-        thread = Thread(
-            target=self._execute_run,
-            args=(runtime, graph, input_payload, run_id),
-            daemon=True,
-        )
         thread.start()
         return run_id
 
@@ -109,12 +142,135 @@ class GraphRunManager:
             if queue in subscribers:
                 subscribers.remove(queue)
 
-    def _execute_run(self, runtime: GraphRuntime, graph, input_payload: Any, run_id: str) -> None:
+    def start_background_services(self) -> None:
+        self._sync_discord_service()
+
+    def stop_background_services(self) -> None:
+        self._discord_service.stop()
+
+    def handle_discord_message(self, message: DiscordMessageEvent) -> list[str]:
+        run_ids: list[str] = []
+        input_payload = normalize_discord_message_payload(message)
+        for graph in self._iter_discord_trigger_graphs():
+            if not self._graph_matches_discord_message(graph, message):
+                continue
+            try:
+                run_ids.append(self.start_run(graph.graph_id, dict(input_payload)))
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Failed to start Discord-triggered run for graph '%s'.", graph.graph_id)
+        return run_ids
+
+    def _execute_run(self, runtime: GraphRuntime, graph: GraphDefinition, input_payload: Any, run_id: str) -> None:
         state = runtime.run(graph, input_payload, run_id=run_id)
         snapshot = serialize_run_state(state)
         with self._lock:
             self._run_states[run_id] = snapshot
         self._close_streams(run_id)
+
+    def _execute_environment_run(
+        self,
+        document: TestEnvironmentDefinition,
+        input_payload: Any,
+        parent_run_id: str,
+    ) -> None:
+        self._record_event(
+            parent_run_id,
+            {
+                "event_type": "run.started",
+                "summary": f"Run started for environment '{document.name}'.",
+                "payload": {
+                    "graph_id": document.graph_id,
+                    "graph_name": document.name,
+                    "agent_count": len(document.agents),
+                },
+                "run_id": parent_run_id,
+                "timestamp": utc_now_iso(),
+                "agent_id": None,
+                "parent_run_id": None,
+            },
+        )
+
+        final_output: dict[str, Any] = {}
+        failed_agent_ids: list[str] = []
+        try:
+            for agent in document.agents:
+                child_snapshot = self._run_agent_in_environment(document, agent, input_payload, parent_run_id)
+                final_output[agent.agent_id] = child_snapshot.get("final_output")
+                if child_snapshot.get("status") == "failed":
+                    failed_agent_ids.append(agent.agent_id)
+        except Exception as exc:  # noqa: BLE001
+            self._record_event(
+                parent_run_id,
+                {
+                    "event_type": "run.failed",
+                    "summary": "Environment run failed unexpectedly.",
+                    "payload": {"error": {"type": "environment_exception", "message": str(exc)}},
+                    "run_id": parent_run_id,
+                    "timestamp": utc_now_iso(),
+                    "agent_id": None,
+                    "parent_run_id": None,
+                },
+            )
+            self._close_streams(parent_run_id)
+            return
+
+        self._record_event(
+            parent_run_id,
+            {
+                "event_type": "run.failed" if failed_agent_ids else "run.completed",
+                "summary": "Environment run finished with agent failures." if failed_agent_ids else "Environment run completed successfully.",
+                "payload": (
+                    {"error": {"type": "agent_failure", "agent_ids": failed_agent_ids}, "final_output": final_output}
+                    if failed_agent_ids
+                    else {"final_output": final_output}
+                ),
+                "run_id": parent_run_id,
+                "timestamp": utc_now_iso(),
+                "agent_id": None,
+                "parent_run_id": None,
+            },
+        )
+        self._close_streams(parent_run_id)
+
+    def _run_agent_in_environment(
+        self,
+        document: TestEnvironmentDefinition,
+        agent: AgentDefinition,
+        input_payload: Any,
+        parent_run_id: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            parent_state = self._run_states[parent_run_id]
+            child_state = parent_state["agent_runs"][agent.agent_id]
+            child_run_id = child_state["run_id"]
+
+        runtime = GraphRuntime(
+            services=self._services,
+            max_steps=self._services.config["max_steps"],
+            max_visits_per_node=self._services.config["max_visits_per_node"],
+            event_listeners=[
+                lambda event, current_agent_id=agent.agent_id, current_agent_name=agent.name: self._record_agent_event(
+                    parent_run_id,
+                    current_agent_id,
+                    current_agent_name,
+                    event.to_dict(),
+                )
+            ],
+        )
+        graph = agent.to_graph(graph_id=document.graph_id, shared_env_vars=document.env_vars)
+        state = runtime.run(graph, input_payload, run_id=child_run_id)
+        snapshot = {
+            **serialize_run_state(state),
+            "agent_id": agent.agent_id,
+            "agent_name": agent.name,
+            "parent_run_id": parent_run_id,
+        }
+
+        with self._lock:
+            self._run_states[child_run_id] = snapshot
+            self._run_states[parent_run_id]["agent_runs"][agent.agent_id] = snapshot
+
+        return snapshot
 
     def _record_event(self, run_id: str, event: dict[str, Any]) -> None:
         encoded = json.dumps(event)
@@ -128,7 +284,63 @@ class GraphRunManager:
         for subscriber in subscribers:
             subscriber.put(encoded)
 
+    def _record_agent_event(
+        self,
+        parent_run_id: str,
+        agent_id: str,
+        agent_name: str,
+        event: dict[str, Any],
+    ) -> None:
+        child_run_id = str(event.get("run_id", ""))
+        wrapped_event = {
+            **event,
+            "event_type": f"agent.{event['event_type']}",
+            "run_id": parent_run_id,
+            "agent_id": agent_id,
+            "parent_run_id": parent_run_id,
+            "summary": f"[{agent_name}] {event['summary']}",
+            "payload": {
+                **event.get("payload", {}),
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "child_run_id": child_run_id,
+            },
+        }
+        self._record_event(parent_run_id, wrapped_event)
+
     def _apply_event_to_state(self, state: dict[str, Any], event: dict[str, Any]) -> None:
+        if event["event_type"].startswith("agent."):
+            self._apply_agent_event_to_state(state, event)
+            return
+        self._apply_run_event_to_state(state, event)
+
+    def _apply_agent_event_to_state(self, state: dict[str, Any], event: dict[str, Any]) -> None:
+        state["event_history"].append(event)
+        payload = event["payload"]
+        agent_id = str(event.get("agent_id") or payload.get("agent_id") or "")
+        if not agent_id:
+            return
+
+        agent_state = state["agent_runs"].get(agent_id)
+        if agent_state is None:
+            agent_state = self._build_run_state(
+                str(payload.get("child_run_id") or uuid4()),
+                state["graph_id"],
+                state["input_payload"],
+                agent_id=agent_id,
+                parent_run_id=state["run_id"],
+                agent_name=str(payload.get("agent_name") or agent_id),
+            )
+            state["agent_runs"][agent_id] = agent_state
+
+        normalized_event = {
+            **event,
+            "event_type": event["event_type"].removeprefix("agent."),
+            "run_id": agent_state["run_id"],
+        }
+        self._apply_run_event_to_state(agent_state, normalized_event)
+
+    def _apply_run_event_to_state(self, state: dict[str, Any], event: dict[str, Any]) -> None:
         state["event_history"].append(event)
         event_type = event["event_type"]
         payload = event["payload"]
@@ -160,6 +372,8 @@ class GraphRunManager:
         elif event_type == "run.failed":
             state["status"] = "failed"
             state["terminal_error"] = payload["error"]
+            if "final_output" in payload:
+                state["final_output"] = payload["final_output"]
             state["ended_at"] = event["timestamp"]
 
     def _close_streams(self, run_id: str) -> None:
@@ -179,4 +393,112 @@ class GraphRunManager:
             "node_providers": [
                 provider.to_dict() for provider in self._services.node_provider_registry.list_definitions()
             ],
+        }
+
+    def _iter_discord_trigger_graphs(self) -> list[GraphDefinition]:
+        graphs: list[GraphDefinition] = []
+        for graph_payload in self._store.list_graphs():
+            try:
+                document = load_graph_document(graph_payload)
+                document.validate_against_services(self._services)
+            except Exception:  # noqa: BLE001
+                LOGGER.warning("Skipping invalid graph '%s' while syncing Discord triggers.", graph_payload.get("graph_id"))
+                continue
+            if document.is_multi_agent:
+                continue
+            graph = document.as_graph()
+            if graph.start_node().provider_id == DISCORD_START_PROVIDER_ID:
+                graphs.append(graph)
+        return graphs
+
+    def _graph_matches_discord_message(self, graph: GraphDefinition, message: DiscordMessageEvent) -> bool:
+        start_node = graph.start_node()
+        if start_node.provider_id != DISCORD_START_PROVIDER_ID:
+            return False
+        config = graph.resolved_start_node_config()
+        channel_id = str(config.get("discord_channel_id", "") or "").strip()
+        if not channel_id or channel_id != message.channel_id:
+            return False
+        if _as_bool(config.get("ignore_bot_messages"), True) and message.author_is_bot:
+            return False
+        if _as_bool(config.get("ignore_self_messages"), True) and message.author_is_self:
+            return False
+        return True
+
+    def _sync_discord_service(self) -> None:
+        token = self._resolve_discord_service_token()
+        if not token:
+            self._discord_service.stop()
+            return
+        try:
+            self._discord_service.start(token)
+        except RuntimeError:
+            LOGGER.exception("Unable to start Discord trigger service.")
+
+    def _resolve_discord_service_token(self) -> str:
+        tokens: set[str] = set()
+        for graph in self._iter_discord_trigger_graphs():
+            config = graph.resolved_start_node_config()
+            token = resolve_graph_process_env(
+                str(config.get("discord_bot_token_env_var", "{DISCORD_BOT_TOKEN}") or "{DISCORD_BOT_TOKEN}"),
+                graph.env_vars,
+            ).strip()
+            if token:
+                tokens.add(token)
+        if not tokens:
+            return ""
+        if len(tokens) > 1:
+            LOGGER.warning("Multiple Discord bot tokens are configured across graphs; Discord triggers are disabled.")
+            return ""
+        return next(iter(tokens))
+
+    def _build_environment_run_state(
+        self,
+        run_id: str,
+        document: TestEnvironmentDefinition,
+        input_payload: Any,
+    ) -> dict[str, Any]:
+        state = self._build_run_state(run_id, document.graph_id, input_payload)
+        state["agent_runs"] = {
+            agent.agent_id: self._build_run_state(
+                str(uuid4()),
+                document.graph_id,
+                input_payload,
+                agent_id=agent.agent_id,
+                parent_run_id=run_id,
+                agent_name=agent.name,
+            )
+            for agent in document.agents
+        }
+        return state
+
+    def _build_run_state(
+        self,
+        run_id: str,
+        graph_id: str,
+        input_payload: Any,
+        *,
+        agent_id: str | None = None,
+        parent_run_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "run_id": run_id,
+            "graph_id": graph_id,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "parent_run_id": parent_run_id,
+            "status": "queued",
+            "input_payload": input_payload,
+            "current_node_id": None,
+            "started_at": None,
+            "ended_at": None,
+            "node_outputs": {},
+            "node_errors": {},
+            "visit_counts": {},
+            "transition_history": [],
+            "event_history": [],
+            "final_output": None,
+            "terminal_error": None,
+            "agent_runs": {},
         }

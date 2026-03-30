@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 from queue import Empty
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from graph_agent.api.manager import GraphRunManager
 
@@ -17,13 +17,18 @@ class RunRequest(BaseModel):
 
 
 class GraphPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     graph_id: str
     name: str
     description: str = ""
     version: str = "1.0"
-    start_node_id: str
-    nodes: list[dict[str, Any]]
-    edges: list[dict[str, Any]]
+    graph_type: Optional[str] = None
+    env_vars: Optional[dict[str, str]] = None
+    start_node_id: Optional[str] = None
+    nodes: Optional[list[dict[str, Any]]] = None
+    edges: Optional[list[dict[str, Any]]] = None
+    agents: Optional[list[dict[str, Any]]] = None
 
 
 app = FastAPI(title="Graph Agent API", version="0.1.0")
@@ -36,6 +41,16 @@ app.add_middleware(
 )
 
 manager = GraphRunManager()
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    manager.start_background_services()
+
+
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    manager.stop_background_services()
 
 
 @app.get("/api/graphs")

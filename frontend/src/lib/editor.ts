@@ -1,8 +1,9 @@
 import dagre from "dagre";
 
 import { DEFAULT_GRAPH_ENV_VARS, getGraphEnvVars } from "./graphEnv";
+import { isTestEnvironment } from "./graphDocuments";
 import type { SavedNode } from "./savedNodes";
-import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition } from "./types";
+import type { AgentDefinition, EditorCatalog, GraphDefinition, GraphDocument, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition } from "./types";
 
 function slugify(value: string): string {
   return value
@@ -90,6 +91,23 @@ function defaultProviderConfig(provider: NodeProviderDefinition): GraphNode["con
   };
 }
 
+function defaultStartConfig(provider: NodeProviderDefinition): GraphNode["config"] {
+  if (provider.provider_id === "start.discord_message") {
+    return {
+      trigger_mode: "discord_message",
+      discord_bot_token_env_var: "{DISCORD_BOT_TOKEN}",
+      discord_channel_id: "",
+      ignore_bot_messages: true,
+      ignore_self_messages: true,
+      input_binding: { type: "input_payload" },
+    };
+  }
+  return {
+    trigger_mode: "manual_run",
+    input_binding: { type: "input_payload" },
+  };
+}
+
 export function syncModelNodeWithProvider(modelNode: GraphNode, providerNode: GraphNode): GraphNode {
   if (modelNode.kind !== "model" || providerNode.kind !== "provider") {
     return modelNode;
@@ -155,9 +173,7 @@ export function createNodeFromProvider(
   if (provider.node_kind === "input") {
     return {
       ...baseNode,
-      config: {
-        input_binding: { type: "input_payload" },
-      },
+      config: defaultStartConfig(provider),
     };
   }
 
@@ -306,6 +322,40 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
   };
 }
 
+function normalizeAgent(agent: AgentDefinition): AgentDefinition {
+  const normalizedGraph = normalizeGraph({
+    graph_id: agent.agent_id,
+    name: agent.name,
+    description: agent.description,
+    version: agent.version,
+    graph_type: "graph",
+    start_node_id: agent.start_node_id,
+    env_vars: agent.env_vars,
+    nodes: agent.nodes,
+    edges: agent.edges,
+  });
+  return {
+    agent_id: agent.agent_id,
+    name: normalizedGraph.name,
+    description: normalizedGraph.description,
+    version: normalizedGraph.version,
+    start_node_id: normalizedGraph.start_node_id,
+    env_vars: normalizedGraph.env_vars,
+    nodes: normalizedGraph.nodes,
+    edges: normalizedGraph.edges,
+  };
+}
+
+export function normalizeGraphDocument(graph: GraphDocument): GraphDocument {
+  if (!isTestEnvironment(graph)) {
+    return normalizeGraph(graph);
+  }
+  return {
+    ...graph,
+    agents: graph.agents.map((agent) => normalizeAgent(agent)),
+  };
+}
+
 export function defaultConditionalCondition(edgeId: string): GraphEdge["condition"] {
   return {
     id: `${edgeId}-condition`,
@@ -367,5 +417,33 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
       ...node,
       position: positionMap.get(node.id) ?? node.position,
     })),
+  };
+}
+
+export function layoutGraphDocument(graph: GraphDocument): GraphDocument {
+  if (!isTestEnvironment(graph)) {
+    return layoutGraphLR(graph);
+  }
+  return {
+    ...graph,
+    agents: graph.agents.map((agent) => {
+      const laidOutGraph = layoutGraphLR({
+        graph_id: agent.agent_id,
+        name: agent.name,
+        description: agent.description,
+        version: agent.version,
+        graph_type: "graph",
+        start_node_id: agent.start_node_id,
+        env_vars: agent.env_vars,
+        nodes: agent.nodes,
+        edges: agent.edges,
+      });
+      return {
+        ...agent,
+        start_node_id: laidOutGraph.start_node_id,
+        nodes: laidOutGraph.nodes,
+        edges: laidOutGraph.edges,
+      };
+    }),
   };
 }

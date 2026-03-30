@@ -1,25 +1,25 @@
-import type { EditorCatalog, GraphDefinition, RunState } from "./types";
+import type { EditorCatalog, GraphDocument, RunState } from "./types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
 
-export async function fetchGraphs(): Promise<GraphDefinition[]> {
+export async function fetchGraphs(): Promise<GraphDocument[]> {
   const response = await fetch(`${API_BASE_URL}/api/graphs`);
   if (!response.ok) {
     throw new Error("Failed to load graph definitions.");
   }
-  const payload = (await response.json()) as { graphs: GraphDefinition[] };
+  const payload = (await response.json()) as { graphs: GraphDocument[] };
   return payload.graphs;
 }
 
-export async function fetchGraph(graphId: string): Promise<GraphDefinition> {
+export async function fetchGraph(graphId: string): Promise<GraphDocument> {
   const response = await fetch(`${API_BASE_URL}/api/graphs/${graphId}`);
   if (!response.ok) {
     throw new Error("Failed to load graph definition.");
   }
-  return (await response.json()) as GraphDefinition;
+  return (await response.json()) as GraphDocument;
 }
 
-export async function createGraph(graph: GraphDefinition): Promise<GraphDefinition> {
+export async function createGraph(graph: GraphDocument): Promise<GraphDocument> {
   const response = await fetch(`${API_BASE_URL}/api/graphs`, {
     method: "POST",
     headers: {
@@ -30,10 +30,10 @@ export async function createGraph(graph: GraphDefinition): Promise<GraphDefiniti
   if (!response.ok) {
     throw new Error(await response.text());
   }
-  return (await response.json()) as GraphDefinition;
+  return (await response.json()) as GraphDocument;
 }
 
-export async function updateGraph(graphId: string, graph: GraphDefinition): Promise<GraphDefinition> {
+export async function updateGraph(graphId: string, graph: GraphDocument): Promise<GraphDocument> {
   const response = await fetch(`${API_BASE_URL}/api/graphs/${graphId}`, {
     method: "PUT",
     headers: {
@@ -44,7 +44,7 @@ export async function updateGraph(graphId: string, graph: GraphDefinition): Prom
   if (!response.ok) {
     throw new Error(await response.text());
   }
-  return (await response.json()) as GraphDefinition;
+  return (await response.json()) as GraphDocument;
 }
 
 export async function deleteGraph(graphId: string): Promise<void> {

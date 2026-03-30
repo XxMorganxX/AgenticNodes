@@ -9,6 +9,7 @@ description = "Graph-based agentic runtime with FastAPI backend and React visual
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+    "discord.py",
     "fastapi",
     "uvicorn",
 ]

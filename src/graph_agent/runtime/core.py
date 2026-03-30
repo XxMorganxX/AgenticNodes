@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
+import os
 import re
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
@@ -51,6 +52,7 @@ class SafeFormatDict(dict[str, Any]):
 DEFAULT_GRAPH_ENV_VARS = {
     "OPENAI_API_KEY": "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
+    "DISCORD_BOT_TOKEN": "DISCORD_BOT_TOKEN",
 }
 
 GRAPH_ENV_REFERENCE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -70,6 +72,27 @@ def _normalize_graph_env_vars(payload: Mapping[str, Any] | None) -> dict[str, st
 
 def _resolve_graph_env_string(value: str, env_vars: Mapping[str, str]) -> str:
     return GRAPH_ENV_REFERENCE_PATTERN.sub(lambda match: env_vars.get(match.group(1), match.group(0)), value)
+
+
+def resolve_graph_env_value(value: Any, env_vars: Mapping[str, str]) -> Any:
+    if isinstance(value, str):
+        return _resolve_graph_env_string(value, env_vars)
+    if isinstance(value, Mapping):
+        return {str(key): resolve_graph_env_value(child, env_vars) for key, child in value.items()}
+    if isinstance(value, list):
+        return [resolve_graph_env_value(item, env_vars) for item in value]
+    return value
+
+
+def resolve_graph_env_var_name(value: str, env_vars: Mapping[str, str]) -> str:
+    return str(resolve_graph_env_value(value, env_vars)).strip()
+
+
+def resolve_graph_process_env(value: str, env_vars: Mapping[str, str]) -> str:
+    env_var_name = resolve_graph_env_var_name(value, env_vars)
+    if not env_var_name:
+        return ""
+    return os.environ.get(env_var_name, "")
 
 
 @dataclass
@@ -118,6 +141,8 @@ class RuntimeEvent:
     summary: str
     payload: dict[str, Any]
     run_id: str
+    agent_id: str | None = None
+    parent_run_id: str | None = None
     timestamp: str = field(default_factory=utc_now_iso)
 
     def to_dict(self) -> dict[str, Any]:
@@ -235,6 +260,8 @@ class RunState:
     graph_id: str
     input_payload: Any
     run_id: str = field(default_factory=lambda: str(uuid4()))
+    agent_id: str | None = None
+    parent_run_id: str | None = None
     current_node_id: str | None = None
     status: str = "pending"
     started_at: str = field(default_factory=utc_now_iso)
@@ -246,11 +273,14 @@ class RunState:
     event_history: list[RuntimeEvent] = field(default_factory=list)
     final_output: Any = None
     terminal_error: dict[str, Any] | None = None
+    agent_runs: dict[str, Any] = field(default_factory=dict)
 
     def snapshot(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "graph_id": self.graph_id,
+            "agent_id": self.agent_id,
+            "parent_run_id": self.parent_run_id,
             "current_node_id": self.current_node_id,
             "status": self.status,
             "started_at": self.started_at,
@@ -263,6 +293,7 @@ class RunState:
             "event_history": [event.to_dict() for event in self.event_history],
             "final_output": self.final_output,
             "terminal_error": self.terminal_error,
+            "agent_runs": self.agent_runs,
         }
 
 
@@ -303,13 +334,7 @@ class NodeContext:
         return dict(self.graph.env_vars)
 
     def resolve_graph_env_value(self, value: Any) -> Any:
-        if isinstance(value, str):
-            return _resolve_graph_env_string(value, self.graph.env_vars)
-        if isinstance(value, Mapping):
-            return {str(key): self.resolve_graph_env_value(child) for key, child in value.items()}
-        if isinstance(value, list):
-            return [self.resolve_graph_env_value(item) for item in value]
-        return value
+        return resolve_graph_env_value(value, self.graph.env_vars)
 
     def available_tool_definitions(self, names: list[str]) -> list[dict[str, Any]]:
         definitions: list[dict[str, Any]] = []
@@ -1000,6 +1025,15 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Node '{edge.source_id}' has more than one standard outgoing edge."
                     )
+
+    def start_node(self) -> BaseNode:
+        return self.nodes[self.start_node_id]
+
+    def start_node_config(self) -> dict[str, Any]:
+        return dict(self.start_node().config)
+
+    def resolved_start_node_config(self) -> dict[str, Any]:
+        return resolve_graph_env_value(self.start_node_config(), self.env_vars)
 
     def validate_against_services(self, services: RuntimeServices) -> None:
         for node in self.nodes.values():
