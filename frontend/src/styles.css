@@ -1711,7 +1711,8 @@ pre {
 }
 
 .graph-canvas.is-dragging-node .react-flow__edge-path,
-.graph-canvas.is-dragging-junction .react-flow__edge-path {
+.graph-canvas.is-dragging-junction .react-flow__edge-path,
+.graph-canvas.is-dragging-waypoint .react-flow__edge-path {
   filter: none !important;
 }
 
@@ -1762,6 +1763,75 @@ pre {
     0 0 0 1px rgba(255, 255, 255, 0.04),
     0 0 14px rgba(134, 125, 255, 0.16),
     0 10px 20px rgba(0, 0, 0, 0.25);
+}
+
+.graph-edge-waypoint {
+  position: absolute;
+  display: block;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid rgba(162, 193, 255, 0.72);
+  border-radius: 999px;
+  opacity: 0.96;
+  background:
+    radial-gradient(
+      circle,
+      rgba(162, 193, 255, 1) 0 5px,
+      rgba(19, 21, 33, 0.98) 5px 9px,
+      rgba(162, 193, 255, 0.86) 9px 10px,
+      rgba(162, 193, 255, 0.18) 10px 14px,
+      rgba(0, 0, 0, 0) 14px 100%
+    );
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 0 12px rgba(111, 150, 255, 0.22),
+    0 10px 18px rgba(0, 0, 0, 0.28);
+  cursor: grab;
+  pointer-events: auto;
+  touch-action: none;
+  outline: none;
+  z-index: 6;
+}
+
+.graph-edge-waypoint.is-selected {
+  border-color: rgba(255, 108, 194, 0.86);
+  background:
+    radial-gradient(
+      circle,
+      rgba(255, 108, 194, 1) 0 5px,
+      rgba(27, 20, 35, 0.98) 5px 9px,
+      rgba(255, 108, 194, 0.88) 9px 10px,
+      rgba(255, 108, 194, 0.2) 10px 14px,
+      rgba(0, 0, 0, 0) 14px 100%
+    );
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 0 16px rgba(255, 108, 194, 0.24),
+    0 12px 22px rgba(0, 0, 0, 0.34);
+}
+
+.graph-edge-waypoint:hover,
+.graph-edge-waypoint:focus-visible,
+.graph-edge-waypoint.is-dragging {
+  background:
+    radial-gradient(
+      circle,
+      rgba(255, 108, 194, 1) 0 5px,
+      rgba(27, 20, 35, 0.98) 5px 9px,
+      rgba(255, 108, 194, 0.88) 9px 10px,
+      rgba(255, 108, 194, 0.24) 10px 14px,
+      rgba(0, 0, 0, 0) 14px 100%
+    );
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.06),
+    0 0 0 4px rgba(118, 136, 255, 0.14),
+    0 12px 22px rgba(0, 0, 0, 0.34);
+}
+
+.graph-edge-waypoint:active,
+.graph-canvas.is-dragging-waypoint .graph-edge-waypoint {
+  cursor: grabbing;
 }
 
 .react-flow__connection-path {

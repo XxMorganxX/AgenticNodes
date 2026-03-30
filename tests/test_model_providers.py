@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 
 from graph_agent.examples.tool_schema_repair import build_example_graph_payload, build_example_services
 from graph_agent.providers.base import ModelMessage, ModelRequest
+from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
 from graph_agent.runtime.core import GraphDefinition
 
@@ -80,6 +81,25 @@ class StubClaudeProvider(ClaudeMessagesModelProvider):
 
     def _headers(self, provider_config: Mapping[str, Any]) -> dict[str, str]:
         return {"x-api-key": "test", "anthropic-version": "2023-06-01"}
+
+
+class StubClaudeCodeProvider(ClaudeCodeCLIModelProvider):
+    def __init__(self) -> None:
+        self.last_command: list[str] | None = None
+        self.last_cwd: str | None = None
+        self.last_timeout_seconds: float | None = None
+
+    def _run_command(self, command: list[str], cwd: str | None, timeout_seconds: float) -> Mapping[str, Any]:
+        self.last_command = command
+        self.last_cwd = cwd
+        self.last_timeout_seconds = timeout_seconds
+        return {
+            "result": "",
+            "structured_output": {"query": "graph agents", "limit": 3},
+            "session_id": "session-123",
+            "duration_ms": 42,
+            "usage": {"input_tokens": 10, "output_tokens": 6},
+        }
 
 
 class ModelProviderTests(unittest.TestCase):
@@ -158,6 +178,51 @@ class ModelProviderTests(unittest.TestCase):
             ["query", "limit"],
         )
 
+    def test_claude_code_provider_uses_json_schema_output_for_tool_call_nodes(self) -> None:
+        provider = StubClaudeCodeProvider()
+        request = ModelRequest(
+            prompt_name="schema_proposal",
+            messages=[
+                ModelMessage(role="system", content="Return structured JSON."),
+                ModelMessage(role="user", content="Build the tool payload."),
+            ],
+            provider_config={
+                "model": "sonnet",
+                "cli_path": "claude",
+                "working_directory": str(ROOT),
+                "timeout_seconds": 15,
+                "max_turns": 1,
+            },
+            metadata={
+                "response_mode": "tool_call",
+                "preferred_tool_name": "search_catalog",
+                "available_tools": [
+                    {
+                        "name": "search_catalog",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string"},
+                                "limit": {"type": "integer"},
+                            },
+                            "required": ["query", "limit"],
+                        },
+                    }
+                ],
+            },
+        )
+
+        response = provider.generate(request)
+
+        self.assertEqual(response.structured_output, {"query": "graph agents", "limit": 3})
+        self.assertIsNotNone(provider.last_command)
+        assert provider.last_command is not None
+        self.assertIn("--json-schema", provider.last_command)
+        self.assertIn("--system-prompt", provider.last_command)
+        self.assertIn("--tools", provider.last_command)
+        self.assertEqual(provider.last_cwd, str(ROOT))
+        self.assertEqual(provider.last_timeout_seconds, 15.0)
+
     def test_graphs_can_swap_between_registered_model_providers(self) -> None:
         services = build_example_services()
         payload = build_example_graph_payload()
@@ -176,6 +241,14 @@ class ModelProviderTests(unittest.TestCase):
                 node["config"]["provider_name"] = "claude"
                 node["config"]["model"] = "claude-3-5-haiku-latest"
                 node["config"]["max_tokens"] = 1024
+
+        GraphDefinition.from_dict(payload).validate_against_services(services)
+
+        for node in payload["nodes"]:
+            if node["kind"] == "model":
+                node["model_provider_name"] = "claude_code"
+                node["config"]["provider_name"] = "claude_code"
+                node["config"]["model"] = "sonnet"
 
         GraphDefinition.from_dict(payload).validate_against_services(services)
 

@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { useRenderDiagnostics } from "../lib/dragDiagnostics";
 import type { SavedNode } from "../lib/savedNodes";
 import type { EditorCatalog, NodeProviderDefinition } from "../lib/types";
 
@@ -123,6 +124,20 @@ export function ProviderSummary({
       return haystack.includes(normalizedQuery);
     });
   const groupedProviders = groupProviders(providers);
+
+  useRenderDiagnostics(
+    "ProviderSummary",
+    variant === "drawer",
+    {
+      variant,
+      activeCategory,
+      queryLength: query.length,
+      providerCount: providers.length,
+      savedCount: filteredSavedNodes.length,
+      quickPickCount: quickPicks.length,
+    },
+    12,
+  );
 
   return (
     <section className={variant === "drawer" ? "provider-summary provider-summary--drawer" : "panel provider-summary"}>

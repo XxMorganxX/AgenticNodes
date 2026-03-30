@@ -1,9 +1,10 @@
 import { memo } from "react";
-import type { CSSProperties, MouseEvent as ReactMouseEvent } from "react";
+import type { CSSProperties } from "react";
 import { Handle, Position } from "reactflow";
 import type { NodeProps } from "reactflow";
 
 import { getToolSourceHandleAnchorRatio, isWireJunctionNode, TOOL_FAILURE_HANDLE_ID, TOOL_SUCCESS_HANDLE_ID } from "../lib/editor";
+import { warnGraphDiagnostic } from "../lib/dragDiagnostics";
 import { buildNodeTooltip } from "../lib/nodeTooltip";
 import type { NodeTooltipData } from "../lib/nodeTooltip";
 import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "../lib/types";
@@ -59,7 +60,6 @@ function GraphCanvasNodeComponent({
     onToggleTooltip,
     onOpenToolDetails,
     onOpenProviderDetails,
-    onHandlePointerDown,
     onJunctionPointerDown,
   } = data;
   const isWireJunction = isWireJunctionNode(node);
@@ -68,7 +68,12 @@ function GraphCanvasNodeComponent({
   if (tooltipVisible && !preview && !isWireJunction) {
     try {
       tooltip = buildNodeTooltip(node, graph, catalog, runState);
-    } catch {
+    } catch (error) {
+      warnGraphDiagnostic("GraphCanvasNode", "tooltip fallback", error, {
+        nodeId: node.id,
+        nodeKind: node.kind,
+        tooltipVisible,
+      });
       tooltip = FALLBACK_TOOLTIP;
     }
   }
@@ -88,19 +93,6 @@ function GraphCanvasNodeComponent({
   const nodeCardClassName = `graph-node-card graph-node-card--${status} ${isToolNode ? "graph-node-card--tool-outputs" : ""} ${
     selected ? "is-selected" : ""
   } ${tooltipVisible ? "is-tooltip-visible" : ""} ${preview ? "is-preview" : ""} ${isConnectionMagnetized ? "is-connection-magnetized" : ""}`;
-
-  const handlePortPointerDown = (
-    event: ReactMouseEvent<HTMLDivElement>,
-    handleType: "source" | "target",
-    handleId: string | null,
-  ) => {
-    const handled = onHandlePointerDown(node.id, handleType, handleId);
-    if (!handled) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-  };
 
   if (isWireJunction) {
     return (
@@ -122,7 +114,6 @@ function GraphCanvasNodeComponent({
             type="target"
             position={Position.Left}
             className={`graph-node-handle graph-node-handle-target graph-junction-handle ${isConnectionMagnetized ? "graph-node-handle-valid is-magnetized" : ""}`}
-            onMouseDownCapture={(event) => handlePortPointerDown(event, "target", null)}
           />
         ) : null}
         {showSourceHandle ? (
@@ -130,7 +121,6 @@ function GraphCanvasNodeComponent({
             type="source"
             position={Position.Right}
             className="graph-node-handle graph-node-handle-source graph-junction-handle"
-            onMouseDownCapture={(event) => handlePortPointerDown(event, "source", null)}
           />
         ) : null}
       </div>
@@ -161,7 +151,6 @@ function GraphCanvasNodeComponent({
           type="target"
           position={Position.Left}
           className={`graph-node-handle graph-node-handle-target ${isConnectionMagnetized ? "graph-node-handle-valid is-magnetized" : ""}`}
-          onMouseDownCapture={(event) => handlePortPointerDown(event, "target", null)}
         />
       ) : null}
       <div className="graph-node-card-inner">
@@ -253,7 +242,6 @@ function GraphCanvasNodeComponent({
             position={Position.Right}
             className="graph-node-handle graph-node-handle-source graph-node-handle-source--success"
             style={successHandleStyle}
-            onMouseDownCapture={(event) => handlePortPointerDown(event, "source", TOOL_SUCCESS_HANDLE_ID)}
           />
           <div className="graph-node-output-port graph-node-output-port--failure" style={failureHandleStyle} aria-hidden="true">
             <span className="graph-node-output-port-label">On Failure</span>
@@ -264,7 +252,6 @@ function GraphCanvasNodeComponent({
             position={Position.Right}
             className="graph-node-handle graph-node-handle-source graph-node-handle-source--failure"
             style={failureHandleStyle}
-            onMouseDownCapture={(event) => handlePortPointerDown(event, "source", TOOL_FAILURE_HANDLE_ID)}
           />
         </>
       ) : null}
@@ -273,7 +260,6 @@ function GraphCanvasNodeComponent({
           type="source"
           position={Position.Right}
           className="graph-node-handle graph-node-handle-source"
-          onMouseDownCapture={(event) => handlePortPointerDown(event, "source", null)}
         />
       ) : null}
     </div>

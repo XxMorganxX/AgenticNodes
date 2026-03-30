@@ -134,6 +134,7 @@ def main() -> int:
             time.sleep(0.5)
     except KeyboardInterrupt:
         print("\nStopping graph-agent workload...")
+        return_code = 0
     except RuntimeError as error:
         print(str(error), file=sys.stderr)
         return_code = 1

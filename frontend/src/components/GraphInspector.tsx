@@ -1,6 +1,7 @@
 import type { ChangeEvent } from "react";
 
 import { isWireJunctionNode } from "../lib/editor";
+import { useRenderDiagnostics } from "../lib/dragDiagnostics";
 import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, NodeProviderDefinition } from "../lib/types";
 
 type GraphInspectorProps = {
@@ -38,6 +39,9 @@ function defaultModelName(providerName: string): string {
   if (providerName === "claude") {
     return "claude-3-5-haiku-latest";
   }
+  if (providerName === "claude_code") {
+    return "sonnet";
+  }
   return "mock-default";
 }
 
@@ -50,6 +54,19 @@ export function GraphInspector({
   onOpenProviderDetails,
   onSaveNode,
 }: GraphInspectorProps) {
+  useRenderDiagnostics(
+    "GraphInspector",
+    true,
+    {
+      hasGraph: Boolean(graph),
+      selectedNodeId: selectedNodeId ?? "none",
+      selectedEdgeId: selectedEdgeId ?? "none",
+      nodeCount: graph?.nodes.length ?? 0,
+      edgeCount: graph?.edges.length ?? 0,
+    },
+    12,
+  );
+
   if (!graph) {
     return (
       <section className="panel inspector-panel">
@@ -121,6 +138,8 @@ export function GraphInspector({
       ? (selectedNode.config.allowed_tool_names as string[])
       : [];
     const availableModelProviders = modelProviders(catalog);
+    const selectedProviderName = String(selectedNode.config.provider_name ?? selectedNode.model_provider_name ?? "mock");
+    const isClaudeCodeProvider = selectedProviderName === "claude_code";
 
     return (
       <section className="panel inspector-panel">
@@ -201,7 +220,7 @@ export function GraphInspector({
               <label>
                 Model Provider
                 <select
-                  value={String(selectedNode.config.provider_name ?? selectedNode.model_provider_name ?? "mock")}
+                  value={selectedProviderName}
                   onChange={(event) => {
                     const nextProvider = availableModelProviders.find((provider) => {
                       const providerName = provider.provider_id.replace("provider.", "");
@@ -221,6 +240,14 @@ export function GraphInspector({
                           provider_name: nextProviderName,
                           model: nextModelName || node.config.model,
                           max_tokens: nextProviderName === "claude" ? Number(node.config.max_tokens ?? 1024) : node.config.max_tokens,
+                          timeout_seconds:
+                            nextProviderName === "claude_code"
+                              ? Number(node.config.timeout_seconds ?? 60)
+                              : node.config.timeout_seconds,
+                          max_turns:
+                            nextProviderName === "claude_code"
+                              ? Number(node.config.max_turns ?? 1)
+                              : node.config.max_turns,
                         },
                       })),
                     );
@@ -354,6 +381,74 @@ export function GraphInspector({
                   }
                 />
               </label>
+              {isClaudeCodeProvider ? (
+                <>
+                  <label>
+                    Claude CLI Path
+                    <input
+                      value={String(selectedNode.config.cli_path ?? "")}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, cli_path: event.target.value },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Working Directory
+                    <input
+                      value={String(selectedNode.config.working_directory ?? "")}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, working_directory: event.target.value },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Timeout Seconds
+                    <input
+                      type="number"
+                      value={String(selectedNode.config.timeout_seconds ?? "")}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              timeout_seconds: event.target.value === "" ? "" : Number(event.target.value),
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Max Turns
+                    <input
+                      type="number"
+                      value={String(selectedNode.config.max_turns ?? "")}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              max_turns: event.target.value === "" ? "" : Number(event.target.value),
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                </>
+              ) : null}
               <label>
                 System Prompt
                 <textarea

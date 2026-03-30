@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from graph_agent import config
+from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.mock import MockModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
 from graph_agent.runtime.core import GraphDefinition, RuntimeServices
@@ -65,6 +66,16 @@ def build_example_services() -> RuntimeServices:
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="provider.claude_code",
+            display_name="Claude Code Provider",
+            category=NodeCategory.PROVIDER,
+            node_kind="provider",
+            description="Uses the local Claude Code CLI authenticated on this machine instead of the Anthropic HTTP API.",
+            capabilities=["local Claude subscription", "structured output", "tool-schema generation"],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="tool.registry",
             display_name="Registry Tool Node",
             category=NodeCategory.TOOL,
@@ -96,6 +107,7 @@ def build_example_services() -> RuntimeServices:
     return RuntimeServices(
         model_providers={
             "claude": ClaudeMessagesModelProvider(),
+            "claude_code": ClaudeCodeCLIModelProvider(),
             "mock": MockModelProvider(),
             "openai": OpenAIChatModelProvider(),
         },

@@ -11,6 +11,7 @@ import {
   GraphCanvasConnectionLine,
   GraphCanvasEdge,
   getEdgeLabelPlacement,
+  resolveEdgeRoutePoints,
 } from "./GraphCanvasEdge";
 import type { GraphCanvasEdgeData } from "./GraphCanvasEdge";
 import { GraphInspector } from "./GraphInspector";
@@ -32,6 +33,7 @@ import {
   TOOL_FAILURE_HANDLE_ID,
   TOOL_SUCCESS_HANDLE_ID,
 } from "../lib/editor";
+import { logGraphDiagnostic, useGraphDiagnosticsEnabled, useRenderDiagnostics, warnGraphDiagnostic } from "../lib/dragDiagnostics";
 import { deleteSavedNode, getSavedNodes, saveNodeToLibrary } from "../lib/savedNodes";
 import type { SavedNode } from "../lib/savedNodes";
 import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition, RunState, RuntimeEvent } from "../lib/types";
@@ -88,6 +90,17 @@ type NodeRegionBounds = {
   maxX: number;
   minY: number;
   maxY: number;
+};
+
+type NodeMeasuredDimensions = {
+  width: number;
+  height: number;
+};
+
+type WaypointDragState = {
+  edgeId: string;
+  waypointIndex: number;
+  pointerOffset: GraphPosition;
 };
 
 type PlacementState =
@@ -209,6 +222,46 @@ type GraphCanvasRuntimeNodeData = GraphCanvasNodeData & {
   isConnectionMagnetized?: boolean;
 };
 
+type DragDiagnosticSession = {
+  active: boolean;
+  sessionId: number;
+  startedAt: number;
+  dragMoveEvents: number;
+  draggedNodeChanges: number;
+  rafTicks: number;
+  nodeBuilds: number;
+  nodeBuildTotalMs: number;
+  nodeBuildMaxMs: number;
+  drawerOpen: boolean;
+  drawerTab: DrawerTab | "closed";
+  minimapVisible: boolean;
+  nodeCount: number;
+  edgeCount: number;
+};
+
+function createDragDiagnosticSession(): DragDiagnosticSession {
+  return {
+    active: false,
+    sessionId: 0,
+    startedAt: 0,
+    dragMoveEvents: 0,
+    draggedNodeChanges: 0,
+    rafTicks: 0,
+    nodeBuilds: 0,
+    nodeBuildTotalMs: 0,
+    nodeBuildMaxMs: 0,
+    drawerOpen: false,
+    drawerTab: "closed",
+    minimapVisible: true,
+    nodeCount: 0,
+    edgeCount: 0,
+  };
+}
+
+function roundDiagnosticValue(value: number) {
+  return Number(value.toFixed(2));
+}
+
 function estimateEdgeLabelWidth(label: string) {
   const trimmedLabel = label.trim();
   const textWidth = Math.max(trimmedLabel.length, 1) * EDGE_LABEL_CHARACTER_WIDTH;
@@ -258,7 +311,13 @@ function sampleEdgePathPoints(edgeId: string, edgePath: string, shiftX = 0, shif
       });
     }
     return points;
-  } catch {
+  } catch (error) {
+    warnGraphDiagnostic("GraphCanvas", "edge path sampling fallback", error, {
+      edgeId,
+      edgePath,
+      shiftX,
+      shiftY,
+    });
     return [];
   }
 }
@@ -444,12 +503,14 @@ export function GraphCanvas({
   const [showHotkeys, setShowHotkeys] = useState(false);
   const [quickAddMinimized, setQuickAddMinimized] = useState(false);
   const [junctionDrag, setJunctionDrag] = useState<JunctionDragState | null>(null);
+  const [waypointDrag, setWaypointDrag] = useState<WaypointDragState | null>(null);
   const [isNodeDragActive, setIsNodeDragActive] = useState(false);
   const [dragRenderTick, setDragRenderTick] = useState(0);
   const [pendingPlacement, setPendingPlacement] = useState<PlacementState | null>(null);
   const [draftConnection, setDraftConnection] = useState<DraftConnectionState | null>(null);
   const [draftConnectionSnapTargetNodeId, setDraftConnectionSnapTargetNodeId] = useState<string | null>(null);
   const [viewportState, setViewportState] = useState<ViewportState>({ x: 0, y: 0, zoom: 1 });
+  const dragDiagnosticsEnabled = useGraphDiagnosticsEnabled();
   const canvasRef = useRef<HTMLDivElement | null>(null);
   const canvasZoomRef = useRef(1);
   const graphRef = useRef<GraphDefinition | null>(graph);
@@ -459,6 +520,8 @@ export function GraphCanvas({
   const draftSnapTargetNodeIdRef = useRef<string | null>(null);
   const isConnectingRef = useRef(isConnecting);
   const nodeDataCacheRef = useRef(new Map<string, GraphCanvasRuntimeNodeData>());
+  const flowNodeCacheRef = useRef(new Map<string, FlowNode<GraphCanvasRuntimeNodeData>>());
+  const measuredNodeDimensionsRef = useRef(new Map<string, NodeMeasuredDimensions>());
   const dragFrameRef = useRef<number | null>(null);
   const pendingDragGraphRef = useRef<GraphDefinition | null>(null);
   const dragPositionMapRef = useRef<Map<string, GraphPosition> | null>(null);
@@ -477,12 +540,130 @@ export function GraphCanvas({
   });
   const didCreateConnectionRef = useRef(false);
   const suppressNextPaneClickRef = useRef(false);
+  const dragDiagnosticSessionRef = useRef<DragDiagnosticSession>(createDragDiagnosticSession());
+  const dragDiagnosticSessionIdRef = useRef(0);
   const zoomAnimationDuration = 120;
   const vizLocked = panLocked || isCommandHeld;
+
+  useRenderDiagnostics(
+    "GraphCanvas",
+    isNodeDragActive || drawerOpen || junctionDrag !== null || waypointDrag !== null,
+    {
+      drawerOpen,
+      drawerTab,
+      isNodeDragActive,
+      isJunctionDragActive: junctionDrag !== null,
+      isWaypointDragActive: waypointDrag !== null,
+      nodeCount: graph?.nodes.length ?? 0,
+      edgeCount: graph?.edges.length ?? 0,
+    },
+    12,
+  );
+
+  const beginDragDiagnosticSession = useCallback(() => {
+    if (!dragDiagnosticsEnabled) {
+      return;
+    }
+
+    const sessionId = dragDiagnosticSessionIdRef.current + 1;
+    dragDiagnosticSessionIdRef.current = sessionId;
+    dragDiagnosticSessionRef.current = {
+      active: true,
+      sessionId,
+      startedAt: performance.now(),
+      dragMoveEvents: 0,
+      draggedNodeChanges: 0,
+      rafTicks: 0,
+      nodeBuilds: 0,
+      nodeBuildTotalMs: 0,
+      nodeBuildMaxMs: 0,
+      drawerOpen,
+      drawerTab: drawerOpen ? drawerTab : "closed",
+      minimapVisible: true,
+      nodeCount: graph?.nodes.length ?? 0,
+      edgeCount: graph?.edges.length ?? 0,
+    };
+
+    logGraphDiagnostic("GraphCanvas", "node-drag-start", {
+      sessionId,
+      drawerOpen,
+      drawerTab: drawerOpen ? drawerTab : "closed",
+      nodeCount: graph?.nodes.length ?? 0,
+      edgeCount: graph?.edges.length ?? 0,
+      minimapVisible: true,
+    });
+  }, [dragDiagnosticsEnabled, drawerOpen, drawerTab, graph]);
+
+  const flushDragDiagnosticSession = useCallback(
+    (reason: string) => {
+      if (!dragDiagnosticsEnabled) {
+        return;
+      }
+
+      const session = dragDiagnosticSessionRef.current;
+      if (!session.active) {
+        return;
+      }
+
+      const elapsedMs = performance.now() - session.startedAt;
+      logGraphDiagnostic("GraphCanvas", "node-drag-summary", {
+        reason,
+        sessionId: session.sessionId,
+        elapsedMs: roundDiagnosticValue(elapsedMs),
+        dragMoveEvents: session.dragMoveEvents,
+        draggedNodeChanges: session.draggedNodeChanges,
+        rafTicks: session.rafTicks,
+        nodeBuilds: session.nodeBuilds,
+        avgNodeBuildMs:
+          session.nodeBuilds > 0 ? roundDiagnosticValue(session.nodeBuildTotalMs / session.nodeBuilds) : 0,
+        maxNodeBuildMs: roundDiagnosticValue(session.nodeBuildMaxMs),
+        drawerOpen: session.drawerOpen,
+        drawerTab: session.drawerTab,
+        minimapVisible: session.minimapVisible,
+        nodeCount: session.nodeCount,
+        edgeCount: session.edgeCount,
+      });
+
+      dragDiagnosticSessionRef.current = createDragDiagnosticSession();
+    },
+    [dragDiagnosticsEnabled],
+  );
+
+  const recordNodeBuildDiagnostic = useCallback(
+    (durationMs: number) => {
+      if (!dragDiagnosticsEnabled) {
+        return;
+      }
+
+      const session = dragDiagnosticSessionRef.current;
+      if (!session.active) {
+        return;
+      }
+
+      session.nodeBuilds += 1;
+      session.nodeBuildTotalMs += durationMs;
+      session.nodeBuildMaxMs = Math.max(session.nodeBuildMaxMs, durationMs);
+
+      if (durationMs >= 8) {
+        logGraphDiagnostic("GraphCanvas", "slow-node-build", {
+          sessionId: session.sessionId,
+          durationMs: roundDiagnosticValue(durationMs),
+          nodeCount: session.nodeCount,
+          drawerOpen: session.drawerOpen,
+          drawerTab: session.drawerTab,
+        });
+      }
+    },
+    [dragDiagnosticsEnabled],
+  );
 
   useEffect(() => {
     graphRef.current = graph;
   }, [graph]);
+
+  useEffect(() => {
+    return () => flushDragDiagnosticSession("unmount");
+  }, [flushDragDiagnosticSession]);
 
   useEffect(() => {
     draftConnectionRef.current = draftConnection;
@@ -562,6 +743,38 @@ export function GraphCanvas({
     }
     return { width: NODE_WIDTH, height: NODE_HEIGHT, regionHeight: NODE_REGION_HEIGHT };
   }, []);
+
+  const updateMeasuredNodeDimensions = useCallback((nodeId: string, dimensions?: { width?: number; height?: number } | null) => {
+    const width = dimensions?.width;
+    const height = dimensions?.height;
+    if (typeof width === "number" && width > 0 && typeof height === "number" && height > 0) {
+      measuredNodeDimensionsRef.current.set(nodeId, { width, height });
+    }
+  }, []);
+
+  const getFlowNodeDimensions = useCallback(
+    (node: GraphNode, cachedNode?: FlowNode<GraphCanvasRuntimeNodeData>): NodeMeasuredDimensions => {
+      const fallbackDimensions = getNodeDimensions(node);
+      const measuredDimensions = measuredNodeDimensionsRef.current.get(node.id);
+      const width = cachedNode?.width ?? measuredDimensions?.width ?? fallbackDimensions.width;
+      const height = cachedNode?.height ?? measuredDimensions?.height ?? fallbackDimensions.height;
+      return { width, height };
+    },
+    [getNodeDimensions],
+  );
+
+  useEffect(() => {
+    if (!graph) {
+      measuredNodeDimensionsRef.current.clear();
+      return;
+    }
+    const activeNodeIds = new Set(graph.nodes.map((node) => node.id));
+    for (const nodeId of measuredNodeDimensionsRef.current.keys()) {
+      if (!activeNodeIds.has(nodeId)) {
+        measuredNodeDimensionsRef.current.delete(nodeId);
+      }
+    }
+  }, [graph]);
 
   const nodeRegionBounds = useMemo<NodeRegionBounds | null>(() => {
     if (!graph || graph.nodes.length === 0) {
@@ -859,9 +1072,7 @@ export function GraphCanvas({
       if (!sourceAnchor || !targetAnchor) {
         return null;
       }
-      const routePoints = edge.waypoints?.length
-        ? buildOrthogonalPolylinePoints([sourceAnchor, ...edge.waypoints, targetAnchor], { endWithHorizontal: true })
-        : [sourceAnchor, targetAnchor];
+      const routePoints = resolveEdgeRoutePoints(sourceAnchor, targetAnchor, edge.waypoints ?? [], { endWithHorizontal: true });
       return routePoints
         .map((point) => `${Math.round(point.x / 12)}:${Math.round(point.y / 12)}`)
         .join("|");
@@ -896,13 +1107,62 @@ export function GraphCanvas({
     return nextGraph;
   }, []);
 
-  const removeEdgeAndPruneJunctions = useCallback(
-    (baseGraph: GraphDefinition, edgeId: string) =>
-      pruneDisconnectedWireJunctions({
+  const removeEdgesAndPruneJunctions = useCallback(
+    (baseGraph: GraphDefinition, edgeIds: string[]) => {
+      if (edgeIds.length === 0) {
+        return baseGraph;
+      }
+      const edgeIdSet = new Set(edgeIds);
+      return pruneDisconnectedWireJunctions({
         ...baseGraph,
-        edges: baseGraph.edges.filter((edge) => edge.id !== edgeId),
-      }),
+        edges: baseGraph.edges.filter((edge) => !edgeIdSet.has(edge.id)),
+      });
+    },
     [pruneDisconnectedWireJunctions],
+  );
+
+  const getEffectiveSourceHandleId = useCallback(
+    (sourceNode: GraphNode | undefined, sourceHandleId: string | null) =>
+      sourceNode?.kind === "tool"
+        ? sourceHandleId === TOOL_FAILURE_HANDLE_ID
+          ? TOOL_FAILURE_HANDLE_ID
+          : TOOL_SUCCESS_HANDLE_ID
+        : (sourceHandleId ?? null),
+    [],
+  );
+
+  const getConnectionConflictState = useCallback(
+    (baseGraph: GraphDefinition, sourceId: string, targetId: string, sourceHandleId: string | null = null) => {
+      const sourceNode = baseGraph.nodes.find((node) => node.id === sourceId);
+      const effectiveSourceHandleId = getEffectiveSourceHandleId(sourceNode, sourceHandleId);
+      const duplicateEdgeId =
+        baseGraph.edges.find((edge) => {
+          if (edge.source_id !== sourceId || edge.target_id !== targetId) {
+            return false;
+          }
+          const existingSourceHandleId =
+            sourceNode?.kind === "tool" ? inferToolEdgeSourceHandle(edge, sourceNode) : (edge.source_handle_id ?? null);
+          return existingSourceHandleId === effectiveSourceHandleId;
+        })?.id ?? null;
+      const conflictingEdgeIds = Array.from(
+        new Set(
+          baseGraph.edges
+            .filter((edge) => {
+              if (edge.id === duplicateEdgeId) {
+                return false;
+              }
+              const existingSourceHandleId =
+                sourceNode?.kind === "tool" ? inferToolEdgeSourceHandle(edge, sourceNode) : (edge.source_handle_id ?? null);
+              return (
+                (edge.source_id === sourceId && existingSourceHandleId === effectiveSourceHandleId) || edge.target_id === targetId
+              );
+            })
+            .map((edge) => edge.id),
+        ),
+      );
+      return { effectiveSourceHandleId, duplicateEdgeId, conflictingEdgeIds };
+    },
+    [getEffectiveSourceHandleId],
   );
 
   const flowToViewportPosition = useCallback(
@@ -1005,11 +1265,22 @@ export function GraphCanvas({
         setEditorMessage("That node connection is not allowed by the category contract matrix.");
         return null;
       }
-      const sourceEdges = baseGraph.edges.filter((edge) => edge.source_id === sourceId);
+      const { effectiveSourceHandleId, duplicateEdgeId, conflictingEdgeIds } = getConnectionConflictState(
+        baseGraph,
+        sourceId,
+        targetId,
+        sourceHandleId,
+      );
+      if (duplicateEdgeId) {
+        setEditorMessage("Those handles are already connected.");
+        return null;
+      }
+      const remainingGraph = removeEdgesAndPruneJunctions(baseGraph, conflictingEdgeIds);
+      const sourceEdges = remainingGraph.edges.filter((edge) => edge.source_id === sourceId);
       const hasStandardOutgoing = sourceEdges.some((edge) => edge.kind === "standard");
       const nextEdgeId = `edge-${sourceId}-${targetId}-${Date.now()}`;
       if (sourceNode?.kind === "tool") {
-        const effectiveHandleId = sourceHandleId === TOOL_FAILURE_HANDLE_ID ? TOOL_FAILURE_HANDLE_ID : TOOL_SUCCESS_HANDLE_ID;
+        const effectiveHandleId = effectiveSourceHandleId === TOOL_FAILURE_HANDLE_ID ? TOOL_FAILURE_HANDLE_ID : TOOL_SUCCESS_HANDLE_ID;
         const hasSuccessOutgoing = sourceEdges.some(
           (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === TOOL_SUCCESS_HANDLE_ID,
         );
@@ -1048,7 +1319,7 @@ export function GraphCanvas({
         condition: hasStandardOutgoing ? defaultConditionalCondition(nextEdgeId) : null,
       };
     },
-    [catalog],
+    [catalog, getConnectionConflictState, removeEdgesAndPruneJunctions],
   );
 
   const commitEdge = useCallback(
@@ -1062,97 +1333,29 @@ export function GraphCanvas({
       if (!baseGraph) {
         return false;
       }
+      const { conflictingEdgeIds } = getConnectionConflictState(baseGraph, sourceId, targetId, sourceHandleId);
+      const nextBaseGraph = removeEdgesAndPruneJunctions(baseGraph, conflictingEdgeIds);
       const nextEdge = buildCommittedEdge(baseGraph, sourceId, targetId, waypoints, sourceHandleId);
       if (!nextEdge) {
         return false;
       }
       onGraphChange({
-        ...baseGraph,
-        edges: [...baseGraph.edges, nextEdge],
+        ...nextBaseGraph,
+        edges: [...nextBaseGraph.edges, nextEdge],
       });
       setEditorMessage(null);
       return true;
     },
-    [buildCommittedEdge, graph, onGraphChange],
+    [buildCommittedEdge, getConnectionConflictState, graph, onGraphChange, removeEdgesAndPruneJunctions],
   );
 
   const handleNodeHandlePointerDown = useCallback(
-    (nodeId: string, handleType: HandleClickType, handleId: string | null) => {
-      if (!graph || pendingPlacement) {
-        return false;
-      }
-
-      const sourceNode = graph.nodes.find((node) => node.id === nodeId);
-      const sourceAnchor = getSourceAnchorPosition(nodeId, handleId);
-      const targetAnchor = getTargetAnchorPosition(nodeId);
-      if (!sourceNode) {
-        return false;
-      }
-
-      const candidateEdges =
-        handleType === "source"
-          ? graph.edges.filter((edge) => {
-              if (edge.source_id !== nodeId) {
-                return false;
-              }
-              if (sourceNode.kind === "tool") {
-                return inferToolEdgeSourceHandle(edge, sourceNode) === (handleId ?? TOOL_SUCCESS_HANDLE_ID);
-              }
-              return true;
-            })
-          : graph.edges.filter((edge) => edge.target_id === nodeId);
-
-      let edgeToRedraw: GraphEdge | null = null;
-      if (candidateEdges.length === 1) {
-        edgeToRedraw = candidateEdges[0];
-      } else if (candidateEdges.length > 1 && selectedEdgeId) {
-        edgeToRedraw = candidateEdges.find((edge) => edge.id === selectedEdgeId) ?? null;
-      }
-
-      if (candidateEdges.length > 1 && !edgeToRedraw) {
-        setEditorMessage("This handle has multiple lines. Select the line you want to redraw, then click the handle again.");
-        return true;
-      }
-
-      if (!edgeToRedraw) {
-        if (handleType !== "source" || !sourceAnchor) {
-          return false;
-        }
-        return false;
-      }
-
-      const redrawSourceNode = graph.nodes.find((node) => node.id === edgeToRedraw.source_id);
-      const redrawSourceHandleId = inferToolEdgeSourceHandle(edgeToRedraw, redrawSourceNode);
-      const redrawSourceAnchor = getSourceAnchorPosition(edgeToRedraw.source_id, redrawSourceHandleId);
-      if (!redrawSourceAnchor) {
-        return false;
-      }
-      const redrawTargetAnchor = getTargetAnchorPosition(edgeToRedraw.target_id);
-
-      const nextGraph = removeEdgeAndPruneJunctions(graph, edgeToRedraw.id);
-      onGraphChange(nextGraph);
-      onSelectionChange(null, null);
-      setTooltipNodeId(null);
-      setDraftConnection({
-        sourceNodeId: edgeToRedraw.source_id,
-        sourceHandleId: redrawSourceHandleId,
-        waypoints: [],
-        pointerPosition: redrawTargetAnchor ?? targetAnchor ?? sourceAnchor ?? redrawSourceAnchor,
-      });
-      setIsConnecting(false);
-      setEditorMessage("Line detached. Click blank space to add bends, then click a node to redraw it.");
-      return true;
+    (_nodeId: string, _handleType: HandleClickType, _handleId: string | null) => {
+      // Let React Flow own the default handle press gesture.
+      // Existing-edge rerouting should not hijack a normal drag-to-connect action.
+      return false;
     },
-    [
-      getSourceAnchorPosition,
-      getTargetAnchorPosition,
-      graph,
-      onGraphChange,
-      onSelectionChange,
-      pendingPlacement,
-      removeEdgeAndPruneJunctions,
-      selectedEdgeId,
-    ],
+    [],
   );
 
   const handleJunctionPointerDown = useCallback(
@@ -1179,6 +1382,50 @@ export function GraphCanvas({
       });
     },
     [getFlowPositionFromScreen, graph, onSelectionChange, pendingPlacement],
+  );
+
+  const handleWaypointPointerDown = useCallback(
+    (edgeId: string, waypointIndex: number, clientPosition: { x: number; y: number }) => {
+      if (!graph || pendingPlacement || draftConnectionRef.current) {
+        return;
+      }
+      const edge = graph.edges.find((candidate) => candidate.id === edgeId);
+      if (!edge) {
+        return;
+      }
+      const sourceNode = graph.nodes.find((node) => node.id === edge.source_id);
+      const targetNode = graph.nodes.find((node) => node.id === edge.target_id);
+      if (!sourceNode || !targetNode) {
+        return;
+      }
+      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+      const sourceAnchor = getSourceAnchorPosition(edge.source_id, sourceHandleId);
+      const targetAnchor = getTargetAnchorPosition(edge.target_id);
+      if (!sourceAnchor || !targetAnchor) {
+        return;
+      }
+      const routePoints = resolveEdgeRoutePoints(sourceAnchor, targetAnchor, edge.waypoints ?? [], { endWithHorizontal: true });
+      const waypoint = routePoints[waypointIndex + 1];
+      if (!waypoint) {
+        return;
+      }
+      const flowPosition = getFlowPositionFromScreen(clientPosition);
+      if (!flowPosition) {
+        return;
+      }
+      suppressNextPaneClickRef.current = true;
+      setTooltipNodeId(null);
+      onSelectionChange(null, edgeId);
+      setWaypointDrag({
+        edgeId,
+        waypointIndex,
+        pointerOffset: {
+          x: flowPosition.x - waypoint.x,
+          y: flowPosition.y - waypoint.y,
+        },
+      });
+    },
+    [getFlowPositionFromScreen, getSourceAnchorPosition, getTargetAnchorPosition, graph, onSelectionChange, pendingPlacement],
   );
 
   const extendDraftConnectionAt = useCallback(
@@ -1284,9 +1531,12 @@ export function GraphCanvas({
     if (nodeDragRafRef.current !== null) return;
     nodeDragRafRef.current = requestAnimationFrame(() => {
       nodeDragRafRef.current = null;
+      if (dragDiagnosticsEnabled && dragDiagnosticSessionRef.current.active) {
+        dragDiagnosticSessionRef.current.rafTicks += 1;
+      }
       setDragRenderTick((t) => t + 1);
     });
-  }, []);
+  }, [dragDiagnosticsEnabled]);
 
   const cancelPendingNodeDragFrame = useCallback(() => {
     if (nodeDragRafRef.current !== null) {
@@ -1312,6 +1562,52 @@ export function GraphCanvas({
     });
     return didChange ? { ...baseGraph, nodes: nextNodes } : baseGraph;
   }, []);
+  const updateEdgeWaypointInGraph = useCallback(
+    (baseGraph: GraphDefinition, waypointEdgeId: string, waypointIndex: number, position: GraphPosition) => {
+      let didChange = false;
+      const nextEdges = baseGraph.edges.map((edge) => {
+        if (edge.id !== waypointEdgeId) {
+          return edge;
+        }
+        const sourceNode = baseGraph.nodes.find((node) => node.id === edge.source_id);
+        const targetNode = baseGraph.nodes.find((node) => node.id === edge.target_id);
+        if (!sourceNode || !targetNode) {
+          return edge;
+        }
+        const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+        const sourceDimensions = getNodeDimensions(sourceNode);
+        const targetDimensions = getNodeDimensions(targetNode);
+        const verticalRatio = getToolSourceHandleAnchorRatio(sourceHandleId);
+        const sourceAnchor = {
+          x: sourceNode.position.x + sourceDimensions.width,
+          y: sourceNode.position.y + sourceDimensions.height * verticalRatio,
+        };
+        const targetAnchor = {
+          x: targetNode.position.x,
+          y: targetNode.position.y + targetDimensions.height * 0.5,
+        };
+        const currentRoutePoints = resolveEdgeRoutePoints(sourceAnchor, targetAnchor, edge.waypoints ?? [], {
+          endWithHorizontal: true,
+        });
+        const controlPointIndex = waypointIndex + 1;
+        const currentWaypoint = currentRoutePoints[controlPointIndex];
+        if (!currentWaypoint) {
+          return edge;
+        }
+        if (Math.abs(currentWaypoint.x - position.x) < 0.01 && Math.abs(currentWaypoint.y - position.y) < 0.01) {
+          return edge;
+        }
+        const nextRoutePoints = currentRoutePoints.map((waypoint, index) => (index === controlPointIndex ? position : waypoint));
+        didChange = true;
+        return {
+          ...edge,
+          waypoints: nextRoutePoints.slice(1, -1),
+        };
+      });
+      return didChange ? { ...baseGraph, edges: nextEdges } : baseGraph;
+    },
+    [getNodeDimensions],
+  );
   useEffect(() => {
     if (!junctionDrag) {
       return;
@@ -1362,6 +1658,56 @@ export function GraphCanvas({
       window.removeEventListener("blur", handleWindowBlur);
     };
   }, [cancelPendingDragFrame, getFlowPositionFromScreen, junctionDrag, onGraphChange, scheduleDragGraphUpdate, updateNodePositionInGraph]);
+  useEffect(() => {
+    if (!waypointDrag) {
+      return;
+    }
+
+    const updateDraggedWaypoint = (clientPosition: { x: number; y: number }, commit: boolean) => {
+      const currentGraph = graphRef.current;
+      if (!currentGraph) {
+        return;
+      }
+      const flowPosition = getFlowPositionFromScreen(clientPosition);
+      if (!flowPosition) {
+        return;
+      }
+      const nextGraph = updateEdgeWaypointInGraph(currentGraph, waypointDrag.edgeId, waypointDrag.waypointIndex, {
+        x: flowPosition.x - waypointDrag.pointerOffset.x,
+        y: flowPosition.y - waypointDrag.pointerOffset.y,
+      });
+      if (commit) {
+        cancelPendingDragFrame();
+        onGraphChange(nextGraph);
+        return;
+      }
+      scheduleDragGraphUpdate(nextGraph);
+    };
+
+    const handleMouseMove = (event: MouseEvent) => {
+      event.preventDefault();
+      updateDraggedWaypoint({ x: event.clientX, y: event.clientY }, false);
+    };
+
+    const handleMouseUp = (event: MouseEvent) => {
+      updateDraggedWaypoint({ x: event.clientX, y: event.clientY }, true);
+      setWaypointDrag(null);
+    };
+
+    const handleWindowBlur = () => {
+      cancelPendingDragFrame();
+      setWaypointDrag(null);
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, [cancelPendingDragFrame, getFlowPositionFromScreen, onGraphChange, scheduleDragGraphUpdate, updateEdgeWaypointInGraph, waypointDrag]);
 
   useEffect(() => {
     setCanvasZoom(flowInstance?.getZoom() ?? 1);
@@ -1733,11 +2079,81 @@ export function GraphCanvas({
 
   const nodes = useMemo<FlowNode[]>(() => {
     if (!graph) {
+      nodeDataCacheRef.current = new Map();
+      flowNodeCacheRef.current = new Map();
+      measuredNodeDimensionsRef.current.clear();
       return [];
+    }
+    const diagnosticsStart = dragDiagnosticsEnabled && isNodeDragActive ? performance.now() : null;
+    if (isNodeDragActive && flowNodeCacheRef.current.size === graph.nodes.length) {
+      const dragPositions = dragPositionMapRef.current;
+      const nextFlowNodeCache = new Map<string, FlowNode<GraphCanvasRuntimeNodeData>>();
+      const nextNodes = graph.nodes.map((node): FlowNode<GraphCanvasRuntimeNodeData> => {
+        const cachedNode = flowNodeCacheRef.current.get(node.id);
+        const nextPosition = dragPositions?.get(node.id) ?? node.position;
+        const nextSelected = node.id === selectedNodeId;
+        const nextStyle = isWireJunctionNode(node) ? JUNCTION_NODE_STYLE : NODE_STYLE;
+        const nextDimensions = getFlowNodeDimensions(node, cachedNode);
+        if (
+          cachedNode &&
+          cachedNode.selected === nextSelected &&
+          cachedNode.style === nextStyle &&
+          cachedNode.position.x === nextPosition.x &&
+          cachedNode.position.y === nextPosition.y &&
+          cachedNode.width === nextDimensions.width &&
+          cachedNode.height === nextDimensions.height
+        ) {
+          nextFlowNodeCache.set(node.id, cachedNode);
+          return cachedNode;
+        }
+        const nextFlowNode = cachedNode
+          ? {
+              ...cachedNode,
+              position: nextPosition,
+              selected: nextSelected,
+              style: nextStyle,
+              width: nextDimensions.width,
+              height: nextDimensions.height,
+            }
+          : {
+              id: node.id,
+              type: "graphNode",
+              position: nextPosition,
+              selected: nextSelected,
+              sourcePosition: "right" as Position,
+              targetPosition: "left" as Position,
+              data: nodeDataCacheRef.current.get(node.id) ?? {
+                node,
+                graph: null,
+                catalog,
+                runState,
+                kindColor: KIND_COLORS[node.kind] ?? "#8486a5",
+                status: "idle",
+                preview: false,
+                tooltipVisible: false,
+                onToggleTooltip: handleToggleTooltip,
+                onOpenToolDetails: handleOpenToolDetails,
+                onOpenProviderDetails: handleOpenProviderDetails,
+                onHandlePointerDown: handleNodeHandlePointerDown,
+                onJunctionPointerDown: handleJunctionPointerDown,
+              },
+              style: nextStyle,
+              width: nextDimensions.width,
+              height: nextDimensions.height,
+            };
+        nextFlowNodeCache.set(node.id, nextFlowNode);
+        return nextFlowNode;
+      });
+      flowNodeCacheRef.current = nextFlowNodeCache;
+      if (diagnosticsStart !== null) {
+        recordNodeBuildDiagnostic(performance.now() - diagnosticsStart);
+      }
+      return nextNodes;
     }
     const isRoutingDraftWire = draftConnection !== null && !isConnecting;
     const snapTargetNodeId = isRoutingDraftWire ? draftConnectionSnapTargetNodeId : null;
     const nextNodeDataCache = new Map<string, GraphCanvasRuntimeNodeData>();
+    const nextFlowNodeCache = new Map<string, FlowNode<GraphCanvasRuntimeNodeData>>();
     const nextNodes = graph.nodes.map((node): FlowNode<GraphCanvasRuntimeNodeData> => {
       const isActive = runState?.current_node_id === node.id;
       const hasError = Boolean(runState?.node_errors?.[node.id]);
@@ -1792,31 +2208,100 @@ export function GraphCanvas({
             };
       nextNodeDataCache.set(node.id, nextData);
       const isJunction = isWireJunctionNode(node);
-
-      return {
-        id: node.id,
-        type: "graphNode",
-        position: dragPositionMapRef.current?.get(node.id) ?? node.position,
-        selected: node.id === selectedNodeId,
-        sourcePosition: "right" as Position,
-        targetPosition: "left" as Position,
-        data: nextData,
-        style: isJunction ? JUNCTION_NODE_STYLE : NODE_STYLE,
-      };
+      const nextPosition = dragPositionMapRef.current?.get(node.id) ?? node.position;
+      const nextSelected = node.id === selectedNodeId;
+      const nextStyle = isJunction ? JUNCTION_NODE_STYLE : NODE_STYLE;
+      const previousFlowNode = flowNodeCacheRef.current.get(node.id);
+      const nextDimensions = getFlowNodeDimensions(node, previousFlowNode);
+      const nextFlowNode =
+        previousFlowNode &&
+        previousFlowNode.data === nextData &&
+        previousFlowNode.selected === nextSelected &&
+        previousFlowNode.style === nextStyle &&
+        previousFlowNode.position.x === nextPosition.x &&
+        previousFlowNode.position.y === nextPosition.y &&
+        previousFlowNode.width === nextDimensions.width &&
+        previousFlowNode.height === nextDimensions.height
+          ? previousFlowNode
+          : {
+              id: node.id,
+              type: "graphNode",
+              position: nextPosition,
+              selected: nextSelected,
+              sourcePosition: "right" as Position,
+              targetPosition: "left" as Position,
+              data: nextData,
+              style: nextStyle,
+              width: nextDimensions.width,
+              height: nextDimensions.height,
+            };
+      nextFlowNodeCache.set(node.id, nextFlowNode);
+      return nextFlowNode;
     });
     nodeDataCacheRef.current = nextNodeDataCache;
+    flowNodeCacheRef.current = nextFlowNodeCache;
+    if (diagnosticsStart !== null) {
+      recordNodeBuildDiagnostic(performance.now() - diagnosticsStart);
+    }
     return nextNodes;
-  }, [catalog, dragRenderTick, draftConnection?.sourceNodeId, draftConnectionSnapTargetNodeId, graph, handleJunctionPointerDown, handleNodeHandlePointerDown, handleOpenProviderDetails, handleOpenToolDetails, handleToggleTooltip, isConnecting, runState, selectedNodeId, tooltipNodeId]);
+  }, [catalog, dragDiagnosticsEnabled, dragRenderTick, draftConnection?.sourceNodeId, draftConnectionSnapTargetNodeId, getFlowNodeDimensions, graph, handleJunctionPointerDown, handleNodeHandlePointerDown, handleOpenProviderDetails, handleOpenToolDetails, handleToggleTooltip, isConnecting, isNodeDragActive, recordNodeBuildDiagnostic, runState, selectedNodeId, tooltipNodeId]);
 
   const edges = useMemo<FlowEdge<GraphCanvasEdgeData>[]>(() => {
     if (!graph) {
       cachedEdgesRef.current = [];
       return [];
     }
-    if ((isNodeDragActive || junctionDrag) && cachedEdgesRef.current.length > 0) {
-      return cachedEdgesRef.current;
-    }
-    const nodeLookup = new Map(graph.nodes.map((node) => [node.id, node]));
+    const dragPositions = isNodeDragActive ? dragPositionMapRef.current : null;
+    const nodeLookup = new Map(
+      graph.nodes.map((node) => {
+        const dragPosition = dragPositions?.get(node.id);
+        return [
+          node.id,
+          dragPosition
+            ? {
+                ...node,
+                position: dragPosition,
+              }
+            : node,
+        ];
+      }),
+    );
+    const getSourceAnchorForLookup = (nodeId: string, sourceHandleId: string | null = null): GraphPosition | null => {
+      const sourceNode = nodeLookup.get(nodeId);
+      if (!sourceNode) {
+        return null;
+      }
+      const dimensions = getNodeDimensions(sourceNode);
+      const verticalRatio =
+        sourceNode.kind === "tool" ? getToolSourceHandleAnchorRatio(sourceHandleId ?? TOOL_SUCCESS_HANDLE_ID) : 0.5;
+      return {
+        x: sourceNode.position.x + dimensions.width,
+        y: sourceNode.position.y + dimensions.height * verticalRatio,
+      };
+    };
+    const getTargetAnchorForLookup = (nodeId: string): GraphPosition | null => {
+      const targetNode = nodeLookup.get(nodeId);
+      if (!targetNode) {
+        return null;
+      }
+      const dimensions = getNodeDimensions(targetNode);
+      return {
+        x: targetNode.position.x,
+        y: targetNode.position.y + dimensions.height * 0.5,
+      };
+    };
+    const getEdgeRouteSignatureForLookup = (edge: GraphEdge, sourceNode: GraphNode | undefined) => {
+      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+      const sourceAnchor = getSourceAnchorForLookup(edge.source_id, sourceHandleId);
+      const targetAnchor = getTargetAnchorForLookup(edge.target_id);
+      if (!sourceAnchor || !targetAnchor) {
+        return null;
+      }
+      const routePoints = resolveEdgeRoutePoints(sourceAnchor, targetAnchor, edge.waypoints ?? [], { endWithHorizontal: true });
+      return routePoints
+        .map((point) => `${Math.round(point.x / 12)}:${Math.round(point.y / 12)}`)
+        .join("|");
+    };
     const siblingEdgesByTarget = new Map<string, GraphEdge[]>();
     const routeSignatureGroups = new Map<string, GraphEdge[]>();
     graph.edges.forEach((edge) => {
@@ -1827,7 +2312,7 @@ export function GraphCanvas({
         siblingEdgesByTarget.set(edge.target_id, [edge]);
       }
       const sourceNode = nodeLookup.get(edge.source_id);
-      const signature = getEdgeRouteSignature(edge, sourceNode);
+      const signature = getEdgeRouteSignatureForLookup(edge, sourceNode);
       if (!signature) {
         return;
       }
@@ -1854,6 +2339,9 @@ export function GraphCanvas({
       });
     });
     const shouldResolveLabelCollisions = !isNodeDragActive && !junctionDrag;
+    const previousEdgeDataById = shouldResolveLabelCollisions
+      ? null
+      : new Map(cachedEdgesRef.current.map((edge) => [edge.id, edge.data]));
 
     const edgeLayouts = graph.edges.map((edge) => {
       const sourceNode = nodeLookup.get(edge.source_id);
@@ -1861,9 +2349,9 @@ export function GraphCanvas({
       const touchesWireJunction = isWireJunctionNode(sourceNode) || isWireJunctionNode(targetNode);
       const labelText = touchesWireJunction ? "" : String(edge.condition?.label ?? edge.label ?? "");
       const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
-      const sourceAnchor = getSourceAnchorPosition(edge.source_id, sourceHandleId);
-      const targetAnchor = getTargetAnchorPosition(edge.target_id);
-      const routeSignature = getEdgeRouteSignature(edge, sourceNode);
+      const sourceAnchor = getSourceAnchorForLookup(edge.source_id, sourceHandleId);
+      const targetAnchor = getTargetAnchorForLookup(edge.target_id);
+      const routeSignature = getEdgeRouteSignatureForLookup(edge, sourceNode);
       const overlappingEdges = routeSignature ? routeSignatureGroups.get(routeSignature) ?? [edge] : [edge];
       const siblingEdges = siblingEdgesByTarget.get(edge.target_id) ?? [edge];
       const toolEdgeTone =
@@ -1886,9 +2374,10 @@ export function GraphCanvas({
           ? laneOffset
           : 0;
       const labelOffset = (siblingIndex - (siblingEdges.length - 1) / 2) * 28;
+      const previousEdgeData = previousEdgeDataById?.get(edge.id);
 
       const edgeGeometry =
-        sourceAnchor && targetAnchor
+        shouldResolveLabelCollisions && sourceAnchor && targetAnchor
           ? getEdgeLabelPlacement({
               sourceX: sourceAnchor.x,
               sourceY: sourceAnchor.y,
@@ -1896,10 +2385,13 @@ export function GraphCanvas({
               targetY: targetAnchor.y,
               sourcePosition: "right" as Position,
               targetPosition: "left" as Position,
-              waypoints: edge.waypoints ?? [],
+              routePoints: edge.waypoints ?? [],
               labelOffset,
             })
           : null;
+      const routePoints = sourceAnchor && targetAnchor
+        ? resolveEdgeRoutePoints(sourceAnchor, targetAnchor, edge.waypoints ?? [], { endWithHorizontal: true }).slice(1, -1)
+        : [];
 
       return {
         id: edge.id,
@@ -1935,13 +2427,19 @@ export function GraphCanvas({
         animated: false,
         data: {
           kind: edge.kind,
-          waypoints: edge.waypoints ?? [],
+          routePoints,
           sourceColor: toolEdgeTone?.sourceColor ?? KIND_COLORS[sourceNode?.kind ?? ""] ?? "#6ea8ff",
           targetColor: toolEdgeTone?.targetColor ?? KIND_COLORS[targetNode?.kind ?? ""] ?? "#6ea8ff",
           routeTone: toolEdgeTone?.routeTone,
           routeShiftX,
           routeShiftY,
           labelOffset,
+          labelShiftX: previousEdgeData?.labelShiftX ?? 0,
+          labelShiftY: previousEdgeData?.labelShiftY ?? 0,
+          showWaypointHandles: (edge.waypoints?.length ?? 0) > 0,
+          waypointSelected: edge.id === selectedEdgeId,
+          waypointDragActive: waypointDrag?.edgeId === edge.id,
+          onWaypointPointerDown: handleWaypointPointerDown,
         },
         style: {
           strokeWidth: edge.id === selectedEdgeId ? SELECTED_EDGE_STROKE_WIDTH : EDGE_STROKE_WIDTH,
@@ -1979,14 +2477,16 @@ export function GraphCanvas({
         ...edge,
         data: {
           ...data,
-          labelShiftX: labelShift?.x ?? 0,
-          labelShiftY: labelShift?.y ?? 0,
+          labelShiftX: labelShift?.x ?? data.labelShiftX ?? 0,
+          labelShiftY: labelShift?.y ?? data.labelShiftY ?? 0,
         },
       };
     });
-    cachedEdgesRef.current = result;
+    if (shouldResolveLabelCollisions) {
+      cachedEdgesRef.current = result;
+    }
     return result;
-  }, [getEdgeRouteSignature, getSourceAnchorPosition, getTargetAnchorPosition, graph, isNodeDragActive, junctionDrag, selectedEdgeId]);
+  }, [dragRenderTick, getNodeDimensions, graph, handleWaypointPointerDown, isNodeDragActive, junctionDrag, selectedEdgeId, waypointDrag]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -1997,12 +2497,16 @@ export function GraphCanvas({
       let isDragMove = false;
       let dragEnded = false;
       let hasNonDragChanges = false;
+      let dragChangeCount = 0;
 
       for (const change of changes) {
-        if (change.type === "position" && change.position) {
+        if (change.type === "dimensions") {
+          updateMeasuredNodeDimensions(change.id, change.dimensions);
+        } else if (change.type === "position" && change.position) {
           const dragging = (change as { dragging?: boolean }).dragging;
           if (dragging === true) {
             isDragMove = true;
+            dragChangeCount += 1;
             if (!dragPositionMapRef.current) {
               dragPositionMapRef.current = new Map();
             }
@@ -2021,6 +2525,13 @@ export function GraphCanvas({
       }
 
       if (isDragMove && !dragEnded && !hasNonDragChanges) {
+        if (dragDiagnosticsEnabled) {
+          if (!dragDiagnosticSessionRef.current.active) {
+            beginDragDiagnosticSession();
+          }
+          dragDiagnosticSessionRef.current.dragMoveEvents += 1;
+          dragDiagnosticSessionRef.current.draggedNodeChanges += dragChangeCount;
+        }
         if (!isNodeDragActive) {
           setIsNodeDragActive(true);
           setDragRenderTick((t) => t + 1);
@@ -2032,6 +2543,7 @@ export function GraphCanvas({
 
       if (dragEnded && isNodeDragActive) {
         setIsNodeDragActive(false);
+        flushDragDiagnosticSession("drag-end");
       }
 
       let nextGraph = graph;
@@ -2057,6 +2569,7 @@ export function GraphCanvas({
           };
         }
         if (change.type === "remove") {
+          measuredNodeDimensionsRef.current.delete(change.id);
           nextGraph = {
             ...nextGraph,
             nodes: nextGraph.nodes.filter((node) => node.id !== change.id),
@@ -2071,9 +2584,12 @@ export function GraphCanvas({
 
       cancelPendingNodeDragFrame();
       cancelPendingDragFrame();
+      if (nextGraph === graph) {
+        return;
+      }
       onGraphChange(nextGraph);
     },
-    [cancelPendingDragFrame, cancelPendingNodeDragFrame, graph, isNodeDragActive, onGraphChange, onSelectionChange, scheduleDragRender, selectedNodeId],
+    [beginDragDiagnosticSession, cancelPendingDragFrame, cancelPendingNodeDragFrame, dragDiagnosticsEnabled, flushDragDiagnosticSession, graph, isNodeDragActive, onGraphChange, onSelectionChange, scheduleDragRender, selectedNodeId, updateMeasuredNodeDimensions],
   );
 
   const onEdgesChange = useCallback(
@@ -2108,9 +2624,21 @@ export function GraphCanvas({
       }
       const sourceNode = graph.nodes.find((node) => node.id === connection.source);
       const targetNode = graph.nodes.find((node) => node.id === connection.target);
-      return canConnectNodes(sourceNode, targetNode, catalog);
+      if (!canConnectNodes(sourceNode, targetNode, catalog)) {
+        return false;
+      }
+      const { duplicateEdgeId } = getConnectionConflictState(
+        graph,
+        connection.source,
+        connection.target,
+        connection.sourceHandle ?? null,
+      );
+      if (duplicateEdgeId) {
+        return false;
+      }
+      return true;
     },
-    [catalog, graph],
+    [catalog, getConnectionConflictState, graph],
   );
 
   const onConnect = useCallback(
@@ -2154,41 +2682,15 @@ export function GraphCanvas({
   );
 
   const onConnectEnd = useCallback(
-    (event: MouseEvent | TouchEvent) => {
+    (_event: MouseEvent | TouchEvent) => {
       setIsConnecting(false);
-      const clientPosition = getEventClientPosition(event);
       if (didCreateConnectionRef.current) {
         didCreateConnectionRef.current = false;
         return;
       }
-      if (!draftConnection || !clientPosition) {
-        setDraftConnection(null);
-        return;
-      }
-      const flowPosition = getFlowPositionFromScreen(clientPosition);
-      if (!flowPosition) {
-        setDraftConnection(null);
-        return;
-      }
-      const snapTargetNodeId = resolveDraftConnectionSnapTargetNodeId(draftConnection.sourceNodeId, flowPosition);
-      if (snapTargetNodeId) {
-        const didCommit = commitEdge(
-          draftConnection.sourceNodeId,
-          snapTargetNodeId,
-          draftConnection.waypoints,
-          graph,
-          draftConnection.sourceHandleId,
-        );
-        if (didCommit) {
-          didCreateConnectionRef.current = true;
-          setDraftConnection(null);
-          return;
-        }
-      }
-      suppressNextPaneClickRef.current = true;
-      void extendDraftConnectionAt(flowPosition);
+      cancelDraftConnection();
     },
-    [commitEdge, draftConnection, extendDraftConnectionAt, getEventClientPosition, getFlowPositionFromScreen, graph, resolveDraftConnectionSnapTargetNodeId],
+    [cancelDraftConnection],
   );
 
   const onDrop = useCallback(
@@ -2274,7 +2776,7 @@ export function GraphCanvas({
       <div className="graph-workspace">
         <div
           ref={canvasRef}
-          className={`graph-canvas${drawerOpen ? " graph-canvas--drawer-open" : ""}${isProviderDragActive || isSavedNodeDragActive ? " is-drop-target" : ""}${isConnecting ? " is-connecting" : ""}${pendingPlacement ? " is-placing-node" : ""}${draftConnection ? " is-routing-wire" : ""}${junctionDrag ? " is-dragging-junction" : ""}${isNodeDragActive ? " is-dragging-node" : ""}`}
+          className={`graph-canvas${drawerOpen ? " graph-canvas--drawer-open" : ""}${isProviderDragActive || isSavedNodeDragActive ? " is-drop-target" : ""}${isConnecting ? " is-connecting" : ""}${pendingPlacement ? " is-placing-node" : ""}${draftConnection ? " is-routing-wire" : ""}${junctionDrag ? " is-dragging-junction" : ""}${waypointDrag ? " is-dragging-waypoint" : ""}${isNodeDragActive ? " is-dragging-node" : ""}`}
           onDrop={onDrop}
           onDragOver={onDragOver}
           onDragLeave={onDragLeave}
@@ -2425,7 +2927,7 @@ export function GraphCanvas({
               filter: "drop-shadow(0 0 10px rgba(111, 130, 255, 0.45))",
             }}
             defaultViewport={{ x: 0, y: 0, zoom: 1 }}
-            panOnDrag={!vizLocked && !pendingPlacement && !junctionDrag}
+            panOnDrag={!vizLocked && !pendingPlacement && !junctionDrag && !waypointDrag}
             panOnScroll={false}
             zoomOnScroll={!vizLocked}
             zoomOnPinch={!vizLocked}
@@ -2441,17 +2943,7 @@ export function GraphCanvas({
             isValidConnection={isValidConnection}
             onNodeClick={(_, node) => {
               if (draftConnection && !isConnecting) {
-                const didCommit = commitEdge(
-                  draftConnection.sourceNodeId,
-                  node.id,
-                  draftConnection.waypoints,
-                  graph,
-                  draftConnection.sourceHandleId,
-                );
-                if (didCommit) {
-                  cancelPendingDraftPointerFrame();
-                  setDraftConnection(null);
-                }
+                cancelDraftConnection();
                 return;
               }
               if (pendingPlacement) {
@@ -2476,25 +2968,7 @@ export function GraphCanvas({
                 return;
               }
               if (draftConnection && !isConnecting) {
-                const flowPosition = getFlowPositionFromScreen({ x: event.clientX, y: event.clientY });
-                if (flowPosition) {
-                  const snapTargetNodeId = resolveDraftConnectionSnapTargetNodeId(draftConnection.sourceNodeId, flowPosition);
-                  if (
-                    snapTargetNodeId &&
-                    commitEdge(
-                      draftConnection.sourceNodeId,
-                      snapTargetNodeId,
-                      draftConnection.waypoints,
-                      graph,
-                      draftConnection.sourceHandleId,
-                    )
-                  ) {
-                    cancelPendingDraftPointerFrame();
-                    setDraftConnection(null);
-                    return;
-                  }
-                  void extendDraftConnectionAt(flowPosition);
-                }
+                cancelDraftConnection();
                 return;
               }
               if (pendingPlacement) {
@@ -2503,7 +2977,6 @@ export function GraphCanvas({
               }
               clearCanvasChrome();
             }}
-            fitView
           >
             <MiniMap
               zoomable

@@ -1,7 +1,9 @@
 import { memo, useMemo } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
 import { EdgeLabelRenderer, getSmoothStepPath } from "reactflow";
 import type { ConnectionLineComponentProps, EdgeProps } from "reactflow";
+
+import { warnGraphDiagnostic } from "../lib/dragDiagnostics";
 
 type GraphPosition = {
   x: number;
@@ -13,12 +15,16 @@ export type GraphCanvasEdgeData = {
   labelOffset?: number;
   labelShiftX?: number;
   labelShiftY?: number;
-  waypoints?: GraphPosition[];
+  routePoints?: GraphPosition[];
   sourceColor?: string;
   targetColor?: string;
   routeTone?: "tool-success" | "tool-failure";
   routeShiftX?: number;
   routeShiftY?: number;
+  showWaypointHandles?: boolean;
+  waypointSelected?: boolean;
+  waypointDragActive?: boolean;
+  onWaypointPointerDown?: (edgeId: string, waypointIndex: number, clientPosition: { x: number; y: number }) => void;
 };
 
 export function offsetPointAcrossEdge(point: { x: number; y: number }, tangent: { x: number; y: number }, offset: number) {
@@ -81,6 +87,17 @@ function collapseCollinearPoints(points: GraphPosition[]) {
   }
   collapsed.push(points[points.length - 1]);
   return collapsed;
+}
+
+function isAxisAlignedRoute(points: GraphPosition[]) {
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const current = points[index];
+    if (Math.abs(previous.x - current.x) >= POINT_EPSILON && Math.abs(previous.y - current.y) >= POINT_EPSILON) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function roundedOrthogonalPath(points: GraphPosition[]) {
@@ -171,6 +188,24 @@ export function buildOrthogonalPolylinePoints(points: GraphPosition[], options?:
 
 export function buildPolylinePath(points: GraphPosition[], options?: { endWithHorizontal?: boolean }): string {
   return roundedOrthogonalPath(buildOrthogonalPolylinePoints(points, options));
+}
+
+export function resolveEdgeRoutePoints(
+  source: GraphPosition,
+  target: GraphPosition,
+  routePoints: GraphPosition[] = [],
+  options?: { endWithHorizontal?: boolean },
+) {
+  if (routePoints.length === 0) {
+    return [source, target];
+  }
+
+  const candidatePoints = [source, ...routePoints, target];
+  if (isAxisAlignedRoute(candidatePoints)) {
+    return collapseCollinearPoints(candidatePoints);
+  }
+
+  return buildOrthogonalPolylinePoints(candidatePoints, options);
 }
 
 export function midpointOnPolyline(points: GraphPosition[]) {
@@ -286,7 +321,11 @@ function samplePathLabelPlacement(
       point: offsetPointAcrossEdge(point, tangent, labelOffset),
       tangent,
     };
-  } catch {
+  } catch (error) {
+    warnGraphDiagnostic("GraphCanvasEdge", "label placement fallback", error, {
+      edgePath,
+      labelOffset,
+    });
     return {
       point: offsetPointAcrossEdge(fallbackPoint, fallbackTangent, labelOffset),
       tangent: fallbackTangent,
@@ -301,7 +340,7 @@ export function getEdgeLabelPlacement({
   targetY,
   sourcePosition,
   targetPosition,
-  waypoints = [],
+  routePoints = [],
   labelOffset = 0,
 }: {
   sourceX: number;
@@ -310,10 +349,10 @@ export function getEdgeLabelPlacement({
   targetY: number;
   sourcePosition: EdgeProps<GraphCanvasEdgeData>["sourcePosition"] | ConnectionLineComponentProps["fromPosition"];
   targetPosition: EdgeProps<GraphCanvasEdgeData>["targetPosition"] | ConnectionLineComponentProps["toPosition"];
-  waypoints?: GraphPosition[];
+  routePoints?: GraphPosition[];
   labelOffset?: number;
 }) {
-  const hasWaypoints = waypoints.length > 0;
+  const hasRoutePoints = routePoints.length > 0;
   const [smoothEdgePath, fallbackLabelX, fallbackLabelY] = buildSmoothEdgePath({
     sourceX,
     sourceY,
@@ -323,9 +362,13 @@ export function getEdgeLabelPlacement({
     targetPosition,
   });
 
-  if (hasWaypoints) {
-    const routedPoints = [{ x: sourceX, y: sourceY }, ...waypoints, { x: targetX, y: targetY }];
-    const routedPolylinePoints = buildOrthogonalPolylinePoints(routedPoints, { endWithHorizontal: true });
+  if (hasRoutePoints) {
+    const routedPolylinePoints = resolveEdgeRoutePoints(
+      { x: sourceX, y: sourceY },
+      { x: targetX, y: targetY },
+      routePoints,
+      { endWithHorizontal: true },
+    );
     const midpoint = midpointOnPolyline(routedPolylinePoints);
     return {
       edgePath: roundedOrthogonalPath(routedPolylinePoints),
@@ -359,7 +402,7 @@ function GraphCanvasEdgeComponent({
   data,
   label,
 }: EdgeProps<GraphCanvasEdgeData>) {
-  const waypoints = data?.waypoints ?? [];
+  const routePoints = data?.routePoints ?? [];
   const sourceColor = data?.sourceColor ?? "#6ea8ff";
   const targetColor = data?.targetColor ?? sourceColor;
   const labelOffset = data?.labelOffset ?? 0;
@@ -367,6 +410,10 @@ function GraphCanvasEdgeComponent({
   const routeShiftY = data?.routeShiftY ?? 0;
   const labelShiftX = data?.labelShiftX ?? 0;
   const labelShiftY = data?.labelShiftY ?? 0;
+  const showWaypointHandles = data?.showWaypointHandles ?? false;
+  const waypointSelected = data?.waypointSelected ?? false;
+  const waypointDragActive = data?.waypointDragActive ?? false;
+  const onWaypointPointerDown = data?.onWaypointPointerDown;
   const { edgePath, point: labelPosition } = useMemo(
     () =>
       getEdgeLabelPlacement({
@@ -376,10 +423,10 @@ function GraphCanvasEdgeComponent({
         targetY,
         sourcePosition,
         targetPosition,
-        waypoints,
+        routePoints,
         labelOffset,
       }),
-    [labelOffset, sourcePosition, sourceX, sourceY, targetPosition, targetX, targetY, waypoints],
+    [labelOffset, routePoints, sourcePosition, sourceX, sourceY, targetPosition, targetX, targetY],
   );
   const pathTransform = routeShiftX !== 0 || routeShiftY !== 0 ? `translate(${routeShiftX} ${routeShiftY})` : undefined;
 
@@ -413,6 +460,11 @@ function GraphCanvasEdgeComponent({
     strokeDasharray: `${stripeLength} ${stripeLength}`,
     filter: undefined,
   } satisfies CSSProperties;
+  const handleWaypointPointerDown = (event: ReactPointerEvent<HTMLButtonElement>, waypointIndex: number) => {
+    event.preventDefault();
+    event.stopPropagation();
+    onWaypointPointerDown?.(id, waypointIndex, { x: event.clientX, y: event.clientY });
+  };
 
   return (
     <>
@@ -431,6 +483,29 @@ function GraphCanvasEdgeComponent({
           >
             {String(label)}
           </div>
+        </EdgeLabelRenderer>
+      ) : null}
+      {routePoints.length > 0 && (showWaypointHandles || waypointDragActive) ? (
+        <EdgeLabelRenderer>
+          <>
+            {routePoints.map((waypoint, waypointIndex) => {
+              const waypointStyle = {
+                transform: `translate(-50%, -50%) translate(${waypoint.x + routeShiftX}px, ${waypoint.y + routeShiftY}px)`,
+                pointerEvents: "all",
+              } satisfies CSSProperties;
+              return (
+                <button
+                  key={`${id}-waypoint-${waypointIndex}`}
+                  type="button"
+                  className={`graph-edge-waypoint nopan nodrag${waypointSelected ? " is-selected" : ""}${waypointDragActive ? " is-dragging" : ""}`}
+                  style={waypointStyle}
+                  onPointerDown={(event) => handleWaypointPointerDown(event, waypointIndex)}
+                  aria-label="Drag wire corner"
+                  title="Drag wire corner"
+                />
+              );
+            })}
+          </>
         </EdgeLabelRenderer>
       ) : null}
     </>

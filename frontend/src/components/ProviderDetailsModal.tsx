@@ -95,7 +95,12 @@ export function ProviderDetailsModal({
     max_tokens: node.config.max_tokens ?? null,
     api_base: resolveGraphEnvReferences(String(node.config.api_base ?? ""), graph) || null,
     api_key_env_var: resolveGraphEnvReferences(String(node.config.api_key_env_var ?? ""), graph) || null,
+    cli_path: resolveGraphEnvReferences(String(node.config.cli_path ?? ""), graph) || null,
+    working_directory: resolveGraphEnvReferences(String(node.config.working_directory ?? ""), graph) || null,
+    timeout_seconds: node.config.timeout_seconds ?? null,
+    max_turns: node.config.max_turns ?? null,
   };
+  const isClaudeCodeProvider = providerName === "claude_code";
 
   return (
     <div className="tool-details-modal-backdrop" onClick={handleOverlayClick} role="presentation">
@@ -182,6 +187,37 @@ export function ProviderDetailsModal({
                 onChange={handleTextInputChange("api_key_env_var")}
               />
             </label>
+            {isClaudeCodeProvider ? (
+              <>
+                <label>
+                  Claude CLI Path
+                  <input value={String(node.config.cli_path ?? "")} onChange={handleTextInputChange("cli_path")} />
+                </label>
+                <label>
+                  Working Directory
+                  <input
+                    value={String(node.config.working_directory ?? "")}
+                    onChange={handleTextInputChange("working_directory")}
+                  />
+                </label>
+                <label>
+                  Timeout Seconds
+                  <input
+                    type="number"
+                    value={String(node.config.timeout_seconds ?? "")}
+                    onChange={handleNumberInputChange("timeout_seconds")}
+                  />
+                </label>
+                <label>
+                  Max Turns
+                  <input
+                    type="number"
+                    value={String(node.config.max_turns ?? "")}
+                    onChange={handleNumberInputChange("max_turns")}
+                  />
+                </label>
+              </>
+            ) : null}
           </div>
 
           <div className="tool-details-modal-help">

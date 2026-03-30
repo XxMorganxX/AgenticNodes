@@ -29,6 +29,9 @@ function defaultModelProviderName(provider: NodeProviderDefinition): string {
   if (provider.provider_id === "provider.claude") {
     return "claude";
   }
+  if (provider.provider_id === "provider.claude_code") {
+    return "claude_code";
+  }
   return "mock";
 }
 
@@ -38,6 +41,9 @@ function defaultModelName(providerName: string): string {
   }
   if (providerName === "claude") {
     return "claude-3-5-haiku-latest";
+  }
+  if (providerName === "claude_code") {
+    return "sonnet";
   }
   return "mock-default";
 }
@@ -70,6 +76,14 @@ function defaultProviderConfig(provider: NodeProviderDefinition): GraphNode["con
       max_tokens: 1024,
     };
   }
+  if (provider.provider_id === "provider.claude_code") {
+    return {
+      provider_name: providerName,
+      model: "sonnet",
+      timeout_seconds: 60,
+      max_turns: 1,
+    };
+  }
   return {
     provider_name: providerName,
     model: "mock-default",
@@ -90,20 +104,13 @@ export function syncModelNodeWithProvider(modelNode: GraphNode, providerNode: Gr
 
   const nextConfig: GraphNode["config"] = {
     ...modelNode.config,
+    ...providerNode.config,
     provider_binding_node_id: providerNode.id,
     provider_name: providerName,
   };
 
   const providerModel = typeof providerNode.config.model === "string" ? providerNode.config.model.trim() : "";
   nextConfig.model = providerModel || String(modelNode.config.model ?? "").trim() || defaultModelName(providerName);
-
-  if (providerNode.config.api_base !== undefined) {
-    nextConfig.api_base = providerNode.config.api_base;
-  }
-
-  if (providerNode.config.max_tokens !== undefined) {
-    nextConfig.max_tokens = providerNode.config.max_tokens;
-  }
 
   return {
     ...modelNode,
