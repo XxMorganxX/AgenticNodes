@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from graph_agent.api.graph_store import GraphStore
+from graph_agent.api.run_log_store import RunLogStore
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.providers.discord import DiscordMessageEvent, DiscordTriggerService, normalize_discord_message_payload
 from graph_agent.runtime.core import GraphDefinition, resolve_graph_process_env, utc_now_iso
@@ -42,6 +44,7 @@ class GraphRunManager:
         *,
         services: Any | None = None,
         store: GraphStore | None = None,
+        run_log_store: RunLogStore | None = None,
         discord_service: DiscordTriggerService | None = None,
     ) -> None:
         self._services = services or build_example_services()
@@ -50,6 +53,7 @@ class GraphRunManager:
         self._run_states: dict[str, dict[str, Any]] = {}
         self._event_backlog: dict[str, list[dict[str, Any]]] = {}
         self._subscribers: dict[str, list[Queue[str | None]]] = {}
+        self._run_log_store = run_log_store or RunLogStore()
         self._discord_service = discord_service or DiscordTriggerService(self.handle_discord_message)
 
     def list_graphs(self) -> list[dict[str, Any]]:
@@ -204,6 +208,10 @@ class GraphRunManager:
                     agent_id=default_agent.agent_id,
                     agent_name=default_agent.name,
                 )
+            states_to_initialize = [self._run_states[run_id], *self._run_states[run_id]["agent_runs"].values()]
+
+        for state in states_to_initialize:
+            self._run_log_store.initialize_run(state)
 
         if document.is_multi_agent:
             thread = Thread(
@@ -275,6 +283,7 @@ class GraphRunManager:
         snapshot = serialize_run_state(state)
         with self._lock:
             self._run_states[run_id] = snapshot
+        self._run_log_store.write_state(run_id, snapshot)
         self._close_streams(run_id)
 
     def _execute_environment_run(
@@ -321,6 +330,9 @@ class GraphRunManager:
                     "parent_run_id": None,
                 },
             )
+            with self._lock:
+                snapshot = deepcopy(self._run_states[parent_run_id])
+            self._run_log_store.write_state(parent_run_id, snapshot)
             self._close_streams(parent_run_id)
             return
 
@@ -340,6 +352,9 @@ class GraphRunManager:
                 "parent_run_id": None,
             },
         )
+        with self._lock:
+            snapshot = deepcopy(self._run_states[parent_run_id])
+        self._run_log_store.write_state(parent_run_id, snapshot)
         self._close_streams(parent_run_id)
 
     def _run_agent_in_environment(
@@ -380,16 +395,41 @@ class GraphRunManager:
             self._run_states[child_run_id] = snapshot
             self._run_states[parent_run_id]["agent_runs"][agent.agent_id] = snapshot
 
+        self._run_log_store.write_state(child_run_id, snapshot)
         return snapshot
 
     def _record_event(self, run_id: str, event: dict[str, Any]) -> None:
         encoded = json.dumps(event)
+        parent_snapshot: dict[str, Any] | None = None
+        child_run_id: str | None = None
+        child_event: dict[str, Any] | None = None
+        child_snapshot: dict[str, Any] | None = None
         with self._lock:
             self._event_backlog.setdefault(run_id, []).append(event)
             state = self._run_states.get(run_id)
             if state is not None:
                 self._apply_event_to_state(state, event)
+                parent_snapshot = deepcopy(state)
+                if event["event_type"].startswith("agent."):
+                    payload = event.get("payload", {})
+                    agent_id = str(event.get("agent_id") or payload.get("agent_id") or "")
+                    agent_state = state["agent_runs"].get(agent_id) if agent_id else None
+                    if agent_state is not None:
+                        child_run_id = str(agent_state["run_id"])
+                        child_event = {
+                            **event,
+                            "event_type": event["event_type"].removeprefix("agent."),
+                            "run_id": child_run_id,
+                        }
+                        child_snapshot = deepcopy(agent_state)
             subscribers = list(self._subscribers.get(run_id, []))
+
+        self._run_log_store.append_event(run_id, event)
+        if parent_snapshot is not None:
+            self._run_log_store.write_state(run_id, parent_snapshot)
+        if child_run_id is not None and child_event is not None and child_snapshot is not None:
+            self._run_log_store.append_event(child_run_id, child_event)
+            self._run_log_store.write_state(child_run_id, child_snapshot)
 
         for subscriber in subscribers:
             subscriber.put(encoded)

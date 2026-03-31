@@ -277,6 +277,7 @@ export function buildNodeTooltip(
           title: "MCP Context",
           rows: [
             { label: "Registered Tools", value: toolNames.length > 0 ? formatList(toolNames) : "None selected" },
+            { label: "Expose Callable Tools", value: node.config.expose_mcp_tools === false ? "Disabled" : "Enabled" },
             { label: "Inject Prompt Context", value: node.config.include_mcp_tool_context ? "Enabled" : "Disabled" },
           ],
         },
@@ -297,6 +298,13 @@ export function buildNodeTooltip(
           title: "MCP Execution",
           rows: [
             { label: "Dispatch", value: "Single tool call from upstream API output" },
+            {
+              label: "Input Binding",
+              value:
+                node.config.input_binding && typeof node.config.input_binding === "object"
+                  ? "Explicit binding configured"
+                  : "Implicit latest incoming edge",
+            },
             { label: "Routes", value: "On success / On failure" },
           ],
         },

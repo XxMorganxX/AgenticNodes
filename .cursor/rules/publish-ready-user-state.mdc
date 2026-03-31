@@ -1,0 +1,20 @@
+---
+description: Keep the repo publish-ready by separating user-specific state from tracked source
+alwaysApply: true
+---
+
+# Publish-Ready User State
+
+Assume this repository may be pushed to GitHub at any time.
+
+- Do not add or keep user-specific, machine-specific, generated, secret, or one-person working files in tracked source.
+- If a feature creates per-user state, store it in a user-local location on first boot, not in the repo. Prefer ignored local paths such as `.graph-agent/` or an OS/user-data directory.
+- Only commit portable defaults, templates, fixtures, or sample data that are safe for every clone.
+- When introducing a new local artifact, update `.gitignore` in the same change so it is ignored immediately.
+- Prefer bootstrap flows like "copy from bundled default into ignored local storage on first run" instead of writing mutable state into `src/`, `tests/`, or other tracked project files.
+
+Examples:
+
+- Good: track `.env.example`, ignore `.env`.
+- Good: ship bundled sample graphs, but persist edits in ignored user-local storage.
+- Bad: commit personal config, machine paths, local caches, runtime exports, or mutable user documents.

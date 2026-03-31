@@ -51,6 +51,7 @@ export function McpServerPanel({
       <div className="contract-card">
         <strong>{title}</strong>
         <span>{description}</span>
+        <span>Server state is project-level. Graph nodes still choose which ready MCP tools they expose or describe to models.</span>
       </div>
       {mcpServers.map((server) => {
         const serverTools = (catalog?.tools ?? []).filter((tool) => tool.server_id === server.server_id);

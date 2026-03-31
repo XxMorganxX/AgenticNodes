@@ -18,6 +18,38 @@ def _normalize_env_vars(payload: Mapping[str, Any] | None) -> dict[str, str]:
     return env_vars
 
 
+def _normalize_legacy_mcp_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized_nodes = [dict(node) for node in nodes]
+    node_lookup = {str(node.get("id", "")): node for node in normalized_nodes}
+    context_provider_ids = {
+        node_id
+        for node_id, node in node_lookup.items()
+        if str(node.get("kind", "")) == "mcp_context_provider"
+        or (
+            str(node.get("kind", "")) == "tool"
+            and isinstance(node.get("config"), Mapping)
+            and bool(node["config"].get("include_mcp_tool_context", False))
+        )
+    }
+    for node in normalized_nodes:
+        if str(node.get("kind", "")) != "model":
+            continue
+        config = node.get("config")
+        if not isinstance(config, Mapping):
+            continue
+        raw_target_ids = config.get("tool_target_node_ids", [])
+        if not isinstance(raw_target_ids, list):
+            continue
+        filtered_target_ids = [str(target_id) for target_id in raw_target_ids if str(target_id) in context_provider_ids]
+        next_config = dict(config)
+        if filtered_target_ids:
+            next_config["tool_target_node_ids"] = filtered_target_ids
+        else:
+            next_config.pop("tool_target_node_ids", None)
+        node["config"] = next_config
+    return normalized_nodes
+
+
 @dataclass
 class AgentDefinition:
     agent_id: str
@@ -31,6 +63,9 @@ class AgentDefinition:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> AgentDefinition:
+        normalized_nodes = _normalize_legacy_mcp_nodes(
+            [dict(node) for node in payload.get("nodes", []) if isinstance(node, Mapping)]
+        )
         graph = GraphDefinition.from_dict(
             {
                 "graph_id": str(payload.get("agent_id", payload.get("graph_id", "agent"))),
@@ -39,7 +74,7 @@ class AgentDefinition:
                 "version": str(payload.get("version", "1.0")),
                 "start_node_id": str(payload["start_node_id"]),
                 "env_vars": payload.get("env_vars"),
-                "nodes": payload.get("nodes", []),
+                "nodes": normalized_nodes,
                 "edges": payload.get("edges", []),
             }
         )
@@ -106,7 +141,11 @@ class TestEnvironmentDefinition:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> TestEnvironmentDefinition:
         if "agents" not in payload:
-            legacy_graph = GraphDefinition.from_dict(payload)
+            normalized_payload = dict(payload)
+            normalized_payload["nodes"] = _normalize_legacy_mcp_nodes(
+                [dict(node) for node in payload.get("nodes", []) if isinstance(node, Mapping)]
+            )
+            legacy_graph = GraphDefinition.from_dict(normalized_payload)
             legacy_agent_id = str(payload.get("agent_id", f"{legacy_graph.graph_id}-agent"))
             graph_type = "graph"
             agents = [AgentDefinition.from_graph(legacy_graph, agent_id=legacy_agent_id)]

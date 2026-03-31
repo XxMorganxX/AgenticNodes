@@ -1,0 +1,20 @@
+---
+description: Enforce immediate gitignore coverage and portable config patterns
+alwaysApply: true
+---
+
+# Gitignore And Local Config Hygiene
+
+When adding features, think through what files they create on disk before finishing the change.
+
+- Add `.gitignore` entries for new local caches, generated assets, logs, exports, databases, runtime state, and personal working files in the same change that introduces them.
+- Keep committed config as templates or defaults such as `.env.example`, starter JSON, or bundled seed data.
+- Do not commit filled-in local config such as `.env`, device-specific settings, auth material, user exports, or developer scratch files.
+- If the app needs writable config or mutable documents, create them from a tracked template on first boot in an ignored local path.
+- Favor stable sample data for demos and tests; keep user-edited or runtime-mutated data outside tracked project files.
+
+Checklist before finishing:
+
+- If this feature writes files, are they user-local rather than tracked?
+- If this feature needs defaults, is there a safe template/example file in the repo?
+- If a new local artifact exists, is it already ignored?

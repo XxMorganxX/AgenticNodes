@@ -141,6 +141,7 @@
     box-shadow 0.15s ease,
     transform 0.15s ease,
     background 0.15s ease;
+  user-select: text;
 }
 
 .agent-swimlane:hover,
@@ -167,6 +168,7 @@
   padding: 0;
   width: 100%;
   cursor: pointer;
+  user-select: text;
 }
 
 .agent-swimlane-meta:hover:not(:disabled),
@@ -262,6 +264,7 @@
     transform 0.15s ease,
     box-shadow 0.15s ease,
     background 0.15s ease;
+  user-select: text;
 }
 
 .agent-swimlane-milestone:hover,
@@ -319,6 +322,7 @@
   font-size: 0.74rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  user-select: text;
 }
 
 .agent-swimlane-milestone-content {
@@ -379,6 +383,7 @@
 .agent-swimlane-milestone-detail span {
   color: #edf0ff;
   font-size: 0.76rem;
+  user-select: text;
 }
 
 .agent-swimlane-milestone-data {
@@ -411,6 +416,7 @@
   line-height: 1.38;
   white-space: pre-wrap;
   word-break: break-word;
+  user-select: text;
 }
 
 .agent-swimlane-milestone-json pre::-webkit-scrollbar {

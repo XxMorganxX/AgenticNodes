@@ -1,3 +1,5 @@
+import type { KeyboardEvent } from "react";
+
 import { formatRunStatusLabel, type AgentRunLane } from "../lib/runVisualization";
 
 type AgentRunSwimlanesProps = {
@@ -6,6 +8,24 @@ type AgentRunSwimlanesProps = {
   onSelectAgent: (agentId: string) => void;
   onSelectNode?: (agentId: string, nodeId: string | null) => void;
 };
+
+function hasActiveTextSelection(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return (window.getSelection?.()?.toString() ?? "").trim().length > 0;
+}
+
+function handleKeyboardActivate(
+  event: KeyboardEvent<HTMLElement>,
+  activate: () => void,
+): void {
+  if (event.key !== "Enter" && event.key !== " ") {
+    return;
+  }
+  event.preventDefault();
+  activate();
+}
 
 function formatEventTypeLabel(eventType: string): string {
   return eventType
@@ -46,13 +66,22 @@ export function AgentRunSwimlanes({
             className={`agent-swimlane ${selectedAgentId === lane.agentId ? "is-selected" : ""}`}
             onClick={() => onSelectAgent(lane.agentId)}
           >
-            <button
-              type="button"
+            <div
+              role="button"
+              tabIndex={0}
               className="agent-swimlane-meta"
               onClick={(event) => {
                 event.stopPropagation();
+                if (hasActiveTextSelection()) {
+                  return;
+                }
                 onSelectAgent(lane.agentId);
               }}
+              onKeyDown={(event) =>
+                handleKeyboardActivate(event, () => {
+                  onSelectAgent(lane.agentId);
+                })
+              }
             >
               <div className="agent-swimlane-heading">
                 <strong>{lane.agentName}</strong>
@@ -68,16 +97,16 @@ export function AgentRunSwimlanes({
                 <span>{lane.elapsedLabel}</span>
               </div>
               <div className="agent-swimlane-current">Current: {lane.currentNodeLabel}</div>
-            </button>
+            </div>
             <div className="agent-swimlane-track" role="list" aria-label={`${lane.agentName} milestones`}>
               {lane.milestones.length === 0 ? (
                 <div className="agent-swimlane-empty">No runtime milestones yet.</div>
               ) : (
                 lane.milestones.map((milestone) => (
-                  <button
+                  <div
                     key={milestone.id}
-                    type="button"
                     role="listitem"
+                    tabIndex={0}
                     className={`agent-swimlane-milestone agent-swimlane-milestone--${milestone.tone}`}
                     title={[
                       milestone.label,
@@ -89,9 +118,18 @@ export function AgentRunSwimlanes({
                       .join(" · ")}
                     onClick={(event) => {
                       event.stopPropagation();
+                      if (hasActiveTextSelection()) {
+                        return;
+                      }
                       onSelectAgent(lane.agentId);
                       onSelectNode?.(lane.agentId, milestone.nodeId);
                     }}
+                    onKeyDown={(event) =>
+                      handleKeyboardActivate(event, () => {
+                        onSelectAgent(lane.agentId);
+                        onSelectNode?.(lane.agentId, milestone.nodeId);
+                      })
+                    }
                   >
                     <span className="agent-swimlane-dot" />
                     <div className="agent-swimlane-milestone-content">
@@ -127,7 +165,7 @@ export function AgentRunSwimlanes({
                         </div>
                       ) : null}
                     </div>
-                  </button>
+                  </div>
                 ))
               )}
             </div>

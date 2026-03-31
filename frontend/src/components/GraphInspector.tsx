@@ -53,6 +53,40 @@ function toolStatusLabel(tool: ToolDefinition): string {
   return "ready";
 }
 
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
+function getModelMcpContextNodes(graph: GraphDefinition, modelNode: GraphNode): GraphNode[] {
+  const candidateNodeIds = new Set<string>();
+  const configuredTargetIds = Array.isArray(modelNode.config.tool_target_node_ids)
+    ? modelNode.config.tool_target_node_ids.map((nodeId) => String(nodeId))
+    : [];
+  configuredTargetIds.forEach((nodeId) => candidateNodeIds.add(nodeId));
+  graph.edges
+    .filter((edge) => edge.kind === "binding" && edge.target_id === modelNode.id)
+    .forEach((edge) => candidateNodeIds.add(edge.source_id));
+  return [...candidateNodeIds]
+    .map((nodeId) => graph.nodes.find((node) => node.id === nodeId) ?? null)
+    .filter((node): node is GraphNode => node !== null && node.kind === "mcp_context_provider");
+}
+
+function describeMcpExecutorBinding(binding: unknown): string {
+  if (!binding || typeof binding !== "object") {
+    return "implicit latest incoming edge";
+  }
+  const bindingRecord = binding as Record<string, unknown>;
+  const bindingType = String(bindingRecord.type ?? "latest_output");
+  if (bindingType === "first_available_envelope") {
+    const sources = Array.isArray(bindingRecord.sources)
+      ? bindingRecord.sources.map((sourceId) => String(sourceId)).filter((sourceId) => sourceId.trim().length > 0)
+      : [];
+    return sources.length > 0 ? `${bindingType} from ${sources.join(", ")}` : bindingType;
+  }
+  const sourceId = String(bindingRecord.source ?? "").trim();
+  return sourceId ? `${bindingType} from ${sourceId}` : bindingType;
+}
+
 export function GraphInspector({
   graph,
   catalog,
@@ -153,9 +187,41 @@ export function GraphInspector({
     const catalogTools = catalog?.tools ?? [];
     const mcpCatalogTools = catalogTools.filter((tool) => tool.source_type === "mcp");
     const standardCatalogTools = catalogTools.filter((tool) => tool.source_type !== "mcp");
+    const mcpToolByName = new Map(mcpCatalogTools.map((tool) => [tool.name, tool] as const));
     const selectedMcpToolNames = Array.isArray(selectedNode.config.tool_names)
       ? (selectedNode.config.tool_names as string[])
       : [];
+    const mcpContextProvidersForModel = selectedNode.kind === "model" ? getModelMcpContextNodes(graph, selectedNode) : [];
+    const modelCallableMcpTools =
+      selectedNode.kind === "model"
+        ? mcpContextProvidersForModel.flatMap((node) => {
+            const nodeToolNames = Array.isArray(node.config.tool_names)
+              ? node.config.tool_names.map((toolName) => String(toolName)).filter((toolName) => toolName.trim().length > 0)
+              : [];
+            if (node.config.expose_mcp_tools === false) {
+              return [];
+            }
+            return nodeToolNames.map((toolName) => {
+              const tool = mcpToolByName.get(toolName);
+              const status = tool ? toolStatusLabel(tool) : "unknown";
+              return `${toolName} (${status}) via ${node.label}`;
+            });
+          })
+        : [];
+    const modelPromptContextProviders =
+      selectedNode.kind === "model"
+        ? uniqueStrings(
+            mcpContextProvidersForModel
+              .filter((node) => Boolean(node.config.include_mcp_tool_context))
+              .map((node) => node.label),
+          )
+        : [];
+    const modelTargetedMcpNodeIds =
+      selectedNode.kind === "model" && Array.isArray(selectedNode.config.tool_target_node_ids)
+        ? uniqueStrings(selectedNode.config.tool_target_node_ids.map((nodeId) => String(nodeId)))
+        : [];
+    const mcpToolExposureEnabled = selectedNode.kind === "mcp_context_provider" ? selectedNode.config.expose_mcp_tools !== false : false;
+    const executorBindingSummary = selectedNode.kind === "mcp_tool_executor" ? describeMcpExecutorBinding(selectedNode.config.input_binding) : "";
     const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
     const isManualStartNode =
       selectedNode.kind === "input" &&
@@ -565,7 +631,7 @@ export function GraphInspector({
                 </select>
               </label>
               <div className="checkbox-grid">
-                <strong>Available Tools</strong>
+                <strong>Direct Registry Tools</strong>
                 {standardCatalogTools.map((tool) => {
                   const isChecked = allowedTools.includes(tool.name);
                   const canSelectTool = isToolEnabled(tool) && isToolOnline(tool);
@@ -599,6 +665,20 @@ export function GraphInspector({
                     </label>
                   );
                 })}
+              </div>
+              <div className="contract-card">
+                <strong>MCP Tools From Context Providers</strong>
+                <span>
+                  Callable MCP tools: {modelCallableMcpTools.length > 0 ? modelCallableMcpTools.join(", ") : "None"}
+                </span>
+                <span>
+                  Prompt context sources: {modelPromptContextProviders.length > 0 ? modelPromptContextProviders.join(", ") : "None"}
+                </span>
+                {modelTargetedMcpNodeIds.length > 0 ? (
+                  <span>Targeted MCP provider IDs: {modelTargetedMcpNodeIds.join(", ")}</span>
+                ) : (
+                  <span>MCP tools are supplied through connected or targeted MCP Context Provider nodes.</span>
+                )}
               </div>
               <label>
                 Preferred Tool Name
@@ -680,6 +760,27 @@ export function GraphInspector({
               <label className="checkbox-option">
                 <input
                   type="checkbox"
+                  checked={mcpToolExposureEnabled}
+                  onChange={(event) =>
+                    onGraphChange(
+                      updateNode(graph, selectedNode.id, (node) => ({
+                        ...node,
+                        config: {
+                          ...node.config,
+                          expose_mcp_tools: event.target.checked,
+                        },
+                      })),
+                    )
+                  }
+                />
+                <span>
+                  Expose MCP Tools To Connected API Nodes
+                  <small>Makes the selected MCP tools callable by connected or targeted API/model nodes when the tools are enabled and online.</small>
+                </span>
+              </label>
+              <label className="checkbox-option">
+                <input
+                  type="checkbox"
                   checked={Boolean(selectedNode.config.include_mcp_tool_context)}
                   onChange={(event) =>
                     onGraphChange(
@@ -694,8 +795,8 @@ export function GraphInspector({
                   }
                 />
                 <span>
-                  Add MCP Context To Connected API Nodes
-                  <small>Inject the registered MCP tool metadata from this node into connected or targeted API/model nodes at runtime.</small>
+                  Inject MCP Prompt Context Into Connected API Nodes
+                  <small>Adds descriptive MCP tool metadata to the connected model system prompt. This does not control tool callability.</small>
                 </span>
               </label>
             </>
@@ -703,6 +804,7 @@ export function GraphInspector({
           {selectedNode.kind === "mcp_tool_executor" ? (
             <div className="inspector-meta">
               <span>Dispatch mode: single MCP tool call from upstream API output</span>
+              <span>Input binding: {executorBindingSummary}</span>
               <span>Routes: on success / on failure</span>
             </div>
           ) : null}

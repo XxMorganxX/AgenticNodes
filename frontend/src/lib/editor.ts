@@ -190,6 +190,7 @@ export function createNodeFromProvider(
       ...baseNode,
       config: {
         tool_names: mcpToolNames.length > 0 ? [mcpToolNames[0]] : [],
+        expose_mcp_tools: true,
         include_mcp_tool_context: false,
       },
     };
@@ -354,6 +355,7 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
       if (node.kind === "mcp_context_provider") {
         const toolNames = Array.isArray(node.config.tool_names) ? node.config.tool_names : [];
         nextNode.config.tool_names = toolNames.map((toolName) => String(toolName)).filter((toolName) => toolName.trim().length > 0);
+        nextNode.config.expose_mcp_tools = nextNode.config.expose_mcp_tools !== false;
       }
       return nextNode;
     }),

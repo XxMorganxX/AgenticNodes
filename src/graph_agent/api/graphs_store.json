@@ -50,7 +50,6 @@
                 "response_mode": "tool_call",
                 "preferred_tool_name": "search_catalog",
                 "allowed_tool_names": ["search_catalog"],
-                "tool_target_node_ids": ["research_tool"],
                 "metadata_bindings": {
                   "user_request": { "type": "latest_payload", "source": "research_start" }
                 }
@@ -255,7 +254,6 @@
                 "response_mode": "tool_call",
                 "preferred_tool_name": "search_catalog",
                 "allowed_tool_names": ["search_catalog"],
-                "tool_target_node_ids": ["executor_tool"],
                 "metadata_bindings": {
                   "user_request": { "type": "latest_payload", "source": "executor_start" }
                 }
@@ -368,7 +366,6 @@
             "response_mode": "tool_call",
             "preferred_tool_name": "search_catalog",
             "allowed_tool_names": ["search_catalog"],
-            "tool_target_node_ids": ["run_tool"],
             "metadata_bindings": {
               "user_request": { "type": "latest_payload", "source": "start" }
             }
@@ -413,7 +410,6 @@
             "response_mode": "tool_call",
             "preferred_tool_name": "search_catalog",
             "allowed_tool_names": ["search_catalog"],
-            "tool_target_node_ids": ["run_tool"],
             "metadata_bindings": {
               "user_request": { "type": "latest_payload", "source": "start" },
               "tool_error": { "type": "latest_error", "source": "run_tool" }
