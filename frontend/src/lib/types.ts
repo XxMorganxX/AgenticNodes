@@ -33,6 +33,7 @@ export type GraphEdge = {
   source_id: string;
   target_id: string;
   source_handle_id?: string | null;
+  target_handle_id?: string | null;
   label: string;
   kind: string;
   priority: number;

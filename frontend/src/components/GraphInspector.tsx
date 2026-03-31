@@ -659,8 +659,8 @@ export function GraphInspector({
                       }
                     />
                     <span>
-                      Pass MCP Context To Model Provider
-                      <small>Expose this tool node's MCP metadata to connected or targeted model nodes as `mcp_tool_context`.</small>
+                      Add MCP Context To Connected API Nodes
+                      <small>Inject this tool node's MCP metadata into the system prompt of connected or targeted API/model nodes and expose it as `mcp_tool_context`.</small>
                     </span>
                   </label>
                 );

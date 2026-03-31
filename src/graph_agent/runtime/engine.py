@@ -178,7 +178,7 @@ class GraphRuntime:
     ) -> Edge | None:
         outgoing = graph.get_outgoing_edges(node_id)
         conditional_edges = [edge for edge in outgoing if edge.kind == "conditional"]
-        standard_edges = [edge for edge in outgoing if edge.kind != "conditional"]
+        standard_edges = [edge for edge in outgoing if edge.kind == "standard"]
 
         for edge in conditional_edges:
             matched = edge.is_match(state, result)

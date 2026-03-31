@@ -194,6 +194,8 @@ class Edge:
     id: str
     source_id: str
     target_id: str
+    source_handle_id: str | None = None
+    target_handle_id: str | None = None
     label: str = ""
     kind: str = "standard"
     priority: int = 100
@@ -212,6 +214,8 @@ class Edge:
             "id": self.id,
             "source_id": self.source_id,
             "target_id": self.target_id,
+            "source_handle_id": self.source_handle_id,
+            "target_handle_id": self.target_handle_id,
             "label": self.label,
             "kind": self.kind,
             "priority": self.priority,
@@ -237,6 +241,8 @@ class Edge:
             id=str(payload["id"]),
             source_id=str(payload["source_id"]),
             target_id=str(payload["target_id"]),
+            source_handle_id=str(payload.get("source_handle_id")) if payload.get("source_handle_id") is not None else None,
+            target_handle_id=str(payload.get("target_handle_id")) if payload.get("target_handle_id") is not None else None,
             label=str(payload.get("label", "")),
             kind=str(payload.get("kind", "standard")),
             priority=int(payload.get("priority", 100)),
@@ -488,11 +494,14 @@ class NodeContext:
         if isinstance(configured_target_ids, Sequence) and not isinstance(configured_target_ids, (str, bytes)):
             candidate_tool_ids.extend(str(tool_id) for tool_id in configured_target_ids if str(tool_id).strip())
         for edge in self.graph.get_incoming_edges(target_node_id):
+            if edge.kind != "binding":
+                continue
             candidate_tool_ids.append(str(edge.source_id))
 
         seen_tool_ids: set[str] = set()
         context_tools: list[dict[str, Any]] = []
         server_ids: set[str] = set()
+        prompt_blocks: list[str] = []
         for tool_node_id in candidate_tool_ids:
             if tool_node_id in seen_tool_ids:
                 continue
@@ -509,6 +518,7 @@ class NodeContext:
             if registry_tool is None or registry_tool.source_type != "mcp":
                 continue
             model_tool_definition = self._apply_tool_node_overrides(tool_name, registry_tool.to_dict())
+            prompt_blocks.append(str(model_tool_definition.get("description", "")).strip())
             server = None
             if registry_tool.server_id and self.services.mcp_server_manager is not None:
                 try:
@@ -542,6 +552,8 @@ class NodeContext:
             "tool_names": [tool["tool_name"] for tool in context_tools],
             "tool_nodes": context_tools,
             "servers": servers,
+            "prompt_blocks": [block for block in prompt_blocks if block],
+            "rendered_prompt_text": "\n\n".join(block for block in prompt_blocks if block),
             "run_context": {
                 "run_id": self.state.run_id,
                 "graph_id": self.state.graph_id,
@@ -787,6 +799,7 @@ class ModelNode(BaseNode):
         mcp_tool_context = context.mcp_tool_context_for_model(self.id)
         if mcp_tool_context is not None and "mcp_tool_context" not in metadata:
             metadata["mcp_tool_context"] = mcp_tool_context
+            metadata["mcp_tool_context_prompt"] = mcp_tool_context.get("rendered_prompt_text", "")
         allowed_tool_names = list(self.config.get("allowed_tool_names", []))
         available_tool_payloads = context.available_tool_definitions(allowed_tool_names)
         available_tools = [
@@ -806,6 +819,12 @@ class ModelNode(BaseNode):
         system_prompt_template = str(self.config.get("system_prompt", ""))
         user_template = str(self.config.get("user_message_template", "{input_payload}"))
         system_prompt = context.render_template(system_prompt_template, metadata)
+        mcp_tool_prompt = str(metadata.get("mcp_tool_context_prompt", "") or "").strip()
+        if mcp_tool_prompt:
+            if system_prompt.strip():
+                system_prompt = f"{system_prompt.rstrip()}\n\nMCP Tool Context\n{mcp_tool_prompt}"
+            else:
+                system_prompt = f"MCP Tool Context\n{mcp_tool_prompt}"
         provider_config = self._provider_config(context, bound_provider_node)
         request = ModelRequest(
             prompt_name=self.prompt_name,
@@ -1118,7 +1137,7 @@ class GraphDefinition:
                 raise GraphValidationError(f"End node '{source_node.id}' cannot have outgoing edges.")
             if edge.kind == "conditional" and edge.condition is None:
                 raise GraphValidationError(f"Edge '{edge.id}' is conditional but missing a condition.")
-            if edge.kind != "conditional":
+            if edge.kind not in {"conditional", "binding"}:
                 if source_node.category == NodeCategory.PROVIDER:
                     continue
                 standard_edge_counts[edge.source_id] = standard_edge_counts.get(edge.source_id, 0) + 1

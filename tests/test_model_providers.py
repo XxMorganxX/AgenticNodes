@@ -246,7 +246,14 @@ class ContextEchoProvider(ModelProvider):
     name = "context_echo"
 
     def generate(self, request: ModelRequest) -> ModelResponse:
-        return ModelResponse(content="", structured_output=request.metadata.get("mcp_tool_context"))
+        system_prompt = request.messages[0].content if request.messages else ""
+        return ModelResponse(
+            content="",
+            structured_output={
+                "system_prompt": system_prompt,
+                "mcp_tool_context": request.metadata.get("mcp_tool_context"),
+            },
+        )
 
     def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
         return ProviderPreflightResult(status="available", ok=True, message="ok")
@@ -571,7 +578,7 @@ class ModelProviderTests(unittest.TestCase):
         finally:
             manager.stop_background_services()
 
-    def test_model_nodes_receive_targeted_tool_node_mcp_context_metadata(self) -> None:
+    def test_model_nodes_receive_tool_node_mcp_context_in_system_prompt(self) -> None:
         services = build_example_services()
         services.model_providers["context_echo"] = ContextEchoProvider()
         runtime = GraphRuntime(
@@ -643,16 +650,28 @@ class ModelProviderTests(unittest.TestCase):
             ],
         }
         graph = GraphDefinition.from_dict(graph_payload)
-        graph.validate_against_services(services)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
 
-        state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-context")
-        self.assertEqual(state.status, "completed")
-        payload = state.final_output
-        assert isinstance(payload, dict)
-        self.assertEqual(payload["tool_names"], ["weather_current"])
-        self.assertEqual(payload["tool_nodes"][0]["tool_name"], "weather_current")
-        self.assertEqual(payload["tool_nodes"][0]["tool_node_id"], "weather_tool")
-        self.assertEqual(payload["tool_nodes"][0]["server"]["server_id"], "weather_mcp")
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-context")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertIn("MCP Tool Context", payload["system_prompt"])
+                    self.assertIn("Tool: weather_current", payload["system_prompt"])
+                    tool_context = payload["mcp_tool_context"]
+                    assert isinstance(tool_context, dict)
+                    self.assertEqual(tool_context["tool_names"], ["weather_current"])
+                    self.assertEqual(tool_context["tool_nodes"][0]["tool_name"], "weather_current")
+                    self.assertEqual(tool_context["tool_nodes"][0]["tool_node_id"], "weather_tool")
+                    self.assertEqual(tool_context["tool_nodes"][0]["server"]["server_id"], "weather_mcp")
+            finally:
+                manager.stop_background_services()
 
     def test_graphs_can_swap_between_registered_model_providers(self) -> None:
         services = build_example_services()
