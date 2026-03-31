@@ -1783,6 +1783,10 @@ pre {
   min-height: 196px;
 }
 
+.graph-node-card--mcp-tool-executor {
+  min-height: 184px;
+}
+
 .graph-node-card--model-inputs .graph-node-card-inner {
   padding-left: 1rem;
 }
@@ -2115,6 +2119,12 @@ pre {
   color: #6f7394;
   font-size: 0.75rem;
   text-transform: lowercase;
+}
+
+.graph-node-summary {
+  color: #9ea7d8;
+  font-size: 0.76rem;
+  line-height: 1.4;
 }
 
 .graph-junction-node {
@@ -3482,6 +3492,83 @@ pre {
   margin: 0;
   color: #7c7e9c;
   font-size: 0.82rem;
+}
+
+.context-builder-binding-card {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.85rem;
+  border-radius: 12px;
+  border: 1px solid #2e2f48;
+  background: rgba(18, 19, 32, 0.88);
+}
+
+.context-builder-binding-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: start;
+}
+
+.context-builder-binding-header small {
+  display: block;
+  margin-top: 0.2rem;
+  color: #7c7e9c;
+  font-size: 0.72rem;
+}
+
+.context-builder-binding-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.context-builder-inline-button {
+  padding: 0.35rem 0.6rem;
+  font-size: 0.76rem;
+}
+
+.context-builder-placeholder-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.context-builder-token-button {
+  padding: 0.4rem 0.65rem;
+  font-size: 0.76rem;
+  font-family:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    "Liberation Mono",
+    "Courier New",
+    monospace;
+}
+
+.context-builder-preview {
+  margin: 0;
+  max-height: 14rem;
+  overflow: auto;
+  padding: 0.7rem 0.8rem;
+  border-radius: 10px;
+  background: rgba(9, 11, 19, 0.92);
+  color: #d6e4ff;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.77rem;
+  line-height: 1.45;
+  font-family:
+    ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Monaco,
+    Consolas,
+    "Liberation Mono",
+    "Courier New",
+    monospace;
 }
 
 /* ── Saved nodes ── */

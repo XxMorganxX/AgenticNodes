@@ -78,8 +78,11 @@ class _McpStdioSession:
     def __init__(self, definition: McpServerDefinition) -> None:
         self.definition = definition
         self._lock = Lock()
+        self._stderr_lock = Lock()
         self._request_id = 0
         self._stderr_lines: deque[str] = deque(maxlen=20)
+        self._stderr_events: deque[tuple[int, str]] = deque(maxlen=200)
+        self._stderr_cursor = 0
         self._stderr_thread: Thread | None = None
         self._process: subprocess.Popen[bytes] | None = None
 
@@ -119,20 +122,27 @@ class _McpStdioSession:
 
     def close(self) -> None:
         process = self._process
-        self._process = None
         if process is None:
             return
         try:
-            if process.poll() is None and process.stdin is not None:
+            if process.poll() is None:
                 try:
-                    self.notify("shutdown", {})
+                    self.request("shutdown", {})
                 except RuntimeError:
                     pass
-                process.terminate()
-                process.wait(timeout=3)
+                try:
+                    self.notify("exit", {})
+                except RuntimeError:
+                    pass
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             process.kill()
         finally:
+            self._process = None
             if process.stdin is not None:
                 process.stdin.close()
             if process.stdout is not None:
@@ -164,11 +174,18 @@ class _McpStdioSession:
         return normalized
 
     def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> ToolResult:
+        stderr_cursor = self.stderr_cursor()
         response = self.request("tools/call", {"name": tool_name, "arguments": dict(arguments)})
+        terminal_output = self._terminal_output_payload(tool_name, stderr_cursor)
         if bool(response.get("isError")):
             details = response.get("structuredContent")
             error = details if isinstance(details, dict) else {"message": "MCP tool execution failed."}
-            return ToolResult(status="error", error=error, summary=f"MCP tool '{tool_name}' failed.")
+            return ToolResult(
+                status="error",
+                error=error,
+                summary=f"MCP tool '{tool_name}' failed.",
+                metadata={"terminal_output": terminal_output} if terminal_output else {},
+            )
 
         structured = response.get("structuredContent")
         if structured is not None:
@@ -176,7 +193,12 @@ class _McpStdioSession:
         else:
             content = response.get("content", [])
             output = response if not isinstance(content, list) else _normalize_content_blocks(content)
-        return ToolResult(status="success", output=output, summary=f"MCP tool '{tool_name}' completed.")
+        return ToolResult(
+            status="success",
+            output=output,
+            summary=f"MCP tool '{tool_name}' completed.",
+            metadata={"terminal_output": terminal_output} if terminal_output else {},
+        )
 
     def notify(self, method: str, params: Mapping[str, Any]) -> None:
         self._send({"jsonrpc": "2.0", "method": method, "params": dict(params)})
@@ -204,7 +226,16 @@ class _McpStdioSession:
                 return dict(result)
 
     def last_stderr(self) -> str:
-        return "\n".join(self._stderr_lines)
+        with self._stderr_lock:
+            return "\n".join(self._stderr_lines)
+
+    def stderr_cursor(self) -> int:
+        with self._stderr_lock:
+            return self._stderr_cursor
+
+    def stderr_since(self, cursor: int) -> list[str]:
+        with self._stderr_lock:
+            return [line for event_cursor, line in self._stderr_events if event_cursor > cursor]
 
     def _require_process(self) -> subprocess.Popen[bytes]:
         process = self._process
@@ -222,7 +253,24 @@ class _McpStdioSession:
             line = process.stderr.readline()
             if not line:
                 break
-            self._stderr_lines.append(line.decode("utf-8", errors="replace").strip())
+            decoded_line = line.decode("utf-8", errors="replace").strip()
+            with self._stderr_lock:
+                self._stderr_cursor += 1
+                self._stderr_lines.append(decoded_line)
+                self._stderr_events.append((self._stderr_cursor, decoded_line))
+
+    def _terminal_output_payload(self, tool_name: str, cursor: int) -> dict[str, Any] | None:
+        stderr_lines = self.stderr_since(cursor)
+        if not stderr_lines:
+            return None
+        return {
+            "server_id": self.definition.server_id,
+            "display_name": self.definition.display_name,
+            "tool_name": tool_name,
+            "pid": self.pid,
+            "stderr": "\n".join(stderr_lines),
+            "stderr_lines": stderr_lines,
+        }
 
     def _send(self, payload: Mapping[str, Any]) -> None:
         process = self._require_process()
@@ -276,12 +324,14 @@ def _normalize_content_blocks(content: list[Any]) -> Any:
 
 
 class McpServerManager:
-    def __init__(self, tool_registry: ToolRegistry) -> None:
+    def __init__(self, tool_registry: ToolRegistry, *, state_path: Path | None = None) -> None:
         self._tool_registry = tool_registry
         self._definitions: dict[str, McpServerDefinition] = {}
         self._states: dict[str, McpServerState] = {}
         self._sessions: dict[str, _McpStdioSession] = {}
         self._lock = Lock()
+        self._state_path = state_path or Path(__file__).resolve().parents[3] / ".graph-agent" / "mcp_servers_state.json"
+        self._desired_running: dict[str, bool] = self._load_desired_running()
 
     def register_server(self, definition: McpServerDefinition) -> None:
         if definition.server_id in self._definitions:
@@ -314,7 +364,7 @@ class McpServerManager:
 
     def start_auto_boot(self) -> None:
         for definition in self._definitions.values():
-            if definition.auto_boot:
+            if definition.auto_boot or (definition.persistent and self._desired_running.get(definition.server_id, False)):
                 self.boot_server(definition.server_id)
 
     def boot_server(self, server_id: str) -> dict[str, Any]:
@@ -334,18 +384,20 @@ class McpServerManager:
                 state.pid = session.pid
                 state.error = ""
                 state.booted_at = state.booted_at or _utc_now_iso()
+                self._set_desired_running(server_id, True)
             except Exception as exc:
                 state.running = False
                 state.pid = None
                 state.error = str(exc)
                 self._tool_registry.mark_server_tools_unavailable(server_id, str(exc))
+                self._set_desired_running(server_id, False)
                 session.close()
                 self._sessions.pop(server_id, None)
                 raise
             state.tool_names = self._tool_registry.list_server_tool_names(server_id)
             return state.to_dict()
 
-    def stop_server(self, server_id: str) -> dict[str, Any]:
+    def stop_server(self, server_id: str, *, preserve_desired_running: bool = False) -> dict[str, Any]:
         with self._lock:
             if server_id not in self._states:
                 raise KeyError(server_id)
@@ -356,6 +408,8 @@ class McpServerManager:
             state.running = False
             state.pid = None
             self._tool_registry.mark_server_tools_unavailable(server_id, "MCP server is offline.")
+            if not preserve_desired_running:
+                self._set_desired_running(server_id, False)
             return state.to_dict()
 
     def refresh_server(self, server_id: str) -> dict[str, Any]:
@@ -373,9 +427,9 @@ class McpServerManager:
             state.tool_names = self._tool_registry.list_server_tool_names(server_id)
             return state.to_dict()
 
-    def shutdown_all(self) -> None:
+    def shutdown_all(self, *, preserve_desired_running: bool = False) -> None:
         for server_id in list(self._states):
-            self.stop_server(server_id)
+            self.stop_server(server_id, preserve_desired_running=preserve_desired_running)
 
     def set_tool_enabled(self, tool_name: str, enabled: bool) -> dict[str, Any]:
         tool = self._tool_registry.set_tool_enabled(tool_name, enabled)
@@ -427,3 +481,33 @@ class McpServerManager:
             return session.call_tool(tool_name, payload)
 
         return _execute
+
+    def _load_desired_running(self) -> dict[str, bool]:
+        try:
+            payload = json.loads(self._state_path.read_text())
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+        desired_running = payload.get("desired_running")
+        if not isinstance(desired_running, Mapping):
+            return {}
+        return {str(server_id): bool(should_run) for server_id, should_run in desired_running.items()}
+
+    def _write_desired_running(self) -> None:
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "desired_running": {
+                server_id: should_run
+                for server_id, should_run in sorted(self._desired_running.items())
+                if self._definitions.get(server_id, None) is None or self._definitions[server_id].persistent
+            }
+        }
+        self._state_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    def _set_desired_running(self, server_id: str, should_run: bool) -> None:
+        definition = self._definitions.get(server_id)
+        if definition is None or not definition.persistent:
+            return
+        self._desired_running[server_id] = should_run
+        self._write_desired_running()

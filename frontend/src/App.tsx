@@ -22,7 +22,7 @@ import {
 import { createBlankGraph, layoutGraphDocument, layoutGraphLR, normalizeGraphDocument } from "./lib/editor";
 import { filterEventsForAgent, getCanvasGraph, getDefaultAgentId, getSelectedRunId, getSelectedRunState, isTestEnvironment, updateSelectedAgentGraph } from "./lib/graphDocuments";
 import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedEventGroups, buildFocusedRunSummary } from "./lib/runVisualization";
-import type { EditorCatalog, GraphDefinition, GraphDocument, RunState, RuntimeEvent } from "./lib/types";
+import type { EditorCatalog, GraphDefinition, GraphDocument, McpServerStatus, RunState, RuntimeEvent, ToolDefinition } from "./lib/types";
 import { useGraphHistory } from "./lib/useGraphHistory";
 
 const DEFAULT_INPUT = "Find graph-agent references for a schema repair workflow.";
@@ -163,6 +163,26 @@ function serializeGraphSnapshot(graph: GraphDocument | null): string {
   return graph ? JSON.stringify(normalizeGraphDocument(graph)) : "";
 }
 
+function mergeCatalogServerStatus(catalog: EditorCatalog | null, serverStatus: McpServerStatus): EditorCatalog | null {
+  if (!catalog) {
+    return catalog;
+  }
+  return {
+    ...catalog,
+    mcp_servers: (catalog.mcp_servers ?? []).map((server) => (server.server_id === serverStatus.server_id ? serverStatus : server)),
+  };
+}
+
+function mergeCatalogTool(catalog: EditorCatalog | null, toolDefinition: ToolDefinition): EditorCatalog | null {
+  if (!catalog) {
+    return catalog;
+  }
+  return {
+    ...catalog,
+    tools: catalog.tools.map((tool) => (tool.name === toolDefinition.name ? toolDefinition : tool)),
+  };
+}
+
 export default function App() {
   const [graphs, setGraphs] = useState<GraphDocument[]>([]);
   const [selectedGraphId, setSelectedGraphId] = useState<string>("");
@@ -293,11 +313,12 @@ export default function App() {
     }
   }
 
-  async function runMcpAction(actionKey: string, callback: () => Promise<void>) {
+  async function runMcpAction<T>(actionKey: string, callback: () => Promise<T>, applyResult?: (result: T) => void) {
     setMcpPendingKey(actionKey);
     setError(null);
     try {
-      await callback();
+      const result = await callback();
+      applyResult?.(result);
       await refreshCatalog();
     } catch (actionError) {
       const message = actionError instanceof Error ? actionError.message : "Unable to update MCP state.";
@@ -533,10 +554,26 @@ export default function App() {
               <div className="mosaic-tile panel mosaic-mcp">
                 <McpServerPanel
                   catalog={catalog}
-                  onBootMcpServer={(serverId) => void runMcpAction(`boot:${serverId}`, () => bootMcpServer(serverId))}
-                  onStopMcpServer={(serverId) => void runMcpAction(`stop:${serverId}`, () => stopMcpServer(serverId))}
-                  onRefreshMcpServer={(serverId) => void runMcpAction(`refresh:${serverId}`, () => refreshMcpServer(serverId))}
-                  onToggleMcpTool={(toolName, enabled) => void runMcpAction(`tool:${toolName}`, () => setMcpToolEnabled(toolName, enabled))}
+                  onBootMcpServer={(serverId) =>
+                    void runMcpAction(`boot:${serverId}`, () => bootMcpServer(serverId), (serverStatus) => {
+                      setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
+                    })
+                  }
+                  onStopMcpServer={(serverId) =>
+                    void runMcpAction(`stop:${serverId}`, () => stopMcpServer(serverId), (serverStatus) => {
+                      setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
+                    })
+                  }
+                  onRefreshMcpServer={(serverId) =>
+                    void runMcpAction(`refresh:${serverId}`, () => refreshMcpServer(serverId), (serverStatus) => {
+                      setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
+                    })
+                  }
+                  onToggleMcpTool={(toolName, enabled) =>
+                    void runMcpAction(`tool:${toolName}`, () => setMcpToolEnabled(toolName, enabled), (toolDefinition) => {
+                      setCatalog((current) => mergeCatalogTool(current, toolDefinition));
+                    })
+                  }
                   mcpPendingKey={mcpPendingKey}
                   title="Project MCP"
                   description="Manage project-level MCP servers. Tool and model nodes can consume these tools, but they do not own the server lifecycle."

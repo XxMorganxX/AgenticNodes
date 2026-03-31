@@ -26,12 +26,38 @@ def utc_now_iso() -> str:
 
 API_TOOL_CALL_HANDLE_ID = "api-tool-call"
 API_MESSAGE_HANDLE_ID = "api-message"
+MCP_TERMINAL_OUTPUT_HANDLE_ID = "mcp-terminal-output"
+PROMPT_BLOCK_PROVIDER_ID = "core.prompt_block"
+PROMPT_BLOCK_MODE = "prompt_block"
+PROMPT_BLOCK_ROLES = {"system", "user", "assistant"}
 
 
 def _json_safe(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, indent=2, sort_keys=True)
+
+
+def _normalize_prompt_block_role(value: Any) -> str:
+    role = str(value or "user").strip().lower()
+    return role if role in PROMPT_BLOCK_ROLES else "user"
+
+
+def _is_prompt_block_payload(value: Any) -> bool:
+    return bool(isinstance(value, Mapping) and str(value.get("kind", "")).strip() == "prompt_block")
+
+
+def _prompt_block_text(value: Mapping[str, Any]) -> str:
+    return str(value.get("content", "") or "")
+
+
+def _render_prompt_block_text(value: Mapping[str, Any]) -> str:
+    role = _normalize_prompt_block_role(value.get("role"))
+    label = role.capitalize()
+    name = str(value.get("name", "") or "").strip()
+    header = f"{label} ({name})" if name else label
+    content = _prompt_block_text(value).strip()
+    return f"{header}: {content}" if content else f"{header}:"
 
 
 def _deep_get(value: Any, path: str | None) -> Any:
@@ -61,6 +87,8 @@ DEFAULT_GRAPH_ENV_VARS = {
 }
 
 GRAPH_ENV_REFERENCE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+CONTEXT_BUILDER_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+CONTEXT_BUILDER_SLUG_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 
 
 def _normalize_graph_env_vars(payload: Mapping[str, Any] | None) -> dict[str, str]:
@@ -77,6 +105,18 @@ def _normalize_graph_env_vars(payload: Mapping[str, Any] | None) -> dict[str, st
 
 def _resolve_graph_env_string(value: str, env_vars: Mapping[str, str]) -> str:
     return GRAPH_ENV_REFERENCE_PATTERN.sub(lambda match: env_vars.get(match.group(1), match.group(0)), value)
+
+
+def _slugify_context_builder_placeholder(value: Any, *, fallback: str = "source") -> str:
+    raw_value = str(value or "").strip().lower()
+    normalized = CONTEXT_BUILDER_SLUG_PATTERN.sub("_", raw_value).strip("_")
+    if not normalized:
+        normalized = CONTEXT_BUILDER_SLUG_PATTERN.sub("_", fallback.strip().lower()).strip("_")
+    if not normalized:
+        normalized = "source"
+    if normalized[0].isdigit():
+        normalized = f"source_{normalized}"
+    return normalized
 
 
 def resolve_graph_env_value(value: Any, env_vars: Mapping[str, str]) -> Any:
@@ -209,6 +249,15 @@ def _is_message_contract_condition(condition: Condition | None) -> bool:
         and condition.condition_type == "result_payload_path_equals"
         and condition.path == "metadata.contract"
         and condition.value == "message_envelope"
+    )
+
+
+def _is_terminal_output_contract_condition(condition: Condition | None) -> bool:
+    return bool(
+        condition is not None
+        and condition.condition_type == "result_payload_path_equals"
+        and condition.path == "metadata.contract"
+        and condition.value == "terminal_output_envelope"
     )
 
 
@@ -442,7 +491,12 @@ class NodeContext:
         route_output = self._current_route_output_for_source(node_id)
         if route_output is not None:
             return route_output
-        return self.state.node_outputs.get(node_id)
+        if node_id in self.state.node_outputs:
+            return self.state.node_outputs.get(node_id)
+        prompt_block_envelope = self.prompt_block_envelope_for_node(node_id)
+        if prompt_block_envelope is not None:
+            return prompt_block_envelope.to_dict()
+        return None
 
     def latest_error(self, node_id: str) -> Any:
         return self.state.node_errors.get(node_id)
@@ -590,6 +644,79 @@ class NodeContext:
             ),
             "input_schema": resolved_schema,
         }
+
+    def prompt_block_payload_for_node(self, node_id: str) -> dict[str, Any] | None:
+        candidate = self.graph.nodes.get(node_id)
+        if candidate is None or candidate.kind != "data" or candidate.provider_id != PROMPT_BLOCK_PROVIDER_ID:
+            return None
+        role = _normalize_prompt_block_role(candidate.config.get("role"))
+        content = self.render_template(str(candidate.config.get("content", "") or ""))
+        name = self.render_template(str(candidate.config.get("name", "") or "")).strip()
+        payload = {
+            "kind": "prompt_block",
+            "role": role,
+            "content": content,
+        }
+        if name:
+            payload["name"] = name
+        return payload
+
+    def prompt_block_envelope_for_node(self, node_id: str) -> MessageEnvelope | None:
+        payload = self.prompt_block_payload_for_node(node_id)
+        if payload is None:
+            return None
+        return MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=node_id,
+            from_category=NodeCategory.DATA.value,
+            payload=payload,
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": "data",
+                "data_mode": PROMPT_BLOCK_MODE,
+                "provider_id": PROMPT_BLOCK_PROVIDER_ID,
+                "binding_only": True,
+                "prompt_block_role": payload["role"],
+            },
+        )
+
+    def _bound_prompt_block_node_ids(self, node_id: str) -> list[str]:
+        target_node = self.graph.nodes.get(node_id)
+        if target_node is None:
+            return []
+        candidate_node_ids: list[str] = []
+        configured_node_ids = target_node.config.get("prompt_block_node_ids", [])
+        if isinstance(configured_node_ids, Sequence) and not isinstance(configured_node_ids, (str, bytes)):
+            candidate_node_ids.extend(str(candidate_id).strip() for candidate_id in configured_node_ids if str(candidate_id).strip())
+        for edge in self.graph.get_incoming_edges(node_id):
+            if edge.kind == "binding":
+                candidate_node_ids.append(edge.source_id)
+        ordered_ids: list[str] = []
+        seen: set[str] = set()
+        for candidate_id in candidate_node_ids:
+            if candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            ordered_ids.append(candidate_id)
+        return ordered_ids
+
+    def prompt_block_payloads_for_node(self, node_id: str) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        for candidate_id in self._bound_prompt_block_node_ids(node_id):
+            payload = self.prompt_block_payload_for_node(candidate_id)
+            if payload is not None:
+                payloads.append(payload)
+        return payloads
+
+    def prompt_block_messages_for_model(self, node_id: str | None = None) -> list[ModelMessage]:
+        target_node_id = node_id or self.node_id
+        messages: list[ModelMessage] = []
+        for payload in self.prompt_block_payloads_for_node(target_node_id):
+            content = _prompt_block_text(payload).strip()
+            if not content:
+                continue
+            messages.append(ModelMessage(role=_normalize_prompt_block_role(payload.get("role")), content=content))
+        return messages
 
     def resolve_binding(self, binding: Mapping[str, Any] | None) -> Any:
         if not binding:
@@ -845,7 +972,131 @@ class DataNode(BaseNode):
             position=position,
         )
 
+    def _context_builder_bindings(self, context: NodeContext) -> list[dict[str, Any]]:
+        incoming_edges = context.graph.get_incoming_edges(self.id)
+        binding_source_ids = [edge.source_id for edge in incoming_edges if edge.kind == "binding"]
+        preferred_source_ids = binding_source_ids if binding_source_ids else [edge.source_id for edge in incoming_edges]
+        incoming_source_ids: list[str] = []
+        for source_id in preferred_source_ids:
+            if source_id == self.id or source_id in incoming_source_ids:
+                continue
+            incoming_source_ids.append(source_id)
+        incoming_source_set = set(incoming_source_ids)
+
+        bindings: list[dict[str, Any]] = []
+        configured_bindings = self.config.get("input_bindings", [])
+        if isinstance(configured_bindings, Sequence) and not isinstance(configured_bindings, (str, bytes)):
+            for index, raw_binding in enumerate(configured_bindings):
+                if not isinstance(raw_binding, Mapping):
+                    continue
+                source_node_id = str(raw_binding.get("source_node_id") or raw_binding.get("source") or "").strip()
+                if not source_node_id or source_node_id not in incoming_source_set:
+                    continue
+                source_node = context.graph.nodes.get(source_node_id)
+                placeholder = _slugify_context_builder_placeholder(
+                    raw_binding.get("placeholder"),
+                    fallback=(source_node.label if source_node is not None else f"source_{index + 1}"),
+                )
+                binding = raw_binding.get("binding")
+                if not isinstance(binding, Mapping):
+                    binding = {"type": "latest_payload", "source": source_node_id}
+                bindings.append(
+                    {
+                        "source_node_id": source_node_id,
+                        "placeholder": placeholder,
+                        "binding": dict(binding),
+                    }
+                )
+
+        configured_sources = {str(binding["source_node_id"]) for binding in bindings}
+        for index, source_node_id in enumerate(incoming_source_ids):
+            if source_node_id in configured_sources:
+                continue
+            source_node = context.graph.nodes.get(source_node_id)
+            placeholder = _slugify_context_builder_placeholder(
+                source_node.label if source_node is not None else source_node_id,
+                fallback=f"source_{index + 1}",
+            )
+            bindings.append(
+                {
+                    "source_node_id": source_node_id,
+                    "placeholder": placeholder,
+                    "binding": {"type": "latest_payload", "source": source_node_id},
+                }
+            )
+        return bindings
+
+    def _execute_context_builder(self, context: NodeContext) -> NodeExecutionResult:
+        bindings = self._context_builder_bindings(context)
+        resolved_variables: dict[str, Any] = {}
+        ordered_values: list[str] = []
+        for binding in bindings:
+            source_binding = binding.get("binding")
+            value = context.resolve_binding(source_binding if isinstance(source_binding, Mapping) else None)
+            if isinstance(value, Mapping) and "payload" in value:
+                value = value.get("payload")
+            placeholder = str(binding.get("placeholder", "")).strip()
+            rendered_value = _render_prompt_block_text(value) if _is_prompt_block_payload(value) else value
+            resolved_variables[placeholder] = rendered_value
+            if value is not None and value != "":
+                ordered_values.append(rendered_value if isinstance(rendered_value, str) else _json_safe(rendered_value))
+
+        template = str(self.config.get("template", "") or "")
+        if template.strip():
+            payload = context.render_template(template, resolved_variables)
+        else:
+            joiner = str(self.config.get("joiner", "\n\n") or "\n\n")
+            payload = joiner.join(ordered_values)
+
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=payload,
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "data_mode": "context_builder",
+                "binding_count": len(bindings),
+                "placeholders": [str(binding.get("placeholder", "")) for binding in bindings],
+            },
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary="Context builder rendered a prompt block." if bindings else "Context builder rendered an empty prompt block.",
+        )
+
+    def _execute_prompt_block(self, context: NodeContext) -> NodeExecutionResult:
+        payload = context.prompt_block_payload_for_node(self.id) or {
+            "kind": "prompt_block",
+            "role": "user",
+            "content": "",
+        }
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=payload,
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "data_mode": PROMPT_BLOCK_MODE,
+                "provider_id": self.provider_id,
+                "binding_only": True,
+                "prompt_block_role": payload["role"],
+            },
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary=f"Prompt block '{self.label}' prepared a {payload['role']} message.",
+        )
+
     def execute(self, context: NodeContext) -> NodeExecutionResult:
+        mode = "passthrough" if bool(self.config.get("lock_passthrough", False)) else self.config.get("mode", "passthrough")
+        if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
+            return self._execute_prompt_block(context)
         source_value = context.resolve_binding(self.config.get("input_binding"))
         display_value = source_value
         source_envelope: MessageEnvelope | None = None
@@ -857,7 +1108,8 @@ class DataNode(BaseNode):
         if isinstance(source_value, Mapping) and "payload" in source_value:
             source_value = source_value.get("payload")
         display_only = bool(self.config.get("show_input_envelope", False))
-        mode = "passthrough" if bool(self.config.get("lock_passthrough", False)) else self.config.get("mode", "passthrough")
+        if mode == "context_builder":
+            return self._execute_context_builder(context)
         if mode == "template":
             payload = context.render_template(str(self.config.get("template", "{input_payload}")), {"source": source_value})
         else:
@@ -955,6 +1207,7 @@ class ModelNode(BaseNode):
         "allowed_tool_names",
         "metadata_bindings",
         "mode",
+        "prompt_block_node_ids",
         "preferred_tool_name",
         "prompt_name",
         "provider_config",
@@ -1014,6 +1267,9 @@ class ModelNode(BaseNode):
         if mcp_tool_context is not None and "mcp_tool_context" not in metadata:
             metadata["mcp_tool_context"] = mcp_tool_context
             metadata["mcp_tool_context_prompt"] = mcp_tool_context.get("rendered_prompt_text", "")
+        prompt_block_payloads = context.prompt_block_payloads_for_node(self.id)
+        if prompt_block_payloads and "prompt_blocks" not in metadata:
+            metadata["prompt_blocks"] = prompt_block_payloads
         allowed_tool_names = list(self.config.get("allowed_tool_names", []))
         available_tool_payloads = context.available_tool_definitions(allowed_tool_names)
         for tool_definition in context.mcp_tool_definitions_for_model(self.id):
@@ -1072,6 +1328,7 @@ class ModelNode(BaseNode):
             prompt_name=self.prompt_name,
             messages=[
                 ModelMessage(role="system", content=system_prompt),
+                *context.prompt_block_messages_for_model(self.id),
                 ModelMessage(role="user", content=context.render_template(user_template, metadata)),
             ],
             response_schema=self.config.get("response_schema"),
@@ -1391,6 +1648,23 @@ class McpToolExecutorNode(BaseNode):
                 state_snapshot=context.state.snapshot(),
             )
             tool_result = context.services.tool_registry.invoke(tool_name, payload, tool_context)
+            route_outputs: dict[str, Any] = {}
+            tool_metadata = dict(tool_result.metadata)
+            terminal_output = tool_metadata.pop("terminal_output", None)
+            if isinstance(terminal_output, Mapping):
+                terminal_envelope = MessageEnvelope(
+                    schema_version="1.0",
+                    from_node_id=self.id,
+                    from_category=self.category.value,
+                    payload=dict(terminal_output),
+                    errors=[tool_result.error] if tool_result.error else [],
+                    metadata={
+                        "contract": "terminal_output_envelope",
+                        "node_kind": self.kind,
+                        "tool_name": tool_name,
+                    },
+                )
+                route_outputs[MCP_TERMINAL_OUTPUT_HANDLE_ID] = terminal_envelope.to_dict()
             envelope = MessageEnvelope(
                 schema_version="1.0",
                 from_node_id=self.id,
@@ -1401,7 +1675,7 @@ class McpToolExecutorNode(BaseNode):
                     "contract": "tool_result_envelope",
                     "node_kind": self.kind,
                     "tool_name": tool_name,
-                    **tool_result.metadata,
+                    **tool_metadata,
                 },
             )
             return NodeExecutionResult(
@@ -1410,6 +1684,7 @@ class McpToolExecutorNode(BaseNode):
                 error=tool_result.error,
                 summary=tool_result.summary or f"MCP tool '{tool_name}' completed.",
                 metadata=envelope.metadata,
+                route_outputs=route_outputs,
             )
         except (KeyError, ValueError) as exc:
             error = {"type": "mcp_tool_dispatch_error", "node_id": self.id, "tool_name": tool_name, "message": str(exc)}
@@ -1615,6 +1890,19 @@ class GraphDefinition:
                 )
             if source_node.category == NodeCategory.END:
                 raise GraphValidationError(f"End node '{source_node.id}' cannot have outgoing edges.")
+            if source_node.kind == "data" and source_node.provider_id == PROMPT_BLOCK_PROVIDER_ID:
+                if edge.kind != "binding":
+                    raise GraphValidationError(
+                        f"Prompt block '{source_node.id}' can only create binding edges."
+                    )
+                if target_node.kind not in {"model", "data"}:
+                    raise GraphValidationError(
+                        f"Prompt block '{source_node.id}' can only bind into model or data nodes."
+                    )
+            if target_node.kind == "data" and target_node.provider_id == PROMPT_BLOCK_PROVIDER_ID:
+                raise GraphValidationError(
+                    f"Prompt block '{target_node.id}' is source-only and cannot receive incoming edges."
+                )
             if edge.kind == "conditional" and edge.condition is None:
                 raise GraphValidationError(f"Edge '{edge.id}' is conditional but missing a condition.")
             if edge.kind not in {"conditional", "binding"}:
@@ -1675,7 +1963,7 @@ class GraphDefinition:
                 allowed_tool_names = [str(tool_name) for tool_name in node.config.get("allowed_tool_names", [])]
                 for tool_name in allowed_tool_names:
                     try:
-                        services.tool_registry.require_exposable(str(tool_name))
+                        services.tool_registry.require_graph_reference(str(tool_name))
                     except (KeyError, ValueError) as exc:
                         raise GraphValidationError(str(exc)) from exc
                 mcp_context_tool_names: list[str] = []
@@ -1697,6 +1985,21 @@ class GraphDefinition:
                         if target_node.id not in seen_context_node_ids:
                             candidate_context_nodes.append(target_node)
                             seen_context_node_ids.add(target_node.id)
+                prompt_block_node_ids = node.config.get("prompt_block_node_ids", [])
+                if prompt_block_node_ids:
+                    if not isinstance(prompt_block_node_ids, Sequence) or isinstance(prompt_block_node_ids, (str, bytes)):
+                        raise GraphValidationError(
+                            f"Model node '{node.id}' must declare prompt_block_node_ids as a list of prompt block node ids."
+                        )
+                    for prompt_block_node_id in prompt_block_node_ids:
+                        prompt_block_node_id_str = str(prompt_block_node_id).strip()
+                        if not prompt_block_node_id_str:
+                            continue
+                        target_node = self.nodes.get(prompt_block_node_id_str)
+                        if target_node is None or target_node.kind != "data" or target_node.provider_id != PROMPT_BLOCK_PROVIDER_ID:
+                            raise GraphValidationError(
+                                f"Model node '{node.id}' references unknown prompt block node '{prompt_block_node_id_str}'."
+                            )
                 for edge in self.get_incoming_edges(node.id):
                     if edge.kind != "binding":
                         continue
@@ -1715,7 +2018,7 @@ class GraphDefinition:
                         if not tool_name_str:
                             continue
                         try:
-                            tool_definition = services.tool_registry.require_exposable(tool_name_str)
+                            tool_definition = services.tool_registry.require_graph_reference(tool_name_str)
                         except (KeyError, ValueError) as exc:
                             raise GraphValidationError(str(exc)) from exc
                         if tool_definition.source_type != "mcp":
@@ -1771,7 +2074,7 @@ class GraphDefinition:
                             )
             if node.kind == "tool":
                 try:
-                    services.tool_registry.require_invocable(str(node.config.get("tool_name", "")))
+                    services.tool_registry.require_graph_reference(str(node.config.get("tool_name", "")), require_executor=True)
                 except (KeyError, ValueError) as exc:
                     raise GraphValidationError(str(exc)) from exc
             if node.kind == "mcp_context_provider":
@@ -1785,7 +2088,7 @@ class GraphDefinition:
                     if not tool_name_str:
                         continue
                     try:
-                        tool_definition = services.tool_registry.require_exposable(tool_name_str)
+                        tool_definition = services.tool_registry.require_graph_reference(tool_name_str)
                     except (KeyError, ValueError) as exc:
                         raise GraphValidationError(str(exc)) from exc
                     if tool_definition.source_type != "mcp":
@@ -1883,6 +2186,55 @@ class GraphDefinition:
                             raise GraphValidationError(
                                 f"MCP tool executor '{node.id}' must use a tool_call_envelope condition on edges from auto-mode model node '{source_node.id}'."
                             )
+                terminal_output_edges = [
+                    edge
+                    for edge in self.get_outgoing_edges(node.id)
+                    if edge.kind != "binding" and edge.source_handle_id == MCP_TERMINAL_OUTPUT_HANDLE_ID
+                ]
+                if len(terminal_output_edges) > 1:
+                    raise GraphValidationError(
+                        f"MCP tool executor '{node.id}' can only declare one terminal output route."
+                    )
+                for edge in terminal_output_edges:
+                    if edge.kind != "conditional" or not _is_terminal_output_contract_condition(edge.condition):
+                        raise GraphValidationError(
+                            f"MCP tool executor '{node.id}' terminal output edge '{edge.id}' must match terminal_output_envelope."
+                        )
+            if node.kind == "data" and node.provider_id == "core.context_builder":
+                raw_bindings = node.config.get("input_bindings", [])
+                if not isinstance(raw_bindings, Sequence) or isinstance(raw_bindings, (str, bytes)):
+                    raise GraphValidationError(f"Context builder '{node.id}' must declare input_bindings as a list.")
+                incoming_source_ids = {edge.source_id for edge in self.get_incoming_edges(node.id)}
+                seen_placeholders: set[str] = set()
+                for index, raw_binding in enumerate(raw_bindings):
+                    if not isinstance(raw_binding, Mapping):
+                        raise GraphValidationError(
+                            f"Context builder '{node.id}' binding at index {index} must be an object."
+                        )
+                    source_node_id = str(raw_binding.get("source_node_id") or raw_binding.get("source") or "").strip()
+                    if source_node_id and source_node_id not in incoming_source_ids:
+                        raise GraphValidationError(
+                            f"Context builder '{node.id}' references '{source_node_id}', but it is not currently connected."
+                        )
+                    placeholder = _slugify_context_builder_placeholder(
+                        raw_binding.get("placeholder"),
+                        fallback=f"source_{index + 1}",
+                    )
+                    if not CONTEXT_BUILDER_IDENTIFIER_PATTERN.match(placeholder):
+                        raise GraphValidationError(
+                            f"Context builder '{node.id}' uses invalid placeholder '{placeholder}'."
+                        )
+                    if placeholder in seen_placeholders:
+                        raise GraphValidationError(
+                            f"Context builder '{node.id}' uses duplicate placeholder '{placeholder}'."
+                        )
+                    seen_placeholders.add(placeholder)
+            if node.kind == "data" and node.provider_id == PROMPT_BLOCK_PROVIDER_ID:
+                raw_role = str(node.config.get("role", "user") or "user").strip().lower()
+                if raw_role not in PROMPT_BLOCK_ROLES:
+                    raise GraphValidationError(
+                        f"Prompt block '{node.id}' uses unsupported role '{raw_role}'."
+                    )
 
     def _resolve_provider_binding(self, node: BaseNode) -> ProviderNode | None:
         binding_node_id = str(node.config.get("provider_binding_node_id", "")).strip()

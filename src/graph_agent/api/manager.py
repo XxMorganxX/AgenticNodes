@@ -264,7 +264,7 @@ class GraphRunManager:
     def stop_background_services(self) -> None:
         self._discord_service.stop()
         if self._services.mcp_server_manager is not None:
-            self._services.mcp_server_manager.shutdown_all()
+            self._services.mcp_server_manager.shutdown_all(preserve_desired_running=True)
 
     def handle_discord_message(self, message: DiscordMessageEvent) -> list[str]:
         run_ids: list[str] = []

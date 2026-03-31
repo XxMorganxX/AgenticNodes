@@ -11,8 +11,10 @@ import {
   getToolSourceHandleAnchorRatio,
   isApiModelNode,
   isMcpContextProviderNode,
+  isPromptBlockNode,
   isRoutableToolNode,
   isWireJunctionNode,
+  MCP_TERMINAL_OUTPUT_HANDLE_ID,
   TOOL_CONTEXT_HANDLE_ID,
   TOOL_FAILURE_HANDLE_ID,
   TOOL_SUCCESS_HANDLE_ID,
@@ -26,6 +28,7 @@ import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "../lib
 export type GraphCanvasNodeData = {
   node: GraphNode;
   graph: GraphDefinition | null;
+  tooltipGraph?: GraphDefinition | null;
   catalog: EditorCatalog | null;
   runState: RunState | null;
   kindColor: string;
@@ -95,6 +98,22 @@ function isContextBooted(catalog: EditorCatalog | null, node: GraphNode): boolea
   return serverIds.every((serverId) => catalog.mcp_servers?.some((server) => server.server_id === serverId && server.running));
 }
 
+function contextBuilderPlaceholderCount(graph: GraphDefinition | null, node: GraphNode): number {
+  const configuredSourceIds = Array.isArray(node.config.input_bindings)
+    ? node.config.input_bindings
+        .map((binding) =>
+          typeof binding === "object" && binding !== null ? String((binding as { source_node_id?: unknown }).source_node_id ?? "") : "",
+        )
+        .filter((sourceId) => sourceId.trim().length > 0)
+    : [];
+  const incomingSourceIds =
+    graph?.edges
+      .filter((edge) => edge.target_id === node.id)
+      .map((edge) => edge.source_id)
+      .filter((sourceId, index, sourceIds) => sourceIds.indexOf(sourceId) === index) ?? [];
+  return new Set([...configuredSourceIds, ...incomingSourceIds]).size;
+}
+
 function GraphCanvasNodeComponent({
   data,
   selected,
@@ -102,6 +121,7 @@ function GraphCanvasNodeComponent({
   const {
     node,
     graph,
+    tooltipGraph = null,
     catalog,
     runState,
     kindColor,
@@ -120,6 +140,7 @@ function GraphCanvasNodeComponent({
   const isContextProviderNode = isMcpContextProviderNode(node);
   const isModelNode = isApiModelNode(node);
   const isDisplayNode = node.provider_id === "core.data_display";
+  const isContextBuilderNode = node.provider_id === "core.context_builder";
   const nodeOutput = runState?.node_outputs?.[node.id];
   const displayEnvelope =
     isDisplayNode &&
@@ -142,7 +163,7 @@ function GraphCanvasNodeComponent({
   let tooltip: NodeTooltipData = FALLBACK_TOOLTIP;
   if (tooltipVisible && !preview && !isWireJunction) {
     try {
-      tooltip = buildNodeTooltip(node, graph, catalog, runState);
+      tooltip = buildNodeTooltip(node, tooltipGraph, catalog, runState);
     } catch (error) {
       warnGraphDiagnostic("GraphCanvasNode", "tooltip fallback", error, {
         nodeId: node.id,
@@ -153,6 +174,7 @@ function GraphCanvasNodeComponent({
     }
   }
   const showTargetHandle = !preview && node.category !== "start";
+  const showPromptBlockTargetHandle = !isPromptBlockNode(node);
   const showSourceHandle = !preview && node.category !== "end";
   const successHandleStyle = {
     top: `${getToolSourceHandleAnchorRatio(TOOL_SUCCESS_HANDLE_ID) * 100}%`,
@@ -169,6 +191,9 @@ function GraphCanvasNodeComponent({
   const apiMessageHandleStyle = {
     top: `${getToolSourceHandleAnchorRatio(API_MESSAGE_HANDLE_ID) * 100}%`,
   } satisfies CSSProperties;
+  const mcpTerminalHandleStyle = {
+    top: `${getToolSourceHandleAnchorRatio(MCP_TERMINAL_OUTPUT_HANDLE_ID) * 100}%`,
+  } satisfies CSSProperties;
   const primaryTargetHandleStyle = {
     top: `${getApiToolContextTargetAnchorRatio(null) * 100}%`,
   } satisfies CSSProperties;
@@ -180,6 +205,12 @@ function GraphCanvasNodeComponent({
     node.kind === "model"
       ? String(node.config.provider_name ?? node.model_provider_name ?? node.provider_label ?? node.provider_id)
       : node.provider_label ?? node.provider_id;
+  const contextBuilderCount = isContextBuilderNode ? contextBuilderPlaceholderCount(graph, node) : 0;
+  const contextBuilderSummary = isContextBuilderNode
+    ? contextBuilderCount > 0
+      ? `${contextBuilderCount} named input${contextBuilderCount === 1 ? "" : "s"}`
+      : "Connect text inputs to build placeholders"
+    : null;
   const isContextConnected = isContextProviderNode ? hasContextConnection(graph, node) : false;
   const contextBooted = isContextProviderNode ? isContextBooted(catalog, node) : false;
   const displayStatus = isContextProviderNode
@@ -192,12 +223,12 @@ function GraphCanvasNodeComponent({
   const isActive = displayStatus === "active";
   const statusLabel = isContextProviderNode
     ? contextBooted && isContextConnected
-      ? "Connected and MCP booted"
+      ? "Bound and MCP booted"
       : isContextConnected
-        ? "Connected but MCP not booted"
+        ? "Bound but MCP not booted"
         : contextBooted
-          ? "MCP booted but not connected"
-          : "MCP not booted and not connected"
+          ? "MCP booted but not bound"
+          : "MCP not booted and not bound"
     : formatRunStatusLabel(displayStatus);
   const nodeCardClassName = `graph-node-card graph-node-card--${displayStatus} ${isRoutableTool ? "graph-node-card--tool-outputs" : ""} ${
     isContextProviderNode ? "graph-node-card--tool-context-provider" : ""
@@ -205,6 +236,8 @@ function GraphCanvasNodeComponent({
     isModelNode ? "graph-node-card--model-inputs" : ""
   } ${
     isModelNode ? "graph-node-card--model-outputs" : ""
+  } ${
+    node.kind === "mcp_tool_executor" ? "graph-node-card--mcp-tool-executor" : ""
   } ${
     isDisplayNode ? "graph-node-card--display-node" : ""
   } ${selected ? "is-selected" : ""} ${tooltipVisible ? "is-tooltip-visible" : ""} ${preview ? "is-preview" : ""} ${
@@ -263,7 +296,7 @@ function GraphCanvasNodeComponent({
         onToggleTooltip(node.id);
       }}
     >
-      {showTargetHandle && !isContextProviderNode ? (
+      {showTargetHandle && showPromptBlockTargetHandle && !isContextProviderNode ? (
         <Handle
           type="target"
           position={Position.Left}
@@ -311,6 +344,7 @@ function GraphCanvasNodeComponent({
           <span className="graph-node-chip">{node.category}</span>
           <span className="graph-node-meta-text">{node.kind}</span>
         </div>
+        {contextBuilderSummary ? <div className="graph-node-summary">{contextBuilderSummary}</div> : null}
         {isDisplayNode ? (
           <div
             role="button"
@@ -418,6 +452,20 @@ function GraphCanvasNodeComponent({
             className="graph-node-handle graph-node-handle-source graph-node-handle-source--failure"
             style={failureHandleStyle}
           />
+          {node.kind === "mcp_tool_executor" ? (
+            <>
+              <div className="graph-node-output-port graph-node-output-port--context" style={mcpTerminalHandleStyle} aria-hidden="true">
+                <span className="graph-node-output-port-label">Terminal</span>
+              </div>
+              <Handle
+                id={MCP_TERMINAL_OUTPUT_HANDLE_ID}
+                type="source"
+                position={Position.Right}
+                className="graph-node-handle graph-node-handle-source graph-node-handle-source--context"
+                style={mcpTerminalHandleStyle}
+              />
+            </>
+          ) : null}
         </>
       ) : null}
       {showSourceHandle && isContextProviderNode ? (

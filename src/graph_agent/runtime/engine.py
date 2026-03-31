@@ -10,6 +10,7 @@ from graph_agent.runtime.core import (
     API_TOOL_CALL_HANDLE_ID,
     Edge,
     GraphDefinition,
+    MCP_TERMINAL_OUTPUT_HANDLE_ID,
     NodeContext,
     NodeExecutionResult,
     RunState,
@@ -192,6 +193,16 @@ class GraphRuntime:
     ) -> list[tuple[Edge, NodeExecutionResult]]:
         outgoing = graph.get_outgoing_edges(node_id)
         source_node = graph.get_node(node_id)
+        if source_node.kind == "mcp_tool_executor":
+            remaining_outgoing = [
+                edge for edge in outgoing if edge.source_handle_id != MCP_TERMINAL_OUTPUT_HANDLE_ID
+            ]
+            selected_edges = self._select_matching_edges(state, node_id, remaining_outgoing, result)
+            route_result = self._route_result(result, MCP_TERMINAL_OUTPUT_HANDLE_ID)
+            if route_result is not None:
+                handle_edges = [edge for edge in outgoing if edge.source_handle_id == MCP_TERMINAL_OUTPUT_HANDLE_ID]
+                selected_edges.extend(self._select_matching_edges(state, node_id, handle_edges, route_result))
+            return selected_edges
         has_explicit_api_outputs = source_node.kind == "model" and any(
             edge.source_handle_id in {API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID} for edge in outgoing
         )

@@ -221,6 +221,29 @@ export function createNodeFromProvider(
 
   if (provider.node_kind === "data") {
     const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
+    if (provider.provider_id === "core.context_builder") {
+      return {
+        ...baseNode,
+        config: {
+          template: "",
+          input_bindings: [],
+          joiner: "\n\n",
+          ...defaultConfig,
+        },
+      };
+    }
+    if (provider.provider_id === "core.prompt_block") {
+      return {
+        ...baseNode,
+        config: {
+          mode: "prompt_block",
+          role: "user",
+          content: "",
+          name: "",
+          ...defaultConfig,
+        },
+      };
+    }
     return {
       ...baseNode,
       config: {
@@ -323,6 +346,10 @@ export function isMcpContextProviderNode(node: GraphNode | null | undefined): bo
   return Boolean(node && node.kind === "mcp_context_provider");
 }
 
+export function isPromptBlockNode(node: GraphNode | null | undefined): boolean {
+  return Boolean(node && node.kind === "data" && node.provider_id === "core.prompt_block");
+}
+
 export function isApiModelNode(node: GraphNode | null | undefined): boolean {
   return Boolean(node && node.kind === "model");
 }
@@ -333,6 +360,8 @@ export const TOOL_CONTEXT_HANDLE_ID = "tool-context";
 export const API_TOOL_CONTEXT_HANDLE_ID = "api-tool-context";
 export const API_TOOL_CALL_HANDLE_ID = "api-tool-call";
 export const API_MESSAGE_HANDLE_ID = "api-message";
+export const MCP_TERMINAL_OUTPUT_HANDLE_ID = "mcp-terminal-output";
+export const PROMPT_BLOCK_PROVIDER_ID = "core.prompt_block";
 
 export function defaultToolFailureCondition(edgeId: string): GraphEdge["condition"] {
   return {
@@ -360,6 +389,16 @@ export function defaultApiMessageCondition(edgeId: string): GraphEdge["condition
     label: "Message output",
     type: "result_payload_path_equals",
     value: "message_envelope",
+    path: "metadata.contract",
+  };
+}
+
+export function defaultMcpTerminalOutputCondition(edgeId: string): GraphEdge["condition"] {
+  return {
+    id: `${edgeId}-condition`,
+    label: "Terminal output",
+    type: "result_payload_path_equals",
+    value: "terminal_output_envelope",
     path: "metadata.contract",
   };
 }
@@ -488,7 +527,8 @@ export function inferToolEdgeSourceHandle(edge: GraphEdge, sourceNode: GraphNode
   }
   if (
     edge.source_handle_id === TOOL_SUCCESS_HANDLE_ID ||
-    edge.source_handle_id === TOOL_FAILURE_HANDLE_ID
+    edge.source_handle_id === TOOL_FAILURE_HANDLE_ID ||
+    (sourceNode.kind === "mcp_tool_executor" && edge.source_handle_id === MCP_TERMINAL_OUTPUT_HANDLE_ID)
   ) {
     return edge.source_handle_id;
   }
@@ -503,6 +543,9 @@ export function getToolSourceHandleAnchorRatio(handleId: string | null | undefin
     return 0.68;
   }
   if (handleId === TOOL_CONTEXT_HANDLE_ID) {
+    return 0.86;
+  }
+  if (handleId === MCP_TERMINAL_OUTPUT_HANDLE_ID) {
     return 0.86;
   }
   return handleId === TOOL_FAILURE_HANDLE_ID ? 0.68 : 0.4;
@@ -559,6 +602,8 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
           ? edge.condition ?? defaultApiToolCallCondition(edge.id)
           : edge.source_handle_id === API_MESSAGE_HANDLE_ID
             ? edge.condition ?? defaultApiMessageCondition(edge.id)
+            : edge.source_handle_id === MCP_TERMINAL_OUTPUT_HANDLE_ID
+              ? edge.condition ?? defaultMcpTerminalOutputCondition(edge.id)
             : edge.kind === "conditional"
               ? edge.condition ?? defaultConditionalCondition(edge.id)
               : null,
@@ -628,6 +673,48 @@ export function canConnectNodes(
 
 const NODE_WIDTH = 280;
 const NODE_HEIGHT = 150;
+const MCP_TOOL_EXECUTOR_NODE_HEIGHT = 214;
+const AUTO_LAYOUT_VERTICAL_GAP = NODE_HEIGHT + 120;
+const AUTO_LAYOUT_COLUMN_TOLERANCE = 120;
+
+function getNodeHeight(node: GraphNode): number {
+  return node.kind === "mcp_tool_executor" ? MCP_TOOL_EXECUTOR_NODE_HEIGHT : NODE_HEIGHT;
+}
+
+function getNodeTargetAnchorRatio(node: GraphNode, targetHandleId: string | null | undefined): number {
+  return node.kind === "model" ? getApiToolContextTargetAnchorRatio(targetHandleId) : 0.5;
+}
+
+function getNodeSourceAnchorRatio(node: GraphNode, sourceHandleId: string | null | undefined): number {
+  if (isApiModelNode(node) || isRoutableToolNode(node) || isMcpContextProviderNode(node)) {
+    return getToolSourceHandleAnchorRatio(sourceHandleId);
+  }
+  return 0.5;
+}
+
+function average(values: number[]): number {
+  if (values.length === 0) {
+    return 0;
+  }
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function groupNodeIdsByColumn(centerMap: Map<string, GraphPosition>) {
+  const columns: Array<{ x: number; nodeIds: string[] }> = [];
+  [...centerMap.entries()]
+    .sort((left, right) => left[1].x - right[1].x)
+    .forEach(([nodeId, center]) => {
+      const column = columns.find((candidate) => Math.abs(candidate.x - center.x) <= AUTO_LAYOUT_COLUMN_TOLERANCE);
+      if (column) {
+        const nextCount = column.nodeIds.length + 1;
+        column.x = (column.x * column.nodeIds.length + center.x) / nextCount;
+        column.nodeIds.push(nodeId);
+        return;
+      }
+      columns.push({ x: center.x, nodeIds: [nodeId] });
+    });
+  return columns;
+}
 
 export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
   if (graph.nodes.length === 0) {
@@ -639,7 +726,7 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
   g.setDefaultEdgeLabel(() => ({}));
 
   for (const node of graph.nodes) {
-    g.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+    g.setNode(node.id, { width: NODE_WIDTH, height: getNodeHeight(node) });
   }
   for (const edge of graph.edges) {
     g.setEdge(edge.source_id, edge.target_id);
@@ -647,12 +734,102 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
 
   dagre.layout(g);
 
-  const positionMap = new Map<string, GraphPosition>();
+  const nodeMap = new Map(graph.nodes.map((node) => [node.id, node]));
+  const incomingEdgesByTarget = new Map<string, GraphEdge[]>();
+  for (const edge of graph.edges) {
+    const existing = incomingEdgesByTarget.get(edge.target_id);
+    if (existing) {
+      existing.push(edge);
+    } else {
+      incomingEdgesByTarget.set(edge.target_id, [edge]);
+    }
+  }
+
+  const centerMap = new Map<string, GraphPosition>();
   g.nodes().forEach((id) => {
     const info = g.node(id);
-    if (info) {
-      positionMap.set(id, { x: info.x - NODE_WIDTH / 2, y: info.y - NODE_HEIGHT / 2 });
+    if (!info) {
+      return;
     }
+    centerMap.set(id, { x: info.x, y: info.y });
+  });
+
+  const columns = groupNodeIdsByColumn(centerMap);
+  columns.slice(1).forEach((column) => {
+    const nodeIds = column.nodeIds;
+    if (nodeIds.length === 0) {
+      return;
+    }
+
+    const orderedNodes = nodeIds
+      .map((nodeId) => {
+        const node = nodeMap.get(nodeId);
+        const center = centerMap.get(nodeId);
+        if (!node || !center) {
+          return null;
+        }
+        const incomingEdges = (incomingEdgesByTarget.get(nodeId) ?? []).filter((edge) => {
+          const sourceCenter = centerMap.get(edge.source_id);
+          return sourceCenter ? sourceCenter.x < center.x : false;
+        });
+        const preferredAnchorYs = incomingEdges
+          .map((edge) => {
+            const sourceNode = nodeMap.get(edge.source_id);
+            const sourceCenter = centerMap.get(edge.source_id);
+            if (!sourceNode || !sourceCenter) {
+              return null;
+            }
+            const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+            const sourceOffset =
+              (getNodeSourceAnchorRatio(sourceNode, sourceHandleId) - 0.5) * getNodeHeight(sourceNode);
+            const targetOffset =
+              (getNodeTargetAnchorRatio(node, edge.target_handle_id ?? null) - 0.5) * getNodeHeight(node);
+            return sourceCenter.y + sourceOffset - targetOffset;
+          })
+          .filter((value): value is number => value !== null);
+        const desiredY =
+          preferredAnchorYs.length > 0 ? average(preferredAnchorYs) * 0.8 + center.y * 0.2 : center.y;
+        return { nodeId, currentY: center.y, desiredY };
+      })
+      .filter((entry): entry is { nodeId: string; currentY: number; desiredY: number } => entry !== null)
+      .sort((left, right) => {
+        const desiredDelta = left.desiredY - right.desiredY;
+        if (Math.abs(desiredDelta) > 0.5) {
+          return desiredDelta;
+        }
+        const currentDelta = left.currentY - right.currentY;
+        if (Math.abs(currentDelta) > 0.5) {
+          return currentDelta;
+        }
+        return left.nodeId.localeCompare(right.nodeId);
+      });
+
+    if (orderedNodes.length === 0) {
+      return;
+    }
+
+    const baseY = average(
+      orderedNodes.map((entry, index) => entry.desiredY - index * AUTO_LAYOUT_VERTICAL_GAP),
+    );
+    orderedNodes.forEach((entry, index) => {
+      const current = centerMap.get(entry.nodeId);
+      if (!current) {
+        return;
+      }
+      centerMap.set(entry.nodeId, {
+        x: current.x,
+        y: baseY + index * AUTO_LAYOUT_VERTICAL_GAP,
+      });
+    });
+  });
+
+  const positionMap = new Map<string, GraphPosition>();
+  centerMap.forEach((center, id) => {
+    const node = nodeMap.get(id);
+    positionMap.set(id, {
+      x: center.x - NODE_WIDTH / 2,
+      y: center.y - (node ? getNodeHeight(node) : NODE_HEIGHT) / 2,
+    });
   });
 
   return {

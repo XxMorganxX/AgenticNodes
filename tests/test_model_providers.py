@@ -4,11 +4,13 @@ import json
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
 from pathlib import Path
 from typing import Any, Mapping
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -25,10 +27,11 @@ from graph_agent.providers.base import ModelMessage, ModelRequest, ModelToolCall
 from graph_agent.providers.base import ModelProvider, ModelResponse, ProviderPreflightResult
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
-from graph_agent.runtime.core import GraphDefinition, GraphValidationError
+from graph_agent.runtime.core import GraphDefinition, GraphValidationError, NodeContext, RunState
 from graph_agent.runtime.documents import load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
-from graph_agent.tools.base import ToolContext, ToolDefinition
+from graph_agent.tools.base import ToolContext, ToolDefinition, ToolRegistry, ToolResult
+from graph_agent.tools.mcp import McpServerDefinition, McpServerManager, _McpStdioSession
 
 
 SEARCH_CATALOG_TOOL = ModelToolDefinition(
@@ -345,6 +348,20 @@ class AutoMixedProvider(ModelProvider):
         return ProviderPreflightResult(status="available", ok=True, message="ok")
 
 
+class PromptBlockEchoProvider(ModelProvider):
+    name = "prompt_block_echo"
+
+    def __init__(self) -> None:
+        self.last_request: ModelRequest | None = None
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        self.last_request = request
+        return ModelResponse(content="ok")
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
 class ModelProviderTests(unittest.TestCase):
     def _build_auto_branch_graph(self, provider_name: str, provider: ModelProvider | None = None) -> tuple[Any, GraphRuntime, dict[str, Any]]:
         services = build_example_services()
@@ -636,9 +653,13 @@ class ModelProviderTests(unittest.TestCase):
         self.assertFalse(weather_tool["available"])
         self.assertEqual(weather_tool["schema_origin"], "static")
 
-    def test_graph_validation_rejects_offline_mcp_tools(self) -> None:
+    def test_offline_mcp_tools_do_not_block_graph_save_or_run_start(self) -> None:
         services = build_example_services()
+        manager = GraphRunManager(services=services)
         payload = build_example_graph_payload()
+        graph_id = f"offline-mcp-graph-{uuid4()}"
+        payload["graph_id"] = graph_id
+        payload["name"] = "Offline MCP Graph"
 
         for node in payload["nodes"]:
             if node["kind"] == "model":
@@ -649,8 +670,25 @@ class ModelProviderTests(unittest.TestCase):
                 node["tool_name"] = "weather_current"
                 node["config"]["tool_name"] = "weather_current"
 
-        with self.assertRaises(GraphValidationError):
-            GraphDefinition.from_dict(payload).validate_against_services(services)
+        manager.set_mcp_tool_enabled("weather_current", True)
+        graph = GraphDefinition.from_dict(payload)
+        graph.validate_against_services(services)
+
+        saved_graph = manager.create_graph(payload)
+        self.assertEqual(saved_graph["graph_id"], graph_id)
+
+        run_id = manager.start_run(graph_id, {"request": "weather please"})
+        snapshot = manager.get_run(run_id)
+        self.assertIn(snapshot["status"], {"queued", "running", "failed", "completed"})
+
+        result = services.tool_registry.invoke(
+            "weather_current",
+            {"location": "Austin"},
+            ToolContext(run_id="run-offline", graph_id=graph_id, node_id="tool-node", state_snapshot={}),
+        )
+        self.assertEqual(result.status, "unavailable")
+        assert result.error is not None
+        self.assertIn("offline", result.error["message"].lower())
 
     def test_booted_enabled_mcp_tools_can_validate_and_execute(self) -> None:
         services = build_example_services()
@@ -1454,6 +1492,542 @@ class ModelProviderTests(unittest.TestCase):
         with self.assertRaises(GraphValidationError):
             GraphDefinition.from_dict(graph_payload).validate_against_services(services)
 
+    def test_prompt_block_node_emits_structured_data_envelope(self) -> None:
+        services = build_example_services()
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "prompt-block-runtime",
+                "name": "Prompt Block Runtime",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "prompt_block",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "System Prompt",
+                        "provider_id": "core.prompt_block",
+                        "provider_label": "Prompt Block",
+                        "config": {
+                            "mode": "prompt_block",
+                            "role": "system",
+                            "name": "instructions",
+                            "content": "You are helping with {graph_id}.",
+                        },
+                        "position": {"x": 120, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "start"}},
+                        "position": {"x": 240, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-finish", "source_id": "start", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        prompt_node = graph.get_node("prompt_block")
+        context = NodeContext(graph=graph, state=RunState(graph_id=graph.graph_id, input_payload="hello"), services=services, node_id="prompt_block")
+        result = prompt_node.execute(context)
+
+        self.assertEqual(result.status, "success")
+        assert isinstance(result.output, dict)
+        self.assertEqual(result.output["metadata"]["contract"], "data_envelope")
+        self.assertEqual(result.output["metadata"]["data_mode"], "prompt_block")
+        self.assertEqual(
+            result.output["payload"],
+            {
+                "kind": "prompt_block",
+                "role": "system",
+                "name": "instructions",
+                "content": "You are helping with prompt-block-runtime.",
+            },
+        )
+
+    def test_context_builder_renders_bound_prompt_blocks_without_executing_them(self) -> None:
+        services = build_example_services()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "prompt-block-context-builder",
+                "name": "Prompt Block Context Builder",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "system_block",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "System Block",
+                        "provider_id": "core.prompt_block",
+                        "provider_label": "Prompt Block",
+                        "config": {"mode": "prompt_block", "role": "system", "content": "Follow the graph rules."},
+                        "position": {"x": 120, "y": 0},
+                    },
+                    {
+                        "id": "user_block",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "User Block",
+                        "provider_id": "core.prompt_block",
+                        "provider_label": "Prompt Block",
+                        "config": {"mode": "prompt_block", "role": "user", "content": "Question: {input_payload}"},
+                        "position": {"x": 120, "y": 120},
+                    },
+                    {
+                        "id": "compose",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Compose",
+                        "provider_id": "core.context_builder",
+                        "provider_label": "Context Builder",
+                        "config": {"mode": "context_builder", "template": "", "input_bindings": [], "joiner": "\n\n"},
+                        "position": {"x": 320, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "compose"}},
+                        "position": {"x": 520, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-compose", "source_id": "start", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "system-compose", "source_id": "system_block", "target_id": "compose", "label": "prompt block", "kind": "binding", "priority": 0},
+                    {"id": "user-compose", "source_id": "user_block", "target_id": "compose", "label": "prompt block", "kind": "binding", "priority": 0},
+                    {"id": "compose-finish", "source_id": "compose", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, "How do prompt blocks work?", run_id="run-prompt-context-builder")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(
+            state.final_output,
+            "System: Follow the graph rules.\n\nUser: Question: How do prompt blocks work?",
+        )
+        self.assertNotIn("system_block", state.node_outputs)
+        self.assertNotIn("user_block", state.node_outputs)
+
+    def test_model_node_consumes_bound_prompt_blocks_as_messages(self) -> None:
+        services = build_example_services()
+        provider = PromptBlockEchoProvider()
+        services.model_providers["prompt_block_echo"] = provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "prompt-block-model",
+                "name": "Prompt Block Model",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "assistant_block",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Assistant Block",
+                        "provider_id": "core.prompt_block",
+                        "provider_label": "Prompt Block",
+                        "config": {"mode": "prompt_block", "role": "assistant", "content": "Previous answer draft."},
+                        "position": {"x": 120, "y": 0},
+                    },
+                    {
+                        "id": "user_block",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "User Block",
+                        "provider_id": "core.prompt_block",
+                        "provider_label": "Prompt Block",
+                        "config": {"mode": "prompt_block", "role": "user", "content": "Bound user context."},
+                        "position": {"x": 120, "y": 120},
+                    },
+                    {
+                        "id": "model",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "prompt_block_echo",
+                        "prompt_name": "prompt_block_echo",
+                        "config": {
+                            "provider_name": "prompt_block_echo",
+                            "prompt_name": "prompt_block_echo",
+                            "system_prompt": "Base system prompt",
+                            "user_message_template": "Live input: {input_payload}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 320, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "model"}},
+                        "position": {"x": 520, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-model", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "assistant-model", "source_id": "assistant_block", "target_id": "model", "label": "prompt block", "kind": "binding", "priority": 0},
+                    {"id": "user-model", "source_id": "user_block", "target_id": "model", "label": "prompt block", "kind": "binding", "priority": 0},
+                    {"id": "model-finish", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, "current request", run_id="run-prompt-model")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output, "ok")
+        self.assertIsNotNone(provider.last_request)
+        assert provider.last_request is not None
+        self.assertEqual(
+            [(message.role, message.content) for message in provider.last_request.messages],
+            [
+                ("system", "Base system prompt"),
+                ("assistant", "Previous answer draft."),
+                ("user", "Bound user context."),
+                ("user", "Live input: current request"),
+            ],
+        )
+        self.assertEqual(
+            provider.last_request.metadata.get("prompt_blocks"),
+            [
+                {"kind": "prompt_block", "role": "assistant", "content": "Previous answer draft."},
+                {"kind": "prompt_block", "role": "user", "content": "Bound user context."},
+            ],
+        )
+
+    def test_mcp_executor_routes_terminal_output_handle(self) -> None:
+        services = build_example_services()
+
+        def _mock_mcp_tool(_payload: Mapping[str, Any], _context: ToolContext) -> ToolResult:
+            return ToolResult(
+                status="success",
+                output={"ok": True},
+                metadata={
+                    "terminal_output": {
+                        "server_id": "mock_mcp",
+                        "tool_name": "mock_terminal_tool",
+                        "stderr": "first line\nsecond line",
+                        "stderr_lines": ["first line", "second line"],
+                    }
+                },
+            )
+
+        class TerminalToolCallProvider:
+            name = "terminal_mock"
+
+            def generate(self, request: ModelRequest) -> ModelResponse:
+                self.last_request = request
+                return ModelResponse(
+                    content="",
+                    tool_calls=[ModelToolCall(tool_name="mock_terminal_tool", arguments={})],
+                )
+
+            def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+                return ProviderPreflightResult(status="ready", ok=True)
+
+        services.model_providers["terminal_mock"] = TerminalToolCallProvider()
+        services.tool_registry.upsert(
+            ToolDefinition(
+                name="mock_terminal_tool",
+                description="Mock MCP tool with terminal output.",
+                input_schema={"type": "object", "properties": {}, "required": []},
+                executor=_mock_mcp_tool,
+                source_type="mcp",
+                server_id="mock_mcp",
+            )
+        )
+
+        graph_payload = {
+            "graph_id": "mcp-executor-terminal-output",
+            "name": "MCP Executor Terminal Output",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "terminal_context",
+                    "kind": "mcp_context_provider",
+                    "category": "tool",
+                    "label": "Terminal Context",
+                    "provider_id": "tool.mcp_context_provider",
+                    "provider_label": "MCP Context Provider",
+                    "config": {"tool_names": ["mock_terminal_tool"], "include_mcp_tool_context": False},
+                    "position": {"x": 120, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "terminal_mock",
+                    "prompt_name": "terminal_prompt",
+                    "config": {
+                        "provider_name": "terminal_mock",
+                        "prompt_name": "terminal_prompt",
+                        "system_prompt": "Call the terminal MCP tool.",
+                        "user_message_template": "{input_payload}",
+                        "response_mode": "tool_call",
+                    },
+                    "position": {"x": 240, "y": 0},
+                },
+                {
+                    "id": "executor",
+                    "kind": "mcp_tool_executor",
+                    "category": "tool",
+                    "label": "Executor",
+                    "provider_id": "tool.mcp_tool_executor",
+                    "provider_label": "MCP Tool Executor",
+                    "config": {},
+                    "position": {"x": 420, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_payload", "source": "executor"}},
+                    "position": {"x": 600, "y": 0},
+                },
+                {
+                    "id": "terminal_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Terminal Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_payload", "source": "executor"}},
+                    "position": {"x": 600, "y": 120},
+                },
+            ],
+            "edges": [
+                {"id": "start-model", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "ctx-binding",
+                    "source_id": "terminal_context",
+                    "target_id": "model",
+                    "source_handle_id": "tool-context",
+                    "target_handle_id": "api-tool-context",
+                    "label": "tool context",
+                    "kind": "binding",
+                    "priority": 0,
+                },
+                {"id": "model-executor", "source_id": "model", "target_id": "executor", "label": "", "kind": "standard", "priority": 100},
+                {"id": "executor-finish", "source_id": "executor", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "executor-terminal",
+                    "source_id": "executor",
+                    "target_id": "terminal_finish",
+                    "source_handle_id": "mcp-terminal-output",
+                    "label": "terminal output",
+                    "kind": "conditional",
+                    "priority": 30,
+                    "condition": {
+                        "id": "executor-terminal-condition",
+                        "label": "Terminal output",
+                        "type": "result_payload_path_equals",
+                        "value": "terminal_output_envelope",
+                        "path": "metadata.contract",
+                    },
+                },
+            ],
+        }
+
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(services)
+
+        runtime = GraphRuntime(services=services, max_steps=10, max_visits_per_node=3)
+        state = runtime.run(graph, {"request": "run"}, run_id="run-mcp-terminal-output")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output, {"ok": True})
+        terminal_output = state.edge_outputs["executor-terminal"]
+        assert isinstance(terminal_output, dict)
+        self.assertEqual(terminal_output["metadata"]["contract"], "terminal_output_envelope")
+        self.assertEqual(terminal_output["payload"]["stderr"], "first line\nsecond line")
+        self.assertEqual(terminal_output["payload"]["stderr_lines"], ["first line", "second line"])
+
+    def test_mcp_executor_validation_rejects_terminal_routes_without_terminal_condition(self) -> None:
+        services = build_example_services()
+        services.tool_registry.upsert(
+            ToolDefinition(
+                name="mock_terminal_tool",
+                description="Mock MCP tool for validation.",
+                input_schema={"type": "object", "properties": {}, "required": []},
+                source_type="mcp",
+                server_id="mock_mcp",
+            )
+        )
+        graph_payload = {
+            "graph_id": "invalid-terminal-route",
+            "name": "Invalid Terminal Route",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "terminal_context",
+                    "kind": "mcp_context_provider",
+                    "category": "tool",
+                    "label": "Terminal Context",
+                    "provider_id": "tool.mcp_context_provider",
+                    "provider_label": "MCP Context Provider",
+                    "config": {"tool_names": ["mock_terminal_tool"], "include_mcp_tool_context": False},
+                    "position": {"x": 120, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "mock",
+                    "prompt_name": "terminal_validation",
+                    "config": {
+                        "provider_name": "mock",
+                        "prompt_name": "terminal_validation",
+                        "system_prompt": "Call the weather tool.",
+                        "user_message_template": "{input_payload}",
+                        "response_mode": "tool_call",
+                    },
+                    "position": {"x": 240, "y": 0},
+                },
+                {
+                    "id": "executor",
+                    "kind": "mcp_tool_executor",
+                    "category": "tool",
+                    "label": "Executor",
+                    "provider_id": "tool.mcp_tool_executor",
+                    "provider_label": "MCP Tool Executor",
+                    "config": {},
+                    "position": {"x": 420, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_payload", "source": "executor"}},
+                    "position": {"x": 600, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "start-model", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "ctx-binding",
+                    "source_id": "terminal_context",
+                    "target_id": "model",
+                    "source_handle_id": "tool-context",
+                    "target_handle_id": "api-tool-context",
+                    "label": "tool context",
+                    "kind": "binding",
+                    "priority": 0,
+                },
+                {"id": "model-executor", "source_id": "model", "target_id": "executor", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "executor-terminal",
+                    "source_id": "executor",
+                    "target_id": "finish",
+                    "source_handle_id": "mcp-terminal-output",
+                    "label": "terminal output",
+                    "kind": "standard",
+                    "priority": 30,
+                },
+            ],
+        }
+
+        with self.assertRaises(GraphValidationError):
+            GraphDefinition.from_dict(graph_payload).validate_against_services(services)
+
     def test_load_graph_document_drops_legacy_tool_targets_for_non_context_tools(self) -> None:
         payload = {
             "graph_id": "legacy-tool-targets",
@@ -1602,6 +2176,56 @@ class ModelProviderTests(unittest.TestCase):
                 node["config"]["model"] = "sonnet"
 
         GraphDefinition.from_dict(payload).validate_against_services(services)
+
+    def test_mcp_session_close_uses_shutdown_then_exit(self) -> None:
+        definition = McpServerDefinition(
+            server_id="weather_mcp",
+            display_name="Weather MCP Server",
+            description="Weather",
+            command=["python", "-m", "weather"],
+        )
+        session = _McpStdioSession(definition)
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        process.stdin = Mock()
+        process.stdout = Mock()
+        process.stderr = Mock()
+        session._process = process
+        session.request = Mock(return_value={})
+        session.notify = Mock()
+
+        session.close()
+
+        session.request.assert_called_once_with("shutdown", {})
+        session.notify.assert_called_once_with("exit", {})
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+        process.wait.assert_called_once_with(timeout=3)
+        self.assertIsNone(session._process)
+
+    def test_shutdown_all_preserves_desired_running_for_persistent_servers(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            state_path = Path(tmp_dir) / "mcp_servers_state.json"
+            manager = McpServerManager(ToolRegistry(), state_path=state_path)
+            definition = McpServerDefinition(
+                server_id="weather_mcp",
+                display_name="Weather MCP Server",
+                description="Weather",
+                command=["python", "-m", "weather"],
+                persistent=True,
+            )
+            manager.register_server(definition)
+            manager._set_desired_running("weather_mcp", True)
+
+            manager.shutdown_all(preserve_desired_running=True)
+
+            restarted = McpServerManager(ToolRegistry(), state_path=state_path)
+            restarted.register_server(definition)
+            with patch.object(restarted, "boot_server") as boot_mock:
+                restarted.start_auto_boot()
+
+            boot_mock.assert_called_once_with("weather_mcp")
 
 
 if __name__ == "__main__":

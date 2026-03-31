@@ -102,6 +102,14 @@ class ToolRegistry:
             raise ValueError(f"Tool '{name}' is not executable.")
         return tool
 
+    def require_graph_reference(self, name: str, *, require_executor: bool = False) -> ToolDefinition:
+        tool = self.get(name)
+        if tool.source_type == "mcp":
+            return tool
+        if require_executor:
+            return self.require_invocable(name)
+        return self.require_exposable(name)
+
     def set_tool_enabled(self, name: str, enabled: bool) -> ToolDefinition:
         tool = self.get(name)
         updated = ToolDefinition(

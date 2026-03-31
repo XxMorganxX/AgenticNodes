@@ -50,6 +50,10 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
 function formatList(values: string[]): string {
   return values.length > 0 ? values.join(", ") : "None";
 }
@@ -317,7 +321,7 @@ export function buildNodeTooltip(
                   ? "Explicit binding configured"
                   : "Implicit latest incoming edge",
             },
-            { label: "Routes", value: "On success / On failure" },
+            { label: "Routes", value: "On success / On failure / Terminal output" },
           ],
         },
         ...baseSections,
@@ -356,6 +360,19 @@ export function buildNodeTooltip(
 
   if (node.kind === "data") {
     const isDisplayNode = node.provider_id === "core.data_display";
+    const isContextBuilderNode = node.provider_id === "core.context_builder";
+    const isPromptBlockNode = node.provider_id === "core.prompt_block";
+    const contextBuilderBindings = Array.isArray(node.config.input_bindings)
+      ? node.config.input_bindings.filter((binding): binding is Record<string, unknown> => isRecord(binding))
+      : [];
+    const configuredPlaceholders = uniqueStrings(
+      contextBuilderBindings
+        .map((binding) => asString(binding.placeholder) ?? "")
+        .filter((placeholder) => placeholder.length > 0),
+    );
+    const connectedSourceCount = uniqueStrings(
+      graph?.edges.filter((edge) => edge.target_id === node.id).map((edge) => edge.source_id) ?? [],
+    ).length;
     return {
       title: node.label,
       eyebrow: `${node.category} / ${node.kind}`,
@@ -364,13 +381,52 @@ export function buildNodeTooltip(
         {
           title: "Configuration",
           rows: [
-            { label: "Mode", value: isDisplayNode ? "display envelope passthrough" : (asString(node.config.mode) ?? "passthrough") },
-            { label: "Template", value: isDisplayNode ? "Disabled for display-only provider" : truncate(asString(node.config.template) ?? "{input_payload}") },
+            {
+              label: "Mode",
+              value: isDisplayNode
+                ? "display envelope passthrough"
+                : isPromptBlockNode
+                  ? "prompt block"
+                : isContextBuilderNode
+                  ? "context builder"
+                  : (asString(node.config.mode) ?? "passthrough"),
+            },
+            {
+              label: "Template",
+              value: isDisplayNode
+                ? "Disabled for display-only provider"
+                : isPromptBlockNode
+                  ? truncate(asString(node.config.content) ?? "")
+                : isContextBuilderNode
+                  ? truncate(asString(node.config.template) ?? "Generated from connected placeholders")
+                  : truncate(asString(node.config.template) ?? "{input_payload}"),
+            },
+            ...(isPromptBlockNode
+              ? [
+                  { label: "Role", value: asString(node.config.role) ?? "user" },
+                  { label: "Name", value: asString(node.config.name) ?? "None" },
+                ]
+              : []),
+            ...(isContextBuilderNode
+              ? [
+                  { label: "Connected Inputs", value: String(connectedSourceCount) },
+                  {
+                    label: "Placeholders",
+                    value: configuredPlaceholders.length > 0 ? formatList(configuredPlaceholders) : "Derived from connected node labels",
+                  },
+                ]
+              : []),
           ],
         },
         ...baseSections,
       ],
       parameters: [],
+      emptyState:
+        isPromptBlockNode && !(asString(node.config.content) ?? "").trim()
+          ? "Add prompt content, then bind this node into a Context Builder or model."
+          : isContextBuilderNode && connectedSourceCount === 0
+          ? "Connect one or more upstream text nodes to start composing a shared prompt block."
+          : undefined,
     };
   }
 

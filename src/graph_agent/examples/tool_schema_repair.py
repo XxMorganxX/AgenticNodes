@@ -275,6 +275,52 @@ def build_example_services() -> RuntimeServices:
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="core.context_builder",
+            display_name="Context Builder",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Collects text from multiple upstream nodes and renders it into one reusable prompt or context block.",
+            capabilities=["multi-input prompt composition", "named placeholders", "templated context assembly"],
+            default_config={
+                "mode": "context_builder",
+                "template": "",
+                "input_bindings": [],
+                "joiner": "\n\n",
+            },
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="core.prompt_block",
+            display_name="Prompt Block",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Defines a single system, user, or assistant prompt message as a reusable binding-only block.",
+            capabilities=["single prompt authoring", "message role selection", "binding-only model context"],
+            default_config={
+                "mode": "prompt_block",
+                "role": "user",
+                "content": "",
+                "name": "",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="role",
+                    label="Message Role",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="system", label="system"),
+                        ProviderConfigOptionDefinition(value="user", label="user"),
+                        ProviderConfigOptionDefinition(value="assistant", label="assistant"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(key="name", label="Message Name"),
+                ProviderConfigFieldDefinition(key="content", label="Message Content", input_type="textarea"),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.data_display",
             display_name="Envelope Display Node",
             category=NodeCategory.DATA,
