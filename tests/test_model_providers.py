@@ -17,7 +17,7 @@ if str(SRC) not in sys.path:
 
 from graph_agent.api.manager import GraphRunManager
 from graph_agent.examples.tool_schema_repair import build_example_graph_payload, build_example_services
-from graph_agent.providers.base import ModelMessage, ModelRequest, ModelToolDefinition
+from graph_agent.providers.base import ModelMessage, ModelRequest, ModelToolCall, ModelToolDefinition
 from graph_agent.providers.base import ModelProvider, ModelResponse, ProviderPreflightResult
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
@@ -253,6 +253,27 @@ class ContextEchoProvider(ModelProvider):
                 "system_prompt": system_prompt,
                 "mcp_tool_context": request.metadata.get("mcp_tool_context"),
             },
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
+class McpDispatchProvider(ModelProvider):
+    name = "mcp_dispatch"
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            content="",
+            structured_output={"location": "Austin"},
+            tool_calls=[
+                ModelToolCall(
+                    tool_name="weather_current",
+                    arguments={"location": "Austin"},
+                    provider_tool_id="provider-tool-1",
+                    metadata={},
+                )
+            ],
         )
 
     def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
@@ -578,7 +599,7 @@ class ModelProviderTests(unittest.TestCase):
         finally:
             manager.stop_background_services()
 
-    def test_model_nodes_receive_tool_node_mcp_context_in_system_prompt(self) -> None:
+    def test_model_nodes_receive_mcp_context_provider_in_system_prompt(self) -> None:
         services = build_example_services()
         services.model_providers["context_echo"] = ContextEchoProvider()
         runtime = GraphRuntime(
@@ -604,14 +625,13 @@ class ModelProviderTests(unittest.TestCase):
                     "position": {"x": 0, "y": 0},
                 },
                 {
-                    "id": "weather_tool",
-                    "kind": "tool",
+                    "id": "weather_context",
+                    "kind": "mcp_context_provider",
                     "category": "tool",
-                    "label": "Weather Tool",
-                    "provider_id": "tool.registry",
-                    "provider_label": "Registry Tool Node",
-                    "tool_name": "weather_current",
-                    "config": {"tool_name": "weather_current", "include_mcp_tool_context": True},
+                    "label": "Weather Context",
+                    "provider_id": "tool.mcp_context_provider",
+                    "provider_label": "MCP Context Provider",
+                    "config": {"tool_names": ["weather_current"], "include_mcp_tool_context": True},
                     "position": {"x": 100, "y": 0},
                 },
                 {
@@ -629,7 +649,6 @@ class ModelProviderTests(unittest.TestCase):
                         "system_prompt": "Use the MCP context.",
                         "user_message_template": "{mcp_tool_context}",
                         "response_mode": "message",
-                        "tool_target_node_ids": ["weather_tool"],
                     },
                     "position": {"x": 200, "y": 0},
                 },
@@ -646,6 +665,16 @@ class ModelProviderTests(unittest.TestCase):
             ],
             "edges": [
                 {"id": "e1", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "ctx-binding",
+                    "source_id": "weather_context",
+                    "target_id": "model",
+                    "source_handle_id": "tool-context",
+                    "target_handle_id": "api-tool-context",
+                    "label": "tool context",
+                    "kind": "binding",
+                    "priority": 0,
+                },
                 {"id": "e2", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
             ],
         }
@@ -668,10 +697,184 @@ class ModelProviderTests(unittest.TestCase):
                     assert isinstance(tool_context, dict)
                     self.assertEqual(tool_context["tool_names"], ["weather_current"])
                     self.assertEqual(tool_context["tool_nodes"][0]["tool_name"], "weather_current")
-                    self.assertEqual(tool_context["tool_nodes"][0]["tool_node_id"], "weather_tool")
+                    self.assertEqual(tool_context["tool_nodes"][0]["tool_node_id"], "weather_context")
                     self.assertEqual(tool_context["tool_nodes"][0]["server"]["server_id"], "weather_mcp")
             finally:
                 manager.stop_background_services()
+
+    def test_mcp_executor_dispatches_selected_mcp_tool(self) -> None:
+        services = build_example_services()
+        services.model_providers["mcp_dispatch"] = McpDispatchProvider()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "mcp-executor-graph",
+            "name": "MCP Executor Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "weather_context",
+                    "kind": "mcp_context_provider",
+                    "category": "tool",
+                    "label": "Weather Context",
+                    "provider_id": "tool.mcp_context_provider",
+                    "provider_label": "MCP Context Provider",
+                    "config": {"tool_names": ["weather_current"], "include_mcp_tool_context": False},
+                    "position": {"x": 120, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "mcp_dispatch",
+                    "prompt_name": "dispatch_prompt",
+                    "config": {
+                        "provider_name": "mcp_dispatch",
+                        "prompt_name": "dispatch_prompt",
+                        "system_prompt": "Call the MCP weather tool.",
+                        "user_message_template": "{input_payload}",
+                        "response_mode": "tool_call",
+                    },
+                    "position": {"x": 240, "y": 0},
+                },
+                {
+                    "id": "executor",
+                    "kind": "mcp_tool_executor",
+                    "category": "tool",
+                    "label": "Executor",
+                    "provider_id": "tool.mcp_tool_executor",
+                    "provider_label": "MCP Tool Executor",
+                    "config": {},
+                    "position": {"x": 420, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_payload", "source": "executor"}},
+                    "position": {"x": 600, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "start-model", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "ctx-binding",
+                    "source_id": "weather_context",
+                    "target_id": "model",
+                    "source_handle_id": "tool-context",
+                    "target_handle_id": "api-tool-context",
+                    "label": "tool context",
+                    "kind": "binding",
+                    "priority": 0,
+                },
+                {"id": "model-executor", "source_id": "model", "target_id": "executor", "label": "", "kind": "standard", "priority": 100},
+                {"id": "executor-finish", "source_id": "executor", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-executor")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertEqual(payload["resolved_location"], "Testville")
+                    self.assertEqual(payload["condition"], "Partly cloudy")
+            finally:
+                manager.stop_background_services()
+
+    def test_model_validation_rejects_non_context_tool_targets(self) -> None:
+        services = build_example_services()
+        graph_payload = {
+            "graph_id": "invalid-context-target",
+            "name": "Invalid MCP Context Target",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "executor",
+                    "kind": "mcp_tool_executor",
+                    "category": "tool",
+                    "label": "Executor",
+                    "provider_id": "tool.mcp_tool_executor",
+                    "provider_label": "MCP Tool Executor",
+                    "config": {},
+                    "position": {"x": 120, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "mock",
+                    "prompt_name": "invalid_context",
+                    "config": {
+                        "provider_name": "mock",
+                        "prompt_name": "invalid_context",
+                        "system_prompt": "Invalid target",
+                        "user_message_template": "{input_payload}",
+                        "response_mode": "tool_call",
+                        "tool_target_node_ids": ["executor"],
+                    },
+                    "position": {"x": 240, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_envelope", "source": "model"}},
+                    "position": {"x": 360, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {"id": "e2", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+        with self.assertRaises(GraphValidationError):
+            GraphDefinition.from_dict(graph_payload).validate_against_services(services)
 
     def test_graphs_can_swap_between_registered_model_providers(self) -> None:
         services = build_example_services()

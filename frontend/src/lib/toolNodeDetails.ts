@@ -62,8 +62,11 @@ export function resolveToolNodeDetails(
   catalog: EditorCatalog | null,
   graph: GraphDefinition | null,
 ): ResolvedToolNodeDetails {
+  const configuredToolNames = Array.isArray(node.config.tool_names)
+    ? node.config.tool_names.map((toolName) => String(toolName)).filter((toolName) => toolName.trim().length > 0)
+    : [];
   const toolName =
-    (typeof node.config.tool_name === "string" && node.config.tool_name) || node.tool_name || "";
+    (typeof node.config.tool_name === "string" && node.config.tool_name) || node.tool_name || configuredToolNames[0] || "";
   const tool = catalog?.tools.find((candidate) => candidate.name === toolName) ?? null;
   const fallbackDescription = tool?.description ?? node.description ?? "";
   const fallbackSchemaText = JSON.stringify(tool?.input_schema ?? {}, null, 2);

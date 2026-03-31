@@ -244,6 +244,27 @@ def build_example_services() -> RuntimeServices:
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="tool.mcp_context_provider",
+            display_name="MCP Context Provider",
+            category=NodeCategory.TOOL,
+            node_kind="mcp_context_provider",
+            description="Registers MCP tools for a connected API node and optionally injects MCP metadata into the runtime system prompt.",
+            capabilities=["mcp tool registration", "system prompt context"],
+            default_config={"tool_names": [], "include_mcp_tool_context": False},
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="tool.mcp_tool_executor",
+            display_name="MCP Tool Executor",
+            category=NodeCategory.TOOL,
+            node_kind="mcp_tool_executor",
+            description="Consumes an API tool-call envelope and dispatches the selected MCP tool with success and failure routes.",
+            capabilities=["mcp tool dispatch", "success routing", "failure routing"],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.data",
             display_name="Core Data Node",
             category=NodeCategory.DATA,
@@ -322,7 +343,6 @@ def build_example_graph_payload() -> dict[str, object]:
                     "response_mode": "tool_call",
                     "preferred_tool_name": "search_catalog",
                     "allowed_tool_names": ["search_catalog"],
-                    "tool_target_node_ids": ["run_tool"],
                     "metadata_bindings": {
                         "user_request": {"type": "latest_payload", "source": "start"},
                     },
@@ -367,7 +387,6 @@ def build_example_graph_payload() -> dict[str, object]:
                     "response_mode": "tool_call",
                     "preferred_tool_name": "search_catalog",
                     "allowed_tool_names": ["search_catalog"],
-                    "tool_target_node_ids": ["run_tool"],
                     "metadata_bindings": {
                         "user_request": {"type": "latest_payload", "source": "start"},
                         "tool_error": {"type": "latest_error", "source": "run_tool"},

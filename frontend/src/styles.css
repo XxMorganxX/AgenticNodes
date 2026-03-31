@@ -1188,6 +1188,11 @@ pre {
   filter: drop-shadow(0 0 10px rgba(255, 128, 157, 0.45));
 }
 
+.graph-draft-wire-path--tool-context {
+  stroke: #7eb8ff;
+  filter: drop-shadow(0 0 10px rgba(111, 181, 255, 0.45));
+}
+
 .graph-drawer {
   position: fixed;
   top: 1rem;
@@ -1750,8 +1755,20 @@ pre {
   padding: 0.9rem 1rem;
 }
 
+.graph-node-card--model-inputs {
+  min-height: 196px;
+}
+
+.graph-node-card--model-inputs .graph-node-card-inner {
+  padding-left: 5.5rem;
+}
+
 .graph-node-card--tool-outputs .graph-node-card-inner {
   padding-right: 8rem;
+}
+
+.graph-node-card--tool-context-provider .graph-node-card-inner {
+  padding-right: 7rem;
 }
 
 .graph-node-header {
@@ -1996,6 +2013,15 @@ pre {
   --graph-handle-halo: rgba(255, 128, 157, 0.16);
 }
 
+.graph-node-handle-source--context,
+.graph-node-handle-target--context {
+  --graph-handle-border: rgba(126, 184, 255, 0.94);
+  --graph-handle-border-active: rgba(226, 242, 255, 1);
+  --graph-handle-glow: rgba(111, 181, 255, 0.34);
+  --graph-handle-glow-active: rgba(111, 181, 255, 0.5);
+  --graph-handle-halo: rgba(111, 181, 255, 0.16);
+}
+
 .graph-node-output-port {
   position: absolute;
   right: 18px;
@@ -2030,6 +2056,20 @@ pre {
   border-color: rgba(255, 128, 157, 0.34);
   color: #ffc1d1;
   background: rgba(40, 20, 30, 0.95);
+}
+
+.graph-node-output-port--context .graph-node-output-port-label {
+  border-color: rgba(111, 181, 255, 0.34);
+  color: #cce3ff;
+  background: rgba(19, 28, 46, 0.95);
+}
+
+.graph-node-input-port {
+  position: absolute;
+  left: 18px;
+  transform: translateY(-50%);
+  pointer-events: none;
+  z-index: 2;
 }
 
 .graph-node-card:hover .graph-node-handle,

@@ -350,10 +350,28 @@ class NodeContext:
             definitions.append(self._apply_tool_node_overrides(tool.name, tool.to_dict()))
         return definitions
 
+    def _configured_tool_names(self, node: BaseNode) -> list[str]:
+        tool_names: list[str] = []
+        raw_tool_names = node.config.get("tool_names", [])
+        if isinstance(raw_tool_names, Sequence) and not isinstance(raw_tool_names, (str, bytes)):
+            tool_names.extend(str(tool_name).strip() for tool_name in raw_tool_names if str(tool_name).strip())
+        configured_name = str(node.config.get("tool_name", "") or getattr(node, "tool_name", "")).strip()
+        if configured_name:
+            tool_names.append(configured_name)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for tool_name in tool_names:
+            if tool_name in seen:
+                continue
+            seen.add(tool_name)
+            deduped.append(tool_name)
+        return deduped
+
     def _matching_tool_node(self, tool_name: str) -> BaseNode | None:
         for node in self.graph.nodes.values():
-            configured_name = str(node.config.get("tool_name", "") or getattr(node, "tool_name", ""))
-            if node.kind == "tool" and configured_name == tool_name:
+            if node.kind not in {"tool", "mcp_context_provider"}:
+                continue
+            if tool_name in self._configured_tool_names(node):
                 return node
         return None
 
@@ -507,35 +525,33 @@ class NodeContext:
                 continue
             seen_tool_ids.add(tool_node_id)
             candidate = self.graph.nodes.get(tool_node_id)
-            if not isinstance(candidate, ToolNode):
+            if not isinstance(candidate, McpContextProviderNode):
                 continue
             if not bool(candidate.config.get("include_mcp_tool_context", False)):
                 continue
-            tool_name = str(candidate.config.get("tool_name", "") or candidate.tool_name).strip()
-            if not tool_name:
-                continue
-            registry_tool = self.services.tool_registry.get_optional(tool_name)
-            if registry_tool is None or registry_tool.source_type != "mcp":
-                continue
-            model_tool_definition = self._apply_tool_node_overrides(tool_name, registry_tool.to_dict())
-            prompt_blocks.append(str(model_tool_definition.get("description", "")).strip())
-            server = None
-            if registry_tool.server_id and self.services.mcp_server_manager is not None:
-                try:
-                    server = self.services.mcp_server_manager.get_server(registry_tool.server_id)
-                    server_ids.add(registry_tool.server_id)
-                except KeyError:
-                    server = None
-            context_tools.append(
-                {
-                    "tool_node_id": candidate.id,
-                    "tool_node_label": candidate.label,
-                    "tool_name": tool_name,
-                    "tool": registry_tool.to_dict(),
-                    "model_tool_definition": model_tool_definition,
-                    "server": server,
-                }
-            )
+            for tool_name in self._configured_tool_names(candidate):
+                registry_tool = self.services.tool_registry.get_optional(tool_name)
+                if registry_tool is None or registry_tool.source_type != "mcp":
+                    continue
+                model_tool_definition = self._apply_tool_node_overrides(tool_name, registry_tool.to_dict())
+                prompt_blocks.append(str(model_tool_definition.get("description", "")).strip())
+                server = None
+                if registry_tool.server_id and self.services.mcp_server_manager is not None:
+                    try:
+                        server = self.services.mcp_server_manager.get_server(registry_tool.server_id)
+                        server_ids.add(registry_tool.server_id)
+                    except KeyError:
+                        server = None
+                context_tools.append(
+                    {
+                        "tool_node_id": candidate.id,
+                        "tool_node_label": candidate.label,
+                        "tool_name": tool_name,
+                        "tool": registry_tool.to_dict(),
+                        "model_tool_definition": model_tool_definition,
+                        "server": server,
+                    }
+                )
 
         if not context_tools:
             return None
@@ -560,6 +576,31 @@ class NodeContext:
                 "node_id": target_node_id,
             },
         }
+
+    def mcp_tool_definitions_for_model(self, node_id: str | None = None) -> list[dict[str, Any]]:
+        target_node_id = node_id or self.node_id
+        target_node = self.graph.nodes.get(target_node_id)
+        if not isinstance(target_node, ModelNode):
+            return []
+        definitions_by_name: dict[str, dict[str, Any]] = {}
+        candidate_tool_ids: list[str] = []
+        configured_target_ids = target_node.config.get("tool_target_node_ids", [])
+        if isinstance(configured_target_ids, Sequence) and not isinstance(configured_target_ids, (str, bytes)):
+            candidate_tool_ids.extend(str(tool_id) for tool_id in configured_target_ids if str(tool_id).strip())
+        for edge in self.graph.get_incoming_edges(target_node_id):
+            if edge.kind != "binding":
+                continue
+            candidate_tool_ids.append(str(edge.source_id))
+        for tool_node_id in candidate_tool_ids:
+            candidate = self.graph.nodes.get(tool_node_id)
+            if not isinstance(candidate, McpContextProviderNode):
+                continue
+            for tool_name in self._configured_tool_names(candidate):
+                registry_tool = self.services.tool_registry.get_optional(tool_name)
+                if registry_tool is None or registry_tool.source_type != "mcp":
+                    continue
+                definitions_by_name[tool_name] = self._apply_tool_node_overrides(tool_name, registry_tool.to_dict())
+        return list(definitions_by_name.values())
 
 
 class BaseNode(ABC):
@@ -802,6 +843,13 @@ class ModelNode(BaseNode):
             metadata["mcp_tool_context_prompt"] = mcp_tool_context.get("rendered_prompt_text", "")
         allowed_tool_names = list(self.config.get("allowed_tool_names", []))
         available_tool_payloads = context.available_tool_definitions(allowed_tool_names)
+        for tool_definition in context.mcp_tool_definitions_for_model(self.id):
+            tool_name = str(tool_definition.get("name", "")).strip()
+            if not tool_name:
+                continue
+            if any(str(existing.get("name", "")).strip() == tool_name for existing in available_tool_payloads):
+                continue
+            available_tool_payloads.append(tool_definition)
         available_tools = [
             ModelToolDefinition(
                 name=str(tool.get("name", "")),
@@ -862,12 +910,12 @@ class ModelNode(BaseNode):
                     "arguments": tool_call.arguments,
                     "provider_tool_id": tool_call.provider_tool_id,
                     "metadata": dict(tool_call.metadata),
-                    "tool_target_node_ids": list(self.config.get("tool_target_node_ids", [])),
                 }
                 for tool_call in response.tool_calls
             ]
             if not normalized_tool_calls and response.structured_output is not None:
-                target_tool = self.config.get("preferred_tool_name") or (allowed_tool_names[0] if allowed_tool_names else None)
+                available_tool_names = [str(tool.get("name", "")).strip() for tool in available_tool_payloads if str(tool.get("name", "")).strip()]
+                target_tool = self.config.get("preferred_tool_name") or (available_tool_names[0] if available_tool_names else None)
                 if target_tool:
                     normalized_tool_calls = [
                         {
@@ -875,7 +923,6 @@ class ModelNode(BaseNode):
                             "arguments": response.structured_output,
                             "provider_tool_id": None,
                             "metadata": {"fallback": True},
-                            "tool_target_node_ids": list(self.config.get("tool_target_node_ids", [])),
                         }
                     ]
             envelope.tool_calls = normalized_tool_calls
@@ -977,6 +1024,175 @@ class ToolNode(BaseNode):
         return payload
 
 
+class McpContextProviderNode(BaseNode):
+    kind = "mcp_context_provider"
+
+    def __init__(
+        self,
+        node_id: str,
+        label: str,
+        provider_id: str = "tool.mcp_context_provider",
+        provider_label: str = "MCP Context Provider",
+        description: str = "",
+        config: Mapping[str, Any] | None = None,
+        position: Mapping[str, Any] | None = None,
+    ) -> None:
+        tool_names: list[str] = []
+        raw_config = dict(config or {})
+        raw_tool_names = raw_config.get("tool_names", [])
+        if isinstance(raw_tool_names, Sequence) and not isinstance(raw_tool_names, (str, bytes)):
+            tool_names.extend(str(tool_name).strip() for tool_name in raw_tool_names if str(tool_name).strip())
+        fallback_tool_name = str(raw_config.get("tool_name", "")).strip()
+        if fallback_tool_name and fallback_tool_name not in tool_names:
+            tool_names.append(fallback_tool_name)
+        merged_config = {
+            "tool_names": tool_names,
+            "include_mcp_tool_context": bool(raw_config.get("include_mcp_tool_context", False)),
+            **raw_config,
+        }
+        super().__init__(
+            node_id=node_id,
+            label=label,
+            category=NodeCategory.TOOL,
+            provider_id=provider_id,
+            provider_label=provider_label,
+            description=description,
+            config=merged_config,
+            position=position,
+        )
+
+    def execute(self, context: NodeContext) -> NodeExecutionResult:
+        output = {
+            "tool_names": list(self.config.get("tool_names", [])),
+            "include_mcp_tool_context": bool(self.config.get("include_mcp_tool_context", False)),
+        }
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=output,
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "binding_only": True,
+            },
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary=f"MCP context provider '{self.label}' prepared context metadata.",
+            metadata=envelope.metadata,
+        )
+
+
+class McpToolExecutorNode(BaseNode):
+    kind = "mcp_tool_executor"
+
+    def __init__(
+        self,
+        node_id: str,
+        label: str,
+        provider_id: str = "tool.mcp_tool_executor",
+        provider_label: str = "MCP Tool Executor",
+        description: str = "",
+        config: Mapping[str, Any] | None = None,
+        position: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            node_id=node_id,
+            label=label,
+            category=NodeCategory.TOOL,
+            provider_id=provider_id,
+            provider_label=provider_label,
+            description=description,
+            config=config,
+            position=position,
+        )
+
+    def execute(self, context: NodeContext) -> NodeExecutionResult:
+        bound_value = context.resolve_binding(self.config.get("input_binding"))
+        tool_call = None
+        if isinstance(bound_value, Mapping) and "tool_calls" in bound_value:
+            tool_calls = list(bound_value.get("tool_calls", []))
+            if tool_calls:
+                tool_call = tool_calls[0]
+        tool_name = str((tool_call or {}).get("tool_name", "")).strip()
+        payload = (tool_call or {}).get("arguments", {})
+        if isinstance(bound_value, Mapping) and "payload" in bound_value and not tool_name:
+            payload = bound_value.get("payload")
+        if not isinstance(payload, Mapping):
+            payload = {}
+        if not tool_name:
+            error = {"type": "missing_tool_call", "node_id": self.id, "message": "No MCP tool call was available to dispatch."}
+            envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id=self.id,
+                from_category=self.category.value,
+                payload=None,
+                errors=[error],
+                metadata={"contract": "tool_result_envelope", "node_kind": self.kind},
+            )
+            return NodeExecutionResult(
+                status="failed",
+                output=envelope.to_dict(),
+                error=error,
+                summary=f"MCP executor '{self.label}' did not receive a tool call.",
+                metadata=envelope.metadata,
+            )
+        try:
+            tool_definition = context.services.tool_registry.require_invocable(tool_name)
+            if tool_definition.source_type != "mcp":
+                raise ValueError(f"Tool '{tool_name}' is not an MCP tool.")
+            tool_context = ToolContext(
+                run_id=context.state.run_id,
+                graph_id=context.state.graph_id,
+                node_id=context.node_id,
+                state_snapshot=context.state.snapshot(),
+            )
+            tool_result = context.services.tool_registry.invoke(tool_name, payload, tool_context)
+            envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id=self.id,
+                from_category=self.category.value,
+                payload=tool_result.output,
+                errors=[tool_result.error] if tool_result.error else [],
+                metadata={
+                    "contract": "tool_result_envelope",
+                    "node_kind": self.kind,
+                    "tool_name": tool_name,
+                    **tool_result.metadata,
+                },
+            )
+            return NodeExecutionResult(
+                status=tool_result.status,
+                output=envelope.to_dict(),
+                error=tool_result.error,
+                summary=tool_result.summary or f"MCP tool '{tool_name}' completed.",
+                metadata=envelope.metadata,
+            )
+        except (KeyError, ValueError) as exc:
+            error = {"type": "mcp_tool_dispatch_error", "node_id": self.id, "tool_name": tool_name, "message": str(exc)}
+            envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id=self.id,
+                from_category=self.category.value,
+                payload=None,
+                errors=[error],
+                metadata={
+                    "contract": "tool_result_envelope",
+                    "node_kind": self.kind,
+                    "tool_name": tool_name,
+                },
+            )
+            return NodeExecutionResult(
+                status="failed",
+                output=envelope.to_dict(),
+                error=error,
+                summary=f"MCP executor '{self.label}' could not dispatch '{tool_name}'.",
+                metadata=envelope.metadata,
+            )
+
+
 class OutputNode(BaseNode):
     kind = "output"
 
@@ -1051,10 +1267,30 @@ def _node_from_dict(payload: Mapping[str, Any]) -> BaseNode:
             **common,
         )
     if kind == "tool":
+        config_payload = payload.get("config", {})
+        include_mcp_context = bool(config_payload.get("include_mcp_tool_context", False)) if isinstance(config_payload, Mapping) else False
+        if include_mcp_context:
+            return McpContextProviderNode(
+                provider_id=str(payload.get("provider_id", "tool.mcp_context_provider")),
+                provider_label=str(payload.get("provider_label", "MCP Context Provider")),
+                **common,
+            )
         return ToolNode(
             tool_name=str(payload.get("tool_name") or payload.get("config", {}).get("tool_name", "")),
             provider_id=str(payload.get("provider_id", "tool.registry")),
             provider_label=str(payload.get("provider_label", "Registry Tool Node")),
+            **common,
+        )
+    if kind == "mcp_context_provider":
+        return McpContextProviderNode(
+            provider_id=str(payload.get("provider_id", "tool.mcp_context_provider")),
+            provider_label=str(payload.get("provider_label", "MCP Context Provider")),
+            **common,
+        )
+    if kind == "mcp_tool_executor":
+        return McpToolExecutorNode(
+            provider_id=str(payload.get("provider_id", "tool.mcp_tool_executor")),
+            provider_label=str(payload.get("provider_label", "MCP Tool Executor")),
             **common,
         )
     if kind == "output":
@@ -1198,18 +1434,10 @@ class GraphDefinition:
                         services.tool_registry.require_exposable(str(tool_name))
                     except (KeyError, ValueError) as exc:
                         raise GraphValidationError(str(exc)) from exc
+                mcp_context_tool_names: list[str] = []
                 response_mode = str(node.config.get("response_mode", "message"))
-                if response_mode == "tool_call" and not allowed_tool_names and not isinstance(
-                    node.config.get("response_schema"), Mapping
-                ):
-                    raise GraphValidationError(
-                        f"Model node '{node.id}' uses tool_call mode but does not expose any allowed tools."
-                    )
-                preferred_tool_name = str(node.config.get("preferred_tool_name", "") or "").strip()
-                if preferred_tool_name and allowed_tool_names and preferred_tool_name not in allowed_tool_names:
-                    raise GraphValidationError(
-                        f"Model node '{node.id}' prefers tool '{preferred_tool_name}', but it is not in allowed_tool_names."
-                    )
+                candidate_context_nodes: list[McpContextProviderNode] = []
+                seen_context_node_ids: set[str] = set()
                 tool_target_node_ids = node.config.get("tool_target_node_ids", [])
                 if tool_target_node_ids:
                     if not isinstance(tool_target_node_ids, Sequence) or isinstance(tool_target_node_ids, (str, bytes)):
@@ -1218,15 +1446,72 @@ class GraphDefinition:
                         )
                     for target_node_id in tool_target_node_ids:
                         target_node = self.nodes.get(str(target_node_id))
-                        if not isinstance(target_node, ToolNode):
+                        if not isinstance(target_node, McpContextProviderNode):
                             raise GraphValidationError(
-                                f"Model node '{node.id}' references unknown tool target node '{target_node_id}'."
+                                f"Model node '{node.id}' references unknown MCP context provider node '{target_node_id}'."
                             )
+                        if target_node.id not in seen_context_node_ids:
+                            candidate_context_nodes.append(target_node)
+                            seen_context_node_ids.add(target_node.id)
+                for edge in self.get_incoming_edges(node.id):
+                    if edge.kind != "binding":
+                        continue
+                    source_node = self.nodes.get(edge.source_id)
+                    if isinstance(source_node, McpContextProviderNode) and source_node.id not in seen_context_node_ids:
+                        candidate_context_nodes.append(source_node)
+                        seen_context_node_ids.add(source_node.id)
+                for target_node in candidate_context_nodes:
+                    tool_names = target_node.config.get("tool_names", [])
+                    if not isinstance(tool_names, Sequence) or isinstance(tool_names, (str, bytes)):
+                        raise GraphValidationError(
+                            f"MCP context provider '{target_node.id}' must declare tool_names as a list."
+                        )
+                    for tool_name in tool_names:
+                        tool_name_str = str(tool_name).strip()
+                        if not tool_name_str:
+                            continue
+                        try:
+                            tool_definition = services.tool_registry.require_exposable(tool_name_str)
+                        except (KeyError, ValueError) as exc:
+                            raise GraphValidationError(str(exc)) from exc
+                        if tool_definition.source_type != "mcp":
+                            raise GraphValidationError(
+                                f"MCP context provider '{target_node.id}' references non-MCP tool '{tool_name_str}'."
+                            )
+                        mcp_context_tool_names.append(tool_name_str)
+                combined_tool_names = [*allowed_tool_names, *[tool_name for tool_name in mcp_context_tool_names if tool_name not in allowed_tool_names]]
+                if response_mode == "tool_call" and not combined_tool_names and not isinstance(node.config.get("response_schema"), Mapping):
+                    raise GraphValidationError(
+                        f"Model node '{node.id}' uses tool_call mode but does not expose any allowed tools."
+                    )
+                preferred_tool_name = str(node.config.get("preferred_tool_name", "") or "").strip()
+                if preferred_tool_name and combined_tool_names and preferred_tool_name not in combined_tool_names:
+                    raise GraphValidationError(
+                        f"Model node '{node.id}' prefers tool '{preferred_tool_name}', but it is not exposed to the node."
+                    )
             if node.kind == "tool":
                 try:
                     services.tool_registry.require_invocable(str(node.config.get("tool_name", "")))
                 except (KeyError, ValueError) as exc:
                     raise GraphValidationError(str(exc)) from exc
+            if node.kind == "mcp_context_provider":
+                tool_names = node.config.get("tool_names", [])
+                if not isinstance(tool_names, Sequence) or isinstance(tool_names, (str, bytes)):
+                    raise GraphValidationError(f"MCP context provider '{node.id}' must declare tool_names as a list.")
+                if not [str(tool_name).strip() for tool_name in tool_names if str(tool_name).strip()]:
+                    raise GraphValidationError(f"MCP context provider '{node.id}' must register at least one MCP tool.")
+                for tool_name in tool_names:
+                    tool_name_str = str(tool_name).strip()
+                    if not tool_name_str:
+                        continue
+                    try:
+                        tool_definition = services.tool_registry.require_exposable(tool_name_str)
+                    except (KeyError, ValueError) as exc:
+                        raise GraphValidationError(str(exc)) from exc
+                    if tool_definition.source_type != "mcp":
+                        raise GraphValidationError(
+                            f"MCP context provider '{node.id}' references non-MCP tool '{tool_name_str}'."
+                        )
 
     def _resolve_provider_binding(self, node: BaseNode) -> ProviderNode | None:
         binding_node_id = str(node.config.get("provider_binding_node_id", "")).strip()

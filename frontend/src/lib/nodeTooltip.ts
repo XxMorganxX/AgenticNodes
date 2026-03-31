@@ -266,6 +266,46 @@ export function buildNodeTooltip(
     };
   }
 
+  if (node.kind === "mcp_context_provider") {
+    const toolNames = Array.isArray(node.config.tool_names) ? node.config.tool_names.map((toolName) => String(toolName)) : [];
+    return {
+      title: node.label,
+      eyebrow: `${node.category} / ${node.kind}`,
+      description: node.description,
+      sections: [
+        {
+          title: "MCP Context",
+          rows: [
+            { label: "Registered Tools", value: toolNames.length > 0 ? formatList(toolNames) : "None selected" },
+            { label: "Inject Prompt Context", value: node.config.include_mcp_tool_context ? "Enabled" : "Disabled" },
+          ],
+        },
+        ...baseSections,
+      ],
+      parameters: [],
+      emptyState: toolNames.length > 0 ? undefined : "Select one or more MCP tools to expose through this context provider.",
+    };
+  }
+
+  if (node.kind === "mcp_tool_executor") {
+    return {
+      title: node.label,
+      eyebrow: `${node.category} / ${node.kind}`,
+      description: node.description,
+      sections: [
+        {
+          title: "MCP Execution",
+          rows: [
+            { label: "Dispatch", value: "Single tool call from upstream API output" },
+            { label: "Routes", value: "On success / On failure" },
+          ],
+        },
+        ...baseSections,
+      ],
+      parameters: [],
+    };
+  }
+
   if (node.kind === "model") {
     const allowedTools = asStringArray(node.config.allowed_tool_names);
     const preferredTool = asString(node.config.preferred_tool_name);

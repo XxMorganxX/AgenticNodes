@@ -184,6 +184,24 @@ export function createNodeFromProvider(
     };
   }
 
+  if (provider.node_kind === "mcp_context_provider") {
+    const mcpToolNames = catalog.tools.filter((tool) => tool.source_type === "mcp").map((tool) => tool.name);
+    return {
+      ...baseNode,
+      config: {
+        tool_names: mcpToolNames.length > 0 ? [mcpToolNames[0]] : [],
+        include_mcp_tool_context: false,
+      },
+    };
+  }
+
+  if (provider.node_kind === "mcp_tool_executor") {
+    return {
+      ...baseNode,
+      config: {},
+    };
+  }
+
   if (provider.node_kind === "data") {
     const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
     return {
@@ -254,8 +272,18 @@ export function isWireJunctionNode(node: GraphNode | null | undefined): boolean 
   return Boolean(node && node.kind === "data" && node.config.is_wire_junction === true);
 }
 
+export function isRoutableToolNode(node: GraphNode | null | undefined): boolean {
+  return Boolean(node && (node.kind === "tool" || node.kind === "mcp_tool_executor"));
+}
+
+export function isMcpContextProviderNode(node: GraphNode | null | undefined): boolean {
+  return Boolean(node && node.kind === "mcp_context_provider");
+}
+
 export const TOOL_SUCCESS_HANDLE_ID = "tool-success";
 export const TOOL_FAILURE_HANDLE_ID = "tool-failure";
+export const TOOL_CONTEXT_HANDLE_ID = "tool-context";
+export const API_TOOL_CONTEXT_HANDLE_ID = "api-tool-context";
 
 export function defaultToolFailureCondition(edgeId: string): GraphEdge["condition"] {
   return {
@@ -268,17 +296,33 @@ export function defaultToolFailureCondition(edgeId: string): GraphEdge["conditio
 }
 
 export function inferToolEdgeSourceHandle(edge: GraphEdge, sourceNode: GraphNode | null | undefined): string | null {
-  if (!sourceNode || sourceNode.kind !== "tool") {
+  if (!sourceNode) {
     return edge.source_handle_id ?? null;
   }
-  if (edge.source_handle_id === TOOL_SUCCESS_HANDLE_ID || edge.source_handle_id === TOOL_FAILURE_HANDLE_ID) {
+  if (isMcpContextProviderNode(sourceNode)) {
+    return TOOL_CONTEXT_HANDLE_ID;
+  }
+  if (!isRoutableToolNode(sourceNode)) {
+    return edge.source_handle_id ?? null;
+  }
+  if (
+    edge.source_handle_id === TOOL_SUCCESS_HANDLE_ID ||
+    edge.source_handle_id === TOOL_FAILURE_HANDLE_ID
+  ) {
     return edge.source_handle_id;
   }
   return edge.kind === "conditional" ? TOOL_FAILURE_HANDLE_ID : TOOL_SUCCESS_HANDLE_ID;
 }
 
 export function getToolSourceHandleAnchorRatio(handleId: string | null | undefined): number {
+  if (handleId === TOOL_CONTEXT_HANDLE_ID) {
+    return 0.86;
+  }
   return handleId === TOOL_FAILURE_HANDLE_ID ? 0.68 : 0.4;
+}
+
+export function getApiToolContextTargetAnchorRatio(handleId: string | null | undefined): number {
+  return handleId === API_TOOL_CONTEXT_HANDLE_ID ? 0.82 : 0.26;
 }
 
 export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
@@ -290,6 +334,13 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
         ...node,
         config: { ...node.config },
       };
+      if (node.kind === "tool" && nextNode.config.include_mcp_tool_context === true) {
+        const legacyToolName = String(node.config.tool_name ?? node.tool_name ?? "").trim();
+        nextNode.kind = "mcp_context_provider";
+        nextNode.provider_id = "tool.mcp_context_provider";
+        nextNode.provider_label = "MCP Context Provider";
+        nextNode.config.tool_names = legacyToolName ? [legacyToolName] : [];
+      }
       if (node.kind === "model") {
         nextNode.model_provider_name = String(node.config.provider_name ?? node.model_provider_name ?? "");
         nextNode.prompt_name = String(node.config.prompt_name ?? node.prompt_name ?? "");
@@ -300,10 +351,15 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
       if (node.kind === "tool") {
         nextNode.tool_name = String(node.config.tool_name ?? node.tool_name ?? "");
       }
+      if (node.kind === "mcp_context_provider") {
+        const toolNames = Array.isArray(node.config.tool_names) ? node.config.tool_names : [];
+        nextNode.config.tool_names = toolNames.map((toolName) => String(toolName)).filter((toolName) => toolName.trim().length > 0);
+      }
       return nextNode;
     }),
     edges: graph.edges.map((edge) => ({
       ...edge,
+      target_handle_id: edge.target_handle_id ?? null,
       waypoints: edge.waypoints?.map((waypoint) => ({ ...waypoint })),
       condition: edge.kind === "conditional" ? edge.condition ?? defaultConditionalCondition(edge.id) : null,
     })),

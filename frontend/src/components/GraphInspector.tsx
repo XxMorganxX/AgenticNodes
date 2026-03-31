@@ -151,6 +151,11 @@ export function GraphInspector({
     const providerConfigFields = selectedProvider?.config_fields ?? [];
     const providerStatus = catalog?.provider_statuses?.[selectedProviderName];
     const catalogTools = catalog?.tools ?? [];
+    const mcpCatalogTools = catalogTools.filter((tool) => tool.source_type === "mcp");
+    const standardCatalogTools = catalogTools.filter((tool) => tool.source_type !== "mcp");
+    const selectedMcpToolNames = Array.isArray(selectedNode.config.tool_names)
+      ? (selectedNode.config.tool_names as string[])
+      : [];
     const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
     const isManualStartNode =
       selectedNode.kind === "input" &&
@@ -561,7 +566,7 @@ export function GraphInspector({
               </label>
               <div className="checkbox-grid">
                 <strong>Available Tools</strong>
-                {catalogTools.map((tool) => {
+                {standardCatalogTools.map((tool) => {
                   const isChecked = allowedTools.includes(tool.name);
                   const canSelectTool = isToolEnabled(tool) && isToolOnline(tool);
                   return (
@@ -627,45 +632,79 @@ export function GraphInspector({
                     )
                   }
                 >
-                  {catalogTools.map((tool) => (
+                  {standardCatalogTools.map((tool) => (
                     <option key={tool.name} value={tool.name}>
                       {tool.name} ({toolStatusLabel(tool)})
                     </option>
                   ))}
                 </select>
               </label>
-              {(() => {
-                const selectedTool = catalogTools.find(
-                  (tool) => tool.name === String(selectedNode.config.tool_name ?? selectedNode.tool_name ?? ""),
-                );
-                if (!selectedTool || selectedTool.source_type !== "mcp") {
-                  return null;
-                }
-                return (
-                  <label className="checkbox-option">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(selectedNode.config.include_mcp_tool_context)}
-                      onChange={(event) =>
-                        onGraphChange(
-                          updateNode(graph, selectedNode.id, (node) => ({
-                            ...node,
-                            config: {
-                              ...node.config,
-                              include_mcp_tool_context: event.target.checked,
-                            },
-                          })),
-                        )
-                      }
-                    />
-                    <span>
-                      Add MCP Context To Connected API Nodes
-                      <small>Inject this tool node's MCP metadata into the system prompt of connected or targeted API/model nodes and expose it as `mcp_tool_context`.</small>
-                    </span>
-                  </label>
-                );
-              })()}
             </>
+          ) : null}
+          {selectedNode.kind === "mcp_context_provider" ? (
+            <>
+              <div className="checkbox-grid">
+                <strong>Registered MCP Tools</strong>
+                {mcpCatalogTools.map((tool) => {
+                  const isChecked = selectedMcpToolNames.includes(tool.name);
+                  const canSelectTool = isToolEnabled(tool) && isToolOnline(tool);
+                  return (
+                    <label key={tool.name} className="checkbox-option">
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        disabled={!isChecked && !canSelectTool}
+                        onChange={(event) => {
+                          const nextTools = event.target.checked
+                            ? [...selectedMcpToolNames, tool.name]
+                            : selectedMcpToolNames.filter((name) => name !== tool.name);
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                tool_names: nextTools,
+                              },
+                            })),
+                          );
+                        }}
+                      />
+                      <span>
+                        {tool.name}
+                        <small>{toolStatusLabel(tool)}</small>
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+              <label className="checkbox-option">
+                <input
+                  type="checkbox"
+                  checked={Boolean(selectedNode.config.include_mcp_tool_context)}
+                  onChange={(event) =>
+                    onGraphChange(
+                      updateNode(graph, selectedNode.id, (node) => ({
+                        ...node,
+                        config: {
+                          ...node.config,
+                          include_mcp_tool_context: event.target.checked,
+                        },
+                      })),
+                    )
+                  }
+                />
+                <span>
+                  Add MCP Context To Connected API Nodes
+                  <small>Inject the registered MCP tool metadata from this node into connected or targeted API/model nodes at runtime.</small>
+                </span>
+              </label>
+            </>
+          ) : null}
+          {selectedNode.kind === "mcp_tool_executor" ? (
+            <div className="inspector-meta">
+              <span>Dispatch mode: single MCP tool call from upstream API output</span>
+              <span>Routes: on success / on failure</span>
+            </div>
           ) : null}
           {selectedNode.kind === "data" ? (
             <>
@@ -772,6 +811,7 @@ export function GraphInspector({
             >
               <option value="standard">standard</option>
               <option value="conditional">conditional</option>
+              <option value="binding">binding</option>
             </select>
           </label>
           <label>

@@ -3,7 +3,17 @@ import type { CSSProperties } from "react";
 import { Handle, Position } from "reactflow";
 import type { NodeProps } from "reactflow";
 
-import { getToolSourceHandleAnchorRatio, isWireJunctionNode, TOOL_FAILURE_HANDLE_ID, TOOL_SUCCESS_HANDLE_ID } from "../lib/editor";
+import {
+  API_TOOL_CONTEXT_HANDLE_ID,
+  getApiToolContextTargetAnchorRatio,
+  getToolSourceHandleAnchorRatio,
+  isMcpContextProviderNode,
+  isRoutableToolNode,
+  isWireJunctionNode,
+  TOOL_CONTEXT_HANDLE_ID,
+  TOOL_FAILURE_HANDLE_ID,
+  TOOL_SUCCESS_HANDLE_ID,
+} from "../lib/editor";
 import { warnGraphDiagnostic } from "../lib/dragDiagnostics";
 import { buildNodeTooltip } from "../lib/nodeTooltip";
 import type { NodeTooltipData } from "../lib/nodeTooltip";
@@ -30,6 +40,8 @@ const KIND_LABELS: Record<string, string> = {
   input: "IN",
   model: "AI",
   tool: "FX",
+  mcp_context_provider: "MC",
+  mcp_tool_executor: "MX",
   data: "DB",
   output: "OUT",
 };
@@ -63,7 +75,9 @@ function GraphCanvasNodeComponent({
     onJunctionPointerDown,
   } = data;
   const isWireJunction = isWireJunctionNode(node);
-  const isToolNode = node.kind === "tool";
+  const isRoutableTool = isRoutableToolNode(node);
+  const isContextProviderNode = isMcpContextProviderNode(node);
+  const isModelNode = node.kind === "model";
   let tooltip: NodeTooltipData = FALLBACK_TOOLTIP;
   if (tooltipVisible && !preview && !isWireJunction) {
     try {
@@ -85,14 +99,27 @@ function GraphCanvasNodeComponent({
   const failureHandleStyle = {
     top: `${getToolSourceHandleAnchorRatio(TOOL_FAILURE_HANDLE_ID) * 100}%`,
   } satisfies CSSProperties;
+  const contextSourceHandleStyle = {
+    top: `${getToolSourceHandleAnchorRatio(TOOL_CONTEXT_HANDLE_ID) * 100}%`,
+  } satisfies CSSProperties;
+  const primaryTargetHandleStyle = {
+    top: `${getApiToolContextTargetAnchorRatio(null) * 100}%`,
+  } satisfies CSSProperties;
+  const contextTargetHandleStyle = {
+    top: `${getApiToolContextTargetAnchorRatio(API_TOOL_CONTEXT_HANDLE_ID) * 100}%`,
+  } satisfies CSSProperties;
   const iconLabel = KIND_LABELS[node.kind] ?? node.kind.slice(0, 2).toUpperCase();
   const subtitle =
     node.kind === "model"
       ? String(node.config.provider_name ?? node.model_provider_name ?? node.provider_label ?? node.provider_id)
       : node.provider_label ?? node.provider_id;
-  const nodeCardClassName = `graph-node-card graph-node-card--${status} ${isToolNode ? "graph-node-card--tool-outputs" : ""} ${
-    selected ? "is-selected" : ""
-  } ${tooltipVisible ? "is-tooltip-visible" : ""} ${preview ? "is-preview" : ""} ${isConnectionMagnetized ? "is-connection-magnetized" : ""}`;
+  const nodeCardClassName = `graph-node-card graph-node-card--${status} ${isRoutableTool ? "graph-node-card--tool-outputs" : ""} ${
+    isContextProviderNode ? "graph-node-card--tool-context-provider" : ""
+  } ${
+    isModelNode ? "graph-node-card--model-inputs" : ""
+  } ${selected ? "is-selected" : ""} ${tooltipVisible ? "is-tooltip-visible" : ""} ${preview ? "is-preview" : ""} ${
+    isConnectionMagnetized ? "is-connection-magnetized" : ""
+  }`;
 
   if (isWireJunction) {
     return (
@@ -151,7 +178,22 @@ function GraphCanvasNodeComponent({
           type="target"
           position={Position.Left}
           className={`graph-node-handle graph-node-handle-target ${isConnectionMagnetized ? "graph-node-handle-valid is-magnetized" : ""}`}
+          style={isModelNode ? primaryTargetHandleStyle : undefined}
         />
+      ) : null}
+      {showTargetHandle && isModelNode ? (
+        <>
+          <div className="graph-node-input-port graph-node-input-port--context" style={contextTargetHandleStyle} aria-hidden="true">
+            <span className="graph-node-output-port-label">Tool Context</span>
+          </div>
+          <Handle
+            id={API_TOOL_CONTEXT_HANDLE_ID}
+            type="target"
+            position={Position.Left}
+            className={`graph-node-handle graph-node-handle-target graph-node-handle-target--context ${isConnectionMagnetized ? "graph-node-handle-valid is-magnetized" : ""}`}
+            style={contextTargetHandleStyle}
+          />
+        </>
       ) : null}
       <div className="graph-node-card-inner">
         <div className="graph-node-header">
@@ -170,7 +212,7 @@ function GraphCanvasNodeComponent({
           <span className="graph-node-chip">{node.category}</span>
           <span className="graph-node-meta-text">{node.kind}</span>
         </div>
-        {!preview && (node.kind === "tool" || node.kind === "model") ? (
+        {!preview && (node.kind === "tool" || node.kind === "mcp_context_provider" || node.kind === "model") ? (
           <div className="graph-node-card-actions">
             <button
               type="button"
@@ -178,14 +220,14 @@ function GraphCanvasNodeComponent({
               onMouseDown={(event) => event.stopPropagation()}
               onClick={(event) => {
                 event.stopPropagation();
-                if (node.kind === "tool") {
+                if (node.kind === "tool" || node.kind === "mcp_context_provider") {
                   onOpenToolDetails(node.id);
                   return;
                 }
                 onOpenProviderDetails(node.id);
               }}
             >
-              {node.kind === "tool" ? "Learn More" : "Provider Info"}
+              {node.kind === "tool" || node.kind === "mcp_context_provider" ? "Learn More" : "Provider Info"}
             </button>
           </div>
         ) : null}
@@ -231,7 +273,7 @@ function GraphCanvasNodeComponent({
           {tooltip.emptyState ? <div className="graph-node-tooltip-empty">{tooltip.emptyState}</div> : null}
         </div>
       ) : null}
-      {showSourceHandle && isToolNode ? (
+      {showSourceHandle && isRoutableTool ? (
         <>
           <div className="graph-node-output-port graph-node-output-port--success" style={successHandleStyle} aria-hidden="true">
             <span className="graph-node-output-port-label">On Success</span>
@@ -255,7 +297,21 @@ function GraphCanvasNodeComponent({
           />
         </>
       ) : null}
-      {showSourceHandle && !isToolNode ? (
+      {showSourceHandle && isContextProviderNode ? (
+        <>
+          <div className="graph-node-output-port graph-node-output-port--context" style={contextSourceHandleStyle} aria-hidden="true">
+            <span className="graph-node-output-port-label">Context</span>
+          </div>
+          <Handle
+            id={TOOL_CONTEXT_HANDLE_ID}
+            type="source"
+            position={Position.Right}
+            className="graph-node-handle graph-node-handle-source graph-node-handle-source--context"
+            style={contextSourceHandleStyle}
+          />
+        </>
+      ) : null}
+      {showSourceHandle && !isRoutableTool && !isContextProviderNode ? (
         <Handle
           type="source"
           position={Position.Right}
