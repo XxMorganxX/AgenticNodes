@@ -39,7 +39,9 @@ export type GraphCanvasNodeData = {
   onToggleTooltip: (nodeId: string) => void;
   onOpenToolDetails: (nodeId: string) => void;
   onOpenProviderDetails: (nodeId: string) => void;
+  onOpenPromptBlockDetails: (nodeId: string) => void;
   onOpenDisplayResponse: (nodeId: string) => void;
+  onOpenContextBuilderPayload: (nodeId: string) => void;
   onHandlePointerDown: (nodeId: string, handleType: "source" | "target", handleId: string | null) => boolean;
   onJunctionPointerDown: (nodeId: string, clientPosition: { x: number; y: number }) => void;
 };
@@ -50,6 +52,7 @@ const KIND_LABELS: Record<string, string> = {
   tool: "FX",
   mcp_context_provider: "MC",
   mcp_tool_executor: "MX",
+  mcp_recheck: "MR",
   data: "DB",
   output: "OUT",
 };
@@ -62,6 +65,20 @@ const FALLBACK_TOOLTIP: NodeTooltipData = {
   parameters: [],
   emptyState: "The node is still available in the canvas.",
 };
+
+function formatInlineDisplayValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === undefined) {
+    return "";
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
 
 function hasContextConnection(graph: GraphDefinition | null, node: GraphNode): boolean {
   if (!graph || node.kind !== "mcp_context_provider") {
@@ -132,7 +149,9 @@ function GraphCanvasNodeComponent({
     onToggleTooltip,
     onOpenToolDetails,
     onOpenProviderDetails,
+    onOpenPromptBlockDetails,
     onOpenDisplayResponse,
+    onOpenContextBuilderPayload,
     onJunctionPointerDown,
   } = data;
   const isWireJunction = isWireJunctionNode(node);
@@ -157,8 +176,23 @@ function GraphCanvasNodeComponent({
     ? status === "active"
       ? "Running..."
       : displayEnvelope !== undefined
-        ? JSON.stringify(displayEnvelope, null, 2)
+        ? formatInlineDisplayValue(displayEnvelope)
         : "Run the graph to inspect the incoming envelope here."
+    : null;
+  const contextBuilderPayload =
+    isContextBuilderNode &&
+    nodeOutput &&
+    typeof nodeOutput === "object" &&
+    nodeOutput !== null &&
+    "payload" in nodeOutput
+      ? nodeOutput.payload
+      : nodeOutput;
+  const contextBuilderDisplayText = isContextBuilderNode
+    ? status === "active"
+      ? "Running..."
+      : contextBuilderPayload !== undefined
+        ? formatInlineDisplayValue(contextBuilderPayload)
+        : "Run the graph to inspect the exact payload produced here."
     : null;
   let tooltip: NodeTooltipData = FALLBACK_TOOLTIP;
   if (tooltipVisible && !preview && !isWireJunction) {
@@ -240,6 +274,8 @@ function GraphCanvasNodeComponent({
     node.kind === "mcp_tool_executor" ? "graph-node-card--mcp-tool-executor" : ""
   } ${
     isDisplayNode ? "graph-node-card--display-node" : ""
+  } ${
+    isContextBuilderNode ? "graph-node-card--context-builder" : ""
   } ${selected ? "is-selected" : ""} ${tooltipVisible ? "is-tooltip-visible" : ""} ${preview ? "is-preview" : ""} ${
     isConnectionMagnetized ? "is-connection-magnetized" : ""
   }`;
@@ -345,6 +381,30 @@ function GraphCanvasNodeComponent({
           <span className="graph-node-meta-text">{node.kind}</span>
         </div>
         {contextBuilderSummary ? <div className="graph-node-summary">{contextBuilderSummary}</div> : null}
+        {isContextBuilderNode ? (
+          <div
+            role="button"
+            tabIndex={preview ? -1 : 0}
+            className="graph-node-inline-display graph-node-inline-display--compact"
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenContextBuilderPayload(node.id);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                event.stopPropagation();
+                onOpenContextBuilderPayload(node.id);
+              }
+            }}
+            aria-label={`Open full payload for ${node.label}`}
+          >
+            <div className="graph-node-inline-display-header">Resolved Payload</div>
+            <pre className="graph-node-inline-display-body">{contextBuilderDisplayText}</pre>
+            <span className="graph-node-inline-display-hint">Click to expand full payload</span>
+          </div>
+        ) : null}
         {isDisplayNode ? (
           <div
             role="button"
@@ -369,7 +429,7 @@ function GraphCanvasNodeComponent({
             <span className="graph-node-inline-display-hint">Click to expand</span>
           </div>
         ) : null}
-        {!preview && (node.kind === "tool" || node.kind === "mcp_context_provider" || node.kind === "model") ? (
+        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node)) ? (
           <div className="graph-node-card-actions">
             <button
               type="button"
@@ -377,14 +437,22 @@ function GraphCanvasNodeComponent({
               onMouseDown={(event) => event.stopPropagation()}
               onClick={(event) => {
                 event.stopPropagation();
-                if (node.kind === "tool" || node.kind === "mcp_context_provider") {
+                if (node.category === "tool") {
                   onOpenToolDetails(node.id);
+                  return;
+                }
+                if (isPromptBlockNode(node)) {
+                  onOpenPromptBlockDetails(node.id);
                   return;
                 }
                 onOpenProviderDetails(node.id);
               }}
             >
-              {node.kind === "tool" || node.kind === "mcp_context_provider" ? "Learn More" : "Provider Info"}
+              {node.category === "tool"
+                ? "Learn More"
+                : isPromptBlockNode(node)
+                  ? "More Info"
+                  : "Provider Info"}
             </button>
           </div>
         ) : null}

@@ -5,6 +5,7 @@ import { EnvironmentRunSummary } from "./components/EnvironmentRunSummary";
 import { GraphCanvas } from "./components/GraphCanvas";
 import { GraphEnvEditor } from "./components/GraphEnvEditor";
 import { McpServerPanel } from "./components/McpServerPanel";
+import { UserPreferencesModal } from "./components/UserPreferencesModal";
 import {
   bootMcpServer,
   createGraph,
@@ -23,6 +24,8 @@ import { createBlankGraph, layoutGraphDocument, layoutGraphLR, normalizeGraphDoc
 import { filterEventsForAgent, getCanvasGraph, getDefaultAgentId, getSelectedRunId, getSelectedRunState, isTestEnvironment, updateSelectedAgentGraph } from "./lib/graphDocuments";
 import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedEventGroups, buildFocusedRunSummary } from "./lib/runVisualization";
 import type { EditorCatalog, GraphDefinition, GraphDocument, McpServerStatus, RunState, RuntimeEvent, ToolDefinition } from "./lib/types";
+import { getUserPreferences, resetUserPreferences, saveUserPreferences } from "./lib/userPreferences";
+import type { UserPreferences } from "./lib/userPreferences";
 import { useGraphHistory } from "./lib/useGraphHistory";
 
 const DEFAULT_INPUT = "Find graph-agent references for a schema repair workflow.";
@@ -202,6 +205,8 @@ export default function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [mcpPendingKey, setMcpPendingKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [userPreferences, setUserPreferences] = useState<UserPreferences>(() => getUserPreferences());
+  const [userPreferencesOpen, setUserPreferencesOpen] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
   const executionBoxRef = useRef<HTMLDivElement | null>(null);
 
@@ -469,6 +474,21 @@ export default function App() {
     setDraftGraphQuiet(updateSelectedAgentGraph(draftGraph, selectedAgentId, nextGraph));
   }
 
+  function handleFormatGraph() {
+    if (!canvasGraph) {
+      return;
+    }
+    handleCanvasGraphChange(layoutGraphLR(canvasGraph));
+  }
+
+  function handleUpdateUserPreferences(nextPreferences: UserPreferences) {
+    setUserPreferences(saveUserPreferences(nextPreferences));
+  }
+
+  function handleResetUserPreferences() {
+    setUserPreferences(resetUserPreferences());
+  }
+
   return (
     <main className="app-shell">
       <div ref={executionBoxRef} className="hero-section">
@@ -476,8 +496,24 @@ export default function App() {
           <div className="hero-main-column">
             <div className="hero-main-row">
               <div className="mosaic-tile panel mosaic-title">
-                <h1>Graph Agent Studio</h1>
-                <p>{isEnvironment ? "Compose a test environment with isolated agents and drill into each run." : "Drag nodes into the canvas, wire edges, and launch your agent."}</p>
+                <div className="mosaic-title-header">
+                  <div className="mosaic-title-copy">
+                    <h1>Graph Agent Studio</h1>
+                    <p>{isEnvironment ? "Compose a test environment with isolated agents and drill into each run." : "Drag nodes into the canvas, wire edges, and launch your agent."}</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="secondary-button mosaic-title-settings-button"
+                    aria-label="Open user preferences"
+                    title="User preferences"
+                    onClick={() => setUserPreferencesOpen(true)}
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M10.3 3.2h3.4l.5 2.2c.5.2 1 .4 1.5.8l2.1-.8 1.7 2.9-1.7 1.5c.1.3.1.8.1 1.2s0 .8-.1 1.2l1.7 1.5-1.7 2.9-2.1-.8c-.5.3-1 .6-1.5.8l-.5 2.2h-3.4l-.5-2.2c-.5-.2-1-.4-1.5-.8l-2.1.8-1.7-2.9 1.7-1.5a6 6 0 0 1 0-2.4L4.7 8.3 6.4 5.4l2.1.8c.5-.3 1-.6 1.5-.8z" />
+                      <circle cx="12" cy="12" r="3.1" />
+                    </svg>
+                  </button>
+                </div>
                 <div className="mosaic-title-actions">
                   <button type="button" className="secondary-button" onClick={handleCreateGraph}>
                     New Agent
@@ -490,14 +526,6 @@ export default function App() {
                   </button>
                   <button type="button" className="secondary-button" onClick={history.redo} disabled={!history.canRedo} title="Redo (⌘⇧Z)">
                     Redo
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => canvasGraph && handleCanvasGraphChange(layoutGraphLR(canvasGraph))}
-                    disabled={!canvasGraph || canvasGraph.nodes.length === 0}
-                  >
-                    Auto Layout
                   </button>
                   <button type="button" className="danger-button" onClick={() => void handleDeleteGraph()} disabled={!draftGraph}>
                     Delete
@@ -610,8 +638,10 @@ export default function App() {
           selectedEdgeId={selectedEdgeId}
           onGraphChange={handleCanvasGraphChange}
           onGraphDrag={handleCanvasGraphDrag}
+          onFormatGraph={handleFormatGraph}
           onRunGraph={() => void handleRun()}
           onScrollToTop={scrollToExecutionBox}
+          backgroundDragSensitivity={userPreferences.backgroundDragSensitivityPercent / 100}
           onSelectionChange={(nodeId, edgeId) => {
             setSelectedNodeId(nodeId);
             setSelectedEdgeId(edgeId);
@@ -629,6 +659,14 @@ export default function App() {
             setSelectedNodeId(nodeId);
             setSelectedEdgeId(null);
           }}
+        />
+      ) : null}
+      {userPreferencesOpen ? (
+        <UserPreferencesModal
+          preferences={userPreferences}
+          onUpdatePreferences={handleUpdateUserPreferences}
+          onResetPreferences={handleResetUserPreferences}
+          onClose={() => setUserPreferencesOpen(false)}
         />
       ) : null}
     </main>

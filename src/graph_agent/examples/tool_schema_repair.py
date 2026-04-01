@@ -21,7 +21,7 @@ from graph_agent.tools.example_tools import build_search_catalog_tool
 from graph_agent.tools.mcp import McpServerDefinition, McpServerManager
 
 
-def _default_mcp_server_definition() -> McpServerDefinition:
+def _mcp_python_path_env() -> dict[str, str]:
     src_root = Path(__file__).resolve().parents[2]
     current_python_path = str(src_root)
     inherited_python_path = str(sys.path[0]).strip()
@@ -31,12 +31,28 @@ def _default_mcp_server_definition() -> McpServerDefinition:
         python_path_parts.append(inherited_python_path)
     if env_python_path and env_python_path not in python_path_parts:
         python_path_parts.append(env_python_path)
+    return {"PYTHONPATH": os.pathsep.join(python_path_parts)}
+
+
+def _weather_mcp_server_definition() -> McpServerDefinition:
     return McpServerDefinition(
         server_id="weather_mcp",
         display_name="Weather MCP Server",
         description="Built-in weather MCP server backed by a live weather lookup tool.",
         command=[sys.executable, "-m", "graph_agent.tools.weather_mcp_server"],
-        env={"PYTHONPATH": os.pathsep.join(python_path_parts)},
+        env=_mcp_python_path_env(),
+        auto_boot=False,
+        persistent=True,
+    )
+
+
+def _time_mcp_server_definition() -> McpServerDefinition:
+    return McpServerDefinition(
+        server_id="time_mcp",
+        display_name="Time MCP Server",
+        description="Built-in MCP server that returns the current local minute time.",
+        command=[sys.executable, "-m", "graph_agent.tools.time_mcp_server"],
+        env=_mcp_python_path_env(),
         auto_boot=False,
         persistent=True,
     )
@@ -62,8 +78,25 @@ def build_example_services() -> RuntimeServices:
             managed=True,
         )
     )
+    registry.register(
+        ToolDefinition(
+            name="time_current_minute",
+            description="Return the current local time rounded down to the minute.",
+            input_schema={
+                "type": "object",
+                "properties": {},
+            },
+            source_type="mcp",
+            server_id="time_mcp",
+            enabled=False,
+            available=False,
+            availability_error="MCP server is offline.",
+            managed=True,
+        )
+    )
     mcp_server_manager = McpServerManager(registry)
-    mcp_server_manager.register_server(_default_mcp_server_definition())
+    mcp_server_manager.register_server(_weather_mcp_server_definition())
+    mcp_server_manager.register_server(_time_mcp_server_definition())
     node_providers = NodeProviderRegistry()
     node_providers.register(
         NodeProviderDefinition(
@@ -261,6 +294,16 @@ def build_example_services() -> RuntimeServices:
             node_kind="mcp_tool_executor",
             description="Consumes an API tool-call envelope and dispatches the selected MCP tool with success and failure routes.",
             capabilities=["mcp tool dispatch", "success routing", "failure routing"],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="tool.mcp_recheck",
+            display_name="MCP Recheck Node",
+            category=NodeCategory.TOOL,
+            node_kind="mcp_recheck",
+            description="Packages the latest MCP execution details into a follow-up envelope so a downstream API node can decide whether more tools are needed.",
+            capabilities=["mcp execution appendix", "follow-up tool loop context", "terminal output intake"],
         )
     )
     node_providers.register(

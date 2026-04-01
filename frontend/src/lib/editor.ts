@@ -339,7 +339,7 @@ export function isWireJunctionNode(node: GraphNode | null | undefined): boolean 
 }
 
 export function isRoutableToolNode(node: GraphNode | null | undefined): boolean {
-  return Boolean(node && (node.kind === "tool" || node.kind === "mcp_tool_executor"));
+  return Boolean(node && (node.kind === "tool" || node.kind === "mcp_tool_executor" || node.kind === "mcp_recheck"));
 }
 
 export function isMcpContextProviderNode(node: GraphNode | null | undefined): boolean {
@@ -671,10 +671,11 @@ export function canConnectNodes(
   );
 }
 
-const NODE_WIDTH = 280;
-const NODE_HEIGHT = 150;
-const MCP_TOOL_EXECUTOR_NODE_HEIGHT = 214;
+const NODE_WIDTH = 320;
+const NODE_HEIGHT = 178;
+const MCP_TOOL_EXECUTOR_NODE_HEIGHT = 244;
 const AUTO_LAYOUT_VERTICAL_GAP = NODE_HEIGHT + 120;
+const AUTO_LAYOUT_DEPTH_SPREAD_MULTIPLIER = 8;  // ADD to user prefernce config
 const AUTO_LAYOUT_COLUMN_TOLERANCE = 120;
 
 function getNodeHeight(node: GraphNode): number {
@@ -699,6 +700,13 @@ function average(values: number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+function normalizedDepthSlot(index: number, count: number): number {
+  if (count <= 1) {
+    return 0.5;
+  }
+  return (index + 1) / (count + 1);
+}
+
 function groupNodeIdsByColumn(centerMap: Map<string, GraphPosition>) {
   const columns: Array<{ x: number; nodeIds: string[] }> = [];
   [...centerMap.entries()]
@@ -714,6 +722,21 @@ function groupNodeIdsByColumn(centerMap: Map<string, GraphPosition>) {
       columns.push({ x: center.x, nodeIds: [nodeId] });
     });
   return columns;
+}
+
+function compareOrderedNodes(
+  left: { nodeId: string; currentY: number; desiredY: number },
+  right: { nodeId: string; currentY: number; desiredY: number },
+): number {
+  const desiredDelta = left.desiredY - right.desiredY;
+  if (Math.abs(desiredDelta) > 0.5) {
+    return desiredDelta;
+  }
+  const currentDelta = left.currentY - right.currentY;
+  if (Math.abs(currentDelta) > 0.5) {
+    return currentDelta;
+  }
+  return left.nodeId.localeCompare(right.nodeId);
 }
 
 export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
@@ -736,12 +759,19 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
 
   const nodeMap = new Map(graph.nodes.map((node) => [node.id, node]));
   const incomingEdgesByTarget = new Map<string, GraphEdge[]>();
+  const outgoingEdgesBySource = new Map<string, GraphEdge[]>();
   for (const edge of graph.edges) {
     const existing = incomingEdgesByTarget.get(edge.target_id);
     if (existing) {
       existing.push(edge);
     } else {
       incomingEdgesByTarget.set(edge.target_id, [edge]);
+    }
+    const outgoing = outgoingEdgesBySource.get(edge.source_id);
+    if (outgoing) {
+      outgoing.push(edge);
+    } else {
+      outgoingEdgesBySource.set(edge.source_id, [edge]);
     }
   }
 
@@ -754,74 +784,89 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
     centerMap.set(id, { x: info.x, y: info.y });
   });
 
+  const allCenterYs = [...centerMap.values()].map((center) => center.y);
+  const graphMinCenterY = Math.min(...allCenterYs);
+  const graphMaxCenterY = Math.max(...allCenterYs);
+  const graphCenterY = average(allCenterYs);
   const columns = groupNodeIdsByColumn(centerMap);
-  columns.slice(1).forEach((column) => {
-    const nodeIds = column.nodeIds;
+  const layoutColumns = columns.slice(1);
+
+  function desiredCenterYForNode(nodeId: string): { nodeId: string; currentY: number; desiredY: number } | null {
+    const node = nodeMap.get(nodeId);
+    const center = centerMap.get(nodeId);
+    if (!node || !center) {
+      return null;
+    }
+
+    const anchorTargets: number[] = [];
+    const targetOffset = (getNodeTargetAnchorRatio(node, null) - 0.5) * getNodeHeight(node);
+
+    (incomingEdgesByTarget.get(nodeId) ?? []).forEach((edge) => {
+      const sourceNode = nodeMap.get(edge.source_id);
+      const sourceCenter = centerMap.get(edge.source_id);
+      if (!sourceNode || !sourceCenter || sourceCenter.x >= center.x) {
+        return;
+      }
+      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+      const sourceOffset = (getNodeSourceAnchorRatio(sourceNode, sourceHandleId) - 0.5) * getNodeHeight(sourceNode);
+      const edgeTargetOffset =
+        (getNodeTargetAnchorRatio(node, edge.target_handle_id ?? null) - 0.5) * getNodeHeight(node);
+      anchorTargets.push(sourceCenter.y + sourceOffset - edgeTargetOffset);
+    });
+
+    (outgoingEdgesBySource.get(nodeId) ?? []).forEach((edge) => {
+      const targetNode = nodeMap.get(edge.target_id);
+      const targetCenter = centerMap.get(edge.target_id);
+      if (!targetNode || !targetCenter || targetCenter.x <= center.x) {
+        return;
+      }
+      const sourceHandleId = inferToolEdgeSourceHandle(edge, node);
+      const sourceOffset = (getNodeSourceAnchorRatio(node, sourceHandleId) - 0.5) * getNodeHeight(node);
+      const edgeTargetOffset =
+        (getNodeTargetAnchorRatio(targetNode, edge.target_handle_id ?? null) - 0.5) * getNodeHeight(targetNode);
+      anchorTargets.push(targetCenter.y + edgeTargetOffset - sourceOffset);
+    });
+
+    const desiredY = anchorTargets.length > 0 ? average(anchorTargets) * 0.9 + center.y * 0.1 : center.y + targetOffset * 0;
+    return { nodeId, currentY: center.y, desiredY };
+  }
+
+  function placeColumn(nodeIds: string[]): void {
     if (nodeIds.length === 0) {
       return;
     }
 
-    const orderedNodes = nodeIds
-      .map((nodeId) => {
-        const node = nodeMap.get(nodeId);
-        const center = centerMap.get(nodeId);
-        if (!node || !center) {
-          return null;
-        }
-        const incomingEdges = (incomingEdgesByTarget.get(nodeId) ?? []).filter((edge) => {
-          const sourceCenter = centerMap.get(edge.source_id);
-          return sourceCenter ? sourceCenter.x < center.x : false;
-        });
-        const preferredAnchorYs = incomingEdges
-          .map((edge) => {
-            const sourceNode = nodeMap.get(edge.source_id);
-            const sourceCenter = centerMap.get(edge.source_id);
-            if (!sourceNode || !sourceCenter) {
-              return null;
-            }
-            const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
-            const sourceOffset =
-              (getNodeSourceAnchorRatio(sourceNode, sourceHandleId) - 0.5) * getNodeHeight(sourceNode);
-            const targetOffset =
-              (getNodeTargetAnchorRatio(node, edge.target_handle_id ?? null) - 0.5) * getNodeHeight(node);
-            return sourceCenter.y + sourceOffset - targetOffset;
-          })
-          .filter((value): value is number => value !== null);
-        const desiredY =
-          preferredAnchorYs.length > 0 ? average(preferredAnchorYs) * 0.8 + center.y * 0.2 : center.y;
-        return { nodeId, currentY: center.y, desiredY };
-      })
-      .filter((entry): entry is { nodeId: string; currentY: number; desiredY: number } => entry !== null)
-      .sort((left, right) => {
-        const desiredDelta = left.desiredY - right.desiredY;
-        if (Math.abs(desiredDelta) > 0.5) {
-          return desiredDelta;
-        }
-        const currentDelta = left.currentY - right.currentY;
-        if (Math.abs(currentDelta) > 0.5) {
-          return currentDelta;
-        }
-        return left.nodeId.localeCompare(right.nodeId);
-      });
+    const orderedNodes = nodeIds.map((nodeId) => desiredCenterYForNode(nodeId)).filter(
+      (entry): entry is { nodeId: string; currentY: number; desiredY: number } => entry !== null,
+    );
+    orderedNodes.sort(compareOrderedNodes);
 
     if (orderedNodes.length === 0) {
       return;
     }
 
-    const baseY = average(
-      orderedNodes.map((entry, index) => entry.desiredY - index * AUTO_LAYOUT_VERTICAL_GAP),
-    );
+    const minimumSpan =
+      AUTO_LAYOUT_VERTICAL_GAP * AUTO_LAYOUT_DEPTH_SPREAD_MULTIPLIER * Math.max(1, orderedNodes.length - 1);
+    const preferredSpan = Math.max(graphMaxCenterY - graphMinCenterY, minimumSpan);
+    const columnCenterY = average(orderedNodes.map((entry) => entry.desiredY)) * 0.9 + graphCenterY * 0.1;
+    const topY = columnCenterY - preferredSpan / 2;
     orderedNodes.forEach((entry, index) => {
       const current = centerMap.get(entry.nodeId);
       if (!current) {
         return;
       }
+      const slotRatio = normalizedDepthSlot(index, orderedNodes.length);
       centerMap.set(entry.nodeId, {
         x: current.x,
-        y: baseY + index * AUTO_LAYOUT_VERTICAL_GAP,
+        y: topY + preferredSpan * slotRatio,
       });
     });
-  });
+  }
+
+  for (let iteration = 0; iteration < 3; iteration += 1) {
+    layoutColumns.forEach((column) => placeColumn(column.nodeIds));
+    [...layoutColumns].reverse().forEach((column) => placeColumn(column.nodeIds));
+  }
 
   const positionMap = new Map<string, GraphPosition>();
   centerMap.forEach((center, id) => {

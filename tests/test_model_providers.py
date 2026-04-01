@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import os
 import sys
@@ -362,6 +363,58 @@ class PromptBlockEchoProvider(ModelProvider):
         return ProviderPreflightResult(status="available", ok=True, message="ok")
 
 
+class UserMessageJsonEchoProvider(ModelProvider):
+    name = "user_message_json_echo"
+
+    def __init__(self) -> None:
+        self.last_request: ModelRequest | None = None
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        self.last_request = request
+        user_content = request.messages[-1].content if request.messages else ""
+        return ModelResponse(content="", structured_output=json.loads(user_content) if user_content else None)
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
+class RecheckLoopProvider(ModelProvider):
+    name = "recheck_loop"
+
+    def __init__(self) -> None:
+        self.last_request: ModelRequest | None = None
+        self.seen_payloads: list[dict[str, Any]] = []
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        self.last_request = request
+        payload = json.loads(request.messages[-1].content) if request.messages else {}
+        assert isinstance(payload, dict)
+        self.seen_payloads.append(payload)
+        current_location = payload.get("tool_arguments", {}).get("location")
+        if current_location == "Austin":
+            return ModelResponse(
+                content="",
+                structured_output={"location": "Seattle"},
+                tool_calls=[
+                    ModelToolCall(
+                        tool_name="weather_current",
+                        arguments={"location": "Seattle"},
+                        provider_tool_id="recheck-tool-1",
+                        metadata={"variant": "loop"},
+                    )
+                ],
+                metadata={"variant": "loop"},
+            )
+        return ModelResponse(
+            content="",
+            structured_output={"message": f"No additional tools needed after {payload.get('tool_name', 'tool')}."},
+            metadata={"variant": "message"},
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
 class ModelProviderTests(unittest.TestCase):
     def _build_auto_branch_graph(self, provider_name: str, provider: ModelProvider | None = None) -> tuple[Any, GraphRuntime, dict[str, Any]]:
         services = build_example_services()
@@ -378,6 +431,180 @@ class ModelProviderTests(unittest.TestCase):
                 node["model_provider_name"] = provider_name
                 node["config"]["provider_name"] = provider_name
         return services, runtime, graph_payload
+
+    def _build_mcp_recheck_graph(
+        self,
+        *,
+        initial_provider_name: str,
+        followup_provider_name: str,
+        tool_name: str,
+    ) -> dict[str, Any]:
+        return {
+            "graph_id": f"mcp-recheck-{tool_name}",
+            "name": "MCP Recheck Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "tool_context",
+                    "kind": "mcp_context_provider",
+                    "category": "tool",
+                    "label": "Tool Context",
+                    "provider_id": "tool.mcp_context_provider",
+                    "provider_label": "MCP Context Provider",
+                    "config": {"tool_names": [tool_name], "include_mcp_tool_context": False},
+                    "position": {"x": 120, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Initial Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": initial_provider_name,
+                    "prompt_name": "initial_prompt",
+                    "config": {
+                        "provider_name": initial_provider_name,
+                        "prompt_name": "initial_prompt",
+                        "system_prompt": "Choose an MCP tool call.",
+                        "user_message_template": "{input_payload}",
+                    },
+                    "position": {"x": 260, "y": 0},
+                },
+                {
+                    "id": "executor",
+                    "kind": "mcp_tool_executor",
+                    "category": "tool",
+                    "label": "Executor",
+                    "provider_id": "tool.mcp_tool_executor",
+                    "provider_label": "MCP Tool Executor",
+                    "config": {},
+                    "position": {"x": 500, "y": 0},
+                },
+                {
+                    "id": "recheck",
+                    "kind": "mcp_recheck",
+                    "category": "tool",
+                    "label": "Recheck",
+                    "provider_id": "tool.mcp_recheck",
+                    "provider_label": "MCP Recheck Node",
+                    "config": {},
+                    "position": {"x": 740, "y": 0},
+                },
+                {
+                    "id": "followup",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Follow-up Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": followup_provider_name,
+                    "prompt_name": "followup_prompt",
+                    "config": {
+                        "provider_name": followup_provider_name,
+                        "prompt_name": "followup_prompt",
+                        "system_prompt": "Review the last MCP execution and decide whether another tool is needed.",
+                        "user_message_template": "{input_payload}",
+                    },
+                    "position": {"x": 980, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_payload", "source": "followup"}},
+                    "position": {"x": 1220, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "start-model", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "ctx-binding",
+                    "source_id": "tool_context",
+                    "target_id": "model",
+                    "source_handle_id": "tool-context",
+                    "target_handle_id": "api-tool-context",
+                    "label": "tool context",
+                    "kind": "binding",
+                    "priority": 0,
+                },
+                {
+                    "id": "ctx-followup-binding",
+                    "source_id": "tool_context",
+                    "target_id": "followup",
+                    "source_handle_id": "tool-context",
+                    "target_handle_id": "api-tool-context",
+                    "label": "tool context",
+                    "kind": "binding",
+                    "priority": 0,
+                },
+                {
+                    "id": "model-executor",
+                    "source_id": "model",
+                    "target_id": "executor",
+                    "source_handle_id": "api-tool-call",
+                    "label": "tool call",
+                    "kind": "conditional",
+                    "priority": 100,
+                    "condition": {
+                        "id": "model-executor-condition",
+                        "label": "Tool call output",
+                        "type": "result_payload_path_equals",
+                        "value": "tool_call_envelope",
+                        "path": "metadata.contract",
+                    },
+                },
+                {"id": "executor-recheck", "source_id": "executor", "target_id": "recheck", "label": "", "kind": "standard", "priority": 100},
+                {"id": "recheck-followup", "source_id": "recheck", "target_id": "followup", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "followup-executor",
+                    "source_id": "followup",
+                    "target_id": "executor",
+                    "source_handle_id": "api-tool-call",
+                    "label": "tool call",
+                    "kind": "conditional",
+                    "priority": 100,
+                    "condition": {
+                        "id": "followup-executor-condition",
+                        "label": "Tool call output",
+                        "type": "result_payload_path_equals",
+                        "value": "tool_call_envelope",
+                        "path": "metadata.contract",
+                    },
+                },
+                {
+                    "id": "followup-finish",
+                    "source_id": "followup",
+                    "target_id": "finish",
+                    "source_handle_id": "api-message",
+                    "label": "message output",
+                    "kind": "conditional",
+                    "priority": 80,
+                    "condition": {
+                        "id": "followup-finish-condition",
+                        "label": "Message output",
+                        "type": "result_payload_path_equals",
+                        "value": "message_envelope",
+                        "path": "metadata.contract",
+                    },
+                },
+            ],
+        }
 
     def test_openai_provider_normalizes_tool_calls_for_tool_call_nodes(self) -> None:
         provider = StubOpenAIProvider()
@@ -647,11 +874,17 @@ class ModelProviderTests(unittest.TestCase):
 
         self.assertIn("mcp_servers", catalog)
         self.assertTrue(any(server["server_id"] == "weather_mcp" for server in catalog["mcp_servers"]))
+        self.assertTrue(any(server["server_id"] == "time_mcp" for server in catalog["mcp_servers"]))
         weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == "weather_current")
+        time_tool = next(tool for tool in catalog["tools"] if tool["name"] == "time_current_minute")
         self.assertEqual(weather_tool["source_type"], "mcp")
         self.assertFalse(weather_tool["enabled"])
         self.assertFalse(weather_tool["available"])
         self.assertEqual(weather_tool["schema_origin"], "static")
+        self.assertEqual(time_tool["source_type"], "mcp")
+        self.assertFalse(time_tool["enabled"])
+        self.assertFalse(time_tool["available"])
+        self.assertEqual(time_tool["schema_origin"], "static")
 
     def test_offline_mcp_tools_do_not_block_graph_save_or_run_start(self) -> None:
         services = build_example_services()
@@ -728,6 +961,32 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertEqual(result.output["temperature_c"], "22")
             finally:
                 manager.stop_background_services()
+
+    def test_booted_enabled_time_mcp_tool_returns_current_minute(self) -> None:
+        services = build_example_services()
+        manager = GraphRunManager(services=services)
+        try:
+            server = manager.boot_mcp_server("time_mcp")
+            self.assertTrue(server["running"])
+            manager.set_mcp_tool_enabled("time_current_minute", True)
+
+            result = services.tool_registry.invoke(
+                "time_current_minute",
+                {},
+                ToolContext(run_id="run-time", graph_id="graph-time", node_id="tool-node", state_snapshot={}),
+            )
+            self.assertEqual(result.status, "success")
+            payload = result.output
+            self.assertIsInstance(payload, dict)
+            parsed = datetime.fromisoformat(payload["local_iso_minute"])
+            self.assertEqual(parsed.second, 0)
+            self.assertEqual(parsed.microsecond, 0)
+            self.assertEqual(payload["hour_24"], parsed.hour)
+            self.assertEqual(payload["minute"], parsed.minute)
+            self.assertIsInstance(payload["timezone"], str)
+            self.assertIsInstance(payload["utc_offset"], str)
+        finally:
+            manager.stop_background_services()
 
     def test_mcp_boot_reports_schema_drift_when_live_tool_metadata_changes(self) -> None:
         services = build_example_services()
@@ -853,6 +1112,7 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertIn("MCP Tool Guidance", payload["system_prompt"])
                     self.assertIn("MCP Tool Context", payload["system_prompt"])
                     self.assertIn("Tool: weather_current", payload["system_prompt"])
+                    self.assertNotIn("MCP Tool Decision Output", payload["system_prompt"])
                     tool_context = payload["mcp_tool_context"]
                     assert isinstance(tool_context, dict)
                     self.assertEqual(tool_context["tool_names"], ["weather_current"])
@@ -961,6 +1221,10 @@ class ModelProviderTests(unittest.TestCase):
                     assert isinstance(payload, dict)
                     self.assertNotIn("MCP Tool Guidance", payload["system_prompt"])
                     self.assertIn("MCP Tool Context", payload["system_prompt"])
+                    self.assertIn("MCP Tool Decision Output", payload["system_prompt"])
+                    self.assertIn("Uses Tool: True|False", payload["system_prompt"])
+                    self.assertIn('Tool Call Schema: {"tool_name":"<tool name>","arguments":{...}} or NA', payload["system_prompt"])
+                    self.assertIn("DELIMITER", payload["system_prompt"])
                     self.assertEqual(payload["available_tool_names"], [])
                     self.assertEqual(payload["mcp_available_tool_names"], [])
                     assert isinstance(payload["mcp_tool_context"], dict)
@@ -1644,10 +1908,102 @@ class ModelProviderTests(unittest.TestCase):
         self.assertEqual(state.status, "completed")
         self.assertEqual(
             state.final_output,
-            "System: Follow the graph rules.\n\nUser: Question: How do prompt blocks work?",
+            [
+                {"role": "user", "content": "How do prompt blocks work?"},
+                {"role": "system", "content": "Follow the graph rules."},
+                {"role": "user", "content": "Question: How do prompt blocks work?"},
+            ],
         )
         self.assertNotIn("system_block", state.node_outputs)
         self.assertNotIn("user_block", state.node_outputs)
+
+    def test_context_builder_compiles_multiple_user_prompt_blocks_into_one_turn(self) -> None:
+        services = build_example_services()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "prompt-block-context-builder-multi-user",
+                "name": "Prompt Block Context Builder Multi User",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "first_user_block",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "First Request",
+                        "provider_id": "core.prompt_block",
+                        "provider_label": "Prompt Block",
+                        "config": {"mode": "prompt_block", "role": "user", "content": "Summarize the issue."},
+                        "position": {"x": 120, "y": 0},
+                    },
+                    {
+                        "id": "second_user_block",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Second Request",
+                        "provider_id": "core.prompt_block",
+                        "provider_label": "Prompt Block",
+                        "config": {"mode": "prompt_block", "role": "user", "content": "Suggest the next debugging step."},
+                        "position": {"x": 120, "y": 120},
+                    },
+                    {
+                        "id": "compose",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Compose",
+                        "provider_id": "core.context_builder",
+                        "provider_label": "Context Builder",
+                        "config": {"mode": "context_builder", "template": "", "input_bindings": [], "joiner": "\n\n"},
+                        "position": {"x": 320, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "compose"}},
+                        "position": {"x": 520, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-compose", "source_id": "start", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "first-compose", "source_id": "first_user_block", "target_id": "compose", "label": "prompt block", "kind": "binding", "priority": 0},
+                    {"id": "second-compose", "source_id": "second_user_block", "target_id": "compose", "label": "prompt block", "kind": "binding", "priority": 0},
+                    {"id": "compose-finish", "source_id": "compose", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, "unused input", run_id="run-prompt-context-builder-multi-user")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(
+            state.final_output,
+            [
+                {"role": "user", "content": "unused input"},
+                {"role": "user", "content": "Summarize the issue."},
+                {"role": "user", "content": "Suggest the next debugging step."},
+            ],
+        )
 
     def test_model_node_consumes_bound_prompt_blocks_as_messages(self) -> None:
         services = build_example_services()
@@ -1757,6 +2113,341 @@ class ModelProviderTests(unittest.TestCase):
                 {"kind": "prompt_block", "role": "user", "content": "Bound user context."},
             ],
         )
+        started_events = {
+            str(event.payload.get("node_id")): event
+            for event in state.event_history
+            if event.event_type == "node.started"
+        }
+        self.assertEqual(started_events["start"].payload.get("received_input"), "current request")
+        self.assertEqual(
+            started_events["model"].payload.get("received_input"),
+            {
+                "messages": [
+                    {"role": "system", "content": "Base system prompt"},
+                    {"role": "assistant", "content": "Previous answer draft."},
+                    {"role": "user", "content": "Bound user context."},
+                    {"role": "user", "content": "Live input: current request"},
+                ],
+                "response_mode": "message",
+            },
+        )
+        self.assertEqual(started_events["finish"].payload.get("received_input"), "ok")
+
+    def test_model_node_consumes_context_builder_payload_as_user_message(self) -> None:
+        services = build_example_services()
+        provider = PromptBlockEchoProvider()
+        services.model_providers["prompt_block_echo"] = provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "context-builder-model",
+                "name": "Context Builder Model",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "first_user_block",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "First Request",
+                        "provider_id": "core.prompt_block",
+                        "provider_label": "Prompt Block",
+                        "config": {"mode": "prompt_block", "role": "user", "content": "Summarize the issue."},
+                        "position": {"x": 120, "y": 0},
+                    },
+                    {
+                        "id": "second_user_block",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Second Request",
+                        "provider_id": "core.prompt_block",
+                        "provider_label": "Prompt Block",
+                        "config": {"mode": "prompt_block", "role": "user", "content": "Suggest the next debugging step."},
+                        "position": {"x": 120, "y": 120},
+                    },
+                    {
+                        "id": "compose",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Compose",
+                        "provider_id": "core.context_builder",
+                        "provider_label": "Context Builder",
+                        "config": {"mode": "context_builder", "template": "", "input_bindings": [], "joiner": "\n\n"},
+                        "position": {"x": 320, "y": 0},
+                    },
+                    {
+                        "id": "model",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "prompt_block_echo",
+                        "prompt_name": "prompt_block_echo",
+                        "config": {
+                            "provider_name": "prompt_block_echo",
+                            "prompt_name": "prompt_block_echo",
+                            "system_prompt": "Base system prompt",
+                            "user_message_template": "{input_payload}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 520, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "model"}},
+                        "position": {"x": 720, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-compose", "source_id": "start", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "first-compose", "source_id": "first_user_block", "target_id": "compose", "label": "prompt block", "kind": "binding", "priority": 0},
+                    {"id": "second-compose", "source_id": "second_user_block", "target_id": "compose", "label": "prompt block", "kind": "binding", "priority": 0},
+                    {"id": "compose-model", "source_id": "compose", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "model-finish", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, "unused input", run_id="run-context-builder-model")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output, "ok")
+        self.assertIsNotNone(provider.last_request)
+        assert provider.last_request is not None
+        self.assertEqual(
+            [message.role for message in provider.last_request.messages],
+            ["system", "user"],
+        )
+        self.assertEqual(provider.last_request.messages[0].content, "Base system prompt")
+        self.assertEqual(
+            json.loads(provider.last_request.messages[1].content),
+            [
+                {"role": "user", "content": "unused input"},
+                {"role": "user", "content": "Summarize the issue."},
+                {"role": "user", "content": "Suggest the next debugging step."},
+            ],
+        )
+
+    def test_mcp_recheck_node_packages_executor_context_for_followup_model(self) -> None:
+        services = build_example_services()
+        followup_provider = UserMessageJsonEchoProvider()
+        services.model_providers["auto_tool_call"] = AutoToolCallProvider()
+        services.model_providers["followup_echo"] = followup_provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = self._build_mcp_recheck_graph(
+            initial_provider_name="auto_tool_call",
+            followup_provider_name="followup_echo",
+            tool_name="weather_current",
+        )
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-recheck-context")
+
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertEqual(payload["tool_name"], "weather_current")
+                    self.assertEqual(payload["tool_arguments"], {"location": "Austin"})
+                    self.assertEqual(payload["tool_output"]["resolved_location"], "Testville")
+                    self.assertEqual(payload["tool_status"], "success")
+                    self.assertIsNone(payload["terminal_output"])
+                    self.assertEqual(payload["tool_call"]["tool_name"], "weather_current")
+                    self.assertEqual(payload["source_tool_call_envelope"]["metadata"]["contract"], "tool_call_envelope")
+                    recheck_output = state.node_outputs["recheck"]
+                    assert isinstance(recheck_output, dict)
+                    self.assertEqual(recheck_output["metadata"]["contract"], "mcp_recheck_envelope")
+                    executor_output = state.node_outputs["executor"]
+                    assert isinstance(executor_output, dict)
+                    self.assertEqual(executor_output["artifacts"]["requested_tool_call"]["arguments"], {"location": "Austin"})
+            finally:
+                manager.stop_background_services()
+
+    def test_mcp_recheck_flow_can_loop_back_into_executor_for_another_tool(self) -> None:
+        services = build_example_services()
+        followup_provider = RecheckLoopProvider()
+        services.model_providers["auto_tool_call"] = AutoToolCallProvider()
+        services.model_providers["recheck_loop"] = followup_provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = self._build_mcp_recheck_graph(
+            initial_provider_name="auto_tool_call",
+            followup_provider_name="recheck_loop",
+            tool_name="weather_current",
+        )
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-recheck-loop")
+
+                    self.assertEqual(state.status, "completed")
+                    self.assertEqual(state.final_output, {"message": "No additional tools needed after weather_current."})
+                    self.assertEqual(state.visit_counts["executor"], 2)
+                    self.assertEqual(len(followup_provider.seen_payloads), 2)
+                    self.assertEqual(followup_provider.seen_payloads[0]["tool_arguments"], {"location": "Austin"})
+                    self.assertEqual(followup_provider.seen_payloads[1]["tool_arguments"], {"location": "Seattle"})
+                    transition_edges = [transition.edge_id for transition in state.transition_history]
+                    self.assertGreaterEqual(transition_edges.count("followup-executor"), 1)
+            finally:
+                manager.stop_background_services()
+
+    def test_mcp_recheck_node_preserves_terminal_output_from_executor(self) -> None:
+        services = build_example_services()
+
+        def _mock_mcp_tool(_payload: Mapping[str, Any], _context: ToolContext) -> ToolResult:
+            return ToolResult(
+                status="success",
+                output={"ok": True},
+                metadata={
+                    "terminal_output": {
+                        "server_id": "mock_mcp",
+                        "tool_name": "mock_terminal_tool",
+                        "stderr": "first line\nsecond line",
+                        "stderr_lines": ["first line", "second line"],
+                    }
+                },
+            )
+
+        class TerminalToolCallProvider:
+            name = "terminal_mock_recheck"
+
+            def generate(self, request: ModelRequest) -> ModelResponse:
+                self.last_request = request
+                return ModelResponse(
+                    content="",
+                    tool_calls=[ModelToolCall(tool_name="mock_terminal_tool", arguments={})],
+                )
+
+            def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+                return ProviderPreflightResult(status="ready", ok=True)
+
+        followup_provider = UserMessageJsonEchoProvider()
+        services.model_providers["terminal_mock_recheck"] = TerminalToolCallProvider()
+        services.model_providers["followup_echo"] = followup_provider
+        services.tool_registry.upsert(
+            ToolDefinition(
+                name="mock_terminal_tool",
+                description="Mock MCP tool with terminal output.",
+                input_schema={"type": "object", "properties": {}, "required": []},
+                executor=_mock_mcp_tool,
+                source_type="mcp",
+                server_id="mock_mcp",
+            )
+        )
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = self._build_mcp_recheck_graph(
+            initial_provider_name="terminal_mock_recheck",
+            followup_provider_name="followup_echo",
+            tool_name="mock_terminal_tool",
+        )
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, {"request": "run"}, run_id="run-mcp-recheck-terminal")
+
+        self.assertEqual(state.status, "completed")
+        payload = state.final_output
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["tool_name"], "mock_terminal_tool")
+        self.assertEqual(payload["terminal_output"]["stderr"], "first line\nsecond line")
+        self.assertEqual(payload["terminal_output_envelope"]["metadata"]["contract"], "terminal_output_envelope")
+        executor_output = state.node_outputs["executor"]
+        assert isinstance(executor_output, dict)
+        self.assertEqual(executor_output["artifacts"]["terminal_output"]["tool_name"], "mock_terminal_tool")
+
+    def test_mcp_recheck_validation_rejects_non_executor_upstreams(self) -> None:
+        services = build_example_services()
+        graph_payload = {
+            "graph_id": "invalid-recheck-upstream",
+            "name": "Invalid Recheck Upstream",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "recheck",
+                    "kind": "mcp_recheck",
+                    "category": "tool",
+                    "label": "Recheck",
+                    "provider_id": "tool.mcp_recheck",
+                    "provider_label": "MCP Recheck Node",
+                    "config": {},
+                    "position": {"x": 200, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_payload", "source": "recheck"}},
+                    "position": {"x": 400, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "start-recheck", "source_id": "start", "target_id": "recheck", "label": "", "kind": "standard", "priority": 100},
+                {"id": "recheck-finish", "source_id": "recheck", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+
+        with self.assertRaises(GraphValidationError):
+            GraphDefinition.from_dict(graph_payload).validate_against_services(services)
 
     def test_mcp_executor_routes_terminal_output_handle(self) -> None:
         services = build_example_services()

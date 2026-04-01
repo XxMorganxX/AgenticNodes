@@ -87,6 +87,11 @@ class GraphRuntime:
                 )
 
             node = graph.get_node(current_node_id)
+            context = NodeContext(graph=graph, state=state, services=self.services, node_id=node.id)
+            try:
+                received_input = node.runtime_input_preview(context)
+            except Exception:  # noqa: BLE001
+                received_input = None
             self.emit(
                 state,
                 "node.started",
@@ -98,10 +103,9 @@ class GraphRuntime:
                     "node_provider_id": node.provider_id,
                     "node_provider_label": node.provider_label,
                     "visit_count": visit_count,
+                    "received_input": received_input,
                 },
             )
-
-            context = NodeContext(graph=graph, state=state, services=self.services, node_id=node.id)
 
             try:
                 result = node.execute(context)

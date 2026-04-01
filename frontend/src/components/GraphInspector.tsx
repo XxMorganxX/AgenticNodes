@@ -9,6 +9,7 @@ import {
   providerDefaultConfig,
   providerModelName,
 } from "../lib/editor";
+import { insertTokenAtEnd, listPromptBlockAvailableVariables, PROMPT_BLOCK_STARTERS, renderPromptBlockPreview } from "../lib/promptBlockEditor";
 import { useRenderDiagnostics } from "../lib/dragDiagnostics";
 import type {
   EditorCatalog,
@@ -70,11 +71,6 @@ const CONTEXT_BUILDER_PROVIDER_ID = "core.context_builder";
 const CONTEXT_BUILDER_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONTEXT_BUILDER_TOKEN_PATTERN = /\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 const CONTEXT_BUILDER_BASE_VARIABLES = ["current_node_id", "graph_id", "input_payload", "run_id"];
-const PROMPT_BLOCK_STARTERS: Record<string, string> = {
-  system: "You are a helpful assistant. Follow the workspace rules and answer clearly.",
-  user: "{input_payload}",
-  assistant: "Previous draft: {input_payload}",
-};
 
 type ContextBuilderBindingRow = {
   sourceNodeId: string;
@@ -99,7 +95,7 @@ function slugifyContextBuilderPlaceholder(value: string, fallback: string): stri
 function getIncomingContextBuilderSourceNodes(graph: GraphDefinition, nodeId: string): GraphNode[] {
   const incomingEdges = graph.edges.filter((edge) => edge.target_id === nodeId);
   const bindingSourceIds = incomingEdges.filter((edge) => edge.kind === "binding").map((edge) => edge.source_id);
-  const sourceIds = uniqueStrings((bindingSourceIds.length > 0 ? bindingSourceIds : incomingEdges.map((edge) => edge.source_id)));
+  const sourceIds = uniqueStrings([...bindingSourceIds, ...incomingEdges.map((edge) => edge.source_id)]);
   return sourceIds
     .map((sourceId) => graph.nodes.find((candidate) => candidate.id === sourceId) ?? null)
     .filter((node): node is GraphNode => node !== null);
@@ -217,34 +213,6 @@ function getModelPromptBlockNodes(graph: GraphDefinition, modelNode: GraphNode):
 
 function renderContextBuilderPreview(template: string, variables: Record<string, string>): string {
   return template.replace(CONTEXT_BUILDER_TOKEN_PATTERN, (_, token: string) => variables[token] ?? `{${token}}`);
-}
-
-function promptBlockTemplateVariables(graph: GraphDefinition, node: GraphNode, runState: RunState | null): Record<string, string> {
-  return {
-    ...Object.fromEntries(Object.entries(graph.env_vars ?? {}).map(([key, value]) => [key, String(value)])),
-    current_node_id: node.id,
-    graph_id: graph.graph_id,
-    input_payload: runState?.input_payload != null ? stringifyPreviewValue(runState.input_payload) : "",
-    run_id: runState?.run_id ?? "",
-  };
-}
-
-function renderPromptBlockPreview(node: GraphNode, graph: GraphDefinition, runState: RunState | null): string {
-  const role = String(node.config.role ?? "user").trim() || "user";
-  const name = String(node.config.name ?? "").trim();
-  const content = String(node.config.content ?? "");
-  const variables = promptBlockTemplateVariables(graph, node, runState);
-  const renderedName = renderContextBuilderPreview(name, variables).trim();
-  const renderedContent = renderContextBuilderPreview(content, variables).trim();
-  const header = renderedName ? `${role} (${renderedName})` : role;
-  return `${header}: ${renderedContent}`.trim();
-}
-
-function insertTokenAtEnd(value: string, token: string): string {
-  if (!value.trim()) {
-    return token;
-  }
-  return `${value}${value.endsWith("\n") ? "" : "\n"}${token}`;
 }
 
 function getModelMcpContextNodes(graph: GraphDefinition, modelNode: GraphNode): GraphNode[] {
@@ -416,6 +384,7 @@ export function GraphInspector({
     const modelPromptBlockNodes = selectedNode.kind === "model" ? getModelPromptBlockNodes(graph, selectedNode) : [];
     const mcpToolExposureEnabled = selectedNode.kind === "mcp_context_provider" ? selectedNode.config.expose_mcp_tools !== false : false;
     const executorBindingSummary = selectedNode.kind === "mcp_tool_executor" ? describeMcpExecutorBinding(selectedNode.config.input_binding) : "";
+    const recheckBindingSummary = selectedNode.kind === "mcp_recheck" ? describeMcpExecutorBinding(selectedNode.config.input_binding) : "";
     const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
     const isManualStartNode =
       selectedNode.kind === "input" &&
@@ -474,9 +443,7 @@ export function GraphInspector({
     const contextBuilderHasPreviewData = isContextBuilderNode
       ? contextBuilderBindings.some((binding) => getContextBuilderSourcePreviewFromGraph(graph, runState, binding.sourceNodeId) !== null)
       : false;
-    const promptBlockAvailableVariables = isPromptBlockDataNode
-      ? [...uniqueStrings([...Object.keys(graph.env_vars ?? {}), ...CONTEXT_BUILDER_BASE_VARIABLES])]
-      : [];
+    const promptBlockAvailableVariables = isPromptBlockDataNode ? listPromptBlockAvailableVariables(graph) : [];
     const promptBlockRenderedPreview = isPromptBlockDataNode ? renderPromptBlockPreview(selectedNode, graph, runState) : "";
     const updateContextBuilderBindings = (bindings: ContextBuilderBindingRow[]) =>
       onGraphChange(
@@ -1086,6 +1053,13 @@ export function GraphInspector({
               <span>Dispatch mode: single MCP tool call from upstream API output</span>
               <span>Input binding: {executorBindingSummary}</span>
               <span>Routes: on success / on failure / terminal output</span>
+            </div>
+          ) : null}
+          {selectedNode.kind === "mcp_recheck" ? (
+            <div className="inspector-meta">
+              <span>Appendix mode: packages the last MCP tool execution for a follow-up API node</span>
+              <span>Input binding: {recheckBindingSummary}</span>
+              <span>Includes: tool call, tool result, status, errors, and preserved terminal output</span>
             </div>
           ) : null}
           {selectedNode.kind === "data" ? (

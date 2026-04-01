@@ -77,6 +77,7 @@ class RunLogStoreTests(unittest.TestCase):
         self.assertEqual(events[0]["event_type"], "run.started")
         self.assertEqual(events[-1]["event_type"], "run.completed")
         self.assertTrue(any(event["event_type"] == "node.completed" for event in events))
+        self.assertTrue(any("received_input" in event["payload"] for event in events if event["event_type"] == "node.started"))
         self.assertTrue(
             any("output" in event["payload"] for event in events if event["event_type"] == "node.completed")
         )

@@ -18,7 +18,9 @@ import type { GraphCanvasEdgeData } from "./GraphCanvasEdge";
 import { GraphInspector } from "./GraphInspector";
 import { GraphCanvasNode } from "./GraphCanvasNode";
 import type { GraphCanvasNodeData } from "./GraphCanvasNode";
+import { ContextBuilderPayloadModal } from "./ContextBuilderPayloadModal";
 import { DisplayResponseModal } from "./DisplayResponseModal";
+import { PromptBlockDetailsModal } from "./PromptBlockDetailsModal";
 import { ProviderSummary } from "./ProviderSummary";
 import { ProviderDetailsModal } from "./ProviderDetailsModal";
 import { ToolDetailsModal } from "./ToolDetailsModal";
@@ -77,8 +79,10 @@ type GraphCanvasProps = {
   selectedEdgeId: string | null;
   onGraphChange: (graph: GraphDefinition) => void;
   onGraphDrag: (graph: GraphDefinition) => void;
+  onFormatGraph: () => void;
   onRunGraph: () => void;
   onScrollToTop: () => void;
+  backgroundDragSensitivity?: number;
   onSelectionChange: (nodeId: string | null, edgeId: string | null) => void;
 };
 
@@ -148,6 +152,30 @@ type NodeClipboardState = {
   pasteCount: number;
 };
 
+type GraphSelectionState = {
+  nodeIds: string[];
+  edgeIds: string[];
+};
+
+type PrimarySelectionState = {
+  nodeId: string | null;
+  edgeId: string | null;
+};
+
+type SelectionRect = {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+};
+
+type MarqueeSelectionState = {
+  originClient: GraphPosition;
+  currentClient: GraphPosition;
+  originFlow: GraphPosition;
+  currentFlow: GraphPosition;
+};
+
 const NODE_CLIPBOARD_PASTE_OFFSET = 48;
 
 const KIND_COLORS: Record<string, string> = {
@@ -157,6 +185,7 @@ const KIND_COLORS: Record<string, string> = {
   tool: "#a78bfa",
   mcp_context_provider: "#5aa7ff",
   mcp_tool_executor: "#a78bfa",
+  mcp_recheck: "#8b5cf6",
   data: "#2dd4bf",
   output: "#4ade80",
 };
@@ -168,6 +197,7 @@ const KIND_LABELS: Record<string, string> = {
   tool: "FX",
   mcp_context_provider: "MC",
   mcp_tool_executor: "MX",
+  mcp_recheck: "MR",
   data: "DB",
   output: "OUT",
 };
@@ -176,20 +206,21 @@ const nodeTypes = { graphNode: GraphCanvasNode };
 const edgeTypes = { graphEdge: GraphCanvasEdge };
 const NODE_STYLE = {
   width: "max-content",
-  minWidth: 280,
+  minWidth: 320,
   background: "transparent",
   border: "none",
   padding: 0,
   boxShadow: "none",
 } as const;
-const NODE_WIDTH = 280;
-const NODE_HEIGHT = 150;
-const NODE_REGION_HEIGHT = 168;
-const MODEL_NODE_HEIGHT = 196;
-const MODEL_NODE_REGION_HEIGHT = 220;
+const NODE_WIDTH = 320;
+const NODE_HEIGHT = 178;
+const NODE_REGION_HEIGHT = 198;
+const MODEL_NODE_HEIGHT = 228;
+const MODEL_NODE_REGION_HEIGHT = 252;
 const JUNCTION_NODE_SIZE = 24;
-const MIN_POINTER_PAN_DAMPING = 0.15;
+const DEFAULT_BACKGROUND_DRAG_SENSITIVITY = 0.28;
 const VIEWPORT_SYNC_EPSILON = 0.25;
+const MIN_GRAPH_ZOOM = 0.1;
 const EDGE_STROKE_WIDTH = 3.6;
 const SELECTED_EDGE_STROKE_WIDTH = 4.3;
 const DRAFT_WIRE_STROKE_WIDTH = 4.6;
@@ -316,6 +347,105 @@ function createDragDiagnosticSession(): DragDiagnosticSession {
 
 function roundDiagnosticValue(value: number) {
   return Number(value.toFixed(2));
+}
+
+function normalizeSelectionRect(start: GraphPosition, end: GraphPosition): SelectionRect {
+  return {
+    minX: Math.min(start.x, end.x),
+    maxX: Math.max(start.x, end.x),
+    minY: Math.min(start.y, end.y),
+    maxY: Math.max(start.y, end.y),
+  };
+}
+
+function selectionRectWidth(rect: SelectionRect) {
+  return rect.maxX - rect.minX;
+}
+
+function selectionRectHeight(rect: SelectionRect) {
+  return rect.maxY - rect.minY;
+}
+
+function pointInsideSelectionRect(point: GraphPosition, rect: SelectionRect) {
+  return point.x >= rect.minX && point.x <= rect.maxX && point.y >= rect.minY && point.y <= rect.maxY;
+}
+
+function rectsIntersect(left: SelectionRect, right: SelectionRect) {
+  return !(
+    left.maxX < right.minX ||
+    left.minX > right.maxX ||
+    left.maxY < right.minY ||
+    left.minY > right.maxY
+  );
+}
+
+function segmentOrientation(start: GraphPosition, middle: GraphPosition, end: GraphPosition) {
+  const cross = (middle.y - start.y) * (end.x - middle.x) - (middle.x - start.x) * (end.y - middle.y);
+  if (Math.abs(cross) <= 0.0001) {
+    return 0;
+  }
+  return cross > 0 ? 1 : 2;
+}
+
+function pointOnSegment(start: GraphPosition, point: GraphPosition, end: GraphPosition) {
+  return (
+    point.x <= Math.max(start.x, end.x) + 0.0001 &&
+    point.x + 0.0001 >= Math.min(start.x, end.x) &&
+    point.y <= Math.max(start.y, end.y) + 0.0001 &&
+    point.y + 0.0001 >= Math.min(start.y, end.y)
+  );
+}
+
+function segmentsIntersect(startA: GraphPosition, endA: GraphPosition, startB: GraphPosition, endB: GraphPosition) {
+  const orientation1 = segmentOrientation(startA, endA, startB);
+  const orientation2 = segmentOrientation(startA, endA, endB);
+  const orientation3 = segmentOrientation(startB, endB, startA);
+  const orientation4 = segmentOrientation(startB, endB, endA);
+
+  if (orientation1 !== orientation2 && orientation3 !== orientation4) {
+    return true;
+  }
+  if (orientation1 === 0 && pointOnSegment(startA, startB, endA)) {
+    return true;
+  }
+  if (orientation2 === 0 && pointOnSegment(startA, endB, endA)) {
+    return true;
+  }
+  if (orientation3 === 0 && pointOnSegment(startB, startA, endB)) {
+    return true;
+  }
+  return orientation4 === 0 && pointOnSegment(startB, endA, endB);
+}
+
+function polylineIntersectsSelectionRect(points: GraphPosition[], rect: SelectionRect) {
+  if (points.length === 0) {
+    return false;
+  }
+  if (points.some((point) => pointInsideSelectionRect(point, rect))) {
+    return true;
+  }
+
+  const corners = [
+    { x: rect.minX, y: rect.minY },
+    { x: rect.maxX, y: rect.minY },
+    { x: rect.maxX, y: rect.maxY },
+    { x: rect.minX, y: rect.maxY },
+  ];
+  const rectSegments: Array<[GraphPosition, GraphPosition]> = [
+    [corners[0], corners[1]],
+    [corners[1], corners[2]],
+    [corners[2], corners[3]],
+    [corners[3], corners[0]],
+  ];
+
+  for (let index = 1; index < points.length; index += 1) {
+    const start = points[index - 1];
+    const end = points[index];
+    if (rectSegments.some(([rectStart, rectEnd]) => segmentsIntersect(start, end, rectStart, rectEnd))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function estimateEdgeLabelWidth(label: string) {
@@ -476,7 +606,7 @@ const QUICK_ADD_SLOTS: QuickAddSlot[] = [
     label: "Tool",
     description: "Create a tool or MCP node.",
     category: "tool",
-    preferredProviderIds: ["tool.mcp_context_provider", "tool.mcp_tool_executor", "tool.registry"],
+    preferredProviderIds: ["tool.mcp_context_provider", "tool.mcp_tool_executor", "tool.mcp_recheck", "tool.registry"],
   },
   {
     hotkey: "4",
@@ -558,15 +688,19 @@ export function GraphCanvas({
   selectedEdgeId,
   onGraphChange,
   onGraphDrag,
+  onFormatGraph,
   onRunGraph,
   onScrollToTop,
+  backgroundDragSensitivity = DEFAULT_BACKGROUND_DRAG_SENSITIVITY,
   onSelectionChange,
 }: GraphCanvasProps) {
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance | null>(null);
   const [editorMessage, setEditorMessage] = useState<string | null>(null);
   const [toolDetailsNodeId, setToolDetailsNodeId] = useState<string | null>(null);
   const [providerDetailsNodeId, setProviderDetailsNodeId] = useState<string | null>(null);
+  const [promptBlockDetailsNodeId, setPromptBlockDetailsNodeId] = useState<string | null>(null);
   const [displayResponseNodeId, setDisplayResponseNodeId] = useState<string | null>(null);
+  const [contextBuilderPayloadNodeId, setContextBuilderPayloadNodeId] = useState<string | null>(null);
   const [tooltipNodeId, setTooltipNodeId] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>("add");
@@ -588,10 +722,14 @@ export function GraphCanvas({
   const [draftConnection, setDraftConnection] = useState<DraftConnectionState | null>(null);
   const [draftConnectionSnapTargetNodeId, setDraftConnectionSnapTargetNodeId] = useState<string | null>(null);
   const [viewportState, setViewportState] = useState<ViewportState>({ x: 0, y: 0, zoom: 1 });
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>(() => (selectedNodeId ? [selectedNodeId] : []));
+  const [selectedEdgeIds, setSelectedEdgeIds] = useState<string[]>(() => (selectedEdgeId ? [selectedEdgeId] : []));
+  const [marqueeSelection, setMarqueeSelection] = useState<MarqueeSelectionState | null>(null);
   const dragDiagnosticsEnabled = useGraphDiagnosticsEnabled();
   const canvasRef = useRef<HTMLDivElement | null>(null);
   const canvasZoomRef = useRef(1);
   const graphRef = useRef<GraphDefinition | null>(graph);
+  const lastRequestedPrimarySelectionRef = useRef<PrimarySelectionState>({ nodeId: selectedNodeId, edgeId: selectedEdgeId });
   const draftConnectionRef = useRef<DraftConnectionState | null>(draftConnection);
   const nodeClipboardRef = useRef<NodeClipboardState | null>(null);
   const draftWirePathRef = useRef<SVGPathElement | null>(null);
@@ -625,7 +763,7 @@ export function GraphCanvas({
   const vizLocked = panLocked || isCommandHeld;
   const toolDetailsNode = useMemo(
     () =>
-      graph?.nodes.find((node) => node.id === toolDetailsNodeId && (node.kind === "tool" || node.kind === "mcp_context_provider")) ??
+      graph?.nodes.find((node) => node.id === toolDetailsNodeId && node.category === "tool") ??
       null,
     [graph, toolDetailsNodeId],
   );
@@ -633,10 +771,20 @@ export function GraphCanvas({
     () => graph?.nodes.find((node) => node.id === providerDetailsNodeId && node.kind === "model") ?? null,
     [graph, providerDetailsNodeId],
   );
+  const promptBlockDetailsNode = useMemo(
+    () => graph?.nodes.find((node) => node.id === promptBlockDetailsNodeId && node.provider_id === "core.prompt_block") ?? null,
+    [graph, promptBlockDetailsNodeId],
+  );
   const displayResponseNode = useMemo(
     () => graph?.nodes.find((node) => node.id === displayResponseNodeId && node.provider_id === "core.data_display") ?? null,
     [displayResponseNodeId, graph],
   );
+  const contextBuilderPayloadNode = useMemo(
+    () => graph?.nodes.find((node) => node.id === contextBuilderPayloadNodeId && node.provider_id === "core.context_builder") ?? null,
+    [contextBuilderPayloadNodeId, graph],
+  );
+  const selectedNodeIdSet = useMemo(() => new Set(selectedNodeIds), [selectedNodeIds]);
+  const selectedEdgeIdSet = useMemo(() => new Set(selectedEdgeIds), [selectedEdgeIds]);
 
   useRenderDiagnostics(
     "GraphCanvas",
@@ -652,6 +800,49 @@ export function GraphCanvas({
     },
     12,
   );
+
+  const requestPrimarySelectionChange = useCallback(
+    (nodeId: string | null, edgeId: string | null) => {
+      lastRequestedPrimarySelectionRef.current = { nodeId, edgeId };
+      onSelectionChange(nodeId, edgeId);
+    },
+    [onSelectionChange],
+  );
+
+  const clearFlowInstanceSelection = useCallback(() => {
+    if (!flowInstance) {
+      return;
+    }
+    flowInstance.setNodes((currentNodes) =>
+      currentNodes.map((node) => (node.selected ? { ...node, selected: false } : node)),
+    );
+    flowInstance.setEdges((currentEdges) =>
+      currentEdges.map((edge) => (edge.selected ? { ...edge, selected: false } : edge)),
+    );
+  }, [flowInstance]);
+
+  const setCanvasSelection = useCallback(
+    (selection: GraphSelectionState) => {
+      const validNodeIds = graph
+        ? graph.nodes.filter((node) => selection.nodeIds.includes(node.id)).map((node) => node.id)
+        : selection.nodeIds;
+      const validEdgeIds = graph
+        ? graph.edges.filter((edge) => selection.edgeIds.includes(edge.id)).map((edge) => edge.id)
+        : selection.edgeIds;
+      setSelectedNodeIds(validNodeIds);
+      setSelectedEdgeIds(validEdgeIds);
+      requestPrimarySelectionChange(
+        validNodeIds.length === 1 && validEdgeIds.length === 0 ? validNodeIds[0] : null,
+        validEdgeIds.length === 1 && validNodeIds.length === 0 ? validEdgeIds[0] : null,
+      );
+    },
+    [graph, requestPrimarySelectionChange],
+  );
+
+  const clearCanvasSelection = useCallback(() => {
+    clearFlowInstanceSelection();
+    setCanvasSelection({ nodeIds: [], edgeIds: [] });
+  }, [clearFlowInstanceSelection, setCanvasSelection]);
 
   const beginDragDiagnosticSession = useCallback(() => {
     if (!dragDiagnosticsEnabled) {
@@ -775,6 +966,37 @@ export function GraphCanvas({
     }
   }, [isConnecting]);
 
+  useEffect(() => {
+    const requestedSelection = lastRequestedPrimarySelectionRef.current;
+    if (selectedNodeId === requestedSelection.nodeId && selectedEdgeId === requestedSelection.edgeId) {
+      return;
+    }
+    setSelectedNodeIds(selectedNodeId ? [selectedNodeId] : []);
+    setSelectedEdgeIds(selectedEdgeId ? [selectedEdgeId] : []);
+    lastRequestedPrimarySelectionRef.current = { nodeId: selectedNodeId, edgeId: selectedEdgeId };
+  }, [selectedEdgeId, selectedNodeId]);
+
+  useEffect(() => {
+    if (!graph) {
+      if (selectedNodeIds.length > 0 || selectedEdgeIds.length > 0) {
+        setSelectedNodeIds([]);
+        setSelectedEdgeIds([]);
+      }
+      return;
+    }
+    const validNodeIds = selectedNodeIds.filter((nodeId) => graph.nodes.some((node) => node.id === nodeId));
+    const validEdgeIds = selectedEdgeIds.filter((edgeId) => graph.edges.some((edge) => edge.id === edgeId));
+    if (validNodeIds.length === selectedNodeIds.length && validEdgeIds.length === selectedEdgeIds.length) {
+      return;
+    }
+    setSelectedNodeIds(validNodeIds);
+    setSelectedEdgeIds(validEdgeIds);
+    requestPrimarySelectionChange(
+      validNodeIds.length === 1 && validEdgeIds.length === 0 ? validNodeIds[0] : null,
+      validEdgeIds.length === 1 && validNodeIds.length === 0 ? validEdgeIds[0] : null,
+    );
+  }, [graph, requestPrimarySelectionChange, selectedEdgeIds, selectedNodeIds]);
+
   const isEditableTarget = useCallback((target: EventTarget | null): boolean => {
     if (!(target instanceof HTMLElement)) {
       return false;
@@ -818,6 +1040,7 @@ export function GraphCanvas({
   const handleOpenToolDetails = useCallback(
     (nodeId: string) => {
       onSelectionChange(nodeId, null);
+      setPromptBlockDetailsNodeId(null);
       setToolDetailsNodeId(nodeId);
     },
     [onSelectionChange],
@@ -1031,9 +1254,12 @@ export function GraphCanvas({
       const visibleHeight = bounds.height / nextViewport.zoom;
       const falloffDistance = Math.max(100, Math.min(220, Math.max(visibleWidth, visibleHeight) * 0.14));
       const normalizedDistance = nextDistance / falloffDistance;
-      return MIN_POINTER_PAN_DAMPING + (1 - MIN_POINTER_PAN_DAMPING) * Math.exp(-1.9 * normalizedDistance * normalizedDistance);
+      return (
+        backgroundDragSensitivity +
+        (1 - backgroundDragSensitivity) * Math.exp(-1.9 * normalizedDistance * normalizedDistance)
+      );
     },
-    [getPointerPanOutsideDistance],
+    [backgroundDragSensitivity, getPointerPanOutsideDistance],
   );
 
   const handleViewportMove = useCallback(
@@ -1100,7 +1326,21 @@ export function GraphCanvas({
   const handleOpenProviderDetails = useCallback(
     (nodeId: string) => {
       onSelectionChange(nodeId, null);
+      setPromptBlockDetailsNodeId(null);
       setProviderDetailsNodeId(nodeId);
+    },
+    [onSelectionChange],
+  );
+
+  const handleOpenPromptBlockDetails = useCallback(
+    (nodeId: string) => {
+      onSelectionChange(nodeId, null);
+      setTooltipNodeId(null);
+      setToolDetailsNodeId(null);
+      setProviderDetailsNodeId(null);
+      setPromptBlockDetailsNodeId(nodeId);
+      setDisplayResponseNodeId(null);
+      setContextBuilderPayloadNodeId(null);
     },
     [onSelectionChange],
   );
@@ -1108,7 +1348,19 @@ export function GraphCanvas({
   const handleOpenDisplayResponse = useCallback(
     (nodeId: string) => {
       onSelectionChange(nodeId, null);
+      setPromptBlockDetailsNodeId(null);
+      setContextBuilderPayloadNodeId(null);
       setDisplayResponseNodeId(nodeId);
+    },
+    [onSelectionChange],
+  );
+
+  const handleOpenContextBuilderPayload = useCallback(
+    (nodeId: string) => {
+      onSelectionChange(nodeId, null);
+      setPromptBlockDetailsNodeId(null);
+      setDisplayResponseNodeId(null);
+      setContextBuilderPayloadNodeId(nodeId);
     },
     [onSelectionChange],
   );
@@ -1126,14 +1378,16 @@ export function GraphCanvas({
   }, [flowInstance]);
 
   const clearCanvasChrome = useCallback(() => {
-    onSelectionChange(null, null);
+    clearCanvasSelection();
     setTooltipNodeId(null);
     setToolDetailsNodeId(null);
     setProviderDetailsNodeId(null);
+    setPromptBlockDetailsNodeId(null);
     setDisplayResponseNodeId(null);
+    setContextBuilderPayloadNodeId(null);
     setDrawerOpen(false);
     setShowHotkeys(false);
-  }, [onSelectionChange]);
+  }, [clearCanvasSelection]);
 
   const getFallbackScreenPosition = useCallback(() => {
     const bounds = canvasRef.current?.getBoundingClientRect();
@@ -1244,6 +1498,149 @@ export function GraphCanvas({
     },
     [getNodeDimensions, graph],
   );
+
+  const getSelectionForRect = useCallback(
+    (rect: SelectionRect): GraphSelectionState => {
+      if (!graph) {
+        return { nodeIds: [], edgeIds: [] };
+      }
+
+      const selectedNodeIds = graph.nodes
+        .filter((node) =>
+          rectsIntersect(rect, {
+            minX: node.position.x,
+            maxX: node.position.x + getFlowNodeDimensions(node).width,
+            minY: node.position.y,
+            maxY: node.position.y + getFlowNodeDimensions(node).height,
+          }),
+        )
+        .map((node) => node.id);
+      const selectedNodeIdSet = new Set(selectedNodeIds);
+      const selectedEdgeIds = graph.edges
+        .filter((edge) => {
+          if (selectedNodeIdSet.has(edge.source_id) && selectedNodeIdSet.has(edge.target_id)) {
+            return true;
+          }
+          const sourceNode = graph.nodes.find((node) => node.id === edge.source_id);
+          const targetNode = graph.nodes.find((node) => node.id === edge.target_id);
+          if (!sourceNode || !targetNode) {
+            return false;
+          }
+          const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+          const sourceAnchor = getSourceAnchorPosition(edge.source_id, sourceHandleId);
+          const targetAnchor = getTargetAnchorPosition(edge.target_id, edge.target_handle_id ?? null);
+          if (!sourceAnchor || !targetAnchor) {
+            return false;
+          }
+          const routePoints = resolveEdgeRoutePoints(sourceAnchor, targetAnchor, edge.waypoints ?? [], { endWithHorizontal: true });
+          return polylineIntersectsSelectionRect(routePoints, rect);
+        })
+        .map((edge) => edge.id);
+
+      return { nodeIds: selectedNodeIds, edgeIds: selectedEdgeIds };
+    },
+    [getFlowNodeDimensions, getSourceAnchorPosition, getTargetAnchorPosition, graph],
+  );
+
+  const isMarqueeSelectionTarget = useCallback((target: EventTarget | null) => {
+    if (!(target instanceof HTMLElement)) {
+      return false;
+    }
+    if (target.closest(PLACEMENT_UI_SELECTOR) || target.closest(".react-flow__node") || target.closest(".react-flow__edge")) {
+      return false;
+    }
+    return Boolean(target.closest(".react-flow__pane"));
+  }, []);
+
+  const handleCanvasMouseDownCapture = useCallback(
+    (event: ReactMouseEvent<HTMLDivElement>) => {
+      if (
+        event.button !== 0 ||
+        !event.shiftKey ||
+        pendingPlacement ||
+        draftConnection ||
+        junctionDrag ||
+        waypointDrag ||
+        !isMarqueeSelectionTarget(event.target)
+      ) {
+        return;
+      }
+      const flowPosition = getFlowPositionFromScreen({ x: event.clientX, y: event.clientY });
+      if (!flowPosition) {
+        return;
+      }
+      setTooltipNodeId(null);
+      event.preventDefault();
+      event.stopPropagation();
+      setMarqueeSelection({
+        originClient: { x: event.clientX, y: event.clientY },
+        currentClient: { x: event.clientX, y: event.clientY },
+        originFlow: flowPosition,
+        currentFlow: flowPosition,
+      });
+    },
+    [draftConnection, getFlowPositionFromScreen, isMarqueeSelectionTarget, junctionDrag, pendingPlacement, waypointDrag],
+  );
+
+  useEffect(() => {
+    if (!marqueeSelection) {
+      return;
+    }
+
+    const updateSelectionPointer = (clientPosition: GraphPosition) => {
+      const flowPosition = getFlowPositionFromScreen(clientPosition);
+      if (!flowPosition) {
+        return;
+      }
+      setMarqueeSelection((current) =>
+        current
+          ? {
+              ...current,
+              currentClient: clientPosition,
+              currentFlow: flowPosition,
+            }
+          : current,
+      );
+    };
+
+    const handleMouseMove = (event: MouseEvent) => {
+      updateSelectionPointer({ x: event.clientX, y: event.clientY });
+    };
+
+    const handleMouseUp = (event: MouseEvent) => {
+      const flowPosition = getFlowPositionFromScreen({ x: event.clientX, y: event.clientY });
+      const finalSelection = flowPosition
+        ? {
+            ...marqueeSelection,
+            currentClient: { x: event.clientX, y: event.clientY },
+            currentFlow: flowPosition,
+          }
+        : marqueeSelection;
+      const flowRect = normalizeSelectionRect(finalSelection.originFlow, finalSelection.currentFlow);
+      setMarqueeSelection(null);
+      suppressNextPaneClickRef.current = true;
+      requestAnimationFrame(() => {
+        suppressNextPaneClickRef.current = false;
+      });
+      if (selectionRectWidth(flowRect) < 4 && selectionRectHeight(flowRect) < 4) {
+        return;
+      }
+      setCanvasSelection(getSelectionForRect(flowRect));
+    };
+
+    const handleWindowBlur = () => {
+      setMarqueeSelection(null);
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, [getFlowPositionFromScreen, getSelectionForRect, marqueeSelection, setCanvasSelection]);
 
   const findDraftConnectionSnapTarget = useCallback(
     (sourceNodeId: string, sourceHandleId: string | null, pointerPosition: GraphPosition): DraftConnectionSnapTarget | null => {
@@ -2264,6 +2661,7 @@ export function GraphCanvas({
       setTooltipNodeId(null);
       setToolDetailsNodeId(null);
       setProviderDetailsNodeId(null);
+      setPromptBlockDetailsNodeId(null);
       setEditorMessage(`Added ${provider.display_name}.`);
     },
     [catalog, getFlowPositionFromScreen, graph, onGraphChange, onSelectionChange],
@@ -2293,6 +2691,7 @@ export function GraphCanvas({
       setTooltipNodeId(null);
       setToolDetailsNodeId(null);
       setProviderDetailsNodeId(null);
+      setPromptBlockDetailsNodeId(null);
       setEditorMessage(`Added saved node "${saved.name}".`);
     },
     [getFlowPositionFromScreen, graph, onGraphChange, onSelectionChange],
@@ -2311,6 +2710,7 @@ export function GraphCanvas({
       setTooltipNodeId(null);
       setToolDetailsNodeId(null);
       setProviderDetailsNodeId(null);
+      setPromptBlockDetailsNodeId(null);
       setDrawerOpen(false);
       setPendingPlacement({
         kind: "provider",
@@ -2335,6 +2735,7 @@ export function GraphCanvas({
       setTooltipNodeId(null);
       setToolDetailsNodeId(null);
       setProviderDetailsNodeId(null);
+      setPromptBlockDetailsNodeId(null);
       setDrawerOpen(false);
       setPendingPlacement({
         kind: "saved",
@@ -2443,6 +2844,7 @@ export function GraphCanvas({
     setTooltipNodeId(null);
     setToolDetailsNodeId(null);
     setProviderDetailsNodeId(null);
+    setPromptBlockDetailsNodeId(null);
     setEditorMessage(`Pasted ${nextNode.label}.`);
   }, [draftConnection, graph, onGraphChange, onSelectionChange, pendingPlacement]);
 
@@ -2454,6 +2856,39 @@ export function GraphCanvas({
     },
     [],
   );
+
+  const deleteSelectedElements = useCallback(() => {
+    if (!graph || (selectedNodeIds.length === 0 && selectedEdgeIds.length === 0)) {
+      return false;
+    }
+
+    const selectedNodeIdSet = new Set(selectedNodeIds);
+    const connectedEdgeIds = graph.edges
+      .filter((edge) => selectedNodeIdSet.has(edge.source_id) || selectedNodeIdSet.has(edge.target_id))
+      .map((edge) => edge.id);
+    const edgeIdsToRemove = [...new Set([...selectedEdgeIds, ...connectedEdgeIds])];
+
+    let nextGraph: GraphDefinition = {
+      ...graph,
+      nodes: graph.nodes.filter((node) => !selectedNodeIdSet.has(node.id)),
+      edges: graph.edges.filter(
+        (edge) =>
+          !selectedNodeIdSet.has(edge.source_id) &&
+          !selectedNodeIdSet.has(edge.target_id) &&
+          !edgeIdsToRemove.includes(edge.id),
+      ),
+      start_node_id: selectedNodeIdSet.has(graph.start_node_id) ? "" : graph.start_node_id,
+    };
+    nextGraph = pruneDisconnectedWireJunctions(nextGraph);
+    nextGraph = removeEdgesAndPruneJunctions(nextGraph, edgeIdsToRemove);
+
+    clearCanvasSelection();
+    onGraphChange(nextGraph);
+    setEditorMessage(
+      `Deleted ${selectedNodeIds.length} node${selectedNodeIds.length === 1 ? "" : "s"} and ${edgeIdsToRemove.length} edge${edgeIdsToRemove.length === 1 ? "" : "s"}.`,
+    );
+    return true;
+  }, [clearCanvasSelection, graph, onGraphChange, pruneDisconnectedWireJunctions, removeEdgesAndPruneJunctions, selectedEdgeIds, selectedNodeIds]);
 
   const handleToggleHotbarFavorite = useCallback(
     (provider: NodeProviderDefinition) => {
@@ -2492,6 +2927,27 @@ export function GraphCanvas({
       transform: `translate(${viewportState.x + pendingPlacement.position.x * viewportState.zoom}px, ${viewportState.y + pendingPlacement.position.y * viewportState.zoom}px) scale(${viewportState.zoom})`,
     };
   }, [pendingPlacement, viewportState]);
+
+  const marqueeSelectionStyle = useMemo<CSSProperties | null>(() => {
+    if (!marqueeSelection) {
+      return null;
+    }
+    const canvasBounds = canvasRef.current?.getBoundingClientRect();
+    if (!canvasBounds) {
+      return null;
+    }
+    const clientRect = normalizeSelectionRect(marqueeSelection.originClient, marqueeSelection.currentClient);
+    const left = Math.max(0, clientRect.minX - canvasBounds.left);
+    const top = Math.max(0, clientRect.minY - canvasBounds.top);
+    const right = Math.min(canvasBounds.width, clientRect.maxX - canvasBounds.left);
+    const bottom = Math.min(canvasBounds.height, clientRect.maxY - canvasBounds.top);
+    return {
+      left,
+      top,
+      width: Math.max(0, right - left),
+      height: Math.max(0, bottom - top),
+    };
+  }, [marqueeSelection]);
 
   const draftConnectionToneClass = useMemo(() => {
     if (!draftConnection || !graph) {
@@ -2546,6 +3002,13 @@ export function GraphCanvas({
         return;
       }
 
+      if ((event.key === "Backspace" || event.key === "Delete") && !pendingPlacement && !draftConnection) {
+        if (deleteSelectedElements()) {
+          event.preventDefault();
+        }
+        return;
+      }
+
       const quickAddItem = quickAddItems.find((item) => item.hotkey === event.key);
       if (quickAddItem?.provider) {
         event.preventDefault();
@@ -2594,7 +3057,7 @@ export function GraphCanvas({
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [beginProviderPlacement, cancelDraftConnection, cancelPlacement, clearCanvasChrome, draftConnection, handleFitView, isEditableTarget, openDrawerTab, pendingPlacement, quickAddItems]);
+  }, [beginProviderPlacement, cancelDraftConnection, cancelPlacement, clearCanvasChrome, deleteSelectedElements, draftConnection, handleFitView, isEditableTarget, openDrawerTab, pendingPlacement, quickAddItems]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2636,7 +3099,7 @@ export function GraphCanvas({
       const nextNodes = graph.nodes.map((node): FlowNode<GraphCanvasRuntimeNodeData> => {
         const cachedNode = flowNodeCacheRef.current.get(node.id);
         const nextPosition = dragPositions?.get(node.id) ?? node.position;
-        const nextSelected = node.id === selectedNodeId;
+        const nextSelected = selectedNodeIdSet.has(node.id);
         const nextStyle = isWireJunctionNode(node) ? JUNCTION_NODE_STYLE : NODE_STYLE;
         const nextDimensions = getFlowNodeDimensions(node, cachedNode);
         if (
@@ -2679,7 +3142,9 @@ export function GraphCanvas({
                 onToggleTooltip: handleToggleTooltip,
                 onOpenToolDetails: handleOpenToolDetails,
                 onOpenProviderDetails: handleOpenProviderDetails,
+                onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
                 onOpenDisplayResponse: handleOpenDisplayResponse,
+                onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
                 onHandlePointerDown: handleNodeHandlePointerDown,
                 onJunctionPointerDown: handleJunctionPointerDown,
               },
@@ -2734,7 +3199,9 @@ export function GraphCanvas({
         previousData.onToggleTooltip === handleToggleTooltip &&
         previousData.onOpenToolDetails === handleOpenToolDetails &&
         previousData.onOpenProviderDetails === handleOpenProviderDetails &&
+        previousData.onOpenPromptBlockDetails === handleOpenPromptBlockDetails &&
         previousData.onOpenDisplayResponse === handleOpenDisplayResponse &&
+        previousData.onOpenContextBuilderPayload === handleOpenContextBuilderPayload &&
         previousData.onHandlePointerDown === handleNodeHandlePointerDown &&
         previousData.onJunctionPointerDown === handleJunctionPointerDown
           ? previousData
@@ -2752,14 +3219,16 @@ export function GraphCanvas({
               onToggleTooltip: handleToggleTooltip,
               onOpenToolDetails: handleOpenToolDetails,
               onOpenProviderDetails: handleOpenProviderDetails,
+              onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
               onOpenDisplayResponse: handleOpenDisplayResponse,
+              onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
               onHandlePointerDown: handleNodeHandlePointerDown,
               onJunctionPointerDown: handleJunctionPointerDown,
             };
       nextNodeDataCache.set(node.id, nextData);
       const isJunction = isWireJunctionNode(node);
       const nextPosition = dragPositionMapRef.current?.get(node.id) ?? node.position;
-      const nextSelected = node.id === selectedNodeId;
+      const nextSelected = selectedNodeIdSet.has(node.id);
       const nextStyle = isJunction ? JUNCTION_NODE_STYLE : NODE_STYLE;
       const previousFlowNode = flowNodeCacheRef.current.get(node.id);
       const nextDimensions = getFlowNodeDimensions(node, previousFlowNode);
@@ -2794,7 +3263,7 @@ export function GraphCanvas({
       recordNodeBuildDiagnostic(performance.now() - diagnosticsStart);
     }
     return nextNodes;
-  }, [catalog, dragDiagnosticsEnabled, dragRenderTick, draftConnection?.sourceNodeId, draftConnectionSnapTargetNodeId, getFlowNodeDimensions, graph, handleJunctionPointerDown, handleNodeHandlePointerDown, handleOpenDisplayResponse, handleOpenProviderDetails, handleOpenToolDetails, handleToggleTooltip, isConnecting, isNodeDragActive, recordNodeBuildDiagnostic, runState, selectedNodeId, tooltipNodeId]);
+  }, [catalog, dragDiagnosticsEnabled, dragRenderTick, draftConnection?.sourceNodeId, draftConnectionSnapTargetNodeId, getFlowNodeDimensions, graph, handleJunctionPointerDown, handleNodeHandlePointerDown, handleOpenContextBuilderPayload, handleOpenDisplayResponse, handleOpenPromptBlockDetails, handleOpenProviderDetails, handleOpenToolDetails, handleToggleTooltip, isConnecting, isNodeDragActive, recordNodeBuildDiagnostic, runState, selectedNodeIdSet, tooltipNodeId]);
 
   const edges = useMemo<FlowEdge<GraphCanvasEdgeData>[]>(() => {
     if (!graph) {
@@ -2982,7 +3451,7 @@ export function GraphCanvas({
         target: edge.target_id,
         sourceHandle: edge.source_handle_id ?? sourceHandleId ?? undefined,
         targetHandle: edge.target_handle_id ?? undefined,
-        selected: edge.id === selectedEdgeId,
+        selected: selectedEdgeIdSet.has(edge.id),
         markerEnd: {
           type: MarkerType.ArrowClosed,
           width: 14,
@@ -3003,15 +3472,15 @@ export function GraphCanvas({
           labelShiftX: previousEdgeData?.labelShiftX ?? 0,
           labelShiftY: previousEdgeData?.labelShiftY ?? 0,
           showWaypointHandles: (edge.waypoints?.length ?? 0) > 0,
-          waypointSelected: edge.id === selectedEdgeId,
+          waypointSelected: selectedEdgeIdSet.has(edge.id),
           waypointDragActive: waypointDrag?.edgeId === edge.id,
           onWaypointPointerDown: handleWaypointPointerDown,
         },
         style: {
-          strokeWidth: edge.id === selectedEdgeId ? SELECTED_EDGE_STROKE_WIDTH : EDGE_STROKE_WIDTH,
+          strokeWidth: selectedEdgeIdSet.has(edge.id) ? SELECTED_EDGE_STROKE_WIDTH : EDGE_STROKE_WIDTH,
           strokeLinecap: "round" as const,
           filter:
-            edge.id === selectedEdgeId
+            selectedEdgeIdSet.has(edge.id)
               ? "drop-shadow(0 0 7px rgba(255, 99, 196, 0.25)) drop-shadow(0 0 10px rgba(92, 146, 255, 0.22))"
               : "drop-shadow(0 0 7px rgba(111, 133, 255, 0.18))",
         },
@@ -3052,7 +3521,7 @@ export function GraphCanvas({
       cachedEdgesRef.current = result;
     }
     return result;
-  }, [dragRenderTick, getNodeDimensions, graph, handleWaypointPointerDown, isNodeDragActive, junctionDrag, selectedEdgeId, waypointDrag]);
+  }, [dragRenderTick, getNodeDimensions, graph, handleWaypointPointerDown, isNodeDragActive, junctionDrag, selectedEdgeIdSet, waypointDrag]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -3084,7 +3553,7 @@ export function GraphCanvas({
             hasNonDragChanges = true;
           }
         } else if (change.type === "select" && change.selected) {
-          onSelectionChange(change.id, null);
+          requestPrimarySelectionChange(change.id, null);
         } else if (change.type !== "select") {
           hasNonDragChanges = true;
         }
@@ -3142,8 +3611,8 @@ export function GraphCanvas({
             edges: nextGraph.edges.filter((edge) => edge.source_id !== change.id && edge.target_id !== change.id),
             start_node_id: nextGraph.start_node_id === change.id ? "" : nextGraph.start_node_id,
           };
-          if (selectedNodeId === change.id) {
-            onSelectionChange(null, null);
+          if (selectedNodeIdSet.has(change.id)) {
+            clearCanvasSelection();
           }
         }
       }
@@ -3155,7 +3624,7 @@ export function GraphCanvas({
       }
       onGraphChange(nextGraph);
     },
-    [beginDragDiagnosticSession, cancelPendingDragFrame, cancelPendingNodeDragFrame, dragDiagnosticsEnabled, flushDragDiagnosticSession, graph, isNodeDragActive, onGraphChange, onSelectionChange, scheduleDragRender, selectedNodeId, updateMeasuredNodeDimensions],
+    [beginDragDiagnosticSession, cancelPendingDragFrame, cancelPendingNodeDragFrame, clearCanvasSelection, dragDiagnosticsEnabled, flushDragDiagnosticSession, graph, isNodeDragActive, onGraphChange, requestPrimarySelectionChange, scheduleDragRender, selectedNodeIdSet, updateMeasuredNodeDimensions],
   );
 
   const onEdgesChange = useCallback(
@@ -3170,17 +3639,17 @@ export function GraphCanvas({
             ...nextGraph,
             edges: nextGraph.edges.filter((edge) => edge.id !== change.id),
           };
-          if (selectedEdgeId === change.id) {
-            onSelectionChange(null, null);
+          if (selectedEdgeIdSet.has(change.id)) {
+            clearCanvasSelection();
           }
         }
         if (change.type === "select" && change.selected) {
-          onSelectionChange(null, change.id);
+          requestPrimarySelectionChange(null, change.id);
         }
       });
       onGraphChange(nextGraph);
     },
-    [graph, onGraphChange, onSelectionChange, selectedEdgeId],
+    [clearCanvasSelection, graph, onGraphChange, requestPrimarySelectionChange, selectedEdgeIdSet],
   );
 
   const isValidConnection = useCallback(
@@ -3415,10 +3884,11 @@ export function GraphCanvas({
         ) : null}
         <div
           ref={canvasRef}
-          className={`graph-canvas${drawerOpen ? " graph-canvas--drawer-open" : ""}${isProviderDragActive || isSavedNodeDragActive ? " is-drop-target" : ""}${isConnecting ? " is-connecting" : ""}${pendingPlacement ? " is-placing-node" : ""}${draftConnection ? " is-routing-wire" : ""}${junctionDrag ? " is-dragging-junction" : ""}${waypointDrag ? " is-dragging-waypoint" : ""}${isNodeDragActive ? " is-dragging-node" : ""}`}
+          className={`graph-canvas${drawerOpen ? " graph-canvas--drawer-open" : ""}${isProviderDragActive || isSavedNodeDragActive ? " is-drop-target" : ""}${isConnecting ? " is-connecting" : ""}${pendingPlacement ? " is-placing-node" : ""}${draftConnection ? " is-routing-wire" : ""}${junctionDrag ? " is-dragging-junction" : ""}${waypointDrag ? " is-dragging-waypoint" : ""}${isNodeDragActive ? " is-dragging-node" : ""}${marqueeSelection ? " is-marquee-selecting" : ""}`}
           onDrop={onDrop}
           onDragOver={onDragOver}
           onDragLeave={onDragLeave}
+          onMouseDownCapture={handleCanvasMouseDownCapture}
           onMouseMove={(event) => {
             if (draftConnection && !isConnecting && !shouldIgnorePlacementTarget(event.target)) {
               const flowPosition = getFlowPositionFromScreen({ x: event.clientX, y: event.clientY });
@@ -3480,6 +3950,19 @@ export function GraphCanvas({
                 )}
               </svg>
               <span>{vizLocked ? "Locked" : "Lock"}</span>
+            </button>
+            <button
+              type="button"
+              className="graph-toolbar-button"
+              onClick={onFormatGraph}
+              aria-label="Format graph layout"
+              title="Format graph layout"
+              disabled={graph.nodes.length === 0}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 6h6M14 6h6M4 12h4M12 12h8M4 18h8M16 18h4" />
+              </svg>
+              <span>Format</span>
             </button>
           </div>
           {graph.nodes.length === 0 ? (
@@ -3552,11 +4035,13 @@ export function GraphCanvas({
               <path ref={draftWirePathRef} d="" className={`graph-draft-wire-path${draftConnectionToneClass}`} />
             </svg>
           ) : null}
+          {marqueeSelectionStyle ? <div className="graph-selection-marquee" style={marqueeSelectionStyle} aria-hidden="true" /> : null}
           <ReactFlow
             nodes={nodes}
             edges={edges}
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
+            minZoom={MIN_GRAPH_ZOOM}
             connectionLineComponent={GraphCanvasConnectionLine}
             connectionLineType={ConnectionLineType.SmoothStep}
             connectionLineStyle={{
@@ -3566,7 +4051,7 @@ export function GraphCanvas({
               filter: "drop-shadow(0 0 10px rgba(111, 130, 255, 0.45))",
             }}
             defaultViewport={{ x: 0, y: 0, zoom: 1 }}
-            panOnDrag={!vizLocked && !pendingPlacement && !junctionDrag && !waypointDrag}
+            panOnDrag={!vizLocked && !pendingPlacement && !junctionDrag && !waypointDrag && !marqueeSelection}
             panOnScroll={false}
             zoomOnScroll={!vizLocked}
             zoomOnPinch={!vizLocked}
@@ -3846,8 +4331,24 @@ export function GraphCanvas({
           onClose={() => setProviderDetailsNodeId(null)}
         />
       ) : null}
+      {promptBlockDetailsNode ? (
+        <PromptBlockDetailsModal
+          graph={graph}
+          node={promptBlockDetailsNode}
+          runState={runState}
+          onGraphChange={onGraphChange}
+          onClose={() => setPromptBlockDetailsNodeId(null)}
+        />
+      ) : null}
       {displayResponseNode ? (
         <DisplayResponseModal node={displayResponseNode} runState={runState} onClose={() => setDisplayResponseNodeId(null)} />
+      ) : null}
+      {contextBuilderPayloadNode ? (
+        <ContextBuilderPayloadModal
+          node={contextBuilderPayloadNode}
+          runState={runState}
+          onClose={() => setContextBuilderPayloadNodeId(null)}
+        />
       ) : null}
     </div>
   );

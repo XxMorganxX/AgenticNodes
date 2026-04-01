@@ -163,6 +163,7 @@ DEFAULT_CONNECTION_RULES: list[ConnectionRule] = [
     ConnectionRule(NodeCategory.API, NodeCategory.TOOL, "Model/API nodes can route tool calls to executable tools."),
     ConnectionRule(NodeCategory.API, NodeCategory.DATA, "Model/API nodes can send outputs into deterministic processing steps."),
     ConnectionRule(NodeCategory.API, NodeCategory.END, "Model/API nodes can finalize a run directly."),
+    ConnectionRule(NodeCategory.TOOL, NodeCategory.TOOL, "Tool nodes can chain execution and follow-up packaging steps before returning to an API node."),
     ConnectionRule(NodeCategory.TOOL, NodeCategory.API, "Tool results commonly return to a model for reasoning or repair."),
     ConnectionRule(NodeCategory.TOOL, NodeCategory.DATA, "Tool results can be normalized or enriched by data nodes."),
     ConnectionRule(NodeCategory.TOOL, NodeCategory.END, "Tool results can finalize a run without another model step."),

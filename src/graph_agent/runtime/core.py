@@ -60,6 +60,23 @@ def _render_prompt_block_text(value: Mapping[str, Any]) -> str:
     return f"{header}: {content}" if content else f"{header}:"
 
 
+def _render_chatgpt_style_messages(prompt_blocks: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    rendered_messages: list[dict[str, str]] = []
+    for payload in prompt_blocks:
+        content = _prompt_block_text(payload).strip()
+        if not content:
+            continue
+        message_payload: dict[str, str] = {
+            "role": _normalize_prompt_block_role(payload.get("role")),
+            "content": content,
+        }
+        name = str(payload.get("name", "") or "").strip()
+        if name:
+            message_payload["name"] = name
+        rendered_messages.append(message_payload)
+    return rendered_messages
+
+
 def _deep_get(value: Any, path: str | None) -> Any:
     if path in {None, "", "$"}:
         return value
@@ -760,9 +777,14 @@ class NodeContext:
         raise ValueError(f"Unsupported binding type '{binding_type}'.")
 
     def template_variables(self, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        input_payload = self.resolve_binding(None)
+        if isinstance(input_payload, Mapping) and "payload" in input_payload:
+            input_payload = input_payload.get("payload")
+        if input_payload is None:
+            input_payload = self.state.input_payload
         variables = {
             **self.graph.env_vars,
-            "input_payload": self.state.input_payload,
+            "input_payload": input_payload,
             "run_id": self.state.run_id,
             "graph_id": self.state.graph_id,
             "current_node_id": self.state.current_node_id,
@@ -896,6 +918,9 @@ class BaseNode(ABC):
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         raise NotImplementedError
 
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        return None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -947,6 +972,12 @@ class InputNode(BaseNode):
         )
         return NodeExecutionResult(status="success", output=envelope.to_dict(), summary="Input payload captured.")
 
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        payload = context.resolve_binding(self.config.get("input_binding"))
+        if payload is None:
+            payload = context.state.input_payload
+        return payload
+
 
 class DataNode(BaseNode):
     kind = "data"
@@ -975,7 +1006,12 @@ class DataNode(BaseNode):
     def _context_builder_bindings(self, context: NodeContext) -> list[dict[str, Any]]:
         incoming_edges = context.graph.get_incoming_edges(self.id)
         binding_source_ids = [edge.source_id for edge in incoming_edges if edge.kind == "binding"]
-        preferred_source_ids = binding_source_ids if binding_source_ids else [edge.source_id for edge in incoming_edges]
+        preferred_source_ids: list[str] = []
+        current_edge = context.current_input_edge()
+        if current_edge is not None:
+            preferred_source_ids.append(current_edge.source_id)
+        preferred_source_ids.extend(binding_source_ids)
+        preferred_source_ids.extend(edge.source_id for edge in incoming_edges)
         incoming_source_ids: list[str] = []
         for source_id in preferred_source_ids:
             if source_id == self.id or source_id in incoming_source_ids:
@@ -1030,14 +1066,30 @@ class DataNode(BaseNode):
         bindings = self._context_builder_bindings(context)
         resolved_variables: dict[str, Any] = {}
         ordered_values: list[str] = []
+        ordered_prompt_blocks: list[dict[str, Any]] = []
+        saw_non_prompt_value = False
         for binding in bindings:
             source_binding = binding.get("binding")
             value = context.resolve_binding(source_binding if isinstance(source_binding, Mapping) else None)
             if isinstance(value, Mapping) and "payload" in value:
                 value = value.get("payload")
+            source_node = context.graph.nodes.get(str(binding.get("source_node_id", "")).strip())
             placeholder = str(binding.get("placeholder", "")).strip()
-            rendered_value = _render_prompt_block_text(value) if _is_prompt_block_payload(value) else value
+            is_prompt_block = _is_prompt_block_payload(value)
+            synthetic_prompt_block: dict[str, Any] | None = None
+            if not is_prompt_block and source_node is not None and source_node.kind == "input" and value is not None and value != "":
+                synthetic_prompt_block = {
+                    "kind": "prompt_block",
+                    "role": "user",
+                    "content": value if isinstance(value, str) else _json_safe(value),
+                }
+            prompt_like_value = dict(value) if is_prompt_block else synthetic_prompt_block
+            rendered_value = _render_prompt_block_text(prompt_like_value) if prompt_like_value is not None else value
             resolved_variables[placeholder] = rendered_value
+            if prompt_like_value is not None:
+                ordered_prompt_blocks.append(prompt_like_value)
+            elif value is not None and value != "":
+                saw_non_prompt_value = True
             if value is not None and value != "":
                 ordered_values.append(rendered_value if isinstance(rendered_value, str) else _json_safe(rendered_value))
 
@@ -1046,7 +1098,12 @@ class DataNode(BaseNode):
             payload = context.render_template(template, resolved_variables)
         else:
             joiner = str(self.config.get("joiner", "\n\n") or "\n\n")
-            payload = joiner.join(ordered_values)
+            should_compile_chatgpt_messages = bool(ordered_prompt_blocks) and not saw_non_prompt_value
+            if should_compile_chatgpt_messages:
+                rendered_messages = _render_chatgpt_style_messages(ordered_prompt_blocks)
+                payload = rendered_messages if rendered_messages else joiner.join(ordered_values)
+            else:
+                payload = joiner.join(ordered_values)
 
         envelope = MessageEnvelope(
             schema_version="1.0",
@@ -1059,6 +1116,7 @@ class DataNode(BaseNode):
                 "data_mode": "context_builder",
                 "binding_count": len(bindings),
                 "placeholders": [str(binding.get("placeholder", "")) for binding in bindings],
+                "prompt_blocks": ordered_prompt_blocks,
             },
         )
         return NodeExecutionResult(
@@ -1092,6 +1150,32 @@ class DataNode(BaseNode):
             output=envelope.to_dict(),
             summary=f"Prompt block '{self.label}' prepared a {payload['role']} message.",
         )
+
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        mode = "passthrough" if bool(self.config.get("lock_passthrough", False)) else self.config.get("mode", "passthrough")
+        if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
+            return context.prompt_block_payload_for_node(self.id)
+        if mode == "context_builder":
+            preview_bindings: list[dict[str, Any]] = []
+            for binding in self._context_builder_bindings(context):
+                source_binding = binding.get("binding")
+                value = context.resolve_binding(source_binding if isinstance(source_binding, Mapping) else None)
+                if isinstance(value, Mapping) and "payload" in value:
+                    value = value.get("payload")
+                preview_bindings.append(
+                    {
+                        "source_node_id": str(binding.get("source_node_id", "")),
+                        "placeholder": str(binding.get("placeholder", "")),
+                        "value": _render_prompt_block_text(value) if _is_prompt_block_payload(value) else value,
+                    }
+                )
+            return preview_bindings
+        source_value = context.resolve_binding(self.config.get("input_binding"))
+        if bool(self.config.get("show_input_envelope", False)):
+            return source_value
+        if isinstance(source_value, Mapping) and "payload" in source_value:
+            return source_value.get("payload")
+        return source_value
 
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         mode = "passthrough" if bool(self.config.get("lock_passthrough", False)) else self.config.get("mode", "passthrough")
@@ -1245,17 +1329,36 @@ class ModelNode(BaseNode):
         self.provider_name = provider_name
         self.prompt_name = prompt_name
 
-    def execute(self, context: NodeContext) -> NodeExecutionResult:
-        bound_provider_node = context.bound_provider_node(self.id)
-        provider_name = str(
-            (
-                bound_provider_node.config.get("provider_name")
-                if bound_provider_node is not None
-                else self.config.get("provider_name", self.provider_name)
-            )
-            or self.provider_name
+    def _prompt_only_mcp_tool_decision_contract(
+        self,
+        *,
+        mcp_tool_context: Mapping[str, Any] | None,
+        mcp_available_tool_names: Sequence[str],
+    ) -> str:
+        if mcp_tool_context is None or mcp_available_tool_names:
+            return ""
+        return "\n".join(
+            [
+                "MCP Tool Decision Output",
+                "When MCP tool metadata is present in prompt context but no MCP tools are directly callable, you must respond using this exact structure:",
+                "",
+                "Uses Tool: True|False",
+                'Tool Call Schema: {"tool_name":"<tool name>","arguments":{...}} or NA',
+                "DELIMITER",
+                "<Explain why the tool schema is needed or why no tool is needed, and describe the next step required to finish the user's request.>",
+                "",
+                "Rules",
+                "- Set `Uses Tool` to `True` only when one of the tools described in the MCP Tool Context is required.",
+                "- When `Uses Tool` is `True`, `Tool Call Schema` must be a single JSON object containing exactly `tool_name` and `arguments`.",
+                "- When `Uses Tool` is `False`, `Tool Call Schema` must be `NA`.",
+                "- Do not claim that you already called a tool unless you were given an actual tool result.",
+                "- The content after `DELIMITER` must be plain-language guidance for the next processing step.",
+            ]
         )
-        provider = context.services.model_providers[provider_name]
+
+    def _build_request(self, context: NodeContext, bound_provider_node: ProviderNode | None = None) -> ModelRequest:
+        if bound_provider_node is None:
+            bound_provider_node = context.bound_provider_node(self.id)
         metadata_bindings = dict(self.config.get("metadata_bindings", {}))
         metadata: dict[str, Any] = {}
         for key, binding in metadata_bindings.items():
@@ -1317,6 +1420,12 @@ class ModelNode(BaseNode):
             mcp_prompt_sections.append("\n".join(guidance_lines))
         if mcp_tool_prompt:
             mcp_prompt_sections.append(f"MCP Tool Context\n{mcp_tool_prompt}")
+        prompt_only_tool_contract = self._prompt_only_mcp_tool_decision_contract(
+            mcp_tool_context=mcp_tool_context,
+            mcp_available_tool_names=mcp_available_tool_names,
+        )
+        if prompt_only_tool_contract:
+            mcp_prompt_sections.append(prompt_only_tool_contract)
         if mcp_prompt_sections:
             appended_prompt = "\n\n".join(section.strip() for section in mcp_prompt_sections if section.strip())
             if system_prompt.strip():
@@ -1324,7 +1433,7 @@ class ModelNode(BaseNode):
             else:
                 system_prompt = appended_prompt
         provider_config = self._provider_config(context, bound_provider_node)
-        request = ModelRequest(
+        return ModelRequest(
             prompt_name=self.prompt_name,
             messages=[
                 ModelMessage(role="system", content=system_prompt),
@@ -1338,6 +1447,22 @@ class ModelNode(BaseNode):
             response_mode=response_mode,
             metadata=metadata,
         )
+
+    def execute(self, context: NodeContext) -> NodeExecutionResult:
+        bound_provider_node = context.bound_provider_node(self.id)
+        provider_name = str(
+            (
+                bound_provider_node.config.get("provider_name")
+                if bound_provider_node is not None
+                else self.config.get("provider_name", self.provider_name)
+            )
+            or self.provider_name
+        )
+        provider = context.services.model_providers[provider_name]
+        request = self._build_request(context, bound_provider_node)
+        metadata = request.metadata
+        response_mode = request.response_mode
+        available_tool_payloads = list(metadata.get("available_tools", []))
         response = provider.generate(request)
         output = response.structured_output if response.structured_output is not None else response.content
         normalized_tool_calls = [
@@ -1429,6 +1554,13 @@ class ModelNode(BaseNode):
             route_outputs=route_outputs,
         )
 
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        request = self._build_request(context)
+        return {
+            "messages": [{"role": message.role, "content": message.content} for message in request.messages],
+            "response_mode": request.response_mode,
+        }
+
     def to_dict(self) -> dict[str, Any]:
         payload = super().to_dict()
         payload["model_provider_name"] = self.provider_name
@@ -1514,6 +1646,17 @@ class ToolNode(BaseNode):
             metadata=envelope.metadata,
         )
 
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        bound_value = context.resolve_binding(self.config.get("input_binding"))
+        payload: Any = bound_value
+        if isinstance(bound_value, Mapping) and "tool_calls" in bound_value:
+            tool_calls = list(bound_value.get("tool_calls", []))
+            if tool_calls:
+                payload = tool_calls[0].get("arguments")
+        elif isinstance(bound_value, Mapping) and "payload" in bound_value:
+            payload = bound_value.get("payload")
+        return payload if isinstance(payload, Mapping) else {}
+
     def to_dict(self) -> dict[str, Any]:
         payload = super().to_dict()
         payload["tool_name"] = self.tool_name
@@ -1582,6 +1725,13 @@ class McpContextProviderNode(BaseNode):
             metadata=envelope.metadata,
         )
 
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        return {
+            "tool_names": list(self.config.get("tool_names", [])),
+            "include_mcp_tool_context": bool(self.config.get("include_mcp_tool_context", False)),
+            "expose_mcp_tools": bool(self.config.get("expose_mcp_tools", True)),
+        }
+
 
 class McpToolExecutorNode(BaseNode):
     kind = "mcp_tool_executor"
@@ -1610,6 +1760,12 @@ class McpToolExecutorNode(BaseNode):
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         bound_value = context.resolve_binding(self.config.get("input_binding"))
         tool_call = None
+        source_envelope: MessageEnvelope | None = None
+        if isinstance(bound_value, Mapping) and "schema_version" in bound_value and "payload" in bound_value:
+            try:
+                source_envelope = MessageEnvelope.from_dict(bound_value)
+            except Exception:  # noqa: BLE001
+                source_envelope = None
         if isinstance(bound_value, Mapping) and "tool_calls" in bound_value:
             tool_calls = list(bound_value.get("tool_calls", []))
             if tool_calls:
@@ -1649,8 +1805,17 @@ class McpToolExecutorNode(BaseNode):
             )
             tool_result = context.services.tool_registry.invoke(tool_name, payload, tool_context)
             route_outputs: dict[str, Any] = {}
+            execution_summary = tool_result.summary or f"MCP tool '{tool_name}' completed."
             tool_metadata = dict(tool_result.metadata)
             terminal_output = tool_metadata.pop("terminal_output", None)
+            tool_artifacts: dict[str, Any] = {}
+            if source_envelope is not None:
+                tool_artifacts["source_tool_call_envelope"] = source_envelope.to_dict()
+                if source_envelope.tool_calls:
+                    tool_artifacts["requested_tool_call"] = dict(source_envelope.tool_calls[0])
+                assistant_message = source_envelope.artifacts.get("assistant_message")
+                if assistant_message:
+                    tool_artifacts["assistant_message"] = assistant_message
             if isinstance(terminal_output, Mapping):
                 terminal_envelope = MessageEnvelope(
                     schema_version="1.0",
@@ -1665,24 +1830,30 @@ class McpToolExecutorNode(BaseNode):
                     },
                 )
                 route_outputs[MCP_TERMINAL_OUTPUT_HANDLE_ID] = terminal_envelope.to_dict()
+                tool_artifacts["terminal_output"] = dict(terminal_output)
+                tool_artifacts["terminal_output_envelope"] = terminal_envelope.to_dict()
             envelope = MessageEnvelope(
                 schema_version="1.0",
                 from_node_id=self.id,
                 from_category=self.category.value,
                 payload=tool_result.output,
+                artifacts=tool_artifacts,
                 errors=[tool_result.error] if tool_result.error else [],
                 metadata={
                     "contract": "tool_result_envelope",
                     "node_kind": self.kind,
                     "tool_name": tool_name,
                     **tool_metadata,
+                    "tool_status": tool_result.status,
+                    "tool_summary": execution_summary,
+                    "terminal_output_present": isinstance(terminal_output, Mapping),
                 },
             )
             return NodeExecutionResult(
                 status=tool_result.status,
                 output=envelope.to_dict(),
                 error=tool_result.error,
-                summary=tool_result.summary or f"MCP tool '{tool_name}' completed.",
+                summary=execution_summary,
                 metadata=envelope.metadata,
                 route_outputs=route_outputs,
             )
@@ -1707,6 +1878,148 @@ class McpToolExecutorNode(BaseNode):
                 summary=f"MCP executor '{self.label}' could not dispatch '{tool_name}'.",
                 metadata=envelope.metadata,
             )
+
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        bound_value = context.resolve_binding(self.config.get("input_binding"))
+        tool_call = None
+        if isinstance(bound_value, Mapping) and "tool_calls" in bound_value:
+            tool_calls = list(bound_value.get("tool_calls", []))
+            if tool_calls:
+                tool_call = tool_calls[0]
+        tool_name = str((tool_call or {}).get("tool_name", "")).strip()
+        payload = (tool_call or {}).get("arguments", {})
+        if isinstance(bound_value, Mapping) and "payload" in bound_value and not tool_name:
+            payload = bound_value.get("payload")
+        return {"tool_name": tool_name, "arguments": payload}
+
+
+class McpRecheckNode(BaseNode):
+    kind = "mcp_recheck"
+
+    def __init__(
+        self,
+        node_id: str,
+        label: str,
+        provider_id: str = "tool.mcp_recheck",
+        provider_label: str = "MCP Recheck Node",
+        description: str = "",
+        config: Mapping[str, Any] | None = None,
+        position: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            node_id=node_id,
+            label=label,
+            category=NodeCategory.TOOL,
+            provider_id=provider_id,
+            provider_label=provider_label,
+            description=description,
+            config=config,
+            position=position,
+        )
+
+    def _source_envelope(self, context: NodeContext) -> MessageEnvelope | None:
+        bound_value = context.resolve_binding(self.config.get("input_binding"))
+        if bound_value is None:
+            bound_value = context.resolve_binding(None)
+        if not (isinstance(bound_value, Mapping) and "schema_version" in bound_value and "payload" in bound_value):
+            return None
+        try:
+            return MessageEnvelope.from_dict(bound_value)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _invalid_input_result(self, message: str) -> NodeExecutionResult:
+        error = {"type": "mcp_recheck_input_error", "node_id": self.id, "message": message}
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=None,
+            errors=[error],
+            metadata={"contract": "mcp_recheck_envelope", "node_kind": self.kind},
+        )
+        return NodeExecutionResult(
+            status="failed",
+            output=envelope.to_dict(),
+            error=error,
+            summary=f"MCP recheck '{self.label}' could not prepare follow-up context.",
+            metadata=envelope.metadata,
+        )
+
+    def execute(self, context: NodeContext) -> NodeExecutionResult:
+        source_envelope = self._source_envelope(context)
+        if source_envelope is None:
+            return self._invalid_input_result("No MCP tool result envelope was available for recheck.")
+        if str(source_envelope.metadata.get("contract", "")).strip() != "tool_result_envelope":
+            return self._invalid_input_result("MCP recheck nodes require an upstream tool_result_envelope.")
+
+        requested_tool_call = source_envelope.artifacts.get("requested_tool_call")
+        source_tool_call_envelope = source_envelope.artifacts.get("source_tool_call_envelope")
+        terminal_output = source_envelope.artifacts.get("terminal_output")
+        terminal_output_envelope = source_envelope.artifacts.get("terminal_output_envelope")
+        tool_name = str(source_envelope.metadata.get("tool_name", "")).strip()
+        tool_error = source_envelope.errors[0] if source_envelope.errors else None
+        normalized_payload = {
+            "tool_name": tool_name,
+            "tool_status": str(source_envelope.metadata.get("tool_status", "") or ("failed" if tool_error else "success")),
+            "tool_summary": str(source_envelope.metadata.get("tool_summary", "") or ""),
+            "tool_arguments": dict(requested_tool_call.get("arguments", {})) if isinstance(requested_tool_call, Mapping) else {},
+            "tool_call": dict(requested_tool_call) if isinstance(requested_tool_call, Mapping) else None,
+            "tool_output": source_envelope.payload,
+            "tool_error": tool_error,
+            "tool_errors": list(source_envelope.errors),
+            "tool_metadata": dict(source_envelope.metadata),
+            "assistant_message": source_envelope.artifacts.get("assistant_message"),
+            "terminal_output": dict(terminal_output) if isinstance(terminal_output, Mapping) else None,
+            "terminal_output_envelope": dict(terminal_output_envelope) if isinstance(terminal_output_envelope, Mapping) else None,
+            "source_tool_call_envelope": (
+                dict(source_tool_call_envelope) if isinstance(source_tool_call_envelope, Mapping) else None
+            ),
+            "source_tool_result_envelope": source_envelope.to_dict(),
+            "recheck_context": {
+                "executor_node_id": source_envelope.from_node_id,
+                "recheck_node_id": self.id,
+                "run_id": context.state.run_id,
+                "graph_id": context.state.graph_id,
+            },
+        }
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=normalized_payload,
+            artifacts={
+                "source_tool_result_envelope": source_envelope.to_dict(),
+            },
+            errors=list(source_envelope.errors),
+            metadata={
+                "contract": "mcp_recheck_envelope",
+                "node_kind": self.kind,
+                "tool_name": tool_name,
+                "tool_status": normalized_payload["tool_status"],
+                "terminal_output_present": normalized_payload["terminal_output"] is not None,
+            },
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary=f"MCP recheck '{self.label}' prepared follow-up context.",
+            metadata=envelope.metadata,
+        )
+
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        source_envelope = self._source_envelope(context)
+        if source_envelope is None:
+            return None
+        requested_tool_call = source_envelope.artifacts.get("requested_tool_call")
+        return {
+            "tool_name": source_envelope.metadata.get("tool_name"),
+            "tool_status": source_envelope.metadata.get("tool_status"),
+            "tool_arguments": (
+                dict(requested_tool_call.get("arguments", {})) if isinstance(requested_tool_call, Mapping) else {}
+            ),
+            "terminal_output_present": bool(source_envelope.artifacts.get("terminal_output")),
+        }
 
 
 class OutputNode(BaseNode):
@@ -1740,6 +2053,12 @@ class OutputNode(BaseNode):
         else:
             output = bound_value
         return NodeExecutionResult(status="success", output=output, summary="Output prepared.")
+
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        bound_value = context.resolve_binding(self.config.get("source_binding"))
+        if isinstance(bound_value, Mapping) and "payload" in bound_value:
+            return bound_value.get("payload")
+        return bound_value
 
 
 class GraphValidationError(ValueError):
@@ -1807,6 +2126,12 @@ def _node_from_dict(payload: Mapping[str, Any]) -> BaseNode:
         return McpToolExecutorNode(
             provider_id=str(payload.get("provider_id", "tool.mcp_tool_executor")),
             provider_label=str(payload.get("provider_label", "MCP Tool Executor")),
+            **common,
+        )
+    if kind == "mcp_recheck":
+        return McpRecheckNode(
+            provider_id=str(payload.get("provider_id", "tool.mcp_recheck")),
+            provider_label=str(payload.get("provider_label", "MCP Recheck Node")),
             **common,
         )
     if kind == "output":
@@ -2199,6 +2524,53 @@ class GraphDefinition:
                     if edge.kind != "conditional" or not _is_terminal_output_contract_condition(edge.condition):
                         raise GraphValidationError(
                             f"MCP tool executor '{node.id}' terminal output edge '{edge.id}' must match terminal_output_envelope."
+                        )
+            if node.kind == "mcp_recheck":
+                input_binding = node.config.get("input_binding")
+                if input_binding is not None:
+                    if not isinstance(input_binding, Mapping):
+                        raise GraphValidationError(
+                            f"MCP recheck node '{node.id}' must declare input_binding as an object."
+                        )
+                    binding_type = str(input_binding.get("type", "latest_output"))
+                    if binding_type not in {"latest_output", "latest_envelope", "first_available_envelope"}:
+                        raise GraphValidationError(
+                            f"MCP recheck node '{node.id}' uses unsupported input binding '{binding_type}'."
+                        )
+                    if binding_type == "first_available_envelope":
+                        raw_sources = input_binding.get("sources", [])
+                        if not isinstance(raw_sources, Sequence) or isinstance(raw_sources, (str, bytes)):
+                            raise GraphValidationError(
+                                f"MCP recheck node '{node.id}' must declare sources as a list for first_available_envelope bindings."
+                            )
+                        binding_source_ids = [str(source_id).strip() for source_id in raw_sources if str(source_id).strip()]
+                    else:
+                        binding_source_id = str(input_binding.get("source", "")).strip()
+                        binding_source_ids = [binding_source_id] if binding_source_id else []
+                    if not binding_source_ids:
+                        raise GraphValidationError(
+                            f"MCP recheck node '{node.id}' must reference at least one upstream source."
+                        )
+                    for source_id in binding_source_ids:
+                        source_node = self.nodes.get(source_id)
+                        if not isinstance(source_node, McpToolExecutorNode):
+                            raise GraphValidationError(
+                                f"MCP recheck node '{node.id}' must bind to an MCP tool executor, but '{source_id}' is not one."
+                            )
+                incoming_edges = [edge for edge in self.get_incoming_edges(node.id) if edge.kind != "binding"]
+                if not incoming_edges:
+                    raise GraphValidationError(
+                        f"MCP recheck node '{node.id}' must have a non-binding incoming edge from an MCP tool executor."
+                    )
+                for edge in incoming_edges:
+                    source_node = self.nodes.get(edge.source_id)
+                    if not isinstance(source_node, McpToolExecutorNode):
+                        raise GraphValidationError(
+                            f"MCP recheck node '{node.id}' can only receive direct input from MCP tool executors."
+                        )
+                    if edge.source_handle_id == MCP_TERMINAL_OUTPUT_HANDLE_ID:
+                        raise GraphValidationError(
+                            f"MCP recheck node '{node.id}' cannot use the executor terminal-output handle as its primary input."
                         )
             if node.kind == "data" and node.provider_id == "core.context_builder":
                 raw_bindings = node.config.get("input_bindings", [])

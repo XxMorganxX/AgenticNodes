@@ -410,9 +410,13 @@ function buildMilestoneDataSections(
     return sections;
   }
   if (event.event_type === "node.started") {
-    appendSection(sections, "Structured input", nodeInputPreview(nodeId, graph, inputPayload, knownNodeOutputs, labels), {
-      allowNull: true,
-    });
+    if ("received_input" in payload) {
+      appendSection(sections, "Received input", payload.received_input, { allowNull: true });
+    } else {
+      appendSection(sections, "Received input", nodeInputPreview(nodeId, graph, inputPayload, knownNodeOutputs, labels), {
+        allowNull: true,
+      });
+    }
     return sections;
   }
   if (event.event_type === "node.completed") {

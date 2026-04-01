@@ -1,0 +1,22 @@
+---
+description: Require a purpose-first README for each new feature
+alwaysApply: true
+---
+
+# Feature README Requirement
+
+When adding a new feature, include a dedicated README near that feature unless the user explicitly asks not to.
+
+- Write the README for humans first: explain the feature's purpose, who it is for, and the problem it solves before implementation details.
+- Include a short implementation section that names the main moving parts, entry points, or data flow so future contributors can orient themselves quickly.
+- Call out important edge cases, failure modes, constraints, or non-obvious behavior when they matter to correct usage or maintenance.
+- Keep the README focused and practical; avoid turning it into a generic dump of code structure.
+- Update the README when the feature's behavior or boundaries change in a meaningful way.
+
+Suggested sections:
+
+- Purpose
+- User or developer workflow
+- Implementation overview
+- Edge cases and constraints
+- Open questions or follow-ups, if relevant

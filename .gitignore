@@ -28,6 +28,7 @@ venv/
 # Local graph store
 .graph-agent/
 .logs/
+visuals/
 
 # Frontend artifacts
 frontend/node_modules/

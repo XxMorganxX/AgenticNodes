@@ -330,6 +330,32 @@ export function buildNodeTooltip(
     };
   }
 
+  if (node.kind === "mcp_recheck") {
+    return {
+      title: node.label,
+      eyebrow: `${node.category} / ${node.kind}`,
+      description: node.description,
+      sections: [
+        {
+          title: "MCP Recheck",
+          rows: [
+            { label: "Role", value: "Packages the latest MCP execution for a follow-up API decision" },
+            {
+              label: "Input Binding",
+              value:
+                node.config.input_binding && typeof node.config.input_binding === "object"
+                  ? "Explicit binding configured"
+                  : "Implicit latest incoming edge",
+            },
+            { label: "Carries", value: "Tool call, result, status, errors, and terminal output when available" },
+          ],
+        },
+        ...baseSections,
+      ],
+      parameters: [],
+    };
+  }
+
   if (node.kind === "model") {
     const allowedTools = asStringArray(node.config.allowed_tool_names);
     const preferredTool = asString(node.config.preferred_tool_name);
