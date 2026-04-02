@@ -26,6 +26,7 @@ import {
 } from "./lib/api";
 import { createBlankGraph, layoutGraphDocument, layoutGraphLR, normalizeGraphDocument } from "./lib/editor";
 import { filterEventsForAgent, getCanvasGraph, getDefaultAgentId, getSelectedRunId, getSelectedRunState, isTestEnvironment, updateSelectedAgentGraph } from "./lib/graphDocuments";
+import { clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
 import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedEventGroups, buildFocusedRunSummary } from "./lib/runVisualization";
 import type { EditorCatalog, GraphDefinition, GraphDocument, McpServerDraft, McpServerStatus, RunState, RuntimeEvent, ToolDefinition } from "./lib/types";
 import { getUserPreferences, resetUserPreferences, saveUserPreferences } from "./lib/userPreferences";
@@ -330,6 +331,14 @@ export default function App() {
     return loadedCatalog;
   }, []);
 
+  const restorePersistedRunSnapshot = useCallback((graphId: string) => {
+    const snapshot = loadPersistedRunSnapshot(graphId);
+    setActiveRunId(snapshot?.activeRunId ?? snapshot?.runState?.run_id ?? null);
+    setEvents(snapshot?.events ?? []);
+    setRunState(snapshot?.runState ?? null);
+    setIsRunning(false);
+  }, []);
+
   useEffect(() => {
     Promise.all([fetchGraphs(), refreshCatalog()])
       .then(([loadedGraphs, loadedCatalog]) => {
@@ -343,6 +352,10 @@ export default function App() {
           setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
           setInput(DEFAULT_INPUT);
           setSavedInputPrompt(DEFAULT_INPUT);
+          setActiveRunId(null);
+          setEvents([]);
+          setRunState(null);
+          setIsRunning(false);
         }
       })
       .catch((loadError: Error) => {
@@ -362,7 +375,7 @@ export default function App() {
     }
     fetchGraph(selectedGraphId)
       .then((graph) => {
-        const nextGraph = layoutGraphDocument(graph);
+        const nextGraph = layoutGraphDocument(normalizeGraphDocument(graph));
         resetHistory(nextGraph);
         setSavedGraphSnapshot(serializeGraphSnapshot(nextGraph));
         const nextInput = getSavedInputPrompt(nextGraph);
@@ -371,9 +384,10 @@ export default function App() {
         setSelectedAgentId(getDefaultAgentId(nextGraph));
         setSelectedNodeId(null);
         setSelectedEdgeId(null);
+        restorePersistedRunSnapshot(nextGraph.graph_id);
       })
       .catch((loadError: Error) => setError(loadError.message));
-  }, [resetHistory, selectedGraphId]);
+  }, [resetHistory, restorePersistedRunSnapshot, selectedGraphId]);
 
   useEffect(() => {
     setSelectedNodeId(null);
@@ -394,6 +408,23 @@ export default function App() {
     };
   }, [hasUnsavedChanges, isSaving]);
 
+  useEffect(() => {
+    if (!draftGraph?.graph_id) {
+      return;
+    }
+    if (!activeRunId && !runState && events.length === 0) {
+      clearPersistedRunSnapshot(draftGraph.graph_id);
+      return;
+    }
+    savePersistedRunSnapshot({
+      graphId: draftGraph.graph_id,
+      activeRunId,
+      events,
+      runState,
+      savedAt: new Date().toISOString(),
+    });
+  }, [activeRunId, draftGraph?.graph_id, events, runState]);
+
   async function refreshGraphs(nextSelectedGraphId?: string) {
     const loadedGraphs = await fetchGraphs();
     setGraphs(loadedGraphs);
@@ -407,6 +438,10 @@ export default function App() {
       setInput(DEFAULT_INPUT);
       setSavedInputPrompt(DEFAULT_INPUT);
       setSelectedAgentId(null);
+      setActiveRunId(null);
+      setEvents([]);
+      setRunState(null);
+      setIsRunning(false);
     }
   }
 
@@ -473,6 +508,7 @@ export default function App() {
     setActiveRunId(null);
     setEvents([]);
     setRunState(null);
+    setIsRunning(false);
     setError(null);
   }
 
@@ -482,6 +518,7 @@ export default function App() {
       return;
     }
     try {
+      clearPersistedRunSnapshot(selectedGraphId);
       await deleteGraph(selectedGraphId);
       const loadedGraphs = await fetchGraphs();
       setGraphs(loadedGraphs);
@@ -495,6 +532,10 @@ export default function App() {
         setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
         setInput(DEFAULT_INPUT);
         setSavedInputPrompt(DEFAULT_INPUT);
+        setActiveRunId(null);
+        setEvents([]);
+        setRunState(null);
+        setIsRunning(false);
       }
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
@@ -517,6 +558,7 @@ export default function App() {
 
     sourceRef.current?.close();
     setError(null);
+    setActiveRunId(null);
     setEvents([]);
     setRunState(null);
     setIsRunning(true);

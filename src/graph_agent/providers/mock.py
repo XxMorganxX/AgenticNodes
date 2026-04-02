@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from graph_agent.providers.base import ModelProvider, ModelRequest, ModelResponse, ProviderPreflightResult
+from graph_agent.providers.base import ModelProvider, ModelRequest, ModelResponse, ModelToolCall, ProviderPreflightResult
 
 
 def _request_text(request: ModelRequest, key: str) -> str:
@@ -17,6 +17,21 @@ def _tool_items(request: ModelRequest) -> list[dict[str, Any]]:
         if isinstance(items, list):
             return [item for item in items if isinstance(item, Mapping)]
     return []
+
+
+def _preferred_tool_name(request: ModelRequest) -> str:
+    if isinstance(request.preferred_tool_name, str) and request.preferred_tool_name.strip():
+        return request.preferred_tool_name.strip()
+    if request.available_tools:
+        return request.available_tools[0].name
+    return "search_catalog"
+
+
+def _catalog_query_arguments(request: ModelRequest, *, limit: Any) -> dict[str, Any]:
+    return {
+        "query": _request_text(request, "user_request"),
+        "limit": limit,
+    }
 
 
 def _decision(
@@ -43,20 +58,42 @@ class MockModelProvider(ModelProvider):
         mode = request.metadata.get("mode")
 
         if mode == "schema_proposal":
+            tool_name = _preferred_tool_name(request)
+            tool_call = ModelToolCall(
+                tool_name=tool_name,
+                arguments=_catalog_query_arguments(request, limit="three"),
+            )
             return ModelResponse(
                 content="Generated an initial tool payload.",
                 structured_output=_decision(
-                    final_message={"query": request.metadata.get("user_request", ""), "limit": "three"}
+                    tool_calls=[
+                        {
+                            "tool_name": tool_name,
+                            "arguments": tool_call.arguments,
+                        }
+                    ]
                 ),
+                tool_calls=[tool_call],
                 metadata={"mode": mode},
             )
 
         if mode == "schema_repair":
+            tool_name = _preferred_tool_name(request)
+            tool_call = ModelToolCall(
+                tool_name=tool_name,
+                arguments=_catalog_query_arguments(request, limit=3),
+            )
             return ModelResponse(
                 content="Generated a repaired tool payload.",
                 structured_output=_decision(
-                    final_message={"query": request.metadata.get("user_request", ""), "limit": 3}
+                    tool_calls=[
+                        {
+                            "tool_name": tool_name,
+                            "arguments": tool_call.arguments,
+                        }
+                    ]
                 ),
+                tool_calls=[tool_call],
                 metadata={"mode": mode},
             )
 
@@ -75,14 +112,22 @@ class MockModelProvider(ModelProvider):
             )
 
         if mode in {"research_query", "executor_plan"}:
+            tool_name = _preferred_tool_name(request)
+            tool_call = ModelToolCall(
+                tool_name=tool_name,
+                arguments=_catalog_query_arguments(request, limit=3),
+            )
             return ModelResponse(
                 content="Generated a valid tool payload for the catalog search.",
                 structured_output=_decision(
-                    final_message={
-                        "query": _request_text(request, "user_request"),
-                        "limit": 3,
-                    }
+                    tool_calls=[
+                        {
+                            "tool_name": tool_name,
+                            "arguments": tool_call.arguments,
+                        }
+                    ]
                 ),
+                tool_calls=[tool_call],
                 metadata={"mode": mode},
             )
 

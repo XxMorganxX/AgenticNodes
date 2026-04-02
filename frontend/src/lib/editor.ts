@@ -503,7 +503,11 @@ export function inferModelResponseMode(graph: GraphDefinition | null, node: Grap
   return "message";
 }
 
-export function inferToolEdgeSourceHandle(edge: GraphEdge, sourceNode: GraphNode | null | undefined): string | null {
+export function inferToolEdgeSourceHandle(
+  edge: GraphEdge,
+  sourceNode: GraphNode | null | undefined,
+  graph?: GraphDefinition | null,
+): string | null {
   if (!sourceNode) {
     return edge.source_handle_id ?? null;
   }
@@ -524,6 +528,22 @@ export function inferToolEdgeSourceHandle(edge: GraphEdge, sourceNode: GraphNode
       edge.condition.value === "message_envelope"
     ) {
       return API_FINAL_MESSAGE_HANDLE_ID;
+    }
+    if (graph) {
+      const responseMode = inferModelResponseMode(graph, sourceNode);
+      if (responseMode === "tool_call") {
+        return API_TOOL_CALL_HANDLE_ID;
+      }
+      if (responseMode === "message") {
+        return API_FINAL_MESSAGE_HANDLE_ID;
+      }
+      const targetNode = graph.nodes.find((candidate) => candidate.id === edge.target_id) ?? null;
+      if (targetNode?.category === "tool") {
+        return API_TOOL_CALL_HANDLE_ID;
+      }
+      if (targetNode && (targetNode.category === "api" || targetNode.category === "data" || targetNode.category === "end")) {
+        return API_FINAL_MESSAGE_HANDLE_ID;
+      }
     }
     return edge.source_handle_id ?? null;
   }
@@ -564,59 +584,69 @@ export function getApiToolContextTargetAnchorRatio(handleId: string | null | und
 }
 
 export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
-  return {
+  const normalizedNodes = graph.nodes.map((node) => {
+    const nextNode: GraphNode = {
+      ...node,
+      config: { ...node.config },
+    };
+    if (node.kind === "tool" && nextNode.config.include_mcp_tool_context === true) {
+      const legacyToolName = String(node.config.tool_name ?? node.tool_name ?? "").trim();
+      nextNode.kind = "mcp_context_provider";
+      nextNode.provider_id = "tool.mcp_context_provider";
+      nextNode.provider_label = "MCP Context Provider";
+      nextNode.config.tool_names = legacyToolName ? [legacyToolName] : [];
+    }
+    if (node.kind === "model") {
+      nextNode.model_provider_name = String(node.config.provider_name ?? node.model_provider_name ?? "");
+      nextNode.prompt_name = String(node.config.prompt_name ?? node.prompt_name ?? "");
+    }
+    if (node.kind === "provider") {
+      nextNode.model_provider_name = String(node.config.provider_name ?? node.model_provider_name ?? "");
+    }
+    if (node.kind === "tool") {
+      nextNode.tool_name = String(node.config.tool_name ?? node.tool_name ?? "");
+    }
+    if (node.kind === "mcp_context_provider") {
+      const toolNames = Array.isArray(node.config.tool_names) ? node.config.tool_names : [];
+      nextNode.config.tool_names = toolNames.map((toolName) => String(toolName)).filter((toolName) => toolName.trim().length > 0);
+      nextNode.config.expose_mcp_tools = nextNode.config.expose_mcp_tools !== false;
+    }
+    return nextNode;
+  });
+
+  const normalizedGraph: GraphDefinition = {
     ...graph,
     env_vars: getGraphEnvVars(graph),
-    nodes: graph.nodes.map((node) => {
-      const nextNode: GraphNode = {
-        ...node,
-        config: { ...node.config },
-      };
-      if (node.kind === "tool" && nextNode.config.include_mcp_tool_context === true) {
-        const legacyToolName = String(node.config.tool_name ?? node.tool_name ?? "").trim();
-        nextNode.kind = "mcp_context_provider";
-        nextNode.provider_id = "tool.mcp_context_provider";
-        nextNode.provider_label = "MCP Context Provider";
-        nextNode.config.tool_names = legacyToolName ? [legacyToolName] : [];
-      }
-      if (node.kind === "model") {
-        nextNode.model_provider_name = String(node.config.provider_name ?? node.model_provider_name ?? "");
-        nextNode.prompt_name = String(node.config.prompt_name ?? node.prompt_name ?? "");
-      }
-      if (node.kind === "provider") {
-        nextNode.model_provider_name = String(node.config.provider_name ?? node.model_provider_name ?? "");
-      }
-      if (node.kind === "tool") {
-        nextNode.tool_name = String(node.config.tool_name ?? node.tool_name ?? "");
-      }
-      if (node.kind === "mcp_context_provider") {
-        const toolNames = Array.isArray(node.config.tool_names) ? node.config.tool_names : [];
-        nextNode.config.tool_names = toolNames.map((toolName) => String(toolName)).filter((toolName) => toolName.trim().length > 0);
-        nextNode.config.expose_mcp_tools = nextNode.config.expose_mcp_tools !== false;
-      }
-      return nextNode;
-    }),
-    edges: graph.edges.map((edge) => ({
+    nodes: normalizedNodes,
+    edges: [],
+  };
+
+  normalizedGraph.edges = graph.edges.map((edge) => {
+    const sourceNode = normalizedNodes.find((node) => node.id === edge.source_id) ?? null;
+    const inferredSourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, normalizedGraph);
+    return {
       ...edge,
-      source_handle_id: edge.source_handle_id ?? null,
+      source_handle_id: inferredSourceHandleId,
       target_handle_id: edge.target_handle_id ?? null,
       waypoints: edge.waypoints?.map((waypoint) => ({ ...waypoint })),
       kind:
-        edge.source_handle_id === API_TOOL_CALL_HANDLE_ID || edge.source_handle_id === API_FINAL_MESSAGE_HANDLE_ID
+        inferredSourceHandleId === API_TOOL_CALL_HANDLE_ID || inferredSourceHandleId === API_FINAL_MESSAGE_HANDLE_ID
           ? "conditional"
           : edge.kind,
       condition:
-        edge.source_handle_id === API_TOOL_CALL_HANDLE_ID
+        inferredSourceHandleId === API_TOOL_CALL_HANDLE_ID
           ? edge.condition ?? defaultApiToolCallCondition(edge.id)
-          : edge.source_handle_id === API_FINAL_MESSAGE_HANDLE_ID
+          : inferredSourceHandleId === API_FINAL_MESSAGE_HANDLE_ID
             ? edge.condition ?? defaultApiMessageCondition(edge.id)
-            : edge.source_handle_id === MCP_TERMINAL_OUTPUT_HANDLE_ID
+            : inferredSourceHandleId === MCP_TERMINAL_OUTPUT_HANDLE_ID
               ? edge.condition ?? defaultMcpTerminalOutputCondition(edge.id)
-            : edge.kind === "conditional"
-              ? edge.condition ?? defaultConditionalCondition(edge.id)
-              : null,
-    })),
-  };
+              : edge.kind === "conditional"
+                ? edge.condition ?? defaultConditionalCondition(edge.id)
+                : null,
+    };
+  });
+
+  return normalizedGraph;
 }
 
 function normalizeAgent(agent: AgentDefinition): AgentDefinition {

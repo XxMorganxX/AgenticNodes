@@ -28,6 +28,7 @@ from graph_agent.examples.tool_schema_repair import (
 from graph_agent.providers.base import ModelMessage, ModelRequest, ModelToolCall, ModelToolDefinition, api_decision_response_schema
 from graph_agent.providers.base import ModelProvider, ModelResponse, ProviderPreflightResult
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
+from graph_agent.providers.mock import MockModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
 from graph_agent.runtime.core import GraphDefinition, GraphValidationError, NodeContext, RunState
 from graph_agent.runtime.documents import load_graph_document
@@ -864,6 +865,40 @@ class ModelProviderTests(unittest.TestCase):
         )
         self.assertEqual(schema["properties"]["tool_calls"]["items"]["properties"]["arguments"]["type"], "object")
         self.assertEqual(schema["required"], ["message", "need_tool", "tool_calls"])
+
+    def test_mock_provider_emits_tool_calls_for_tool_call_modes(self) -> None:
+        provider = MockModelProvider()
+
+        for prompt_name in ("schema_proposal", "schema_repair", "research_query", "executor_plan"):
+            with self.subTest(prompt_name=prompt_name):
+                request = ModelRequest(
+                    prompt_name=prompt_name,
+                    messages=[ModelMessage(role="user", content="Build the tool payload.")],
+                    provider_config={"model": "mock-default"},
+                    response_mode="tool_call",
+                    preferred_tool_name="search_catalog",
+                    available_tools=[SEARCH_CATALOG_TOOL],
+                    metadata={"mode": prompt_name, "user_request": "graph agents"},
+                )
+
+                response = provider.generate(request)
+
+                self.assertEqual(
+                    response.structured_output,
+                    _decision(
+                        tool_calls=[
+                            {
+                                "tool_name": "search_catalog",
+                                "arguments": {
+                                    "query": "graph agents",
+                                    "limit": "three" if prompt_name == "schema_proposal" else 3,
+                                },
+                            }
+                        ]
+                    ),
+                )
+                self.assertEqual(len(response.tool_calls), 1)
+                self.assertEqual(response.tool_calls[0].tool_name, "search_catalog")
 
     def test_claude_code_preflight_reports_live_auth_success(self) -> None:
         provider = StubClaudeCodeProvider()
