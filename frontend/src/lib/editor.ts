@@ -271,6 +271,21 @@ export function createNodeFromProvider(
         },
       };
     }
+    if (provider.provider_id === "core.spreadsheet_rows") {
+      return {
+        ...baseNode,
+        config: {
+          mode: "spreadsheet_rows",
+          file_format: "auto",
+          file_path: "",
+          sheet_name: "",
+          header_row_index: 1,
+          start_row_index: 2,
+          empty_row_policy: "skip",
+          ...defaultConfig,
+        },
+      };
+    }
     return {
       ...baseNode,
       config: {

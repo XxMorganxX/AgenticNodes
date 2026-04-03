@@ -61,6 +61,7 @@ class RuntimeEventContractTests(unittest.TestCase):
             {
                 "run_id": "parent",
                 "graph_id": "graph-1",
+                "node_statuses": {"node-a": "active"},
                 "event_history": [
                     {
                         "event_type": "agent.run.started",
@@ -76,6 +77,7 @@ class RuntimeEventContractTests(unittest.TestCase):
                     "agent-a": {
                         "run_id": "child",
                         "graph_id": "graph-1",
+                        "node_statuses": {"node-b": "success"},
                         "event_history": [
                             {
                                 "event_type": "run.started",
@@ -92,7 +94,9 @@ class RuntimeEventContractTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(normalized)
+        self.assertEqual(normalized["node_statuses"], {"node-a": "active"})
         self.assertEqual(normalized["event_history"][0]["schema_version"], RUNTIME_EVENT_SCHEMA_VERSION)
+        self.assertEqual(normalized["agent_runs"]["agent-a"]["node_statuses"], {"node-b": "success"})
         self.assertEqual(
             normalized["agent_runs"]["agent-a"]["event_history"][0]["schema_version"],
             RUNTIME_EVENT_SCHEMA_VERSION,

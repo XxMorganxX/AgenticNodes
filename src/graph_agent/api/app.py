@@ -4,7 +4,7 @@ import json
 from queue import Empty
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
@@ -12,15 +12,37 @@ from pydantic import BaseModel, ConfigDict
 from graph_agent.api.manager import GraphRunManager
 
 
+class RunDocumentPayload(BaseModel):
+    document_id: str
+    name: str
+    mime_type: str = "application/octet-stream"
+    size_bytes: int = 0
+    storage_path: str = ""
+    text_content: str = ""
+    text_excerpt: str = ""
+    status: str = "ready"
+    error: Optional[str] = None
+
+
 class RunRequest(BaseModel):
     input: Any
     agent_ids: Optional[list[str]] = None
+    documents: Optional[list[RunDocumentPayload]] = None
 
 
 class ProviderPreflightRequest(BaseModel):
     provider_name: str
     provider_config: Optional[dict[str, Any]] = None
     live: bool = False
+
+
+class SpreadsheetPreviewRequest(BaseModel):
+    file_path: str
+    file_format: str = "auto"
+    sheet_name: Optional[str] = None
+    header_row_index: int = 1
+    start_row_index: int = 2
+    empty_row_policy: str = "skip"
 
 
 class GraphPayload(BaseModel):
@@ -150,6 +172,53 @@ def provider_diagnostics(request: ProviderPreflightRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Unknown provider '{request.provider_name}'.") from exc
 
 
+@app.post("/api/editor/data/spreadsheet/preview")
+def preview_spreadsheet_rows(request: SpreadsheetPreviewRequest) -> dict[str, Any]:
+    try:
+        return manager.preview_spreadsheet_rows(request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/editor/documents/upload")
+async def upload_run_documents(request: Request) -> dict[str, Any]:
+    try:
+        form = await request.form()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail="Document uploads require multipart form support in the backend environment.",
+        ) from exc
+    files = form.getlist("files")
+    if not files:
+        raise HTTPException(status_code=400, detail="Select at least one document to upload.")
+    payloads: list[dict[str, Any]] = []
+    for upload in files:
+        filename = getattr(upload, "filename", None)
+        read = getattr(upload, "read", None)
+        close = getattr(upload, "close", None)
+        if not callable(read):
+            continue
+        try:
+            payloads.append(
+                {
+                    "name": filename or "document",
+                    "content_type": getattr(upload, "content_type", None),
+                    "data": await read(),
+                }
+            )
+        finally:
+            if callable(close):
+                await close()
+    if not payloads:
+        raise HTTPException(status_code=400, detail="Select at least one document to upload.")
+    try:
+        documents = manager.upload_run_documents(payloads)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"documents": documents}
+
+
 @app.post("/api/editor/mcp/servers/{server_id}/boot")
 def boot_mcp_server(server_id: str) -> dict[str, Any]:
     try:
@@ -237,7 +306,12 @@ def list_graph_runs(graph_id: str, limit: int = 50) -> dict[str, Any]:
 @app.post("/api/graphs/{graph_id}/runs")
 def start_run(graph_id: str, request: RunRequest) -> dict[str, str]:
     try:
-        run_id = manager.start_run(graph_id, request.input, agent_ids=request.agent_ids)
+        run_id = manager.start_run(
+            graph_id,
+            request.input,
+            agent_ids=request.agent_ids,
+            documents=[document.model_dump() for document in request.documents or []],
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Unknown graph '{graph_id}'.") from exc
     except ValueError as exc:

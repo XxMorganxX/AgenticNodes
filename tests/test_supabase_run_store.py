@@ -129,7 +129,24 @@ class SupabaseRunStoreTests(unittest.TestCase):
     def test_store_recovers_run_state_from_events(self) -> None:
         with SupabaseStubServer() as url:
             store = SupabaseRunStore(url=url, service_role_key="test-key")
-            state = build_run_state("run-1", "graph-1", {"prompt": "hello"})
+            state = build_run_state(
+                "run-1",
+                "graph-1",
+                {"prompt": "hello"},
+                documents=[
+                    {
+                        "document_id": "doc-1",
+                        "name": "brief.txt",
+                        "mime_type": "text/plain",
+                        "size_bytes": 24,
+                        "storage_path": "/tmp/brief.txt",
+                        "text_content": "Use the attached checklist.",
+                        "text_excerpt": "Use the attached checklist.",
+                        "status": "ready",
+                        "error": None,
+                    }
+                ],
+            )
             store.initialize_run(state)
             state = apply_single_run_event(
                 state,
@@ -187,6 +204,7 @@ class SupabaseRunStoreTests(unittest.TestCase):
 
             recovered = store.recover_run_state("run-1")
             self.assertEqual(recovered, state)
+            self.assertEqual(recovered["documents"][0]["document_id"], "doc-1")
             self.assertTrue(all(event["schema_version"] == RUNTIME_EVENT_SCHEMA_VERSION for event in recovered["event_history"]))
             rows = store.list_runs(graph_id="graph-1")
             self.assertEqual(len(rows), 1)

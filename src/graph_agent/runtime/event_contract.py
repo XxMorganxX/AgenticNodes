@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from graph_agent.runtime.run_documents import normalize_run_documents
+
 
 RUNTIME_EVENT_SCHEMA_VERSION = "runtime.v1"
 
@@ -70,6 +72,19 @@ def normalize_runtime_state_snapshot(state: Mapping[str, Any] | None) -> dict[st
         if isinstance(event_history, list)
         else []
     )
+    node_statuses = state.get("node_statuses")
+    normalized["node_statuses"] = (
+        {str(node_id): str(status or "") for node_id, status in node_statuses.items()}
+        if isinstance(node_statuses, Mapping)
+        else {}
+    )
+    iterator_states = state.get("iterator_states")
+    normalized["iterator_states"] = (
+        {str(node_id): dict(iterator_state) for node_id, iterator_state in iterator_states.items() if isinstance(iterator_state, Mapping)}
+        if isinstance(iterator_states, Mapping)
+        else {}
+    )
+    normalized["documents"] = normalize_run_documents(state.get("documents"))
     agent_runs = state.get("agent_runs")
     if isinstance(agent_runs, Mapping):
         normalized["agent_runs"] = {

@@ -1,4 +1,4 @@
-import type { RunState, RuntimeEvent } from "./types";
+import type { RunDocument, RunState, RuntimeEvent } from "./types";
 
 export const RUNTIME_EVENT_SCHEMA_VERSION = "runtime.v1";
 
@@ -11,6 +11,26 @@ function normalizeNullableString(value: unknown): string | null {
     return null;
   }
   return typeof value === "string" ? value : String(value);
+}
+
+function normalizeRunDocuments(value: unknown): RunDocument[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((candidate) => isRecord(candidate))
+    .map((candidate) => ({
+      ...candidate,
+      document_id: typeof candidate.document_id === "string" ? candidate.document_id : String(candidate.document_id ?? ""),
+      name: typeof candidate.name === "string" ? candidate.name : String(candidate.name ?? ""),
+      mime_type: typeof candidate.mime_type === "string" ? candidate.mime_type : String(candidate.mime_type ?? ""),
+      size_bytes: typeof candidate.size_bytes === "number" ? candidate.size_bytes : Number(candidate.size_bytes ?? 0),
+      storage_path: typeof candidate.storage_path === "string" ? candidate.storage_path : String(candidate.storage_path ?? ""),
+      text_content: typeof candidate.text_content === "string" ? candidate.text_content : String(candidate.text_content ?? ""),
+      text_excerpt: typeof candidate.text_excerpt === "string" ? candidate.text_excerpt : String(candidate.text_excerpt ?? ""),
+      status: typeof candidate.status === "string" ? candidate.status : String(candidate.status ?? ""),
+      error: candidate.error == null ? null : String(candidate.error),
+    }));
 }
 
 export function normalizeRuntimeEvent(event: unknown): RuntimeEvent {
@@ -42,6 +62,18 @@ export function normalizeRunState(runState: RunState | null | undefined): RunSta
   return {
     ...normalized,
     event_history: normalizeRuntimeEventHistory(normalized.event_history),
+    documents: normalizeRunDocuments(normalized.documents),
+    node_statuses: isRecord(normalized.node_statuses)
+      ? Object.fromEntries(Object.entries(normalized.node_statuses).map(([nodeId, status]) => [nodeId, String(status ?? "")]))
+      : {},
+    iterator_states: isRecord(normalized.iterator_states)
+      ? Object.fromEntries(
+          Object.entries(normalized.iterator_states).map(([nodeId, iteratorState]) => [
+            nodeId,
+            isRecord(iteratorState) ? iteratorState : {},
+          ]),
+        )
+      : {},
     agent_runs:
       isRecord(normalized.agent_runs)
         ? Object.fromEntries(

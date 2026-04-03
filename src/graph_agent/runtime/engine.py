@@ -134,24 +134,220 @@ class GraphRuntime:
         summary = f"No outgoing edge matched after node '{node_label}'."
         return summary, error
 
-    def run(self, graph: GraphDefinition, input_payload: Any, *, run_id: str | None = None) -> RunState:
-        state = RunState(
-            graph_id=graph.graph_id,
-            input_payload=input_payload,
-            run_id=run_id or str(uuid4()),
-            status="running",
-        )
-        pending_nodes = deque([{"node_id": graph.start_node_id, "incoming_edge_id": None}])
+    def _frame_iteration_context(self, frame: dict[str, Any]) -> dict[str, Any]:
+        context: dict[str, Any] = {}
+        iterator_node_id = frame.get("iterator_node_id")
+        iterator_row_index = frame.get("iterator_row_index")
+        iterator_total_rows = frame.get("iterator_total_rows")
+        if isinstance(iterator_node_id, str) and iterator_node_id:
+            context["iterator_node_id"] = iterator_node_id
+        if isinstance(iterator_row_index, int):
+            context["iterator_row_index"] = iterator_row_index
+        if isinstance(iterator_total_rows, int):
+            context["iterator_total_rows"] = iterator_total_rows
+        return context
 
+    def _scoped_visit_key(self, node_id: str, frame: dict[str, Any]) -> tuple[str, str | None, int | None]:
+        return (
+            node_id,
+            str(frame.get("iterator_node_id", "") or "").strip() or None,
+            int(frame["iterator_row_index"]) if isinstance(frame.get("iterator_row_index"), int) else None,
+        )
+
+    def _binding_edges_for_node(self, graph: GraphDefinition, node_id: str) -> list[Edge]:
+        return [
+            edge
+            for edge in graph.get_outgoing_edges(node_id)
+            if edge.kind == "binding"
+            and (target := graph.nodes.get(edge.target_id)) is not None
+            and getattr(target, "provider_id", None) == "core.context_builder"
+        ]
+
+    def _extract_internal_metadata(self, result: NodeExecutionResult) -> dict[str, Any]:
+        metadata = dict(result.metadata or {})
+        internal = metadata.pop("_internal", {})
+        result.metadata = metadata
+        return dict(internal) if isinstance(internal, dict) else {}
+
+    def _update_iterator_state(self, state: RunState, node_id: str, payload: dict[str, Any]) -> None:
+        state.iterator_states[node_id] = {
+            "iterator_type": payload.get("iterator_type"),
+            "status": payload.get("status"),
+            "current_row_index": payload.get("current_row_index"),
+            "total_rows": payload.get("total_rows"),
+            "headers": payload.get("headers"),
+            "sheet_name": payload.get("sheet_name"),
+            "source_file": payload.get("source_file"),
+            "file_format": payload.get("file_format"),
+        }
+
+    def _emit_iterator_update(self, state: RunState, node_id: str, payload: dict[str, Any]) -> None:
+        iterator_payload = {
+            "node_id": node_id,
+            **payload,
+        }
+        self._update_iterator_state(state, node_id, iterator_payload)
         self.emit(
             state,
-            "run.started",
-            f"Run started for graph '{graph.name}'.",
-            {"graph_id": graph.graph_id, "graph_name": graph.name},
+            "node.iterator.updated",
+            f"Updated iterator progress for node '{node_id}'.",
+            iterator_payload,
         )
 
-        step = 0
-        while pending_nodes and step < self.max_steps:
+    def _enqueue_selected_edges(
+        self,
+        graph: GraphDefinition,
+        state: RunState,
+        pending_nodes: deque[dict[str, Any]],
+        next_edges: list[tuple[Edge, NodeExecutionResult]],
+        binding_edges: list[Edge],
+        *,
+        iteration_context: dict[str, Any] | None = None,
+    ) -> None:
+        inherited_context = dict(iteration_context or {})
+        for next_edge, edge_result in next_edges:
+            if edge_result.output is not None:
+                state.edge_outputs[next_edge.id] = edge_result.output
+            state.transition_history.append(
+                TransitionRecord(
+                    edge_id=next_edge.id,
+                    source_id=next_edge.source_id,
+                    target_id=next_edge.target_id,
+                )
+            )
+            self.emit(
+                state,
+                "edge.selected",
+                f"Transitioning from '{next_edge.source_id}' to '{next_edge.target_id}'.",
+                next_edge.to_dict(),
+            )
+            frame = {"node_id": next_edge.target_id, "incoming_edge_id": next_edge.id, **inherited_context}
+            target = graph.nodes.get(next_edge.target_id)
+            if target is not None and getattr(target, "provider_id", None) == "core.context_builder":
+                pending_nodes.appendleft(frame)
+            else:
+                pending_nodes.append(frame)
+
+        for edge in binding_edges:
+            state.transition_history.append(
+                TransitionRecord(
+                    edge_id=edge.id,
+                    source_id=edge.source_id,
+                    target_id=edge.target_id,
+                )
+            )
+            self.emit(
+                state,
+                "edge.selected",
+                f"Transitioning from '{edge.source_id}' to '{edge.target_id}'.",
+                edge.to_dict(),
+            )
+            pending_nodes.appendleft(
+                {"node_id": edge.target_id, "incoming_edge_id": edge.id, **inherited_context},
+            )
+
+    def _run_spreadsheet_row_iterator(
+        self,
+        graph: GraphDefinition,
+        state: RunState,
+        node: Any,
+        result: NodeExecutionResult,
+        row_envelopes: list[dict[str, Any]],
+        step_state: dict[str, int],
+        scoped_visit_counts: dict[tuple[str, str | None, int | None], int],
+    ) -> RunState | None:
+        iterator_state = dict(result.metadata.get("iterator_state", {})) if isinstance(result.metadata.get("iterator_state"), dict) else {}
+        total_rows = len(row_envelopes)
+        initial_state = {
+            **iterator_state,
+            "status": "completed" if total_rows == 0 else "running",
+            "current_row_index": 0 if total_rows == 0 else 1,
+            "total_rows": total_rows,
+        }
+        self._emit_iterator_update(state, node.id, initial_state)
+        if total_rows == 0:
+            return None
+
+        for row_index, row_envelope in enumerate(row_envelopes, start=1):
+            if self.cancel_requested():
+                return self.cancel_run(state, summary=f"Run cancelled during spreadsheet iteration for node '{node.label}'.")
+            state.node_outputs[node.id] = row_envelope
+            self._emit_iterator_update(
+                state,
+                node.id,
+                {
+                    **iterator_state,
+                    "status": "running",
+                    "current_row_index": row_index,
+                    "total_rows": total_rows,
+                },
+            )
+            row_result = NodeExecutionResult(
+                status="success",
+                output=row_envelope,
+                summary=f"Prepared spreadsheet row {row_index} of {total_rows}.",
+                metadata={
+                    "iterator_type": "spreadsheet_rows",
+                    "current_row_index": row_index,
+                    "total_rows": total_rows,
+                },
+            )
+            next_edges = self.select_edges(graph, state, node.id, row_result)
+            binding_edges = self._binding_edges_for_node(graph, node.id)
+            if not next_edges and not binding_edges:
+                failure_summary, failure_error = self._no_matching_edge_error(graph, node.id, row_result)
+                return self.fail_run(
+                    state,
+                    summary=failure_summary,
+                    error=failure_error,
+                )
+            row_pending_nodes: deque[dict[str, Any]] = deque()
+            self._enqueue_selected_edges(
+                graph,
+                state,
+                row_pending_nodes,
+                next_edges,
+                binding_edges,
+                iteration_context={
+                    "iterator_node_id": node.id,
+                    "iterator_row_index": row_index,
+                    "iterator_total_rows": total_rows,
+                },
+            )
+            terminal_state = self._drain_pending_nodes(
+                graph,
+                state,
+                row_pending_nodes,
+                step_state=step_state,
+                scoped_visit_counts=scoped_visit_counts,
+                complete_run_on_output=False,
+            )
+            if terminal_state is not None and terminal_state.status in {"failed", "cancelled"}:
+                return terminal_state
+
+        self._emit_iterator_update(
+            state,
+            node.id,
+            {
+                **iterator_state,
+                "status": "completed",
+                "current_row_index": total_rows,
+                "total_rows": total_rows,
+            },
+        )
+        return None
+
+    def _drain_pending_nodes(
+        self,
+        graph: GraphDefinition,
+        state: RunState,
+        pending_nodes: deque[dict[str, Any]],
+        *,
+        step_state: dict[str, int],
+        scoped_visit_counts: dict[tuple[str, str | None, int | None], int],
+        complete_run_on_output: bool,
+    ) -> RunState | None:
+        while pending_nodes and step_state["count"] < self.max_steps:
             if self.cancel_requested():
                 return self.cancel_run(state, summary="Run cancelled before starting the next node.")
             frame = pending_nodes.popleft()
@@ -163,12 +359,15 @@ class GraphRuntime:
             context = NodeContext(graph=graph, state=state, services=self.services, node_id=node.id)
             if not node.is_ready(context):
                 pending_nodes.append(frame)
-                step += 1
+                step_state["count"] += 1
                 continue
+
+            scope_key = self._scoped_visit_key(current_node_id, frame)
+            scoped_visit_count = scoped_visit_counts.get(scope_key, 0) + 1
+            scoped_visit_counts[scope_key] = scoped_visit_count
             visit_count = state.visit_counts.get(current_node_id, 0) + 1
             state.visit_counts[current_node_id] = visit_count
-
-            if visit_count > self.max_visits_per_node:
+            if scoped_visit_count > self.max_visits_per_node:
                 return self.fail_run(
                     state,
                     summary=f"Node '{current_node_id}' exceeded the visit limit.",
@@ -211,6 +410,7 @@ class GraphRuntime:
 
             if self.cancel_requested():
                 return self.cancel_run(state, summary=f"Run cancelled while node '{node.label}' was executing.")
+            internal_metadata = self._extract_internal_metadata(result)
             if result.error is not None:
                 state.node_errors[node.id] = result.error
             if result.output is not None:
@@ -234,10 +434,26 @@ class GraphRuntime:
                 },
             )
 
+            row_envelopes = internal_metadata.get("spreadsheet_row_envelopes")
+            if isinstance(row_envelopes, list):
+                terminal_state = self._run_spreadsheet_row_iterator(
+                    graph,
+                    state,
+                    node,
+                    result,
+                    [row for row in row_envelopes if isinstance(row, dict)],
+                    step_state,
+                    scoped_visit_counts,
+                )
+                if terminal_state is not None:
+                    return terminal_state
+                step_state["count"] += 1
+                continue
+
             if node.kind == "output":
                 if self._should_promote_output_result(graph, state, node.id, result):
                     state.final_output = result.output
-                if not pending_nodes:
+                if complete_run_on_output and not pending_nodes:
                     state.status = "completed"
                     completion_event = self.emit(
                         state,
@@ -247,17 +463,11 @@ class GraphRuntime:
                     )
                     state.ended_at = completion_event.timestamp
                     return state
-                step += 1
+                step_state["count"] += 1
                 continue
 
             next_edges = self.select_edges(graph, state, node.id, result)
-            binding_edges = [
-                edge
-                for edge in graph.get_outgoing_edges(node.id)
-                if edge.kind == "binding"
-                and (target := graph.nodes.get(edge.target_id)) is not None
-                and getattr(target, "provider_id", None) == "core.context_builder"
-            ]
+            binding_edges = self._binding_edges_for_node(graph, node.id)
             hold_outgoing = bool(result.metadata.get("hold_outgoing_edges"))
             if hold_outgoing:
                 next_edges = []
@@ -266,7 +476,7 @@ class GraphRuntime:
                 if hold_outgoing:
                     state.current_node_id = None
                     state.current_edge_id = None
-                    step += 1
+                    step_state["count"] += 1
                     continue
                 failure_summary, failure_error = self._no_matching_edge_error(graph, node.id, result)
                 return self.fail_run(
@@ -275,55 +485,71 @@ class GraphRuntime:
                     error=failure_error,
                 )
 
-            for next_edge, edge_result in next_edges:
-                if edge_result.output is not None:
-                    state.edge_outputs[next_edge.id] = edge_result.output
-                state.transition_history.append(
-                    TransitionRecord(
-                        edge_id=next_edge.id,
-                        source_id=next_edge.source_id,
-                        target_id=next_edge.target_id,
-                    )
-                )
-                self.emit(
-                    state,
-                    "edge.selected",
-                    f"Transitioning from '{next_edge.source_id}' to '{next_edge.target_id}'.",
-                    next_edge.to_dict(),
-                )
-                frame = {"node_id": next_edge.target_id, "incoming_edge_id": next_edge.id}
-                target = graph.nodes.get(next_edge.target_id)
-                if target is not None and getattr(target, "provider_id", None) == "core.context_builder":
-                    pending_nodes.appendleft(frame)
-                else:
-                    pending_nodes.append(frame)
+            self._enqueue_selected_edges(
+                graph,
+                state,
+                pending_nodes,
+                next_edges,
+                binding_edges,
+                iteration_context=self._frame_iteration_context(frame),
+            )
+            step_state["count"] += 1
 
-            for edge in binding_edges:
-                state.transition_history.append(
-                    TransitionRecord(
-                        edge_id=edge.id,
-                        source_id=edge.source_id,
-                        target_id=edge.target_id,
-                    )
-                )
-                self.emit(
-                    state,
-                    "edge.selected",
-                    f"Transitioning from '{edge.source_id}' to '{edge.target_id}'.",
-                    edge.to_dict(),
-                )
-                pending_nodes.appendleft(
-                    {"node_id": edge.target_id, "incoming_edge_id": edge.id},
-                )
-            step += 1
+        if step_state["count"] >= self.max_steps:
+            return self.fail_run(
+                state,
+                summary="Run exceeded the maximum number of steps.",
+                error={"type": "max_steps_exceeded", "max_steps": self.max_steps},
+            )
+        if complete_run_on_output and not pending_nodes and state.status == "running":
+            state.status = "completed"
+            completion_event = self.emit(
+                state,
+                "run.completed",
+                "Run completed successfully.",
+                {"final_output": state.final_output, "terminal_node_id": state.current_node_id},
+            )
+            state.ended_at = completion_event.timestamp
+            return state
+        return None
 
+    def run(
+        self,
+        graph: GraphDefinition,
+        input_payload: Any,
+        *,
+        run_id: str | None = None,
+        documents: list[dict[str, Any]] | None = None,
+    ) -> RunState:
+        state = RunState(
+            graph_id=graph.graph_id,
+            input_payload=input_payload,
+            documents=list(documents or []),
+            run_id=run_id or str(uuid4()),
+            status="running",
+        )
+        pending_nodes = deque([{"node_id": graph.start_node_id, "incoming_edge_id": None}])
+
+        self.emit(
+            state,
+            "run.started",
+            f"Run started for graph '{graph.name}'.",
+            {"graph_id": graph.graph_id, "graph_name": graph.name},
+        )
+        step_state = {"count": 0}
+        terminal_state = self._drain_pending_nodes(
+            graph,
+            state,
+            pending_nodes,
+            step_state=step_state,
+            scoped_visit_counts={},
+            complete_run_on_output=True,
+        )
+        if terminal_state is not None:
+            return terminal_state
         if self.cancel_requested():
             return self.cancel_run(state, summary="Run cancelled before completion.")
-        return self.fail_run(
-            state,
-            summary="Run exceeded the maximum number of steps.",
-            error={"type": "max_steps_exceeded", "max_steps": self.max_steps},
-        )
+        return state
 
     def select_edges(
         self,

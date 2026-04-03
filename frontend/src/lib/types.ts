@@ -214,6 +214,7 @@ export type McpServerTestResult = {
 
 export type StartRunOptions = {
   agent_ids?: string[];
+  documents?: RunDocument[];
 };
 
 export type ConnectionRule = {
@@ -262,6 +263,33 @@ export type ProviderDiagnosticsResult = {
   preflight: ProviderPreflightResult;
 };
 
+export type SpreadsheetPreviewRow = {
+  row_number: number;
+  row_data: Record<string, unknown>;
+};
+
+export type SpreadsheetPreviewResult = {
+  source_file: string;
+  file_format: string;
+  sheet_name?: string | null;
+  sheet_names: string[];
+  headers: string[];
+  row_count: number;
+  sample_rows: SpreadsheetPreviewRow[];
+};
+
+export type RunDocument = {
+  document_id: string;
+  name: string;
+  mime_type: string;
+  size_bytes: number;
+  storage_path: string;
+  text_content: string;
+  text_excerpt: string;
+  status: string;
+  error?: string | null;
+};
+
 export type RuntimeEvent = {
   schema_version: string;
   event_type: string;
@@ -288,10 +316,13 @@ export type RunState = {
   runtime_instance_id?: string | null;
   last_heartbeat_at?: string | null;
   input_payload: unknown;
+  documents?: RunDocument[];
   node_inputs?: Record<string, unknown>;
   node_outputs: Record<string, unknown>;
   edge_outputs?: Record<string, unknown>;
   node_errors: Record<string, unknown>;
+  node_statuses?: Record<string, string>;
+  iterator_states?: Record<string, Record<string, unknown>>;
   visit_counts: Record<string, number>;
   transition_history: Array<Record<string, unknown>>;
   event_history: RuntimeEvent[];

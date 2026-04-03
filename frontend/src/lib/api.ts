@@ -6,7 +6,9 @@ import type {
   McpServerTestResult,
   ProviderDiagnosticsResult,
   ProviderPreflightResult,
+  RunDocument,
   RunState,
+  SpreadsheetPreviewResult,
   StartRunOptions,
   ToolDefinition,
 } from "./types";
@@ -122,6 +124,41 @@ export async function fetchProviderDiagnostics(
   return (await response.json()) as ProviderDiagnosticsResult;
 }
 
+export async function previewSpreadsheetRows(config: {
+  file_path: string;
+  file_format: string;
+  sheet_name?: string | null;
+  header_row_index: number;
+  start_row_index: number;
+  empty_row_policy: string;
+}): Promise<SpreadsheetPreviewResult> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/data/spreadsheet/preview`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return (await response.json()) as SpreadsheetPreviewResult;
+}
+
+export async function uploadRunDocuments(files: File[]): Promise<RunDocument[]> {
+  const formData = new FormData();
+  files.forEach((file) => formData.append("files", file));
+  const response = await fetch(`${API_BASE_URL}/api/editor/documents/upload`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    throw new Error("Failed to upload documents.");
+  }
+  const payload = (await response.json()) as { documents?: RunDocument[] };
+  return Array.isArray(payload.documents) ? payload.documents : [];
+}
+
 export async function bootMcpServer(serverId: string): Promise<McpServerStatus> {
   const response = await fetch(`${API_BASE_URL}/api/editor/mcp/servers/${serverId}/boot`, {
     method: "POST",
@@ -226,6 +263,7 @@ export async function startRun(graphId: string, input: string, options?: StartRu
     body: JSON.stringify({
       input,
       agent_ids: options?.agent_ids,
+      documents: options?.documents,
     }),
   });
 

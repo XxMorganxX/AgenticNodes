@@ -1,3 +1,6 @@
+import { useEffect, useState } from "react";
+
+import { previewSpreadsheetRows } from "../lib/api";
 import {
   defaultModelName,
   findProviderDefinition,
@@ -9,6 +12,7 @@ import {
   providerDefaultConfig,
   providerModelName,
 } from "../lib/editor";
+import { getGraphEnvVars, resolveGraphEnvReferences } from "../lib/graphEnv";
 import {
   getContextBuilderBindings,
   slugifyContextBuilderPlaceholder,
@@ -16,6 +20,7 @@ import {
 } from "../lib/contextBuilderBindings";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import { insertTokenAtEnd, listPromptBlockAvailableVariables, PROMPT_BLOCK_STARTERS, renderPromptBlockPreview } from "../lib/promptBlockEditor";
+import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
 import { useRenderDiagnostics } from "../lib/dragDiagnostics";
 import type {
   EditorCatalog,
@@ -23,6 +28,7 @@ import type {
   GraphEdge,
   GraphNode,
   RunState,
+  SpreadsheetPreviewResult,
   ToolDefinition,
 } from "../lib/types";
 
@@ -90,9 +96,10 @@ function uniqueStrings(values: string[]): string[] {
 }
 
 const CONTEXT_BUILDER_PROVIDER_ID = "core.context_builder";
+const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
 const CONTEXT_BUILDER_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONTEXT_BUILDER_TOKEN_PATTERN = /\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
-const CONTEXT_BUILDER_BASE_VARIABLES = ["current_node_id", "graph_id", "input_payload", "run_id"];
+const CONTEXT_BUILDER_BASE_VARIABLES = ["current_node_id", "documents", "graph_id", "input_payload", "run_id"];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -169,6 +176,71 @@ function renderContextBuilderPreview(template: string, variables: Record<string,
   return template.replace(CONTEXT_BUILDER_TOKEN_PATTERN, (_, token: string) => variables[token] ?? `{${token}}`);
 }
 
+function buildPromptOnlyMcpToolDecisionContract(hasToolContext: boolean, callableToolNames: string[]): string {
+  if (!hasToolContext || callableToolNames.length > 0) {
+    return "";
+  }
+  return [
+    "MCP Tool Decision Output",
+    "When MCP tool metadata is present in prompt context but no MCP tools are directly callable, you must respond using this exact structure:",
+    "",
+    "Uses Tool: True|False",
+    'Tool Call Schema: {"tool_name":"<tool name>","arguments":{...}} or NA',
+    "DELIMITER",
+    "<Explain why the tool schema is needed or why no tool is needed, and describe the next step required to finish the user's request.>",
+    "",
+    "Rules",
+    "- Set `Uses Tool` to `True` only when one of the tools described in the MCP Tool Context is required.",
+    "- When `Uses Tool` is `True`, `Tool Call Schema` must be a single JSON object containing exactly `tool_name` and `arguments`.",
+    "- When `Uses Tool` is `False`, `Tool Call Schema` must be `NA`.",
+    "- Do not claim that you already called a tool unless you were given an actual tool result.",
+    "- The content after `DELIMITER` must be plain-language guidance for the next processing step.",
+  ].join("\n");
+}
+
+function buildMcpToolGuidanceBlock(callableToolNames: string[], guidanceText: string): string {
+  let guidanceLines: string[] = [];
+  if (callableToolNames.length > 0) {
+    guidanceLines = [
+      "MCP Tool Guidance",
+      "Use MCP tools only when a listed live capability is needed to answer the request or complete the task.",
+      "Call only MCP tools that are explicitly exposed to you and follow their schemas exactly.",
+      "Do not invent MCP tool names or arguments.",
+      "If no exposed MCP tool is necessary, continue without calling one.",
+    ];
+  }
+  if (guidanceText.trim().length > 0) {
+    guidanceLines = guidanceLines.length > 0
+      ? [...guidanceLines, "", "Connected MCP Tool Notes:", guidanceText]
+      : ["MCP Tool Guidance", guidanceText];
+  }
+  return guidanceLines.join("\n").trim();
+}
+
+function mcpToolPlaceholderToken(index: number): string {
+  return `MCP_TOOL_${index + 1}`;
+}
+
+function buildMcpToolPlaceholderTemplate(
+  tools: Array<{
+    placeholderToken: string;
+    displayName: string;
+  }>,
+): string {
+  if (tools.length === 0) {
+    return "";
+  }
+  return [
+    "You are a tool calling assistant.",
+    "",
+    "{mcp_tool_guidance_block}",
+    "",
+    "You have these tools:",
+    "",
+    ...tools.map((tool) => `# ${tool.displayName}\n{${tool.placeholderToken}}`),
+  ].join("\n\n");
+}
+
 function getModelMcpContextNodes(graph: GraphDefinition, modelNode: GraphNode): GraphNode[] {
   const candidateNodeIds = new Set<string>();
   const configuredTargetIds = Array.isArray(modelNode.config.tool_target_node_ids)
@@ -221,6 +293,9 @@ export function GraphInspector({
     },
     12,
   );
+  const [spreadsheetPreview, setSpreadsheetPreview] = useState<SpreadsheetPreviewResult | null>(null);
+  const [spreadsheetPreviewError, setSpreadsheetPreviewError] = useState<string | null>(null);
+  const [isSpreadsheetPreviewLoading, setIsSpreadsheetPreviewLoading] = useState(false);
 
   if (!graph) {
     return (
@@ -235,6 +310,23 @@ export function GraphInspector({
 
   const selectedNode = selectedNodeId ? graph.nodes.find((node) => node.id === selectedNodeId) ?? null : null;
   const selectedEdge = selectedEdgeId ? graph.edges.find((edge) => edge.id === selectedEdgeId) ?? null : null;
+  const spreadsheetPreviewKey =
+    selectedNode?.provider_id === SPREADSHEET_ROW_PROVIDER_ID
+      ? JSON.stringify({
+          id: selectedNode.id,
+          file_format: selectedNode.config.file_format ?? "auto",
+          file_path: selectedNode.config.file_path ?? "",
+          sheet_name: selectedNode.config.sheet_name ?? "",
+          header_row_index: selectedNode.config.header_row_index ?? 1,
+          start_row_index: selectedNode.config.start_row_index ?? 2,
+          empty_row_policy: selectedNode.config.empty_row_policy ?? "skip",
+        })
+      : "none";
+  useEffect(() => {
+    setSpreadsheetPreview(null);
+    setSpreadsheetPreviewError(null);
+    setIsSpreadsheetPreviewLoading(false);
+  }, [spreadsheetPreviewKey]);
   const formatNodeLabel = (node: GraphNode) => getNodeInstanceLabel(graph, node);
   const executorFollowUpEnabled =
     selectedNode?.kind === "mcp_tool_executor" && Boolean(selectedNode.config.enable_follow_up_decision);
@@ -350,11 +442,306 @@ export function GraphInspector({
               .map((node) => formatNodeLabel(node)),
           )
         : [];
+    const modelPromptGuidanceProviders =
+      isPromptDrivenNode
+        ? uniqueStrings(
+            mcpContextProvidersForModel
+              .filter(
+                (node) =>
+                  Boolean(node.config.include_mcp_tool_context) && String(node.config.usage_hint ?? "").trim().length > 0,
+              )
+              .map((node) => formatNodeLabel(node)),
+          )
+        : [];
     const modelTargetedMcpNodeIds =
       selectedNode.kind === "model" && Array.isArray(selectedNode.config.tool_target_node_ids)
         ? uniqueStrings(selectedNode.config.tool_target_node_ids.map((nodeId) => String(nodeId)))
         : [];
     const modelPromptBlockNodes = selectedNode.kind === "model" ? getModelPromptBlockNodes(graph, selectedNode) : [];
+    const modelMetadataBindingKeys =
+      selectedNode.kind === "model" && isRecord(selectedNode.config.metadata_bindings)
+        ? uniqueStrings(Object.keys(selectedNode.config.metadata_bindings).map((key) => String(key)))
+        : [];
+    const graphEnvVars = getGraphEnvVars(graph);
+    const modelSystemPromptTemplate = selectedNode.kind === "model" ? String(selectedNode.config.system_prompt ?? "") : "";
+    const modelSystemPromptTokens = selectedNode.kind === "model" ? extractTemplateTokens(modelSystemPromptTemplate) : [];
+    const modelDirectRegistryToolSummaries =
+      selectedNode.kind === "model"
+        ? allowedTools
+            .map((toolName) => {
+              const tool = standardCatalogTools.find((candidate) => toolMatchesReference(candidate, toolName));
+              if (!tool) {
+                return {
+                  label: toolName,
+                  canonicalName: toolName,
+                  status: "unknown",
+                };
+              }
+              return {
+                label: toolLabel(tool),
+                canonicalName: toolCanonicalName(tool),
+                status: toolStatusLabel(tool),
+              };
+            })
+            .filter((tool) => tool.canonicalName.trim().length > 0)
+        : [];
+    const findPromptOverrideNodeForTool = (toolName: string): GraphNode | null => {
+      for (const candidate of graph.nodes) {
+        if (candidate.kind !== "tool" && candidate.kind !== "mcp_context_provider") {
+          continue;
+        }
+        const configuredToolNames = Array.isArray(candidate.config.tool_names)
+          ? candidate.config.tool_names.map((value) => String(value))
+          : [];
+        const configuredToolName = typeof candidate.config.tool_name === "string" ? [candidate.config.tool_name] : [];
+        const candidateToolNames = [...configuredToolNames, ...configuredToolName];
+        if (candidateToolNames.some((configuredName) => toolMatchesReference({ name: toolName, description: "", input_schema: {} }, configuredName) || configuredName.trim() === toolName.trim())) {
+          return candidate;
+        }
+        const matchingCatalogTool = catalogTools.find((tool) => toolMatchesReference(tool, toolName));
+        if (matchingCatalogTool && candidateToolNames.some((configuredName) => toolMatchesReference(matchingCatalogTool, configuredName))) {
+          return candidate;
+        }
+      }
+      return null;
+    };
+    const modelPromptToolSummaries =
+      selectedNode.kind === "model"
+        ? mcpContextProvidersForModel.flatMap((node) => {
+            const nodeToolNames = Array.isArray(node.config.tool_names)
+              ? node.config.tool_names.map((toolName) => String(toolName)).filter((toolName) => toolName.trim().length > 0)
+              : [];
+            const sourceNodeLabel = formatNodeLabel(node);
+            const usageHint = String(node.config.usage_hint ?? "").trim();
+            const injectsPromptContext = Boolean(node.config.include_mcp_tool_context);
+            const isCallableSource = node.config.expose_mcp_tools !== false;
+            return nodeToolNames.map((toolName) => {
+              const tool = mcpToolByName.get(toolName) ?? null;
+              const canonicalName = tool ? toolCanonicalName(tool) : toolName;
+              const overrideNode = findPromptOverrideNodeForTool(canonicalName) ?? node;
+              const previewNode: GraphNode = {
+                ...overrideNode,
+                tool_name: canonicalName,
+                config: {
+                  ...overrideNode.config,
+                  tool_name: canonicalName,
+                  tool_names: [canonicalName],
+                },
+              };
+              const resolvedDetails = resolveToolNodeDetails(previewNode, catalog, graph);
+              const status = tool ? toolStatusLabel(tool) : "unknown";
+              return {
+                sourceNodeId: node.id,
+                sourceNodeLabel,
+                overrideNodeLabel: formatNodeLabel(overrideNode),
+                toolName: canonicalName,
+                displayName: tool ? toolLabel(tool) : canonicalName,
+                status,
+                isCallable: isCallableSource && status === "ready",
+                injectsPromptContext,
+                usageHint,
+                renderedPromptText: resolvedDetails.renderedPromptText,
+                templateText: resolvedDetails.templateText,
+                descriptionText: resolvedDetails.agentDescriptionText,
+              };
+            });
+          })
+        : [];
+    const modelPromptContextToolSummaries =
+      selectedNode.kind === "model"
+        ? modelPromptToolSummaries
+            .filter((tool) => tool.injectsPromptContext)
+            .map((tool, index) => ({
+              ...tool,
+              placeholderToken: mcpToolPlaceholderToken(index),
+            }))
+        : [];
+    const modelGeneratedMcpPlaceholderTemplate =
+      selectedNode.kind === "model" ? buildMcpToolPlaceholderTemplate(modelPromptContextToolSummaries) : "";
+    const modelPromptGuidanceBlocks =
+      selectedNode.kind === "model"
+        ? mcpContextProvidersForModel
+            .filter(
+              (node) =>
+                Boolean(node.config.include_mcp_tool_context) &&
+                String(node.config.usage_hint ?? "").trim().length > 0 &&
+                Array.isArray(node.config.tool_names) &&
+                node.config.tool_names.length > 0,
+            )
+            .map((node) => {
+              const toolNames = (node.config.tool_names as unknown[])
+                .map((toolName) => String(toolName))
+                .filter((toolName) => toolName.trim().length > 0)
+                .map((toolName) => mcpToolByName.get(toolName))
+                .filter((tool): tool is ToolDefinition => tool !== undefined)
+                .map((tool) => toolLabel(tool));
+              const dedupedToolNames = uniqueStrings(toolNames);
+              const usageHint = String(node.config.usage_hint ?? "").trim();
+              if (!usageHint || dedupedToolNames.length === 0) {
+                return "";
+              }
+              return [`Tools: ${dedupedToolNames.join(", ")}`, "Guidance:", usageHint].join("\n");
+            })
+            .filter((block) => block.trim().length > 0)
+        : [];
+    const modelMcpToolContextPrompt =
+      selectedNode.kind === "model"
+        ? modelPromptContextToolSummaries.map((tool) => tool.renderedPromptText.trim()).filter((text) => text.length > 0).join("\n\n")
+        : "";
+    const modelCallableMcpToolNames =
+      selectedNode.kind === "model"
+        ? uniqueStrings(modelPromptToolSummaries.filter((tool) => tool.isCallable).map((tool) => tool.toolName)).sort()
+        : [];
+    const modelPromptVariables =
+      selectedNode.kind === "model"
+        ? uniqueStrings([
+            ...Object.keys(graphEnvVars),
+            "documents",
+            "input_payload",
+            "run_id",
+            "graph_id",
+            "current_node_id",
+            "available_tools",
+            "mcp_available_tool_names",
+            "mcp_tool_context",
+            "mcp_tool_context_prompt",
+            "mcp_tool_context_block",
+            "mcp_tool_guidance",
+            "mcp_tool_guidance_block",
+            "mode",
+            "preferred_tool_name",
+            "response_mode",
+            "prompt_blocks",
+            ...modelPromptContextToolSummaries.map((tool) => tool.placeholderToken),
+            ...modelMetadataBindingKeys,
+          ]).sort()
+        : [];
+    const modelPreviewVariableValues: Record<string, string> =
+      selectedNode.kind === "model"
+        ? {
+            documents: stringifyPreviewValue(runState?.documents ?? []),
+            input_payload: stringifyPreviewValue(runState?.input_payload ?? ""),
+            run_id: runState?.run_id ?? "",
+            graph_id: graph.graph_id,
+            current_node_id: selectedNode.id,
+            available_tools: JSON.stringify(
+              [
+                ...modelDirectRegistryToolSummaries.map((tool) => ({
+                  name: tool.canonicalName,
+                  description: tool.label,
+                  status: tool.status,
+                })),
+                ...modelPromptToolSummaries
+                  .filter((tool) => tool.isCallable)
+                  .map((tool) => ({
+                    name: tool.toolName,
+                    description: tool.descriptionText,
+                    status: tool.status,
+                  })),
+              ],
+              null,
+              2,
+            ),
+            mcp_available_tool_names: JSON.stringify(modelCallableMcpToolNames, null, 2),
+            mcp_tool_context: JSON.stringify(
+              {
+                tool_names: modelPromptContextToolSummaries.map((tool) => tool.toolName),
+                prompt_blocks: modelPromptContextToolSummaries.map((tool) => tool.renderedPromptText),
+                usage_hints_text: modelPromptGuidanceBlocks.join("\n\n"),
+              },
+              null,
+              2,
+            ),
+            mcp_tool_context_prompt: modelMcpToolContextPrompt,
+            mcp_tool_guidance: modelPromptGuidanceBlocks.join("\n\n"),
+            mcp_tool_context_block: modelMcpToolContextPrompt.trim().length > 0
+              ? `MCP Tool Context\n${modelMcpToolContextPrompt}`
+              : "",
+            mcp_tool_guidance_block: buildMcpToolGuidanceBlock(
+              modelCallableMcpToolNames,
+              modelPromptGuidanceBlocks.join("\n\n"),
+            ),
+            mode: String(selectedNode.config.mode ?? selectedNode.prompt_name ?? ""),
+            preferred_tool_name: String(selectedNode.config.preferred_tool_name ?? ""),
+            response_mode: selectedModelResponseMode ?? "message",
+            prompt_blocks: JSON.stringify(
+              modelPromptBlockNodes.map((node) => ({
+                role: String(node.config.role ?? "user"),
+                name: String(node.config.name ?? ""),
+                content: renderPromptBlockPreview(node, graph, runState),
+              })),
+              null,
+              2,
+            ),
+            ...Object.fromEntries(modelPromptContextToolSummaries.map((tool) => [tool.placeholderToken, tool.renderedPromptText])),
+            ...Object.fromEntries(modelMetadataBindingKeys.map((key) => [key, `[bound at runtime: ${key}]`])),
+          }
+        : {};
+    const modelSystemPromptTemplatePreview =
+      selectedNode.kind === "model"
+        ? resolveGraphEnvReferences(modelSystemPromptTemplate, graph, modelPreviewVariableValues)
+        : "";
+    const modelPromptOnlyToolContract =
+      selectedNode.kind === "model"
+        ? buildPromptOnlyMcpToolDecisionContract(modelPromptContextToolSummaries.length > 0, modelCallableMcpToolNames)
+        : "";
+    const modelMcpToolPlaceholderTokens =
+      selectedNode.kind === "model" ? modelPromptContextToolSummaries.map((tool) => tool.placeholderToken) : [];
+    const modelHasInlineMcpGuidanceBlock =
+      selectedNode.kind === "model" && modelSystemPromptTemplate.includes("{mcp_tool_guidance_block}");
+    const modelHasInlineMcpContextCoverage =
+      selectedNode.kind === "model" && (
+        modelSystemPromptTemplate.includes("{mcp_tool_context_block}")
+        || modelSystemPromptTemplate.includes("{mcp_tool_context_prompt}")
+        || (
+          modelMcpToolPlaceholderTokens.length > 0
+          && modelMcpToolPlaceholderTokens.every((token) => modelSystemPromptTemplate.includes(`{${token}}`))
+        )
+      );
+    const modelOptionalPromptVariables =
+      selectedNode.kind === "model"
+        ? modelPromptVariables.filter(
+            (token) => !["mcp_tool_guidance_block", "mcp_tool_context_block", "mcp_tool_context_prompt", ...modelMcpToolPlaceholderTokens].includes(token),
+          )
+        : [];
+    const modelMcpGuidanceBlock =
+      selectedNode.kind === "model"
+        ? String(modelPreviewVariableValues.mcp_tool_guidance_block ?? "").trim()
+        : "";
+    const modelMcpContextBlock =
+      selectedNode.kind === "model"
+        ? String(modelPreviewVariableValues.mcp_tool_context_block ?? "").trim()
+        : "";
+    const modelPromptAssemblySections =
+      selectedNode.kind === "model"
+        ? (() => {
+            const sections: string[] = [];
+            const hasInlineMcpGuidanceBlock = modelSystemPromptTemplate.includes("{mcp_tool_guidance_block}");
+            const hasInlineMcpContextCoverage =
+              modelSystemPromptTemplate.includes("{mcp_tool_context_block}")
+              || modelSystemPromptTemplate.includes("{mcp_tool_context_prompt}")
+              || (
+                modelPromptContextToolSummaries.length > 0
+                && modelPromptContextToolSummaries.every((tool) => modelSystemPromptTemplate.includes(`{${tool.placeholderToken}}`))
+              );
+            if (modelMcpGuidanceBlock.length > 0 && !hasInlineMcpGuidanceBlock) {
+              sections.push(modelMcpGuidanceBlock);
+            }
+            if (modelMcpContextBlock.length > 0 && !hasInlineMcpContextCoverage) {
+              sections.push(modelMcpContextBlock);
+            }
+            if (modelPromptOnlyToolContract.trim().length > 0) {
+              sections.push(modelPromptOnlyToolContract);
+            }
+            return sections;
+          })()
+        : [];
+    const modelFinalSystemPromptPreview =
+      selectedNode.kind === "model"
+        ? [modelSystemPromptTemplatePreview.trim(), ...modelPromptAssemblySections.map((section) => section.trim()).filter((section) => section.length > 0)]
+            .filter((section) => section.length > 0)
+            .join("\n\n")
+        : "";
     const mcpToolExposureEnabled = selectedNode.kind === "mcp_context_provider" ? selectedNode.config.expose_mcp_tools !== false : false;
     const executorBindingSummary = selectedNode.kind === "mcp_tool_executor" ? describeMcpExecutorBinding(selectedNode.config.input_binding) : "";
     const executorFollowUpResponseMode =
@@ -366,6 +753,37 @@ export function GraphInspector({
       (selectedNode.provider_id === "start.manual_run" || selectedNode.provider_id === "core.input");
     const isContextBuilderNode = selectedNode.kind === "data" && selectedNode.provider_id === CONTEXT_BUILDER_PROVIDER_ID;
     const isPromptBlockDataNode = selectedNode.kind === "data" && selectedNode.provider_id === PROMPT_BLOCK_PROVIDER_ID;
+    const isSpreadsheetRowNode = selectedNode.kind === "data" && selectedNode.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
+    const spreadsheetNode = isSpreadsheetRowNode ? selectedNode : null;
+    const spreadsheetIteratorState =
+      isSpreadsheetRowNode && runState?.iterator_states
+        ? (runState.iterator_states[selectedNode.id] as Record<string, unknown> | undefined)
+        : undefined;
+    const spreadsheetResolvedFilePath =
+      spreadsheetNode ? String(resolveGraphEnvReferences(String(spreadsheetNode.config.file_path ?? ""), graph) ?? "") : "";
+    async function handleSpreadsheetPreview(): Promise<void> {
+      if (!spreadsheetNode) {
+        return;
+      }
+      setIsSpreadsheetPreviewLoading(true);
+      setSpreadsheetPreviewError(null);
+      try {
+        const preview = await previewSpreadsheetRows({
+          file_path: spreadsheetResolvedFilePath,
+          file_format: String(spreadsheetNode.config.file_format ?? "auto"),
+          sheet_name: String(spreadsheetNode.config.sheet_name ?? "") || null,
+          header_row_index: Number(spreadsheetNode.config.header_row_index ?? 1) || 1,
+          start_row_index: Number(spreadsheetNode.config.start_row_index ?? 2) || 2,
+          empty_row_policy: String(spreadsheetNode.config.empty_row_policy ?? "skip"),
+        });
+        setSpreadsheetPreview(preview);
+      } catch (error) {
+        setSpreadsheetPreview(null);
+        setSpreadsheetPreviewError(error instanceof Error ? error.message : "Failed to preview spreadsheet rows.");
+      } finally {
+        setIsSpreadsheetPreviewLoading(false);
+      }
+    }
     const contextBuilderBindings = isContextBuilderNode ? getContextBuilderBindings(selectedNode, graph) : [];
     const generatedContextBuilderTemplate = buildContextBuilderTemplate(contextBuilderBindings);
     const rawContextBuilderTemplate = isContextBuilderNode ? String(selectedNode.config.template ?? "") : "";
@@ -891,6 +1309,43 @@ export function GraphInspector({
                     )
                   }
                 />
+                {selectedNode.kind === "model" && modelPromptContextToolSummaries.length > 0 ? (
+                  <div className="context-builder-binding-actions">
+                    <button
+                      type="button"
+                      className="secondary-button context-builder-inline-button"
+                      onClick={() =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              system_prompt: modelGeneratedMcpPlaceholderTemplate,
+                            },
+                          })),
+                        )
+                      }
+                    >
+                      Build From Connected MCP Tools
+                    </button>
+                  </div>
+                ) : null}
+                {selectedNode.kind === "model" && (modelCallableMcpToolNames.length > 0 || modelPromptGuidanceProviders.length > 0) ? (
+                  <small>
+                    Connected MCP edges already guarantee which tools are in scope. For full inline MCP coverage, include{" "}
+                    <code>{"{mcp_tool_guidance_block}"}</code> and either <code>{"{mcp_tool_context_block}"}</code> or
+                    every ordered tool placeholder below. Missing MCP sections are appended automatically.
+                  </small>
+                ) : null}
+                {selectedNode.kind === "model" && modelPromptContextToolSummaries.length > 0 ? (
+                  <small>
+                    Ordered MCP tool placeholders:{" "}
+                    {modelPromptContextToolSummaries.map((tool) => (
+                      <code key={tool.placeholderToken}>{`{${tool.placeholderToken}}`}</code>
+                    ))}{" "}
+                    resolve inline at runtime.
+                  </small>
+                ) : null}
               </label>
               <label>
                 User Message Template
@@ -911,11 +1366,24 @@ export function GraphInspector({
                 Response Mode
                 {selectedNode.kind === "model" ? (
                   <>
-                    <input type="text" value={selectedModelResponseMode ?? "message"} readOnly />
+                    <select
+                      value={String(selectedNode.config.response_mode ?? "auto") || "auto"}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, response_mode: event.target.value },
+                          })),
+                        )
+                      }
+                    >
+                      <option value="auto">auto</option>
+                      <option value="tool_call">tool_call</option>
+                      <option value="message">message</option>
+                    </select>
                     <small>
-                      Uses the node response mode when configured. Otherwise it falls back to graph wiring: tool-call
-                      routes enable structured tool decisions, both outputs allow parsed message and tool branches in
-                      parallel, and message-only wiring keeps it in message mode.
+                      Choose a fixed mode or leave it on `auto` to follow graph wiring. Current effective mode:{" "}
+                      <code>{selectedModelResponseMode ?? "message"}</code>.
                     </small>
                   </>
                 ) : (
@@ -1004,6 +1472,205 @@ export function GraphInspector({
                   </span>
                   <span>Bind Prompt Block nodes into the model to inject additional system, user, or assistant messages before the standard user template.</span>
                 </div>
+              ) : null}
+              {selectedNode.kind === "model" ? (
+                <>
+                  <div className="contract-card">
+                    <strong>System Prompt Assembly</strong>
+                    <span>
+                      Template placeholders: {modelSystemPromptTokens.length > 0 ? modelSystemPromptTokens.join(", ") : "None"}
+                    </span>
+                    <span>
+                      Required MCP guidance:{" "}
+                      {modelMcpGuidanceBlock.length > 0
+                        ? modelHasInlineMcpGuidanceBlock
+                          ? "inline"
+                          : "auto-appended"
+                        : "not needed"}
+                    </span>
+                    <span>
+                      Required MCP context:{" "}
+                      {modelPromptContextToolSummaries.length > 0
+                        ? modelHasInlineMcpContextCoverage
+                          ? "inline"
+                          : "auto-appended"
+                        : "not needed"}
+                    </span>
+                    <span>
+                      Prompt block messages stay separate from the system prompt:{" "}
+                      {modelPromptBlockNodes.length > 0 ? `${modelPromptBlockNodes.length} bound block${modelPromptBlockNodes.length === 1 ? "" : "s"}` : "None"}
+                    </span>
+                  </div>
+                  {modelGeneratedMcpPlaceholderTemplate ? (
+                    <section className="tool-details-modal-preview">
+                      <div className="tool-details-modal-preview-header">
+                        <strong>Generated MCP Placeholder Template</strong>
+                        <span>
+                          This scaffold is built from connected MCP prompt-context edges and can replace the system prompt
+                          with ordered placeholders before runtime.
+                        </span>
+                      </div>
+                      <pre>{modelGeneratedMcpPlaceholderTemplate}</pre>
+                    </section>
+                  ) : null}
+                  <div className="checkbox-grid">
+                    <strong>Required MCP Placeholders</strong>
+                    <span className="inspector-meta">
+                      Necessary for full inline MCP control. If these are omitted, the runtime appends the missing MCP
+                      sections automatically.
+                    </span>
+                    <div className="context-builder-placeholder-bar">
+                      {modelMcpGuidanceBlock.length > 0 ? (
+                        <button
+                          type="button"
+                          className="secondary-button context-builder-token-button context-builder-token-button--required"
+                          onClick={() =>
+                            onGraphChange(
+                              updateNode(graph, selectedNode.id, (node) => ({
+                                ...node,
+                                config: {
+                                  ...node.config,
+                                  system_prompt: insertTokenAtEnd(String(node.config.system_prompt ?? ""), "{mcp_tool_guidance_block}"),
+                                },
+                              })),
+                            )
+                          }
+                        >
+                          mcp_tool_guidance_block
+                        </button>
+                      ) : null}
+                      {modelPromptContextToolSummaries.length > 0 ? (
+                        <button
+                          type="button"
+                          className="secondary-button context-builder-token-button context-builder-token-button--required"
+                          onClick={() =>
+                            onGraphChange(
+                              updateNode(graph, selectedNode.id, (node) => ({
+                                ...node,
+                                config: {
+                                  ...node.config,
+                                  system_prompt: insertTokenAtEnd(String(node.config.system_prompt ?? ""), "{mcp_tool_context_block}"),
+                                },
+                              })),
+                            )
+                          }
+                        >
+                          mcp_tool_context_block
+                        </button>
+                      ) : null}
+                      {modelMcpToolPlaceholderTokens.map((token) => (
+                        <button
+                          key={token}
+                          type="button"
+                          className="secondary-button context-builder-token-button context-builder-token-button--required"
+                          onClick={() =>
+                            onGraphChange(
+                              updateNode(graph, selectedNode.id, (node) => ({
+                                ...node,
+                                config: {
+                                  ...node.config,
+                                  system_prompt: insertTokenAtEnd(String(node.config.system_prompt ?? ""), `{${token}}`),
+                                },
+                              })),
+                            )
+                          }
+                        >
+                          {token}
+                        </button>
+                      ))}
+                    </div>
+                    {modelPromptContextToolSummaries.length > 0 ? (
+                      <span className="inspector-meta">
+                        Context coverage can come from <code>{"{mcp_tool_context_block}"}</code> or from all ordered tool
+                        placeholders.
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="checkbox-grid">
+                    <strong>Optional Runtime Variables</strong>
+                    <span className="inspector-meta">
+                      These are available if you want to reference other runtime values explicitly.
+                    </span>
+                    <div className="context-builder-placeholder-bar">
+                      {modelOptionalPromptVariables.map((token) => (
+                        <button
+                          key={token}
+                          type="button"
+                          className="secondary-button context-builder-token-button context-builder-token-button--optional"
+                          onClick={() =>
+                            onGraphChange(
+                              updateNode(graph, selectedNode.id, (node) => ({
+                                ...node,
+                                config: {
+                                  ...node.config,
+                                  system_prompt: insertTokenAtEnd(String(node.config.system_prompt ?? ""), `{${token}}`),
+                                },
+                              })),
+                            )
+                          }
+                        >
+                          {token}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="prompt-preview-tool-list">
+                    <div className="contract-card">
+                      <strong>Connected MCP Tool Info</strong>
+                      <span>
+                        Callable MCP tools: {modelCallableMcpToolNames.length > 0 ? modelCallableMcpToolNames.join(", ") : "None"}
+                      </span>
+                      <span>
+                        Prompt context tools:{" "}
+                        {modelPromptContextToolSummaries.length > 0
+                          ? modelPromptContextToolSummaries.map((tool) => tool.displayName).join(", ")
+                          : "None"}
+                      </span>
+                    </div>
+                    {modelPromptToolSummaries.length > 0 ? (
+                      modelPromptToolSummaries.map((tool) => (
+                        <div
+                          key={`${tool.sourceNodeId}-${tool.toolName}`}
+                          className="contract-card prompt-preview-tool-card"
+                        >
+                          <strong>
+                            {tool.displayName} <code>{tool.toolName}</code>
+                          </strong>
+                          <span>Source: {tool.sourceNodeLabel}</span>
+                          <span>Prompt override source: {tool.overrideNodeLabel}</span>
+                          <span>Status: {tool.status}</span>
+                          <span>Callable by model: {tool.isCallable ? "Yes" : "No"}</span>
+                          <span>Injects prompt context: {tool.injectsPromptContext ? "Yes" : "No"}</span>
+                          {"placeholderToken" in tool ? <span>Placeholder: <code>{`{${tool.placeholderToken}}`}</code></span> : null}
+                          <span>Usage guidance: {tool.usageHint || "None"}</span>
+                          <span>Prompt template:</span>
+                          <pre className="context-builder-preview">{tool.templateText || "No prompt template."}</pre>
+                          <span>Rendered MCP context block:</span>
+                          <pre className="context-builder-preview">{tool.renderedPromptText || "No MCP prompt block."}</pre>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="contract-card">
+                        <strong>Connected MCP Tool Info</strong>
+                        <span>No MCP Context Provider tools are connected to this model.</span>
+                      </div>
+                    )}
+                  </div>
+                  <section className="tool-details-modal-preview">
+                    <div className="tool-details-modal-preview-header">
+                      <strong>System Prompt Template Preview</strong>
+                      <span>This resolves graph env references and currently visible runtime variables before auto-appended MCP sections are added.</span>
+                    </div>
+                    <pre>{modelSystemPromptTemplatePreview || "Add a system prompt template to preview it here."}</pre>
+                  </section>
+                  <section className="tool-details-modal-preview">
+                    <div className="tool-details-modal-preview-header">
+                      <strong>Final System Prompt Preview</strong>
+                      <span>This mirrors the current runtime assembly path for MCP guidance, MCP tool context, and prompt-only MCP decision instructions.</span>
+                    </div>
+                    <pre>{modelFinalSystemPromptPreview || "The final assembled system prompt will appear here."}</pre>
+                  </section>
+                </>
               ) : null}
               <label>
                 Preferred Tool Name
@@ -1137,6 +1804,28 @@ export function GraphInspector({
                   <small>Adds descriptive MCP tool metadata to the connected model system prompt. This does not control tool callability.</small>
                 </span>
               </label>
+              <label>
+                Usage Guidance
+                <textarea
+                  rows={4}
+                  value={String(selectedNode.config.usage_hint ?? "")}
+                  onChange={(event) =>
+                    onGraphChange(
+                      updateNode(graph, selectedNode.id, (node) => ({
+                        ...node,
+                        config: {
+                          ...node.config,
+                          usage_hint: event.target.value,
+                        },
+                      })),
+                    )
+                  }
+                />
+                <small>
+                  Natural-language hint folded into the connected model&apos;s required MCP guidance block when MCP prompt
+                  context is enabled.
+                </small>
+              </label>
             </>
           ) : null}
           {selectedNode.kind === "mcp_tool_executor" ? (
@@ -1221,7 +1910,170 @@ export function GraphInspector({
           ) : null}
           {selectedNode.kind === "data" ? (
             <>
-              {selectedNode.provider_id === "core.data_display" ? (
+              {isSpreadsheetRowNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Spreadsheet Rows</strong>
+                    <span>Reads a CSV or XLSX file, maps each row to a header-keyed dictionary, and runs downstream nodes once per row in strict sequence.</span>
+                    <span>Each row is emitted as `payload.row_data` with `row_index`, `row_number`, `sheet_name`, and `source_file` metadata.</span>
+                  </div>
+                  <label>
+                    File Format
+                    <select
+                      value={String(selectedNode.config.file_format ?? "auto")}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, file_format: event.target.value, mode: "spreadsheet_rows" },
+                          })),
+                        )
+                      }
+                    >
+                      <option value="auto">Auto Detect</option>
+                      <option value="csv">CSV</option>
+                      <option value="xlsx">Excel (.xlsx)</option>
+                    </select>
+                  </label>
+                  <label>
+                    File Path
+                    <input
+                      value={String(selectedNode.config.file_path ?? "")}
+                      placeholder="/absolute/path/to/file.xlsx or {GRAPH_ENV_VAR}"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, file_path: event.target.value, mode: "spreadsheet_rows" },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Sheet Name
+                    <input
+                      value={String(selectedNode.config.sheet_name ?? "")}
+                      placeholder="Leave blank to use the first sheet"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, sheet_name: event.target.value, mode: "spreadsheet_rows" },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="checkbox-grid">
+                    <label>
+                      Header Row
+                      <input
+                        type="number"
+                        min={1}
+                        value={String(selectedNode.config.header_row_index ?? 1)}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                header_row_index: event.target.value === "" ? "" : Number(event.target.value),
+                                mode: "spreadsheet_rows",
+                              },
+                            })),
+                          )
+                        }
+                      />
+                    </label>
+                    <label>
+                      First Data Row
+                      <input
+                        type="number"
+                        min={1}
+                        value={String(selectedNode.config.start_row_index ?? 2)}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                start_row_index: event.target.value === "" ? "" : Number(event.target.value),
+                                mode: "spreadsheet_rows",
+                              },
+                            })),
+                          )
+                        }
+                      />
+                    </label>
+                    <label>
+                      Empty Row Policy
+                      <select
+                        value={String(selectedNode.config.empty_row_policy ?? "skip")}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: { ...node.config, empty_row_policy: event.target.value, mode: "spreadsheet_rows" },
+                            })),
+                          )
+                        }
+                      >
+                        <option value="skip">Skip empty rows</option>
+                        <option value="include">Include empty rows</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div className="context-builder-binding-actions">
+                    <button
+                      type="button"
+                      className="secondary-button context-builder-inline-button"
+                      onClick={() => void handleSpreadsheetPreview()}
+                      disabled={isSpreadsheetPreviewLoading || spreadsheetResolvedFilePath.trim().length === 0}
+                    >
+                      {isSpreadsheetPreviewLoading ? "Loading Preview..." : "Preview Rows"}
+                    </button>
+                  </div>
+                  <div className="inspector-meta">
+                    <span>Resolved file path: {spreadsheetResolvedFilePath || "Enter a file path or graph env reference."}</span>
+                    <span>Execution mode: sequential per-row loop through downstream nodes</span>
+                    <span>Recommended shape for downstream prompts/tools: `payload.row_data` key-value pairs</span>
+                  </div>
+                  {spreadsheetIteratorState ? (
+                    <div className="contract-card">
+                      <strong>Iterator Progress</strong>
+                      <span>Status: {String(spreadsheetIteratorState.status ?? "unknown")}</span>
+                      <span>
+                        Row progress: {String(spreadsheetIteratorState.current_row_index ?? 0)} / {String(spreadsheetIteratorState.total_rows ?? 0)}
+                      </span>
+                      <span>Sheet: {String(spreadsheetIteratorState.sheet_name ?? "first sheet")}</span>
+                    </div>
+                  ) : null}
+                  {spreadsheetPreviewError ? <div className="tool-details-modal-help">{spreadsheetPreviewError}</div> : null}
+                  <div className="contract-card">
+                    <strong>Parsed Preview</strong>
+                    <span>
+                      {spreadsheetPreview
+                        ? `${spreadsheetPreview.row_count} row(s) parsed from ${spreadsheetPreview.file_format.toUpperCase()}`
+                        : "Run a preview to inspect headers and sample rows before execution."}
+                    </span>
+                    <pre className="context-builder-preview">
+                      {spreadsheetPreview
+                        ? JSON.stringify(
+                            {
+                              headers: spreadsheetPreview.headers,
+                              sheet_name: spreadsheetPreview.sheet_name,
+                              row_count: spreadsheetPreview.row_count,
+                              sample_rows: spreadsheetPreview.sample_rows,
+                            },
+                            null,
+                            2,
+                          )
+                        : "Preview output will appear here."}
+                    </pre>
+                  </div>
+                </>
+              ) : selectedNode.provider_id === "core.data_display" ? (
                 <div className="inspector-meta">
                   <span>Display mode: visualizer envelope inspection</span>
                   <span>Behavior: passes the original payload through unchanged</span>

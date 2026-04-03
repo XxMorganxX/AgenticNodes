@@ -1,6 +1,6 @@
 import type { GraphDefinition, GraphNode, RunState } from "./types";
 
-const PROMPT_BLOCK_BASE_VARIABLES = ["current_node_id", "graph_id", "input_payload", "run_id"];
+const PROMPT_BLOCK_BASE_VARIABLES = ["current_node_id", "documents", "graph_id", "input_payload", "run_id"];
 const PROMPT_BLOCK_TOKEN_PATTERN = /\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
 export const PROMPT_BLOCK_STARTERS: Record<string, string> = {
@@ -43,6 +43,7 @@ export function promptBlockTemplateVariables(
   return {
     ...Object.fromEntries(Object.entries(graph.env_vars ?? {}).map(([key, value]) => [key, String(value)])),
     current_node_id: node.id,
+    documents: runState?.documents != null ? stringifyPreviewValue(runState.documents) : "",
     graph_id: graph.graph_id,
     input_payload: runState?.input_payload != null ? stringifyPreviewValue(runState.input_payload) : "",
     run_id: runState?.run_id ?? "",

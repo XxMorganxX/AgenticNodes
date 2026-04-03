@@ -7,6 +7,7 @@ import {
   API_FINAL_MESSAGE_HANDLE_ID,
   API_TOOL_CALL_HANDLE_ID,
   API_TOOL_CONTEXT_HANDLE_ID,
+  inferModelResponseMode,
   getApiToolContextTargetAnchorRatio,
   getToolSourceHandleAnchorRatio,
   isApiModelNode,
@@ -141,6 +142,11 @@ function contextBuilderPlaceholderCount(graph: GraphDefinition | null, node: Gra
       .map((edge) => edge.source_id)
       .filter((sourceId, index, sourceIds) => sourceIds.indexOf(sourceId) === index) ?? [];
   return new Set([...configuredSourceIds, ...incomingSourceIds]).size;
+}
+
+function configuredResponseMode(node: GraphNode): "auto" | "tool_call" | "message" {
+  const value = String(node.config.response_mode ?? "auto").trim();
+  return value === "tool_call" || value === "message" || value === "auto" ? value : "auto";
 }
 
 function GraphCanvasNodeComponent({
@@ -285,6 +291,9 @@ function GraphCanvasNodeComponent({
   const displayStatus = status;
   const isActive = displayStatus === "active";
   const executorRetriesEnabled = node.kind === "mcp_tool_executor" ? node.config.allow_retries !== false : false;
+  const modelConfiguredResponseMode = isModelNode ? configuredResponseMode(node) : null;
+  const modelEffectiveResponseMode = isModelNode ? inferModelResponseMode(graph, node) : null;
+  const executorConfiguredResponseMode = node.kind === "mcp_tool_executor" ? configuredResponseMode(node) : null;
   const contextBindingLabel = isContextProviderNode
     ? contextBooted && isContextConnected
       ? "Bound and MCP booted"
@@ -412,6 +421,19 @@ function GraphCanvasNodeComponent({
         <div className="graph-node-meta">
           <span className="graph-node-chip">{node.category}</span>
           <span className="graph-node-meta-text">{node.kind}</span>
+          {isModelNode ? (
+            <span className="graph-node-chip graph-node-chip--response-mode">
+              response {modelConfiguredResponseMode}
+              {modelConfiguredResponseMode === "auto" && modelEffectiveResponseMode && modelEffectiveResponseMode !== "auto"
+                ? ` -> ${modelEffectiveResponseMode}`
+                : ""}
+            </span>
+          ) : null}
+          {node.kind === "mcp_tool_executor" ? (
+            <span className="graph-node-chip graph-node-chip--response-mode">
+              follow-up {node.config.enable_follow_up_decision === true ? executorConfiguredResponseMode : "off"}
+            </span>
+          ) : null}
         </div>
         {node.kind === "mcp_tool_executor" ? (
           <div className="graph-node-inline-toggle-row">
@@ -484,7 +506,7 @@ function GraphCanvasNodeComponent({
           </div>
         ) : null}
         {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node)) ? (
-          <div className="graph-node-card-actions">
+          <div className="graph-node-card-actions" aria-hidden="false">
             <button
               type="button"
               className="secondary-button graph-node-card-button"

@@ -14,10 +14,13 @@ def build_run_state(
     graph_id: str,
     input_payload: Any,
     *,
+    documents: list[dict[str, Any]] | None = None,
+    execution_node_ids: list[str] | None = None,
     agent_id: str | None = None,
     parent_run_id: str | None = None,
     agent_name: str | None = None,
 ) -> dict[str, Any]:
+    normalized_execution_node_ids = [node_id for node_id in dict.fromkeys(execution_node_ids or []) if isinstance(node_id, str) and node_id]
     return {
         "run_id": run_id,
         "graph_id": graph_id,
@@ -27,6 +30,7 @@ def build_run_state(
         "status": "queued",
         "status_reason": None,
         "input_payload": input_payload,
+        "documents": list(documents or []),
         "current_node_id": None,
         "current_edge_id": None,
         "started_at": None,
@@ -37,6 +41,8 @@ def build_run_state(
         "node_outputs": {},
         "edge_outputs": {},
         "node_errors": {},
+        "node_statuses": {node_id: "idle" for node_id in normalized_execution_node_ids},
+        "iterator_states": {},
         "visit_counts": {},
         "transition_history": [],
         "event_history": [],
@@ -80,6 +86,31 @@ def _resolve_edge_output_from_event_history(
     return _MISSING
 
 
+def _mark_terminal_node_statuses(
+    node_statuses: dict[str, Any] | None,
+    visit_counts: dict[str, Any] | None,
+    node_errors: dict[str, Any] | None,
+    *,
+    terminal_status: str,
+) -> dict[str, Any]:
+    next_statuses = dict(node_statuses or {})
+    for node_id, status in list(next_statuses.items()):
+        normalized_status = str(status or "").strip() or "idle"
+        if normalized_status == "active":
+            if isinstance(node_errors, dict) and node_id in node_errors:
+                normalized_status = "failed"
+            elif terminal_status == "failed":
+                normalized_status = "failed"
+            elif isinstance(visit_counts, dict) and int(visit_counts.get(node_id, 0) or 0) > 0:
+                normalized_status = "success"
+            else:
+                normalized_status = "idle"
+        if normalized_status == "idle":
+            normalized_status = "unreached"
+        next_statuses[node_id] = normalized_status
+    return next_statuses
+
+
 def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
     event = normalize_runtime_event_dict(event)
     next_state = {
@@ -111,6 +142,10 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
                 node_id: payload.get("received_input"),
             }
             next_state["node_errors"] = _omit_run_state_entry(next_state.get("node_errors"), node_id)
+            next_state["node_statuses"] = {
+                **next_state.get("node_statuses", {}),
+                node_id: "active",
+            }
 
     if event_type == "node.completed":
         node_id = payload.get("node_id")
@@ -128,6 +163,28 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
             }
         elif isinstance(node_id, str):
             next_state["node_errors"] = _omit_run_state_entry(next_state.get("node_errors"), node_id)
+        if isinstance(node_id, str):
+            next_state["node_statuses"] = {
+                **next_state.get("node_statuses", {}),
+                node_id: "failed" if payload.get("error") is not None else "success",
+            }
+
+    if event_type == "node.iterator.updated":
+        node_id = payload.get("node_id")
+        if isinstance(node_id, str):
+            next_state["iterator_states"] = {
+                **next_state.get("iterator_states", {}),
+                node_id: {
+                    "iterator_type": payload.get("iterator_type"),
+                    "status": payload.get("status"),
+                    "current_row_index": payload.get("current_row_index"),
+                    "total_rows": payload.get("total_rows"),
+                    "headers": payload.get("headers"),
+                    "sheet_name": payload.get("sheet_name"),
+                    "source_file": payload.get("source_file"),
+                    "file_format": payload.get("file_format"),
+                },
+            }
 
     if event_type == "edge.selected":
         selected_edge_id = payload.get("id")
@@ -155,6 +212,12 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
         next_state["current_edge_id"] = None
         next_state["ended_at"] = event.get("timestamp")
         next_state["final_output"] = payload.get("final_output")
+        next_state["node_statuses"] = _mark_terminal_node_statuses(
+            next_state.get("node_statuses"),
+            next_state.get("visit_counts"),
+            next_state.get("node_errors"),
+            terminal_status="completed",
+        )
 
     if event_type == "run.failed":
         next_state["status"] = "failed"
@@ -165,6 +228,12 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
         next_state["terminal_error"] = payload.get("error")
         if "final_output" in payload:
             next_state["final_output"] = payload.get("final_output")
+        next_state["node_statuses"] = _mark_terminal_node_statuses(
+            next_state.get("node_statuses"),
+            next_state.get("visit_counts"),
+            next_state.get("node_errors"),
+            terminal_status="failed",
+        )
 
     if event_type == "run.cancelled":
         next_state["status"] = "cancelled"
@@ -175,6 +244,12 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
         next_state["terminal_error"] = payload.get("error")
         if "final_output" in payload:
             next_state["final_output"] = payload.get("final_output")
+        next_state["node_statuses"] = _mark_terminal_node_statuses(
+            next_state.get("node_statuses"),
+            next_state.get("visit_counts"),
+            next_state.get("node_errors"),
+            terminal_status="cancelled",
+        )
 
     if event_type == "run.interrupted":
         next_state["status"] = "interrupted"
@@ -185,6 +260,12 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
         next_state["terminal_error"] = payload.get("error")
         if "final_output" in payload:
             next_state["final_output"] = payload.get("final_output")
+        next_state["node_statuses"] = _mark_terminal_node_statuses(
+            next_state.get("node_statuses"),
+            next_state.get("visit_counts"),
+            next_state.get("node_errors"),
+            terminal_status="interrupted",
+        )
 
     return next_state
 
@@ -212,6 +293,7 @@ def apply_event(previous: dict[str, Any], event: dict[str, Any]) -> dict[str, An
             str(payload.get("child_run_id") or uuid4()),
             str(previous.get("graph_id") or ""),
             previous.get("input_payload"),
+            documents=previous.get("documents"),
             agent_id=agent_id,
             parent_run_id=str(previous.get("run_id") or ""),
             agent_name=str(payload.get("agent_name") or agent_id),

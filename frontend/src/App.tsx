@@ -23,6 +23,7 @@ import {
   startRun,
   stopMcpServer,
   testMcpServer,
+  uploadRunDocuments,
   updateMcpServer,
   updateGraph,
 } from "./lib/api";
@@ -32,7 +33,7 @@ import { filterEventsForAgent, getCanvasGraph, getDefaultAgentId, getSelectedRun
 import { clearAllPersistedRunSnapshots, clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
 import { isTerminalRuntimeEvent, normalizeRunState, normalizeRuntimeEvent } from "./lib/runtimeEvents";
 import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedRunProjection } from "./lib/runVisualization";
-import type { EditorCatalog, GraphDefinition, GraphDocument, McpServerDraft, McpServerStatus, RunState, RuntimeEvent, ToolDefinition } from "./lib/types";
+import type { EditorCatalog, GraphDefinition, GraphDocument, McpServerDraft, McpServerStatus, RunDocument, RunState, RuntimeEvent, ToolDefinition } from "./lib/types";
 import { getUserPreferences, resetUserPreferences, saveUserPreferences } from "./lib/userPreferences";
 import type { UserPreferences } from "./lib/userPreferences";
 import { useGraphHistory } from "./lib/useGraphHistory";
@@ -43,6 +44,66 @@ const ENVIRONMENT_AGENT_SELECTION_STORAGE_KEY = "agentic-nodes-environment-agent
 
 function isTerminalRunStatus(status: string | null | undefined): boolean {
   return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
+}
+
+function buildIdleNodeStatuses(
+  startNodeId: string,
+  nodes: Array<{ id: string }>,
+  edges: Array<{ kind: string; source_id: string; target_id: string }>,
+): Record<string, string> {
+  const executionNodeIds = new Set<string>();
+  if (startNodeId) {
+    executionNodeIds.add(startNodeId);
+  }
+  for (const edge of edges) {
+    if (edge.kind === "binding") {
+      continue;
+    }
+    executionNodeIds.add(edge.source_id);
+    executionNodeIds.add(edge.target_id);
+  }
+  return Object.fromEntries(nodes.filter((node) => executionNodeIds.has(node.id)).map((node) => [node.id, "idle"]));
+}
+
+function formatDocumentSize(sizeBytes: number): string {
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+    return "0 B";
+  }
+  if (sizeBytes < 1024) {
+    return `${sizeBytes} B`;
+  }
+  if (sizeBytes < 1024 * 1024) {
+    return `${(sizeBytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function markTerminalNodeStatuses(
+  nodeStatuses: Record<string, string> | undefined,
+  visitCounts: Record<string, number>,
+  nodeErrors: Record<string, unknown>,
+  terminalStatus: string,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(nodeStatuses ?? {}).map(([nodeId, status]) => {
+      let nextStatus = status || "idle";
+      if (nextStatus === "active") {
+        if (Object.prototype.hasOwnProperty.call(nodeErrors, nodeId)) {
+          nextStatus = "failed";
+        } else if (terminalStatus === "failed") {
+          nextStatus = "failed";
+        } else if ((visitCounts[nodeId] ?? 0) > 0) {
+          nextStatus = "success";
+        } else {
+          nextStatus = "idle";
+        }
+      }
+      if (nextStatus === "idle") {
+        nextStatus = "unreached";
+      }
+      return [nodeId, nextStatus];
+    }),
+  );
 }
 
 function getSavedInputPrompt(graph: GraphDocument | null | undefined): string {
@@ -110,7 +171,7 @@ function saveEnvironmentAgentSelection(graphId: string, selection: Record<string
   }
 }
 
-function createEmptyRunState(runId: string, graphId: string, input: string): RunState {
+function createEmptyRunState(runId: string, graphId: string, input: string, documents: RunDocument[] = []): RunState {
   return {
     run_id: runId,
     graph_id: graphId,
@@ -126,10 +187,13 @@ function createEmptyRunState(runId: string, graphId: string, input: string): Run
     runtime_instance_id: null,
     last_heartbeat_at: null,
     input_payload: input,
+    documents,
     node_inputs: {},
     node_outputs: {},
     edge_outputs: {},
     node_errors: {},
+    node_statuses: {},
+    iterator_states: {},
     visit_counts: {},
     transition_history: [],
     event_history: [],
@@ -139,10 +203,19 @@ function createEmptyRunState(runId: string, graphId: string, input: string): Run
   };
 }
 
-function createPendingRunState(graph: GraphDocument, runId: string, input: string, agentIds?: string[]): RunState {
-  const next = createEmptyRunState(runId, graph.graph_id, input);
+function createPendingRunState(
+  graph: GraphDocument,
+  runId: string,
+  input: string,
+  agentIds?: string[],
+  documents: RunDocument[] = [],
+): RunState {
+  const next = createEmptyRunState(runId, graph.graph_id, input, documents);
   if (!isTestEnvironment(graph)) {
-    return next;
+    return {
+      ...next,
+      node_statuses: buildIdleNodeStatuses(graph.start_node_id, graph.nodes, graph.edges),
+    };
   }
   const selectedAgentIds = new Set(agentIds ?? graph.agents.map((agent) => agent.agent_id));
   return {
@@ -153,7 +226,8 @@ function createPendingRunState(graph: GraphDocument, runId: string, input: strin
         .map((agent) => [
         agent.agent_id,
         {
-          ...createEmptyRunState(`${runId}:${agent.agent_id}`, agent.agent_id, input),
+          ...createEmptyRunState(`${runId}:${agent.agent_id}`, agent.agent_id, input, documents),
+          node_statuses: buildIdleNodeStatuses(agent.start_node_id, agent.nodes, agent.edges),
           agent_id: agent.agent_id,
           agent_name: agent.name,
           parent_run_id: runId,
@@ -229,6 +303,10 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
       [payload.node_id]: payload.received_input,
     };
     next.node_errors = omitRunStateEntry(next.node_errors, payload.node_id);
+    next.node_statuses = {
+      ...(next.node_statuses ?? {}),
+      [payload.node_id]: "active",
+    };
   }
 
   if (event.event_type === "node.completed") {
@@ -249,6 +327,30 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
       };
     } else {
       next.node_errors = omitRunStateEntry(next.node_errors, payload.node_id);
+    }
+    next.node_statuses = {
+      ...(next.node_statuses ?? {}),
+      [payload.node_id]: payload.error != null ? "failed" : "success",
+    };
+  }
+
+  if (event.event_type === "node.iterator.updated") {
+    const payload = event.payload as Record<string, unknown>;
+    const nodeId = typeof payload.node_id === "string" ? payload.node_id : null;
+    if (nodeId) {
+      next.iterator_states = {
+        ...(next.iterator_states ?? {}),
+        [nodeId]: {
+          iterator_type: payload.iterator_type,
+          status: payload.status,
+          current_row_index: payload.current_row_index,
+          total_rows: payload.total_rows,
+          headers: payload.headers,
+          sheet_name: payload.sheet_name,
+          source_file: payload.source_file,
+          file_format: payload.file_format,
+        },
+      };
     }
   }
 
@@ -281,6 +383,7 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
     next.current_edge_id = null;
     next.ended_at = event.timestamp;
     next.final_output = event.payload.final_output;
+    next.node_statuses = markTerminalNodeStatuses(next.node_statuses, next.visit_counts, next.node_errors, "completed");
   }
 
   if (event.event_type === "run.failed") {
@@ -293,6 +396,7 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
     if ("final_output" in event.payload) {
       next.final_output = event.payload.final_output;
     }
+    next.node_statuses = markTerminalNodeStatuses(next.node_statuses, next.visit_counts, next.node_errors, "failed");
   }
 
   if (event.event_type === "run.cancelled") {
@@ -305,6 +409,7 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
     if ("final_output" in event.payload) {
       next.final_output = event.payload.final_output;
     }
+    next.node_statuses = markTerminalNodeStatuses(next.node_statuses, next.visit_counts, next.node_errors, "cancelled");
   }
 
   if (event.event_type === "run.interrupted") {
@@ -317,20 +422,27 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
     if ("final_output" in event.payload) {
       next.final_output = event.payload.final_output;
     }
+    next.node_statuses = markTerminalNodeStatuses(next.node_statuses, next.visit_counts, next.node_errors, "interrupted");
   }
 
   return next;
 }
 
-function applyEvent(previous: RunState | null, event: RuntimeEvent, graphId: string, input: string): RunState {
-  const next = previous ?? createEmptyRunState(event.run_id, graphId, input);
+function applyEvent(
+  previous: RunState | null,
+  event: RuntimeEvent,
+  graphId: string,
+  input: string,
+  documents: RunDocument[] = [],
+): RunState {
+  const next = previous ?? createEmptyRunState(event.run_id, graphId, input, documents);
   if (event.agent_id) {
     const agentId = event.agent_id;
     const payload = event.payload as { child_run_id?: string; agent_name?: string };
     const priorAgentRun =
       next.agent_runs?.[agentId] ??
       {
-        ...createEmptyRunState(payload.child_run_id ?? `${event.run_id}:${agentId}`, graphId, input),
+        ...createEmptyRunState(payload.child_run_id ?? `${event.run_id}:${agentId}`, graphId, input, next.documents ?? documents),
         agent_id: agentId,
         agent_name: payload.agent_name ?? agentId,
         parent_run_id: event.run_id,
@@ -396,6 +508,9 @@ export default function App() {
   const [visualizerResetVersion, setVisualizerResetVersion] = useState(0);
   const [input, setInput] = useState(DEFAULT_INPUT);
   const [savedInputPrompt, setSavedInputPrompt] = useState(DEFAULT_INPUT);
+  const [runDocuments, setRunDocuments] = useState<RunDocument[]>([]);
+  const [isUploadingDocuments, setIsUploadingDocuments] = useState(false);
+  const [documentUploadError, setDocumentUploadError] = useState<string | null>(null);
   const [events, setEvents] = useState<RuntimeEvent[]>([]);
   const [runState, setRunState] = useState<RunState | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -435,6 +550,11 @@ export default function App() {
   const focusedEventGroups = focusedRunProjection.eventGroups;
   const draftGraphSnapshot = useMemo(() => serializeGraphSnapshot(draftGraph), [draftGraph]);
   const hasUnsavedChanges = (Boolean(draftGraph) && draftGraphSnapshot !== savedGraphSnapshot) || input !== savedInputPrompt;
+  const readyRunDocuments = useMemo(() => runDocuments.filter((document) => document.status === "ready"), [runDocuments]);
+  const visibleRunDocuments = useMemo(
+    () => ((selectedRunState?.documents?.length ?? 0) > 0 ? selectedRunState?.documents ?? [] : runDocuments),
+    [runDocuments, selectedRunState],
+  );
 
   useEffect(() => {
     runStateRef.current = runState;
@@ -444,6 +564,27 @@ export default function App() {
     const loadedCatalog = await fetchEditorCatalog();
     setCatalog(loadedCatalog);
     return loadedCatalog;
+  }, []);
+
+  const handleDocumentUpload = useCallback(async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) {
+      return;
+    }
+    setDocumentUploadError(null);
+    setIsUploadingDocuments(true);
+    try {
+      const uploadedDocuments = await uploadRunDocuments(Array.from(fileList));
+      setRunDocuments((current) => [...current, ...uploadedDocuments]);
+    } catch (uploadError) {
+      const message = uploadError instanceof Error ? uploadError.message : "Unable to upload documents.";
+      setDocumentUploadError(message);
+    } finally {
+      setIsUploadingDocuments(false);
+    }
+  }, []);
+
+  const removeRunDocument = useCallback((documentId: string) => {
+    setRunDocuments((current) => current.filter((document) => document.document_id !== documentId));
   }, []);
 
   const clearRunPolling = useCallback(() => {
@@ -524,7 +665,7 @@ export default function App() {
     }, 1500);
   }, [applyFetchedRunState, clearRunPolling, markRecoveredRunInterrupted]);
 
-  const connectToRunStream = useCallback((runId: string, graphId: string, inputValue: string) => {
+  const connectToRunStream = useCallback((runId: string, graphId: string, inputValue: string, documents: RunDocument[] = []) => {
     clearRunPolling();
     sourceRef.current?.close();
     const source = new EventSource(eventStreamUrl(runId));
@@ -533,7 +674,7 @@ export default function App() {
     source.onmessage = (message) => {
       const event = normalizeRuntimeEvent(JSON.parse(message.data) as RuntimeEvent);
       setEvents((previous) => [...previous, event]);
-      setRunState((previous) => applyEvent(previous, event, graphId, inputValue));
+      setRunState((previous) => applyEvent(previous, event, graphId, inputValue, documents));
 
       if (!event.agent_id && isTerminalRuntimeEvent(event)) {
         source.close();
@@ -584,7 +725,7 @@ export default function App() {
         return;
       }
       applyFetchedRunState(recoveredRunState);
-      connectToRunStream(recoveredRunState.run_id, graphId, input);
+      connectToRunStream(recoveredRunState.run_id, graphId, input, recoveredRunState.documents ?? []);
     } catch {
       markRecoveredRunInterrupted(graphId, shouldHydrateLocalSnapshot ? snapshotRunState : null, snapshotRunId, snapshot?.savedAt);
     }
@@ -827,6 +968,10 @@ export default function App() {
     if (!draftGraph) {
       return;
     }
+    if (isUploadingDocuments) {
+      setError("Wait for document uploads to finish before starting the run.");
+      return;
+    }
     const agentIdsToRun = isTestEnvironment(draftGraph) ? getSelectedEnvironmentAgentIds(draftGraph, environmentAgentSelection) : undefined;
     if (isTestEnvironment(draftGraph) && (!agentIdsToRun || agentIdsToRun.length === 0)) {
       setError("Turn on at least one agent before running the environment.");
@@ -842,6 +987,7 @@ export default function App() {
     sourceRef.current?.close();
     sourceRef.current = null;
     setError(null);
+    setDocumentUploadError(null);
     clearPersistedRunSnapshot(savedGraph.graph_id);
     setActiveRunId(null);
     setEvents([]);
@@ -853,10 +999,10 @@ export default function App() {
     }
 
     try {
-      const runId = await startRun(savedGraph.graph_id, input, { agent_ids: agentIdsToRun });
+      const runId = await startRun(savedGraph.graph_id, input, { agent_ids: agentIdsToRun, documents: readyRunDocuments });
       setActiveRunId(runId);
-      setRunState(createPendingRunState(savedGraph, runId, input, agentIdsToRun));
-      connectToRunStream(runId, savedGraph.graph_id, input);
+      setRunState(createPendingRunState(savedGraph, runId, input, agentIdsToRun, readyRunDocuments));
+      connectToRunStream(runId, savedGraph.graph_id, input, readyRunDocuments);
     } catch (runError) {
       const message = runError instanceof Error ? runError.message : "Unable to start run.";
       setError(message);
@@ -993,7 +1139,69 @@ export default function App() {
                 <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={10} />
               </label>
               <div className="mosaic-execution-run">
-                <button type="button" onClick={() => void handleRun()} disabled={!draftGraph || isRunning || isSaving || isResettingRuntime}>
+                <div className="execution-documents-panel">
+                  <div className="execution-documents-header">
+                    <strong>Run Documents</strong>
+                    <span>
+                      {readyRunDocuments.length} ready
+                      {runDocuments.length !== readyRunDocuments.length ? ` / ${runDocuments.length} uploaded` : ""}
+                    </span>
+                  </div>
+                  <p>Upload reference files for this editor session. Ready documents are available during the run as <code>{"{documents}"}</code>.</p>
+                  <label className="execution-documents-picker">
+                    <span>{isUploadingDocuments ? "Uploading..." : "Add Documents"}</span>
+                    <input
+                      type="file"
+                      accept=".txt,.md,.markdown,.json,.csv,.pdf,text/plain,text/markdown,text/csv,application/json,application/pdf"
+                      multiple
+                      disabled={isRunning || isSaving || isResettingRuntime || isUploadingDocuments}
+                      onChange={(event) => {
+                        void handleDocumentUpload(event.target.files);
+                        event.target.value = "";
+                      }}
+                    />
+                  </label>
+                  {visibleRunDocuments.length > 0 ? (
+                    <div className="execution-documents-list">
+                      {visibleRunDocuments.map((document) => (
+                        <div key={document.document_id} className={`execution-document-card is-${document.status}`}>
+                          <div className="execution-document-card-header">
+                            <div>
+                              <strong>{document.name}</strong>
+                              <span>
+                                {formatDocumentSize(document.size_bytes)} · {document.mime_type || "document"}
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              className="secondary-button execution-document-remove"
+                              onClick={() => removeRunDocument(document.document_id)}
+                              disabled={isRunning || isSaving || isResettingRuntime}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                          <span className={`execution-document-status execution-document-status--${document.status}`}>{document.status}</span>
+                          {document.text_excerpt ? <pre className="execution-document-excerpt">{document.text_excerpt}</pre> : null}
+                          {document.error ? <span className="execution-document-error">{document.error}</span> : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p>No documents attached yet.</p>
+                  )}
+                  {selectedRunState?.documents && selectedRunState.documents.length > 0 ? (
+                    <p className="execution-documents-run-note">
+                      Current run includes {selectedRunState.documents.length} document{selectedRunState.documents.length === 1 ? "" : "s"}.
+                    </p>
+                  ) : null}
+                  {documentUploadError ? <p className="error-text">{documentUploadError}</p> : null}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void handleRun()}
+                  disabled={!draftGraph || isRunning || isSaving || isResettingRuntime || isUploadingDocuments}
+                >
                   {isRunning ? "Running..." : isEnvironment ? "Run Environment" : "Run Graph"}
                 </button>
                 {isEnvironment && draftGraph ? (

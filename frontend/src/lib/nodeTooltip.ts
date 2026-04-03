@@ -410,6 +410,7 @@ export function buildNodeTooltip(
     const isDisplayNode = node.provider_id === "core.data_display";
     const isContextBuilderNode = node.provider_id === "core.context_builder";
     const isPromptBlockNode = node.provider_id === "core.prompt_block";
+    const isSpreadsheetNode = node.provider_id === "core.spreadsheet_rows";
     const contextBuilderBindings = Array.isArray(node.config.input_bindings)
       ? node.config.input_bindings.filter((binding): binding is Record<string, unknown> => isRecord(binding))
       : [];
@@ -437,6 +438,8 @@ export function buildNodeTooltip(
                   ? "prompt block"
                 : isContextBuilderNode
                   ? "context builder"
+                  : isSpreadsheetNode
+                    ? "spreadsheet rows"
                   : (asString(node.config.mode) ?? "passthrough"),
             },
             {
@@ -447,6 +450,8 @@ export function buildNodeTooltip(
                   ? truncate(asString(node.config.content) ?? "")
                 : isContextBuilderNode
                   ? truncate(asString(node.config.template) ?? "Generated from connected placeholders")
+                  : isSpreadsheetNode
+                    ? truncate(asString(node.config.file_path) ?? "Select a CSV or XLSX file")
                   : truncate(asString(node.config.template) ?? "{input_payload}"),
             },
             ...(isPromptBlockNode
@@ -464,6 +469,14 @@ export function buildNodeTooltip(
                   },
                 ]
               : []),
+            ...(isSpreadsheetNode
+              ? [
+                  { label: "Format", value: asString(node.config.file_format) ?? "auto" },
+                  { label: "Sheet", value: asString(node.config.sheet_name) ?? "first sheet" },
+                  { label: "Header Row", value: String(node.config.header_row_index ?? 1) },
+                  { label: "First Data Row", value: String(node.config.start_row_index ?? 2) },
+                ]
+              : []),
           ],
         },
         ...baseSections,
@@ -474,6 +487,8 @@ export function buildNodeTooltip(
           ? "Add prompt content, then bind this node into a Context Builder or model."
           : isContextBuilderNode && connectedSourceCount === 0
           ? "Connect one or more upstream text nodes to start composing a shared prompt block."
+          : isSpreadsheetNode && !(asString(node.config.file_path) ?? "").trim()
+          ? "Set a local CSV or XLSX file path to parse row dictionaries sequentially."
           : undefined,
     };
   }

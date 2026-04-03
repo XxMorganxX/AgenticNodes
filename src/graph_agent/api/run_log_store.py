@@ -13,7 +13,7 @@ from graph_agent.runtime.core import utc_now_iso
 def _merge_snapshot_metadata(recovered: dict[str, Any], snapshot: dict[str, Any] | None) -> dict[str, Any]:
     if snapshot is None:
         return recovered
-    for key in ("status_reason", "runtime_instance_id", "last_heartbeat_at"):
+    for key in ("status_reason", "runtime_instance_id", "last_heartbeat_at", "node_statuses", "iterator_states", "documents"):
         if key in snapshot:
             recovered[key] = snapshot.get(key)
     snapshot_agent_runs = snapshot.get("agent_runs")
@@ -23,7 +23,7 @@ def _merge_snapshot_metadata(recovered: dict[str, Any], snapshot: dict[str, Any]
             recovered_agent_state = recovered_agent_runs.get(agent_id)
             if not isinstance(snapshot_agent_state, dict) or not isinstance(recovered_agent_state, dict):
                 continue
-            for key in ("status_reason", "runtime_instance_id", "last_heartbeat_at"):
+            for key in ("status_reason", "runtime_instance_id", "last_heartbeat_at", "node_statuses", "iterator_states", "documents"):
                 if key in snapshot_agent_state:
                     recovered_agent_state[key] = snapshot_agent_state.get(key)
     return recovered
@@ -48,6 +48,7 @@ class FilesystemRunStore:
                     "agent_name": state.get("agent_name"),
                     "parent_run_id": state.get("parent_run_id"),
                     "input_payload": state.get("input_payload"),
+                    "documents": state.get("documents", []),
                     "created_at": utc_now_iso(),
                 },
             )
@@ -102,10 +103,12 @@ class FilesystemRunStore:
             or run_id
         )
         input_payload = manifest.get("input_payload", (snapshot or {}).get("input_payload"))
+        documents = manifest.get("documents", (snapshot or {}).get("documents"))
         initial_state = build_run_state(
             run_id,
             graph_id,
             input_payload,
+            documents=documents,
             agent_id=manifest.get("agent_id", (snapshot or {}).get("agent_id")),
             parent_run_id=manifest.get("parent_run_id", (snapshot or {}).get("parent_run_id")),
             agent_name=manifest.get("agent_name", (snapshot or {}).get("agent_name")),

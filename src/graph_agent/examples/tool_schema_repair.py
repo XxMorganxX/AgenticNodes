@@ -396,6 +396,68 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="core.spreadsheet_rows",
+            display_name="Spreadsheet Rows",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Reads a CSV or XLSX file, normalizes each row into a header-keyed dictionary, and iterates rows sequentially through downstream execution steps.",
+            capabilities=["csv parsing", "xlsx parsing", "header normalization", "sequential row iteration"],
+            default_config={
+                "mode": "spreadsheet_rows",
+                "file_format": "auto",
+                "file_path": "",
+                "sheet_name": "",
+                "header_row_index": 1,
+                "start_row_index": 2,
+                "empty_row_policy": "skip",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="file_format",
+                    label="File Format",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="auto", label="Auto Detect"),
+                        ProviderConfigOptionDefinition(value="csv", label="CSV"),
+                        ProviderConfigOptionDefinition(value="xlsx", label="Excel (.xlsx)"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(
+                    key="file_path",
+                    label="File Path",
+                    placeholder="/absolute/path/to/file.xlsx or {GRAPH_ENV_VAR}",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="sheet_name",
+                    label="Sheet Name",
+                    placeholder="Leave blank to use the first sheet",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="header_row_index",
+                    label="Header Row",
+                    input_type="number",
+                    placeholder="1",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="start_row_index",
+                    label="First Data Row",
+                    input_type="number",
+                    placeholder="2",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="empty_row_policy",
+                    label="Empty Row Policy",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="skip", label="Skip Empty Rows"),
+                        ProviderConfigOptionDefinition(value="include", label="Include Empty Rows"),
+                    ],
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.output",
             display_name="Core Output Node",
             category=NodeCategory.END,

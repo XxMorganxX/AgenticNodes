@@ -29,6 +29,8 @@ from graph_agent.runtime.node_providers import (
     get_category_contract,
     is_valid_category_connection,
 )
+from graph_agent.runtime.run_documents import normalize_run_documents
+from graph_agent.runtime.spreadsheets import SpreadsheetParseError, parse_spreadsheet
 from graph_agent.tools.base import ToolContext, ToolRegistry
 from graph_agent.tools.mcp import McpServerManager
 
@@ -39,12 +41,14 @@ def utc_now_iso() -> str:
 
 API_TOOL_CALL_HANDLE_ID = "api-tool-call"
 API_MESSAGE_HANDLE_ID = "api-message"
+NO_TOOL_CALL_MESSAGE = "No Tool Call Made"
 MCP_TERMINAL_OUTPUT_HANDLE_ID = "mcp-terminal-output"
 PROMPT_BLOCK_PROVIDER_ID = "core.prompt_block"
 PROMPT_BLOCK_MODE = "prompt_block"
 PROMPT_BLOCK_ROLES = {"system", "user", "assistant"}
 DISCORD_END_PROVIDER_ID = "end.discord_message"
 DEFAULT_DISCORD_BOT_TOKEN_ENV_VAR = "{DISCORD_BOT_TOKEN}"
+SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows"
 
 
 def _json_safe(value: Any) -> str:
@@ -567,6 +571,7 @@ class TransitionRecord:
 class RunState:
     graph_id: str
     input_payload: Any
+    documents: list[dict[str, Any]] = field(default_factory=list)
     run_id: str = field(default_factory=lambda: str(uuid4()))
     agent_id: str | None = None
     parent_run_id: str | None = None
@@ -578,6 +583,8 @@ class RunState:
     node_outputs: dict[str, Any] = field(default_factory=dict)
     edge_outputs: dict[str, Any] = field(default_factory=dict)
     node_errors: dict[str, Any] = field(default_factory=dict)
+    node_statuses: dict[str, str] = field(default_factory=dict)
+    iterator_states: dict[str, Any] = field(default_factory=dict)
     visit_counts: dict[str, int] = field(default_factory=dict)
     transition_history: list[TransitionRecord] = field(default_factory=list)
     event_history: list[RuntimeEvent] = field(default_factory=list)
@@ -597,9 +604,12 @@ class RunState:
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "input_payload": self.input_payload,
+            "documents": normalize_run_documents(self.documents),
             "node_outputs": self.node_outputs,
             "edge_outputs": self.edge_outputs,
             "node_errors": self.node_errors,
+            "node_statuses": self.node_statuses,
+            "iterator_states": self.iterator_states,
             "visit_counts": self.visit_counts,
             "transition_history": [transition.to_dict() for transition in self.transition_history],
             "event_history": [event.to_dict() for event in self.event_history],
@@ -965,6 +975,8 @@ class NodeContext:
         binding_type = str(binding.get("type", "latest_output"))
         if binding_type == "input_payload":
             return self.state.input_payload
+        if binding_type == "documents":
+            return self.state.documents
         if binding_type == "latest_output":
             return self.latest_output(str(binding["source"]))
         if binding_type == "latest_payload":
@@ -999,6 +1011,7 @@ class NodeContext:
         variables = {
             **self.graph.env_vars,
             "input_payload": input_payload,
+            "documents": self.state.documents,
             "run_id": self.state.run_id,
             "graph_id": self.state.graph_id,
             "current_node_id": self.state.current_node_id,
@@ -1034,16 +1047,30 @@ class NodeContext:
         context_tools: list[dict[str, Any]] = []
         server_ids: set[str] = set()
         prompt_blocks: list[str] = []
+        usage_hint_blocks: list[str] = []
+        placeholder_blocks: list[dict[str, str]] = []
         for candidate in self._candidate_mcp_context_nodes_for_model(target_node_id):
             if not self._mcp_tool_prompt_enabled(candidate):
                 continue
+            candidate_usage_hint = str(candidate.config.get("usage_hint", "") or "").strip()
+            candidate_tool_display_names: list[str] = []
             for configured_tool_name in self._configured_tool_names(candidate):
                 registry_tool = self._exposable_mcp_tool(configured_tool_name)
                 if registry_tool is None:
                     continue
                 tool_name = str(registry_tool.get("name", "")).strip() or self._resolved_tool_name(configured_tool_name)
                 model_tool_definition = self._apply_tool_node_overrides(tool_name, registry_tool)
-                prompt_blocks.append(str(model_tool_definition.get("description", "")).strip())
+                rendered_prompt_text = str(model_tool_definition.get("description", "")).strip()
+                prompt_blocks.append(rendered_prompt_text)
+                candidate_tool_display_names.append(str(registry_tool.get("display_name", tool_name) or tool_name))
+                placeholder_blocks.append(
+                    {
+                        "token": f"MCP_TOOL_{len(placeholder_blocks) + 1}",
+                        "tool_name": tool_name,
+                        "display_name": str(registry_tool.get("display_name", tool_name) or tool_name),
+                        "prompt_text": rendered_prompt_text,
+                    }
+                )
                 server = None
                 server_id = str(registry_tool.get("server_id", "") or "")
                 if server_id and self.services.mcp_server_manager is not None:
@@ -1066,6 +1093,16 @@ class NodeContext:
                         "expose_mcp_tools": self._mcp_tool_exposure_enabled(candidate),
                     }
                 )
+            if candidate_usage_hint and candidate_tool_display_names:
+                usage_hint_blocks.append(
+                    "\n".join(
+                        [
+                            f"Tools: {', '.join(list(dict.fromkeys(candidate_tool_display_names)))}",
+                            "Guidance:",
+                            candidate_usage_hint,
+                        ]
+                    )
+                )
 
         if not context_tools:
             return None
@@ -1083,7 +1120,9 @@ class NodeContext:
             "tool_nodes": context_tools,
             "servers": servers,
             "prompt_blocks": [block for block in prompt_blocks if block],
+            "placeholder_blocks": placeholder_blocks,
             "rendered_prompt_text": "\n\n".join(block for block in prompt_blocks if block),
+            "usage_hints_text": "\n\n".join(block for block in usage_hint_blocks if block),
             "run_context": {
                 "run_id": self.state.run_id,
                 "graph_id": self.state.graph_id,
@@ -1484,8 +1523,119 @@ class DataNode(BaseNode):
             summary=f"Prompt block '{self.label}' prepared a {payload['role']} message.",
         )
 
+    def _spreadsheet_config(self, context: NodeContext) -> dict[str, Any]:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        file_format = str(resolved.get("file_format", "auto") or "auto").strip().lower() or "auto"
+        file_path = str(resolved.get("file_path", "") or "").strip()
+        sheet_name = str(resolved.get("sheet_name", "") or "").strip()
+        header_row_index = int(resolved.get("header_row_index", 1) or 1)
+        start_row_index = int(resolved.get("start_row_index", header_row_index + 1) or (header_row_index + 1))
+        empty_row_policy = str(resolved.get("empty_row_policy", "skip") or "skip").strip().lower() or "skip"
+        return {
+            "file_format": file_format,
+            "file_path": file_path,
+            "sheet_name": sheet_name,
+            "header_row_index": header_row_index,
+            "start_row_index": start_row_index,
+            "empty_row_policy": empty_row_policy,
+        }
+
+    def _spreadsheet_iterator_state(self, parse_result: Any) -> dict[str, Any]:
+        return {
+            "iterator_type": "spreadsheet_rows",
+            "status": "ready" if parse_result.row_count > 0 else "completed",
+            "current_row_index": 0,
+            "total_rows": parse_result.row_count,
+            "headers": list(parse_result.headers),
+            "sheet_name": parse_result.sheet_name,
+            "source_file": parse_result.source_file,
+            "file_format": parse_result.file_format,
+        }
+
+    def _spreadsheet_row_envelopes(self, parse_result: Any) -> list[dict[str, Any]]:
+        row_envelopes: list[dict[str, Any]] = []
+        total_rows = parse_result.row_count
+        for position, row in enumerate(parse_result.rows, start=1):
+            envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id=self.id,
+                from_category=self.category.value,
+                payload={
+                    "row_index": position,
+                    "row_number": row.row_number,
+                    "row_data": dict(row.row_data),
+                    "sheet_name": parse_result.sheet_name,
+                    "source_file": parse_result.source_file,
+                },
+                metadata={
+                    "contract": "data_envelope",
+                    "node_kind": self.kind,
+                    "data_mode": "spreadsheet_row",
+                    "provider_id": self.provider_id,
+                    "iterator_type": "spreadsheet_rows",
+                    "row_index": position,
+                    "row_number": row.row_number,
+                    "total_rows": total_rows,
+                    "headers": list(parse_result.headers),
+                    "sheet_name": parse_result.sheet_name,
+                    "source_file": parse_result.source_file,
+                    "file_format": parse_result.file_format,
+                },
+            )
+            row_envelopes.append(envelope.to_dict())
+        return row_envelopes
+
+    def _execute_spreadsheet_rows(self, context: NodeContext) -> NodeExecutionResult:
+        resolved_config = self._spreadsheet_config(context)
+        try:
+            parse_result = parse_spreadsheet(**resolved_config)
+        except SpreadsheetParseError as exc:
+            return NodeExecutionResult(
+                status="failed",
+                error={"type": "spreadsheet_parse_error", "message": str(exc)},
+                summary=str(exc),
+            )
+        iterator_state = self._spreadsheet_iterator_state(parse_result)
+        summary_envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload={
+                "source_file": parse_result.source_file,
+                "file_format": parse_result.file_format,
+                "sheet_name": parse_result.sheet_name,
+                "headers": list(parse_result.headers),
+                "row_count": parse_result.row_count,
+            },
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "data_mode": "spreadsheet_rows",
+                "provider_id": self.provider_id,
+                "iterator_type": "spreadsheet_rows",
+                "headers": list(parse_result.headers),
+                "sheet_name": parse_result.sheet_name,
+                "source_file": parse_result.source_file,
+                "file_format": parse_result.file_format,
+                "total_rows": parse_result.row_count,
+            },
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=summary_envelope.to_dict(),
+            summary=f"Prepared {parse_result.row_count} spreadsheet row(s).",
+            metadata={
+                "iterator_state": iterator_state,
+                "_internal": {
+                    "spreadsheet_row_envelopes": self._spreadsheet_row_envelopes(parse_result),
+                },
+            },
+        )
+
     def runtime_input_preview(self, context: NodeContext) -> Any:
         mode = "passthrough" if bool(self.config.get("lock_passthrough", False)) else self.config.get("mode", "passthrough")
+        if self.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
+            return self._spreadsheet_config(context)
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return context.prompt_block_payload_for_node(self.id)
         if mode == "context_builder":
@@ -1518,6 +1668,8 @@ class DataNode(BaseNode):
 
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         mode = "passthrough" if bool(self.config.get("lock_passthrough", False)) else self.config.get("mode", "passthrough")
+        if self.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
+            return self._execute_spreadsheet_rows(context)
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return self._execute_prompt_block(context)
         source_value = context.resolve_binding(self.config.get("input_binding"))
@@ -1695,6 +1847,28 @@ class ModelNode(BaseNode):
             ]
         )
 
+    def _mcp_tool_guidance_block(
+        self,
+        *,
+        mcp_available_tool_names: Sequence[str],
+        mcp_tool_guidance: str,
+    ) -> str:
+        guidance_lines: list[str] = []
+        if mcp_available_tool_names:
+            guidance_lines = [
+                "MCP Tool Guidance",
+                "Use MCP tools only when a listed live capability is needed to answer the request or complete the task.",
+                "Call only MCP tools that are explicitly exposed to you and follow their schemas exactly.",
+                "Do not invent MCP tool names or arguments.",
+                "If no exposed MCP tool is necessary, continue without calling one.",
+            ]
+        if mcp_tool_guidance:
+            if guidance_lines:
+                guidance_lines.extend(["", "Connected MCP Tool Notes:", mcp_tool_guidance])
+            else:
+                guidance_lines = ["MCP Tool Guidance", mcp_tool_guidance]
+        return "\n".join(guidance_lines).strip()
+
     def _build_request(self, context: NodeContext, bound_provider_node: ProviderNode | None = None) -> ModelRequest:
         if bound_provider_node is None:
             bound_provider_node = context.bound_provider_node(self.id)
@@ -1709,6 +1883,18 @@ class ModelNode(BaseNode):
         if mcp_tool_context is not None and "mcp_tool_context" not in metadata:
             metadata["mcp_tool_context"] = mcp_tool_context
             metadata["mcp_tool_context_prompt"] = mcp_tool_context.get("rendered_prompt_text", "")
+        if "mcp_tool_guidance" not in metadata:
+            metadata["mcp_tool_guidance"] = ""
+        if mcp_tool_context is not None and not str(metadata.get("mcp_tool_guidance", "") or "").strip():
+            metadata["mcp_tool_guidance"] = str(mcp_tool_context.get("usage_hints_text", "") or "")
+        if mcp_tool_context is not None:
+            for placeholder_block in mcp_tool_context.get("placeholder_blocks", []):
+                if not isinstance(placeholder_block, Mapping):
+                    continue
+                token = str(placeholder_block.get("token", "") or "").strip()
+                if not token or token in metadata:
+                    continue
+                metadata[token] = str(placeholder_block.get("prompt_text", "") or "")
         prompt_block_payloads = context.prompt_block_payloads_for_node(self.id)
         if prompt_block_payloads and "prompt_blocks" not in metadata:
             metadata["prompt_blocks"] = prompt_block_payloads
@@ -1749,20 +1935,31 @@ class ModelNode(BaseNode):
         metadata["response_mode"] = response_mode
         system_prompt_template = str(self.config.get("system_prompt", ""))
         user_template = str(self.config.get("user_message_template", "{input_payload}"))
-        system_prompt = context.render_template(system_prompt_template, metadata)
+        mcp_tool_guidance = str(metadata.get("mcp_tool_guidance", "") or "").strip()
         mcp_tool_prompt = str(metadata.get("mcp_tool_context_prompt", "") or "").strip()
+        mcp_tool_guidance_block = self._mcp_tool_guidance_block(
+            mcp_available_tool_names=mcp_available_tool_names,
+            mcp_tool_guidance=mcp_tool_guidance,
+        )
+        mcp_tool_context_block = f"MCP Tool Context\n{mcp_tool_prompt}" if mcp_tool_prompt else ""
+        metadata.setdefault("mcp_tool_guidance_block", mcp_tool_guidance_block)
+        metadata.setdefault("mcp_tool_context_block", mcp_tool_context_block)
+        placeholder_tokens = [
+            str(placeholder_block.get("token", "") or "").strip()
+            for placeholder_block in (mcp_tool_context or {}).get("placeholder_blocks", [])
+            if isinstance(placeholder_block, Mapping) and str(placeholder_block.get("token", "") or "").strip()
+        ]
+        has_inline_mcp_context_placeholder = "{mcp_tool_context_prompt}" in system_prompt_template or "{mcp_tool_context_block}" in system_prompt_template
+        has_complete_inline_mcp_tool_placeholders = bool(placeholder_tokens) and all(
+            f"{{{token}}}" in system_prompt_template for token in placeholder_tokens
+        )
+        has_inline_mcp_guidance_block = "{mcp_tool_guidance_block}" in system_prompt_template
+        system_prompt = context.render_template(system_prompt_template, metadata)
         mcp_prompt_sections: list[str] = []
-        if mcp_available_tool_names:
-            guidance_lines = [
-                "MCP Tool Guidance",
-                "Use MCP tools only when a listed live capability is needed to answer the request or complete the task.",
-                "Call only MCP tools that are explicitly exposed to you and follow their schemas exactly.",
-                "Do not invent MCP tool names or arguments.",
-                "If no exposed MCP tool is necessary, continue without calling one.",
-            ]
-            mcp_prompt_sections.append("\n".join(guidance_lines))
-        if mcp_tool_prompt:
-            mcp_prompt_sections.append(f"MCP Tool Context\n{mcp_tool_prompt}")
+        if mcp_tool_guidance_block and not has_inline_mcp_guidance_block:
+            mcp_prompt_sections.append(mcp_tool_guidance_block)
+        if mcp_tool_context_block and not (has_inline_mcp_context_placeholder or has_complete_inline_mcp_tool_placeholders):
+            mcp_prompt_sections.append(mcp_tool_context_block)
         prompt_only_tool_contract = self._prompt_only_mcp_tool_decision_contract(
             mcp_tool_context=mcp_tool_context,
             mcp_available_tool_names=mcp_available_tool_names,
@@ -1903,6 +2100,35 @@ class ModelNode(BaseNode):
             )
             route_outputs[API_TOOL_CALL_HANDLE_ID] = tool_envelope.to_dict()
 
+        if not emit_tool_call_envelope and callable_tool_names:
+            tool_artifacts_nt: dict[str, Any] = {}
+            source_input_nt = context.resolve_binding(None)
+            source_input_envelope_nt: MessageEnvelope | None = None
+            if isinstance(source_input_nt, Mapping) and "metadata" in source_input_nt:
+                try:
+                    source_input_envelope_nt = MessageEnvelope.from_dict(source_input_nt)
+                except Exception:  # noqa: BLE001
+                    source_input_envelope_nt = None
+            if source_input_envelope_nt is not None:
+                tool_artifacts_nt["source_input_payload"] = source_input_envelope_nt.payload
+                tool_artifacts_nt["source_input_metadata"] = dict(source_input_envelope_nt.metadata)
+            elif source_input_nt is not None:
+                tool_artifacts_nt["source_input_payload"] = source_input_nt
+            no_tool_call_envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id=self.id,
+                from_category=self.category.value,
+                payload=NO_TOOL_CALL_MESSAGE,
+                artifacts=tool_artifacts_nt,
+                tool_calls=[],
+                metadata={
+                    "contract": "no_tool_call_envelope",
+                    "no_tool_call": True,
+                    **base_metadata,
+                },
+            )
+            route_outputs[API_TOOL_CALL_HANDLE_ID] = no_tool_call_envelope.to_dict()
+
         message_envelope: MessageEnvelope | None = None
         if emit_message_envelope:
             message_payload = decision_output["message"]
@@ -1996,6 +2222,9 @@ class ToolNode(BaseNode):
             tool_calls = list(bound_value.get("tool_calls", []))
             if tool_calls:
                 payload = tool_calls[0].get("arguments")
+            else:
+                raw_payload = bound_value.get("payload")
+                payload = raw_payload if isinstance(raw_payload, Mapping) else {}
         elif isinstance(bound_value, Mapping) and "payload" in bound_value:
             payload = bound_value.get("payload")
         if not isinstance(payload, Mapping):

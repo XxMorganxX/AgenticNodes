@@ -35,7 +35,7 @@ def _event(
 
 class RunStateReducerTests(unittest.TestCase):
     def test_single_run_reducer_tracks_inputs_edges_and_terminal_status(self) -> None:
-        state = build_run_state("run-1", "graph-1", {"prompt": "hello"})
+        state = build_run_state("run-1", "graph-1", {"prompt": "hello"}, execution_node_ids=["node-a", "node-b"])
         state = apply_single_run_event(state, _event("run.started", run_id="run-1"))
         state = apply_single_run_event(
             state,
@@ -77,6 +77,8 @@ class RunStateReducerTests(unittest.TestCase):
         )
 
         self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["node_statuses"]["node-a"], "success")
+        self.assertEqual(state["node_statuses"]["node-b"], "unreached")
         self.assertEqual(state["node_inputs"]["node-a"], {"text": "hello"})
         self.assertEqual(state["node_outputs"]["node-a"], {"answer": "ok"})
         self.assertEqual(state["edge_outputs"]["edge-1"], {"answer": "routed"})
@@ -86,7 +88,7 @@ class RunStateReducerTests(unittest.TestCase):
         self.assertTrue(all(event["schema_version"] == RUNTIME_EVENT_SCHEMA_VERSION for event in state["event_history"]))
 
     def test_single_run_reducer_tracks_failure_and_cancellation(self) -> None:
-        failed_state = build_run_state("run-failed", "graph-1", None)
+        failed_state = build_run_state("run-failed", "graph-1", None, execution_node_ids=["node-a", "node-b"])
         failed_state = apply_single_run_event(
             failed_state,
             _event(
@@ -104,7 +106,7 @@ class RunStateReducerTests(unittest.TestCase):
             ),
         )
         cancelled_state = apply_single_run_event(
-            build_run_state("run-cancelled", "graph-1", None),
+            build_run_state("run-cancelled", "graph-1", None, execution_node_ids=["node-a", "node-b"]),
             _event(
                 "run.cancelled",
                 run_id="run-cancelled",
@@ -113,15 +115,27 @@ class RunStateReducerTests(unittest.TestCase):
         )
 
         self.assertEqual(failed_state["status"], "failed")
+        self.assertEqual(failed_state["node_statuses"]["node-a"], "failed")
+        self.assertEqual(failed_state["node_statuses"]["node-b"], "unreached")
         self.assertEqual(failed_state["node_errors"]["node-a"], {"type": "boom"})
         self.assertEqual(failed_state["terminal_error"], {"type": "node_exception", "message": "boom"})
         self.assertEqual(cancelled_state["status"], "cancelled")
+        self.assertEqual(cancelled_state["node_statuses"]["node-a"], "unreached")
+        self.assertEqual(cancelled_state["node_statuses"]["node-b"], "unreached")
         self.assertEqual(cancelled_state["terminal_error"], {"type": "run_cancelled", "message": "stopped"})
 
     def test_single_run_reducer_tracks_interruption(self) -> None:
         state = apply_single_run_event(
-            build_run_state("run-interrupted", "graph-1", None),
+            build_run_state("run-interrupted", "graph-1", None, execution_node_ids=["node-a"]),
             _event("run.started", run_id="run-interrupted"),
+        )
+        state = apply_single_run_event(
+            state,
+            _event(
+                "node.started",
+                run_id="run-interrupted",
+                payload={"node_id": "node-a", "visit_count": 1, "received_input": None},
+            ),
         )
         state = apply_single_run_event(
             state,
@@ -137,6 +151,7 @@ class RunStateReducerTests(unittest.TestCase):
 
         self.assertEqual(state["status"], "interrupted")
         self.assertEqual(state["status_reason"], "runtime_heartbeat_expired")
+        self.assertEqual(state["node_statuses"]["node-a"], "success")
         self.assertEqual(state["terminal_error"], {"type": "runtime_interrupted", "message": "heartbeat expired"})
 
     def test_agent_events_create_and_update_nested_child_state(self) -> None:
@@ -187,9 +202,21 @@ class RunStateReducerTests(unittest.TestCase):
         self.assertEqual(child_state["agent_name"], "Agent A")
         self.assertEqual(child_state["status"], "completed")
         self.assertEqual(child_state["current_node_id"], None)
+        self.assertEqual(child_state["node_statuses"]["node-a"], "success")
         self.assertEqual(child_state["node_inputs"]["node-a"], "hello")
         self.assertEqual(len(state["event_history"]), 3)
         self.assertTrue(all(event["schema_version"] == RUNTIME_EVENT_SCHEMA_VERSION for event in child_state["event_history"]))
+
+    def test_build_run_state_seeds_idle_node_statuses(self) -> None:
+        state = build_run_state("run-1", "graph-1", None, execution_node_ids=["node-a", "node-b", "node-a"])
+
+        self.assertEqual(
+            state["node_statuses"],
+            {
+                "node-a": "idle",
+                "node-b": "idle",
+            },
+        )
 
     def test_legacy_events_upgrade_to_runtime_v1_during_reduction(self) -> None:
         state = build_run_state("legacy-run", "graph-1", None)

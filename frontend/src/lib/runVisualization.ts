@@ -788,20 +788,6 @@ function normalizeFocusedEvents(events: RuntimeEvent[]): RuntimeEvent[] {
   return events.map((event) => ({ ...event, event_type: normalizeEventType(event.event_type) }));
 }
 
-const syncInvariantWarnings = new Set<string>();
-
-function warnSyncInvariantOnce(key: string, details: Record<string, unknown>): void {
-  if (typeof window === "undefined" || syncInvariantWarnings.has(key)) {
-    return;
-  }
-  syncInvariantWarnings.add(key);
-  console.warn("[runVisualization] runtime projection sync invariant", details);
-}
-
-function setDifference(left: Set<string>, right: Set<string>): string[] {
-  return [...left].filter((value) => !right.has(value));
-}
-
 function deriveRunStatus(runState: RunState | null, normalizedEvents: RuntimeEvent[]): string {
   const currentStatus = runState?.status?.trim();
   if (currentStatus) {
@@ -824,29 +810,16 @@ function deriveRunStatus(runState: RunState | null, normalizedEvents: RuntimeEve
 }
 
 function deriveCurrentNodeId(runState: RunState | null, normalizedEvents: RuntimeEvent[]): string | null {
-  let currentNodeId: string | null = null;
-  for (const event of normalizedEvents) {
-    if (event.event_type === "node.started") {
-      currentNodeId = nodeIdFromEvent(event);
-      continue;
-    }
-    if (event.event_type === "node.completed" && nodeIdFromEvent(event) === currentNodeId) {
-      currentNodeId = null;
-      continue;
-    }
-    if (event.event_type === "run.completed" || event.event_type === "run.failed" || event.event_type === "run.interrupted") {
-      currentNodeId = null;
-    }
-  }
-  if (currentNodeId) {
-    return currentNodeId;
-  }
   return runState?.current_node_id ?? null;
 }
 
 function wasNodeVisited(nodeId: string, runState: RunState | null, completedNodeIdSet: Set<string>): boolean {
   if (!runState) {
     return completedNodeIdSet.has(nodeId);
+  }
+  const status = runState.node_statuses?.[nodeId] ?? "";
+  if (status === "active" || status === "success" || status === "failed") {
+    return true;
   }
   return (
     (runState.visit_counts?.[nodeId] ?? 0) > 0 ||
@@ -889,13 +862,14 @@ function buildFocusedNodeStates(
       const latestOutput = Object.prototype.hasOwnProperty.call(latestEventOutputs, node.id)
         ? latestEventOutputs[node.id]
         : runState?.node_outputs?.[node.id];
+      const effectiveStatus = runState?.node_statuses?.[node.id] ?? "idle";
       return [
         node.id,
         {
           nodeId: node.id,
-          isActive: currentNodeId === node.id,
+          isActive: effectiveStatus === "active" || currentNodeId === node.id,
           wasVisited: wasNodeVisited(node.id, runState, completedNodeIdSet),
-          hasError: latestError != null,
+          hasError: effectiveStatus === "failed" || latestError != null,
           latestOutput,
           latestError,
           visitCount: runState?.visit_counts?.[node.id] ?? 0,
@@ -903,40 +877,6 @@ function buildFocusedNodeStates(
       ] satisfies [string, FocusedRunNodeState];
     }),
   );
-}
-
-function validateFocusedRunProjection(
-  runState: RunState | null,
-  normalizedEvents: RuntimeEvent[],
-  completedNodeIdSet: Set<string>,
-  currentNodeId: string | null,
-): void {
-  if (!runState) {
-    return;
-  }
-  const historyCompletedNodeIds = completedNodeIds(normalizeFocusedEvents(runState.event_history ?? []));
-  const missingFromProjection = setDifference(historyCompletedNodeIds, completedNodeIdSet);
-  const missingFromHistory = setDifference(completedNodeIdSet, historyCompletedNodeIds);
-  if (missingFromProjection.length > 0 || missingFromHistory.length > 0) {
-    warnSyncInvariantOnce(
-      `completed:${runState.run_id}:${missingFromProjection.join(",")}:${missingFromHistory.join(",")}`,
-      {
-        runId: runState.run_id,
-        projectionCompletedNodeIds: [...completedNodeIdSet],
-        historyCompletedNodeIds: [...historyCompletedNodeIds],
-        missingFromProjection,
-        missingFromHistory,
-      },
-    );
-  }
-  if ((runState.current_node_id ?? null) !== currentNodeId) {
-    warnSyncInvariantOnce(`current-node:${runState.run_id}:${runState.current_node_id ?? "none"}:${currentNodeId ?? "none"}`, {
-      runId: runState.run_id,
-      projectedCurrentNodeId: currentNodeId,
-      runStateCurrentNodeId: runState.current_node_id ?? null,
-      lastEventType: normalizedEvents[normalizedEvents.length - 1]?.event_type ?? null,
-    });
-  }
 }
 
 function buildFocusedEventGroupsFromNormalizedEvents(
@@ -956,11 +896,14 @@ export function buildFocusedRunProjection(
 ): FocusedRunProjection {
   const labels = nodeLabelMap(graph);
   const normalizedEvents = normalizeFocusedEvents(events);
-  const completedNodeIdSet = completedNodeIds(normalizedEvents);
+  const completedNodeIdSet = new Set(
+    Object.entries(runState?.node_statuses ?? {})
+      .filter(([, status]) => status === "success" || status === "failed")
+      .map(([nodeId]) => nodeId),
+  );
   const currentNodeId = deriveCurrentNodeId(runState, normalizedEvents);
   const errorSummaries = summarizeNodeErrors(runState?.node_errors ?? {}, labels);
   const nodeStates = buildFocusedNodeStates(graph, runState, normalizedEvents, completedNodeIdSet, currentNodeId);
-  validateFocusedRunProjection(runState, normalizedEvents, completedNodeIdSet, currentNodeId);
   return {
     normalizedEvents,
     completedNodeIds: completedNodeIdSet,

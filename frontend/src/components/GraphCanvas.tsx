@@ -3403,6 +3403,7 @@ export function GraphCanvas({
     const normalizedEvents = runProjection?.normalizedEvents ?? runState?.event_history ?? [];
     const nextNodes = graph.nodes.map((node): FlowNode<GraphCanvasRuntimeNodeData> => {
       const runtimeNodeState = runProjection?.nodeStates[node.id];
+      const backendStatus = runState?.node_statuses?.[node.id];
       const isActive = runtimeNodeState?.isActive ?? (runState?.current_node_id === node.id);
       const hasError = runtimeNodeState?.hasError ?? Object.prototype.hasOwnProperty.call(runState?.node_errors ?? {}, node.id);
       const wasVisited =
@@ -3433,7 +3434,7 @@ export function GraphCanvas({
             ...contextBuilderRuntime.sources.map((s) => `${s.sourceNodeId}:${s.status}`),
           ].join("|")
         : "";
-      let status: GraphCanvasNodeData["status"] = hasError
+      const fallbackStatus: GraphCanvasNodeData["status"] = hasError
         ? "failed"
         : isActive
           ? "active"
@@ -3442,6 +3443,14 @@ export function GraphCanvas({
             : didLastRunFinish && expectsExecutionStatus
               ? "unreached"
               : "idle";
+      let status: GraphCanvasNodeData["status"] =
+        backendStatus === "idle" ||
+        backendStatus === "active" ||
+        backendStatus === "success" ||
+        backendStatus === "failed" ||
+        backendStatus === "unreached"
+          ? backendStatus
+          : fallbackStatus;
       if (contextBuilderRuntime?.isWaitingToForward && !hasError) {
         status = "active";
       }

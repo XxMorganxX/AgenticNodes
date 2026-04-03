@@ -22,6 +22,8 @@ from graph_agent.runtime.core import GraphDefinition, resolve_graph_process_env,
 from graph_agent.runtime.documents import AgentDefinition, TestEnvironmentDefinition, load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
+from graph_agent.runtime.run_documents import ingest_run_documents, normalize_run_documents
+from graph_agent.runtime.spreadsheets import SpreadsheetParseError, parse_spreadsheet
 from graph_agent.tools.mcp import McpServerDefinition
 
 
@@ -54,6 +56,18 @@ def _read_interval_env(name: str, default: float) -> float:
         return max(float(raw), 0.1)
     except ValueError:
         return default
+
+
+def _execution_node_ids_for_graph(graph: GraphDefinition) -> list[str]:
+    execution_node_ids: set[str] = set()
+    if graph.start_node_id:
+        execution_node_ids.add(graph.start_node_id)
+    for edge in graph.edges:
+        if edge.kind == "binding":
+            continue
+        execution_node_ids.add(edge.source_id)
+        execution_node_ids.add(edge.target_id)
+    return [node_id for node_id in graph.nodes if node_id in execution_node_ids]
 
 
 def _load_mcp_server_template_payloads_from_file(path: Path) -> list[dict[str, Any]]:
@@ -332,6 +346,23 @@ class GraphRunManager:
             "preflight": preflight,
         }
 
+    def preview_spreadsheet_rows(self, config: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parsed = parse_spreadsheet(
+                file_path=str(config.get("file_path", "") or "").strip(),
+                file_format=str(config.get("file_format", "auto") or "auto").strip().lower() or "auto",
+                sheet_name=str(config.get("sheet_name", "") or "").strip() or None,
+                header_row_index=int(config.get("header_row_index", 1) or 1),
+                start_row_index=int(config.get("start_row_index", 2) or 2),
+                empty_row_policy=str(config.get("empty_row_policy", "skip") or "skip").strip().lower() or "skip",
+            )
+        except SpreadsheetParseError as exc:
+            raise ValueError(str(exc)) from exc
+        return parsed.preview()
+
+    def upload_run_documents(self, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return ingest_run_documents(documents)
+
     def get_run(self, run_id: str) -> dict[str, Any]:
         recovered = self._recover_run_state(run_id)
         if recovered is not None:
@@ -372,25 +403,41 @@ class GraphRunManager:
             )
         return history
 
-    def start_run(self, graph_id: str, input_payload: Any, agent_ids: list[str] | None = None) -> str:
+    def start_run(
+        self,
+        graph_id: str,
+        input_payload: Any,
+        agent_ids: list[str] | None = None,
+        documents: list[dict[str, Any]] | None = None,
+    ) -> str:
         self._start_heartbeat_loop()
         document = load_graph_document(self._store.get_graph(graph_id))
         document.validate_against_services(self._services)
         run_id = str(uuid4())
         selected_agents = self._resolve_environment_agents(document, agent_ids) if document.is_multi_agent else None
+        normalized_documents = normalize_run_documents(documents)
 
         with self._lock:
             self._run_controls[run_id] = RunControl(run_id=run_id, cancel_event=Event())
             self._event_backlog[run_id] = []
             self._subscribers.setdefault(run_id, [])
             if document.is_multi_agent:
-                self._run_states[run_id] = self._build_environment_run_state(run_id, document, input_payload, selected_agents or [])
+                self._run_states[run_id] = self._build_environment_run_state(
+                    run_id,
+                    document,
+                    input_payload,
+                    selected_agents or [],
+                    documents=normalized_documents,
+                )
             else:
                 default_agent = document.agents[0]
+                graph = document.as_graph()
                 self._run_states[run_id] = self._build_run_state(
                     run_id,
                     graph_id,
                     input_payload,
+                    documents=normalized_documents,
+                    execution_node_ids=_execution_node_ids_for_graph(graph),
                     agent_id=default_agent.agent_id,
                     agent_name=default_agent.name,
                 )
@@ -403,11 +450,10 @@ class GraphRunManager:
         if document.is_multi_agent:
             thread = Thread(
                 target=self._execute_environment_run,
-                args=(document, selected_agents or [], input_payload, run_id),
+                args=(document, selected_agents or [], input_payload, run_id, normalized_documents),
                 daemon=True,
             )
         else:
-            graph = document.as_graph()
             runtime = GraphRuntime(
                 services=self._services,
                 max_steps=self._services.config["max_steps"],
@@ -417,7 +463,7 @@ class GraphRunManager:
             )
             thread = Thread(
                 target=self._execute_run,
-                args=(runtime, graph, input_payload, run_id),
+                args=(runtime, graph, input_payload, run_id, normalized_documents),
                 daemon=True,
             )
 
@@ -508,9 +554,16 @@ class GraphRunManager:
                 LOGGER.exception("Failed to start Discord-triggered run for graph '%s'.", graph.graph_id)
         return run_ids
 
-    def _execute_run(self, runtime: GraphRuntime, graph: GraphDefinition, input_payload: Any, run_id: str) -> None:
+    def _execute_run(
+        self,
+        runtime: GraphRuntime,
+        graph: GraphDefinition,
+        input_payload: Any,
+        run_id: str,
+        documents: list[dict[str, Any]] | None,
+    ) -> None:
         try:
-            runtime.run(graph, input_payload, run_id=run_id)
+            runtime.run(graph, input_payload, run_id=run_id, documents=documents)
             with self._lock:
                 snapshot = deepcopy(self._run_states[run_id])
             self._run_store.write_state(run_id, snapshot)
@@ -524,6 +577,7 @@ class GraphRunManager:
         agents: list[AgentDefinition],
         input_payload: Any,
         parent_run_id: str,
+        documents: list[dict[str, Any]] | None,
     ) -> None:
         try:
             self._record_event(
@@ -556,7 +610,7 @@ class GraphRunManager:
                     self._run_store.write_state(parent_run_id, snapshot)
                     self._close_streams(parent_run_id)
                     return
-                child_snapshot = self._run_agent_in_environment(document, agent, input_payload, parent_run_id)
+                child_snapshot = self._run_agent_in_environment(document, agent, input_payload, parent_run_id, documents)
                 final_output[agent.agent_id] = child_snapshot.get("final_output")
                 if child_snapshot.get("status") == "cancelled":
                     self._record_run_cancelled(
@@ -617,6 +671,7 @@ class GraphRunManager:
         agent: AgentDefinition,
         input_payload: Any,
         parent_run_id: str,
+        documents: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
         with self._lock:
             parent_state = self._run_states[parent_run_id]
@@ -638,7 +693,7 @@ class GraphRunManager:
             cancel_requested=lambda current_run_id=parent_run_id: self._cancel_requested(current_run_id),
         )
         graph = agent.to_graph(graph_id=document.graph_id, shared_env_vars=document.env_vars)
-        runtime.run(graph, input_payload, run_id=child_run_id)
+        runtime.run(graph, input_payload, run_id=child_run_id, documents=documents)
 
         with self._lock:
             snapshot = deepcopy(self._run_states[parent_run_id]["agent_runs"][agent.agent_id])
@@ -987,13 +1042,19 @@ class GraphRunManager:
         document: TestEnvironmentDefinition,
         input_payload: Any,
         agents: list[AgentDefinition],
+        *,
+        documents: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        state = self._build_run_state(run_id, document.graph_id, input_payload)
+        state = self._build_run_state(run_id, document.graph_id, input_payload, documents=documents)
         state["agent_runs"] = {
             agent.agent_id: self._build_run_state(
                 str(uuid4()),
                 document.graph_id,
                 input_payload,
+                documents=documents,
+                execution_node_ids=_execution_node_ids_for_graph(
+                    agent.to_graph(graph_id=document.graph_id, shared_env_vars=document.env_vars)
+                ),
                 agent_id=agent.agent_id,
                 parent_run_id=run_id,
                 agent_name=agent.name,
@@ -1025,6 +1086,8 @@ class GraphRunManager:
         graph_id: str,
         input_payload: Any,
         *,
+        documents: list[dict[str, Any]] | None = None,
+        execution_node_ids: list[str] | None = None,
         agent_id: str | None = None,
         parent_run_id: str | None = None,
         agent_name: str | None = None,
@@ -1033,6 +1096,8 @@ class GraphRunManager:
             run_id,
             graph_id,
             input_payload,
+            documents=documents,
+            execution_node_ids=execution_node_ids,
             agent_id=agent_id,
             parent_run_id=parent_run_id,
             agent_name=agent_name,

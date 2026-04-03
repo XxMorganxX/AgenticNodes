@@ -30,7 +30,7 @@ from graph_agent.providers.base import ModelProvider, ModelResponse, ProviderPre
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.mock import MockModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
-from graph_agent.runtime.core import GraphDefinition, GraphValidationError, NodeContext, RunState
+from graph_agent.runtime.core import NO_TOOL_CALL_MESSAGE, GraphDefinition, GraphValidationError, NodeContext, RunState
 from graph_agent.runtime.documents import load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.tools.base import ToolContext, ToolDefinition, ToolRegistry, ToolResult
@@ -1374,6 +1374,518 @@ class ModelProviderTests(unittest.TestCase):
             finally:
                 manager.stop_background_services()
 
+    def test_model_nodes_can_place_mcp_tool_guidance_inline(self) -> None:
+        services = build_example_services()
+        services.model_providers["context_echo"] = ContextEchoProvider()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        usage_hint = (
+            "Use the weather tool when the user asks for current conditions. "
+            "Call it before answering weather questions."
+        )
+        graph_payload = {
+            "graph_id": "mcp-inline-guidance-graph",
+            "name": "MCP Inline Guidance Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "weather_context",
+                    "kind": "mcp_context_provider",
+                    "category": "tool",
+                    "label": "Weather Context",
+                    "provider_id": "tool.mcp_context_provider",
+                    "provider_label": "MCP Context Provider",
+                    "config": {
+                        "tool_names": ["weather_current"],
+                        "include_mcp_tool_context": True,
+                        "usage_hint": usage_hint,
+                    },
+                    "position": {"x": 100, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "context_echo",
+                    "prompt_name": "context_prompt",
+                    "config": {
+                        "provider_name": "context_echo",
+                        "prompt_name": "context_prompt",
+                        "system_prompt": "Base instructions.\n\n{mcp_tool_guidance}",
+                        "user_message_template": "{input_payload}",
+                        "response_mode": "message",
+                    },
+                    "position": {"x": 200, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_envelope", "source": "model"}},
+                    "position": {"x": 300, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "ctx-binding",
+                    "source_id": "weather_context",
+                    "target_id": "model",
+                    "source_handle_id": "tool-context",
+                    "target_handle_id": "api-tool-context",
+                    "label": "tool context",
+                    "kind": "binding",
+                    "priority": 0,
+                },
+                {"id": "e2", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-inline-guidance")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertIn(usage_hint, payload["system_prompt"])
+                    self.assertEqual(payload["system_prompt"].count(usage_hint), 2)
+                    self.assertIn("MCP Tool Guidance", payload["system_prompt"])
+                    self.assertIn("MCP Tool Context", payload["system_prompt"])
+                    self.assertNotIn("{mcp_tool_guidance}", payload["system_prompt"])
+                    tool_context = payload["mcp_tool_context"]
+                    assert isinstance(tool_context, dict)
+                    self.assertIn("Tools: weather_current", tool_context["usage_hints_text"])
+                    self.assertIn(usage_hint, tool_context["usage_hints_text"])
+            finally:
+                manager.stop_background_services()
+
+    def test_model_nodes_can_place_connected_mcp_tool_placeholders_inline(self) -> None:
+        services = build_example_services()
+        services.model_providers["context_echo"] = ContextEchoProvider()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "mcp-inline-tool-placeholder-graph",
+            "name": "MCP Inline Tool Placeholder Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "weather_context",
+                    "kind": "mcp_context_provider",
+                    "category": "tool",
+                    "label": "Weather Context",
+                    "provider_id": "tool.mcp_context_provider",
+                    "provider_label": "MCP Context Provider",
+                    "config": {"tool_names": ["weather_current"], "include_mcp_tool_context": True},
+                    "position": {"x": 100, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "context_echo",
+                    "prompt_name": "context_prompt",
+                    "config": {
+                        "provider_name": "context_echo",
+                        "prompt_name": "context_prompt",
+                        "system_prompt": "You are a tool calling assistant. You have these tools:\n\n{MCP_TOOL_1}",
+                        "user_message_template": "{input_payload}",
+                        "response_mode": "message",
+                    },
+                    "position": {"x": 200, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_envelope", "source": "model"}},
+                    "position": {"x": 300, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "ctx-binding",
+                    "source_id": "weather_context",
+                    "target_id": "model",
+                    "source_handle_id": "tool-context",
+                    "target_handle_id": "api-tool-context",
+                    "label": "tool context",
+                    "kind": "binding",
+                    "priority": 0,
+                },
+                {"id": "e2", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-inline-tool-placeholder")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertNotIn("{MCP_TOOL_1}", payload["system_prompt"])
+                    self.assertIn(f"Tool: {WEATHER_TOOL_ID}", payload["system_prompt"])
+                    self.assertEqual(payload["system_prompt"].count(f"Tool: {WEATHER_TOOL_ID}"), 1)
+                    self.assertNotIn("MCP Tool Context", payload["system_prompt"])
+                    tool_context = payload["mcp_tool_context"]
+                    assert isinstance(tool_context, dict)
+                    self.assertEqual(tool_context["placeholder_blocks"][0]["token"], "MCP_TOOL_1")
+            finally:
+                manager.stop_background_services()
+
+    def test_model_nodes_can_place_full_mcp_blocks_inline(self) -> None:
+        services = build_example_services()
+        services.model_providers["context_echo"] = ContextEchoProvider()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "mcp-inline-full-block-graph",
+            "name": "MCP Inline Full Block Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "weather_context",
+                    "kind": "mcp_context_provider",
+                    "category": "tool",
+                    "label": "Weather Context",
+                    "provider_id": "tool.mcp_context_provider",
+                    "provider_label": "MCP Context Provider",
+                    "config": {"tool_names": ["weather_current"], "include_mcp_tool_context": True},
+                    "position": {"x": 100, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "context_echo",
+                    "prompt_name": "context_prompt",
+                    "config": {
+                        "provider_name": "context_echo",
+                        "prompt_name": "context_prompt",
+                        "system_prompt": "Base instructions.\n\n{mcp_tool_guidance_block}\n\n{mcp_tool_context_block}",
+                        "user_message_template": "{input_payload}",
+                        "response_mode": "message",
+                    },
+                    "position": {"x": 200, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_envelope", "source": "model"}},
+                    "position": {"x": 300, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "ctx-binding",
+                    "source_id": "weather_context",
+                    "target_id": "model",
+                    "source_handle_id": "tool-context",
+                    "target_handle_id": "api-tool-context",
+                    "label": "tool context",
+                    "kind": "binding",
+                    "priority": 0,
+                },
+                {"id": "e2", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-inline-full-block")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertNotIn("{mcp_tool_guidance_block}", payload["system_prompt"])
+                    self.assertNotIn("{mcp_tool_context_block}", payload["system_prompt"])
+                    self.assertEqual(payload["system_prompt"].count("MCP Tool Guidance"), 1)
+                    self.assertEqual(payload["system_prompt"].count("MCP Tool Context"), 1)
+                    self.assertIn(f"Tool: {WEATHER_TOOL_ID}", payload["system_prompt"])
+            finally:
+                manager.stop_background_services()
+
+    def test_model_nodes_append_missing_mcp_sections_when_inline_template_is_partial(self) -> None:
+        services = build_example_services()
+        services.model_providers["context_echo"] = ContextEchoProvider()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "mcp-partial-inline-block-graph",
+            "name": "MCP Partial Inline Block Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "weather_context",
+                    "kind": "mcp_context_provider",
+                    "category": "tool",
+                    "label": "Weather Context",
+                    "provider_id": "tool.mcp_context_provider",
+                    "provider_label": "MCP Context Provider",
+                    "config": {"tool_names": ["weather_current"], "include_mcp_tool_context": True},
+                    "position": {"x": 100, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "context_echo",
+                    "prompt_name": "context_prompt",
+                    "config": {
+                        "provider_name": "context_echo",
+                        "prompt_name": "context_prompt",
+                        "system_prompt": "Base instructions.\n\n{mcp_tool_guidance_block}",
+                        "user_message_template": "{input_payload}",
+                        "response_mode": "message",
+                    },
+                    "position": {"x": 200, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_envelope", "source": "model"}},
+                    "position": {"x": 300, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "ctx-binding",
+                    "source_id": "weather_context",
+                    "target_id": "model",
+                    "source_handle_id": "tool-context",
+                    "target_handle_id": "api-tool-context",
+                    "label": "tool context",
+                    "kind": "binding",
+                    "priority": 0,
+                },
+                {"id": "e2", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-inline-partial-block")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertNotIn("{mcp_tool_guidance_block}", payload["system_prompt"])
+                    self.assertIn("MCP Tool Guidance", payload["system_prompt"])
+                    self.assertIn("MCP Tool Context", payload["system_prompt"])
+                    self.assertIn(f"Tool: {WEATHER_TOOL_ID}", payload["system_prompt"])
+            finally:
+                manager.stop_background_services()
+
+    def test_mcp_tool_guidance_placeholder_resolves_empty_without_usage_hint(self) -> None:
+        services = build_example_services()
+        services.model_providers["context_echo"] = ContextEchoProvider()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "mcp-empty-guidance-placeholder-graph",
+            "name": "MCP Empty Guidance Placeholder Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "weather_context",
+                    "kind": "mcp_context_provider",
+                    "category": "tool",
+                    "label": "Weather Context",
+                    "provider_id": "tool.mcp_context_provider",
+                    "provider_label": "MCP Context Provider",
+                    "config": {"tool_names": ["weather_current"], "include_mcp_tool_context": True},
+                    "position": {"x": 100, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "context_echo",
+                    "prompt_name": "context_prompt",
+                    "config": {
+                        "provider_name": "context_echo",
+                        "prompt_name": "context_prompt",
+                        "system_prompt": "Base instructions.\n\n{mcp_tool_guidance}",
+                        "user_message_template": "{input_payload}",
+                        "response_mode": "message",
+                    },
+                    "position": {"x": 200, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_envelope", "source": "model"}},
+                    "position": {"x": 300, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "ctx-binding",
+                    "source_id": "weather_context",
+                    "target_id": "model",
+                    "source_handle_id": "tool-context",
+                    "target_handle_id": "api-tool-context",
+                    "label": "tool context",
+                    "kind": "binding",
+                    "priority": 0,
+                },
+                {"id": "e2", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "weather please"}, run_id="run-mcp-empty-guidance-placeholder")
+                    self.assertEqual(state.status, "completed")
+                    payload = state.final_output
+                    assert isinstance(payload, dict)
+                    self.assertNotIn("{mcp_tool_guidance}", payload["system_prompt"])
+                    tool_context = payload["mcp_tool_context"]
+                    assert isinstance(tool_context, dict)
+                    self.assertEqual(tool_context["usage_hints_text"], "")
+            finally:
+                manager.stop_background_services()
+
     def test_mcp_context_provider_can_inject_prompt_without_exposing_tools(self) -> None:
         services = build_example_services()
         services.model_providers["context_echo"] = ContextEchoProvider()
@@ -1706,6 +2218,20 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertEqual(model_output["metadata"]["contract"], "message_envelope")
                     self.assertEqual(model_output["payload"], "A direct reply is enough.")
                     self.assertEqual(model_output["tool_calls"], [])
+                    self.assertEqual(state.visit_counts.get("executor", 0), 0)
+                    model_completed = next(
+                        event
+                        for event in state.event_history
+                        if event.event_type == "node.completed" and event.payload.get("node_id") == "model"
+                    )
+                    route_outputs = model_completed.payload.get("route_outputs") or {}
+                    assert isinstance(route_outputs, dict)
+                    self.assertIn("api-tool-call", route_outputs)
+                    no_call_route = route_outputs["api-tool-call"]
+                    assert isinstance(no_call_route, dict)
+                    self.assertEqual(no_call_route.get("payload"), NO_TOOL_CALL_MESSAGE)
+                    self.assertEqual(no_call_route.get("metadata", {}).get("contract"), "no_tool_call_envelope")
+                    self.assertEqual(no_call_route.get("tool_calls"), [])
             finally:
                 manager.stop_background_services()
 
