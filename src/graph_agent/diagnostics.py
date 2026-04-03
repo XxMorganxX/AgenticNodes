@@ -64,11 +64,22 @@ def _graph_tool_candidates(graph: GraphDefinition) -> list[str]:
 
 def _prepare_graph_mcp_tools(manager: GraphRunManager, graph: GraphDefinition) -> dict[str, Any]:
     catalog = manager.get_catalog()
-    tool_by_name = {
-        str(tool.get("name", "")).strip(): tool
-        for tool in catalog.get("tools", [])
-        if isinstance(tool, Mapping) and str(tool.get("name", "")).strip()
-    }
+    tool_by_name: dict[str, Mapping[str, Any]] = {}
+    for tool in catalog.get("tools", []):
+        if not isinstance(tool, Mapping):
+            continue
+        identifiers = [
+            str(tool.get("name", "")).strip(),
+            str(tool.get("canonical_name", "")).strip(),
+            *[
+                str(alias).strip()
+                for alias in tool.get("aliases", [])
+                if str(alias).strip()
+            ],
+        ]
+        for identifier in identifiers:
+            if identifier and identifier not in tool_by_name:
+                tool_by_name[identifier] = tool
     requested_tools = _graph_tool_candidates(graph)
     mcp_tools = []
     booted_servers: list[str] = []
@@ -77,7 +88,7 @@ def _prepare_graph_mcp_tools(manager: GraphRunManager, graph: GraphDefinition) -
         tool = tool_by_name.get(tool_name)
         if not tool or str(tool.get("source_type", "")).strip() != "mcp":
             continue
-        mcp_tools.append(tool_name)
+        mcp_tools.append(str(tool.get("name", tool_name)).strip() or tool_name)
 
     for server_id in sorted(
         {

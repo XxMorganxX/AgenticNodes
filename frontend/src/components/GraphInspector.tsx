@@ -69,6 +69,22 @@ function toolStatusLabel(tool: ToolDefinition): string {
   return "ready";
 }
 
+function toolCanonicalName(tool: ToolDefinition): string {
+  return tool.canonical_name ?? tool.name;
+}
+
+function toolLabel(tool: ToolDefinition): string {
+  return tool.display_name ?? tool.name;
+}
+
+function toolMatchesReference(tool: ToolDefinition, reference: string): boolean {
+  const normalizedReference = reference.trim();
+  if (!normalizedReference) {
+    return false;
+  }
+  return [toolCanonicalName(tool), tool.name, ...(tool.aliases ?? [])].includes(normalizedReference);
+}
+
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
 }
@@ -297,7 +313,15 @@ export function GraphInspector({
     const mcpCatalogTools = catalogTools.filter((tool) => tool.source_type === "mcp");
     const standardCatalogTools = catalogTools.filter((tool) => tool.source_type !== "mcp");
     const followUpSelectableTools = selectedNode.kind === "mcp_tool_executor" ? mcpCatalogTools : standardCatalogTools;
-    const mcpToolByName = new Map(mcpCatalogTools.map((tool) => [tool.name, tool] as const));
+    const mcpToolByName = new Map<string, ToolDefinition>();
+    for (const tool of mcpCatalogTools) {
+      for (const identifier of [toolCanonicalName(tool), tool.name, ...(tool.aliases ?? [])]) {
+        const normalizedIdentifier = String(identifier).trim();
+        if (normalizedIdentifier && !mcpToolByName.has(normalizedIdentifier)) {
+          mcpToolByName.set(normalizedIdentifier, tool);
+        }
+      }
+    }
     const selectedMcpToolNames = Array.isArray(selectedNode.config.tool_names)
       ? (selectedNode.config.tool_names as string[])
       : [];
@@ -314,7 +338,7 @@ export function GraphInspector({
             return nodeToolNames.map((toolName) => {
               const tool = mcpToolByName.get(toolName);
               const status = tool ? toolStatusLabel(tool) : "unknown";
-              return `${toolName} (${status}) via ${formatNodeLabel(node)}`;
+              return `${tool ? toolLabel(tool) : toolName} (${status}) via ${formatNodeLabel(node)}`;
             });
           })
         : [];
@@ -336,6 +360,7 @@ export function GraphInspector({
     const executorFollowUpResponseMode =
       selectedNode.kind === "mcp_tool_executor" ? String(selectedNode.config.response_mode ?? "auto") : "auto";
     const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
+    const isDiscordEndNode = selectedNode.kind === "output" && selectedNode.provider_id === "end.discord_message";
     const isManualStartNode =
       selectedNode.kind === "input" &&
       (selectedNode.provider_id === "start.manual_run" || selectedNode.provider_id === "core.input");
@@ -585,6 +610,82 @@ export function GraphInspector({
                     />
                     <span>Ignore this bot's own messages</span>
                   </label>
+                </>
+              ) : null}
+            </>
+          ) : null}
+          {selectedNode.kind === "output" ? (
+            <>
+              <div className="contract-card">
+                <strong>{isDiscordEndNode ? "Discord Side-Effect End" : "Canonical Output End"}</strong>
+                <span>
+                  {isDiscordEndNode
+                    ? "Sends the resolved payload to a Discord channel and leaves run final_output unchanged."
+                    : "Promotes the resolved payload into the run final_output when this branch completes."}
+                </span>
+              </div>
+              {isDiscordEndNode ? (
+                <>
+                  <label>
+                    Discord Bot Token Env Var
+                    <input
+                      value={String(selectedNode.config.discord_bot_token_env_var ?? "{DISCORD_BOT_TOKEN}")}
+                      placeholder="{DISCORD_BOT_TOKEN}"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              discord_bot_token_env_var: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Discord Channel ID
+                    <input
+                      value={String(selectedNode.config.discord_channel_id ?? "")}
+                      placeholder="123456789012345678"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              discord_channel_id: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Message Template
+                    <textarea
+                      rows={4}
+                      value={String(selectedNode.config.message_template ?? "{message_payload}")}
+                      placeholder="{message_payload}"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              message_template: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="contract-card">
+                    <strong>Template Variables</strong>
+                    <span><code>{"{message_payload}"}</code> renders the resolved payload as text.</span>
+                    <span><code>{"{message_json}"}</code> renders JSON for structured payloads.</span>
+                  </div>
                 </>
               ) : null}
             </>
@@ -841,18 +942,19 @@ export function GraphInspector({
               <div className="checkbox-grid">
                 <strong>{selectedNode.kind === "mcp_tool_executor" ? "Allowed MCP Tools" : "Direct Registry Tools"}</strong>
                 {followUpSelectableTools.map((tool) => {
-                  const isChecked = allowedTools.includes(tool.name);
+                  const canonicalName = toolCanonicalName(tool);
+                  const isChecked = allowedTools.some((name) => toolMatchesReference(tool, name));
                   const canSelectTool = isToolEnabled(tool) && isToolOnline(tool);
                   return (
-                    <label key={tool.name} className="checkbox-option">
+                    <label key={canonicalName} className="checkbox-option">
                       <input
                         type="checkbox"
                         checked={isChecked}
                         disabled={!isChecked && !canSelectTool}
                         onChange={(event) => {
                           const nextTools = event.target.checked
-                            ? [...allowedTools, tool.name]
-                            : allowedTools.filter((name) => name !== tool.name);
+                            ? [...allowedTools.filter((name) => !toolMatchesReference(tool, name)), canonicalName]
+                            : allowedTools.filter((name) => !toolMatchesReference(tool, name));
                           onGraphChange(
                             updateNode(graph, selectedNode.id, (node) => ({
                               ...node,
@@ -867,7 +969,8 @@ export function GraphInspector({
                         }}
                       />
                       <span>
-                        {tool.name}
+                        {toolLabel(tool)}
+                        {toolLabel(tool) !== canonicalName ? <small><code>{canonicalName}</code></small> : null}
                         <small>{toolStatusLabel(tool)}</small>
                       </span>
                     </label>
@@ -923,7 +1026,15 @@ export function GraphInspector({
               <label>
                 Tool
                 <select
-                  value={String(selectedNode.config.tool_name ?? selectedNode.tool_name ?? "")}
+                  value={
+                    standardCatalogTools.find((tool) =>
+                      toolMatchesReference(tool, String(selectedNode.config.tool_name ?? selectedNode.tool_name ?? "")),
+                    )?.canonical_name ??
+                    standardCatalogTools.find((tool) =>
+                      toolMatchesReference(tool, String(selectedNode.config.tool_name ?? selectedNode.tool_name ?? "")),
+                    )?.name ??
+                    String(selectedNode.config.tool_name ?? selectedNode.tool_name ?? "")
+                  }
                   onChange={(event) =>
                     onGraphChange(
                       updateNode(graph, selectedNode.id, (node) => ({
@@ -935,8 +1046,8 @@ export function GraphInspector({
                   }
                 >
                   {standardCatalogTools.map((tool) => (
-                    <option key={tool.name} value={tool.name}>
-                      {tool.name} ({toolStatusLabel(tool)})
+                    <option key={toolCanonicalName(tool)} value={toolCanonicalName(tool)}>
+                      {toolLabel(tool)} ({toolStatusLabel(tool)})
                     </option>
                   ))}
                 </select>
@@ -951,18 +1062,19 @@ export function GraphInspector({
               <div className="checkbox-grid">
                 <strong>Registered MCP Tools</strong>
                 {mcpCatalogTools.map((tool) => {
-                  const isChecked = selectedMcpToolNames.includes(tool.name);
+                  const canonicalName = toolCanonicalName(tool);
+                  const isChecked = selectedMcpToolNames.some((name) => toolMatchesReference(tool, name));
                   const canSelectTool = isToolEnabled(tool) && isToolOnline(tool);
                   return (
-                    <label key={tool.name} className="checkbox-option">
+                    <label key={canonicalName} className="checkbox-option">
                       <input
                         type="checkbox"
                         checked={isChecked}
                         disabled={!isChecked && !canSelectTool}
                         onChange={(event) => {
                           const nextTools = event.target.checked
-                            ? [...selectedMcpToolNames, tool.name]
-                            : selectedMcpToolNames.filter((name) => name !== tool.name);
+                            ? [...selectedMcpToolNames.filter((name) => !toolMatchesReference(tool, name)), canonicalName]
+                            : selectedMcpToolNames.filter((name) => !toolMatchesReference(tool, name));
                           onGraphChange(
                             updateNode(graph, selectedNode.id, (node) => ({
                               ...node,
@@ -975,7 +1087,8 @@ export function GraphInspector({
                         }}
                       />
                       <span>
-                        {tool.name}
+                        {toolLabel(tool)}
+                        {toolLabel(tool) !== canonicalName ? <small><code>{canonicalName}</code></small> : null}
                         <small>{toolStatusLabel(tool)}</small>
                       </span>
                     </label>

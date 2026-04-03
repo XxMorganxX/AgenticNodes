@@ -6,6 +6,7 @@ import sys
 
 from graph_agent import config
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
+from graph_agent.providers.discord import DiscordMessageSender
 from graph_agent.providers.mock import MockModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
 from graph_agent.runtime.core import GraphDefinition, RuntimeServices
@@ -18,7 +19,7 @@ from graph_agent.runtime.node_providers import (
 )
 from graph_agent.tools.base import ToolDefinition, ToolRegistry
 from graph_agent.tools.example_tools import build_search_catalog_tool
-from graph_agent.tools.mcp import McpServerDefinition, McpServerManager
+from graph_agent.tools.mcp import McpServerDefinition, McpServerManager, canonical_mcp_tool_name
 
 
 def _mcp_python_path_env() -> dict[str, str]:
@@ -65,7 +66,9 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     registry.register(build_search_catalog_tool())
     registry.register(
         ToolDefinition(
-            name="weather_current",
+            name=canonical_mcp_tool_name("weather_mcp", "weather_current"),
+            display_name="weather_current",
+            aliases=["weather_current"],
             description="Fetch the current weather conditions for a city or location string.",
             input_schema={
                 "type": "object",
@@ -73,6 +76,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 "required": ["location"],
             },
             source_type="mcp",
+            capability_type="tool",
             server_id="weather_mcp",
             enabled=True,
             available=False,
@@ -82,13 +86,16 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     registry.register(
         ToolDefinition(
-            name="time_current_minute",
+            name=canonical_mcp_tool_name("time_mcp", "time_current_minute"),
+            display_name="time_current_minute",
+            aliases=["time_current_minute"],
             description="Return the current local time rounded down to the minute.",
             input_schema={
                 "type": "object",
                 "properties": {},
             },
             source_type="mcp",
+            capability_type="tool",
             server_id="time_mcp",
             enabled=True,
             available=False,
@@ -397,6 +404,40 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             capabilities=["final output"],
         )
     )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="end.discord_message",
+            display_name="Discord Message End",
+            category=NodeCategory.END,
+            node_kind="output",
+            description="Sends the resolved output to a designated Discord channel without replacing the canonical run final output.",
+            capabilities=["discord delivery", "side-effect output"],
+            default_config={
+                "discord_bot_token_env_var": "{DISCORD_BOT_TOKEN}",
+                "discord_channel_id": "",
+                "message_template": "{message_payload}",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="discord_bot_token_env_var",
+                    label="Discord Bot Token Env Var",
+                    placeholder="{DISCORD_BOT_TOKEN}",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="discord_channel_id",
+                    label="Discord Channel ID",
+                    placeholder="123456789012345678",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="message_template",
+                    label="Message Template",
+                    help_text="Optional template. Use {message_payload} or {message_json} to format the Discord message.",
+                    input_type="textarea",
+                    placeholder="{message_payload}",
+                ),
+            ],
+        )
+    )
     return RuntimeServices(
         model_providers={
             "claude": ClaudeMessagesModelProvider(),
@@ -407,6 +448,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
         node_provider_registry=node_providers,
         tool_registry=registry,
         mcp_server_manager=mcp_server_manager,
+        discord_message_sender=DiscordMessageSender(),
         config={
             "max_steps": config.DEFAULT_RUN_MAX_STEPS,
             "max_visits_per_node": config.DEFAULT_MAX_VISITS_PER_NODE,

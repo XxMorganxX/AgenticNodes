@@ -13,6 +13,10 @@ if str(SRC) not in sys.path:
 from graph_agent.diagnostics import run_baked_environment_probe
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.providers.base import ModelProvider, ModelRequest, ModelResponse, ModelToolCall, ProviderPreflightResult
+from graph_agent.tools.mcp import canonical_mcp_tool_name
+
+
+TIME_TOOL_ID = canonical_mcp_tool_name("time_mcp", "time_current_minute")
 
 
 class TimeToolCallerProvider(ModelProvider):
@@ -116,13 +120,13 @@ class BakedMcpEnvironmentProbeTests(unittest.TestCase):
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(summary["agent_status"], "completed")
         self.assertEqual(summary["node_errors"], {})
-        self.assertEqual(summary["mcp_setup"]["configured_mcp_tools"], ["time_current_minute"])
-        self.assertEqual(summary["mcp_setup"]["enabled_tools"], ["time_current_minute"])
-        self.assertEqual(summary["mcp_activity"]["called_tools"], ["time_current_minute"])
+        self.assertEqual(summary["mcp_setup"]["configured_mcp_tools"], [TIME_TOOL_ID])
+        self.assertEqual(summary["mcp_setup"]["enabled_tools"], [TIME_TOOL_ID])
+        self.assertEqual(summary["mcp_activity"]["called_tools"], [TIME_TOOL_ID])
         self.assertTrue(summary["mcp_activity"]["requested_tool_calls"])
-        self.assertEqual(summary["mcp_activity"]["requested_tool_calls"][0]["tool_name"], "time_current_minute")
+        self.assertEqual(summary["mcp_activity"]["requested_tool_calls"][0]["tool_name"], TIME_TOOL_ID)
         self.assertTrue(summary["mcp_activity"]["executor_results"])
-        self.assertEqual(summary["mcp_activity"]["executor_results"][0]["tool_name"], "time_current_minute")
+        self.assertEqual(summary["mcp_activity"]["executor_results"][0]["tool_name"], TIME_TOOL_ID)
         self.assertTrue(summary["mcp_activity"]["executor_results"][0]["has_requested_tool_call"])
 
 

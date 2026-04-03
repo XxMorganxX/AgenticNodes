@@ -128,6 +128,14 @@ function toolStatusLabel(tool: ToolDefinition): string {
   return "ready";
 }
 
+function toolCanonicalName(tool: ToolDefinition): string {
+  return tool.canonical_name ?? tool.name;
+}
+
+function toolLabel(tool: ToolDefinition): string {
+  return tool.display_name ?? tool.name;
+}
+
 export function McpServerPanel({
   catalog,
   onBootMcpServer,
@@ -416,17 +424,19 @@ export function McpServerPanel({
             {serverTools.length > 0 ? (
               <div className="mcp-tool-list">
                 {serverTools.map((tool) => {
-                  const pending = mcpPendingKey === `tool:${tool.name}`;
+                  const toolName = toolCanonicalName(tool);
+                  const pending = mcpPendingKey === `tool:${toolName}`;
                   return (
-                    <label key={tool.name} className="checkbox-option mcp-tool-option">
+                    <label key={toolName} className="checkbox-option mcp-tool-option">
                       <input
                         type="checkbox"
                         checked={isToolEnabled(tool)}
                         disabled={pending}
-                        onChange={(event) => onToggleMcpTool(tool.name, event.target.checked)}
+                        onChange={(event) => onToggleMcpTool(toolName, event.target.checked)}
                       />
                       <span>
-                        {tool.name}
+                        {toolLabel(tool)}
+                        {toolLabel(tool) !== toolName ? <small><code>{toolName}</code></small> : null}
                         <small>{toolStatusLabel(tool)}</small>
                         {tool.schema_warning ? <small>{tool.schema_warning}</small> : null}
                       </span>

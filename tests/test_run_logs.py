@@ -17,6 +17,7 @@ from graph_agent.api.manager import GraphRunManager
 from graph_agent.api.run_log_store import RunLogStore
 from graph_agent.api.run_state_reducer import apply_single_run_event, build_run_state
 from graph_agent.examples.tool_schema_repair import build_example_graph_payload, build_example_services
+from graph_agent.runtime.event_contract import RUNTIME_EVENT_SCHEMA_VERSION
 
 
 def wait_for_run_completion(manager: GraphRunManager, run_id: str, timeout_seconds: float = 5.0) -> dict[str, object]:
@@ -75,6 +76,7 @@ class RunLogStoreTests(unittest.TestCase):
         self.assertEqual(manifest["parent_run_id"], None)
 
         events = read_jsonl(run_dir / "events.jsonl")
+        self.assertTrue(all(event["schema_version"] == RUNTIME_EVENT_SCHEMA_VERSION for event in events))
         self.assertEqual(events[0]["event_type"], "run.started")
         self.assertEqual(events[-1]["event_type"], "run.completed")
         self.assertTrue(any(event["event_type"] == "node.completed" for event in events))
@@ -111,6 +113,7 @@ class RunLogStoreTests(unittest.TestCase):
 
         parent_dir = self.logs_root / run_id
         parent_events = read_jsonl(parent_dir / "events.jsonl")
+        self.assertTrue(all(event["schema_version"] == RUNTIME_EVENT_SCHEMA_VERSION for event in parent_events))
         self.assertTrue(any(event["event_type"].startswith("agent.") for event in parent_events))
         self.assertTrue(
             any(
@@ -130,6 +133,7 @@ class RunLogStoreTests(unittest.TestCase):
             self.assertTrue((child_dir / "state.json").exists())
 
             child_events = read_jsonl(child_dir / "events.jsonl")
+            self.assertTrue(all(event["schema_version"] == RUNTIME_EVENT_SCHEMA_VERSION for event in child_events))
             self.assertEqual(child_events[0]["event_type"], "run.started")
             self.assertEqual(child_events[-1]["event_type"], "run.completed")
             self.assertTrue(all(event["run_id"] == child_run_id for event in child_events))

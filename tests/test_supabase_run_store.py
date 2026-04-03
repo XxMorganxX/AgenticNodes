@@ -20,6 +20,7 @@ from graph_agent.api.manager import GraphRunManager
 from graph_agent.api.run_state_reducer import apply_single_run_event, build_run_state
 from graph_agent.api.supabase_run_store import SupabaseRunStore
 from graph_agent.examples.tool_schema_repair import build_example_graph_payload, build_example_services
+from graph_agent.runtime.event_contract import RUNTIME_EVENT_SCHEMA_VERSION
 
 
 class _SupabaseStubHandler(BaseHTTPRequestHandler):
@@ -186,6 +187,7 @@ class SupabaseRunStoreTests(unittest.TestCase):
 
             recovered = store.recover_run_state("run-1")
             self.assertEqual(recovered, state)
+            self.assertTrue(all(event["schema_version"] == RUNTIME_EVENT_SCHEMA_VERSION for event in recovered["event_history"]))
             rows = store.list_runs(graph_id="graph-1")
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["run_id"], "run-1")

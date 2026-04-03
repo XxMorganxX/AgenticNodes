@@ -26,6 +26,8 @@ The run state includes:
 - final output payload
 - terminal status
 
+The `event_history` list stores versioned runtime events. The current contract is `runtime.v1`, which means each stored event keeps a `schema_version` alongside the event envelope used for SSE, replay, and UI projections.
+
 ## Access Patterns
 
 - The runtime is the main owner of state mutation.
@@ -44,3 +46,5 @@ Future versions can swap the in-memory store for:
 - persisted run storage
 - distributed execution state
 - replayable event sourcing
+
+Because replay depends on `event_history`, contract compatibility matters as much as storage durability. Within `runtime.v1`, event names and reducer-critical payload fields must remain stable so persisted runs can still be reconstructed after upgrades.

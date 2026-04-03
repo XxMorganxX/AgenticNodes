@@ -943,31 +943,10 @@ function buildFocusedEventGroupsFromNormalizedEvents(
   graph: GraphDefinition | null,
   normalizedEvents: RuntimeEvent[],
 ): FocusedEventGroup[] {
-  const groups: FocusedEventGroup[] = [];
-  for (let index = 0; index < normalizedEvents.length; index += 1) {
-    const event = normalizedEvents[index];
-    if (event.event_type === "node.started") {
-      const nextEvent = normalizedEvents[index + 1];
-      const sameNodeCompleted =
-        nextEvent &&
-        nextEvent.event_type === "node.completed" &&
-        nodeIdFromEvent(nextEvent) === nodeIdFromEvent(event);
-      groups.push(
-        buildExecutionGroup(
-          `node-${event.timestamp}-${index}`,
-          graph,
-          event,
-          sameNodeCompleted ? nextEvent : null,
-        ),
-      );
-      if (sameNodeCompleted) {
-        index += 1;
-      }
-      continue;
-    }
-    groups.push(buildSingleEventGroup(`event-${event.timestamp}-${index}`, event));
-  }
-  return groups.reverse();
+  return normalizedEvents
+    .filter((event) => event.event_type !== "edge.selected")
+    .map((event, index) => buildSingleEventGroup(`event-${event.timestamp}-${index}`, event, graph))
+    .reverse();
 }
 
 export function buildFocusedRunProjection(
@@ -1014,40 +993,12 @@ export function buildFocusedRunSummary(
   return buildFocusedRunProjection(graph, runState, events).runSummary;
 }
 
-function buildExecutionGroup(
-  id: string,
-  graph: GraphDefinition | null,
-  startedEvent: RuntimeEvent,
-  completedEvent: RuntimeEvent | null,
-): FocusedEventGroup {
-  const labels = nodeLabelMap(graph);
-  const nodeId = nodeIdFromEvent(startedEvent);
-  const nodeLabel = nodeId ? (labels.get(nodeId) ?? nodeId) : "Node";
-  const completePayloadError = completedEvent?.payload.error;
-  const tone =
-    completePayloadError != null ? "danger" : completedEvent ? "success" : "running";
-  return {
-    id,
-    title: nodeLabel,
-    subtitle: completePayloadError != null ? "Execution failed" : completedEvent ? "Execution completed" : "Execution in progress",
-    tone,
-    eventCount: completedEvent ? 2 : 1,
-    startedAt: startedEvent.timestamp,
-    endedAt: completedEvent?.timestamp ?? null,
-    nodeId,
-    lines: [
-      startedEvent.summary,
-      ...(completedEvent ? [completedEvent.summary] : []),
-    ],
-  };
-}
-
-function buildSingleEventGroup(id: string, event: RuntimeEvent): FocusedEventGroup {
+function buildSingleEventGroup(id: string, event: RuntimeEvent, graph: GraphDefinition | null): FocusedEventGroup {
   const eventType = normalizeEventType(event.event_type);
   const tone = eventTone(eventType);
   return {
     id,
-    title: milestoneLabel(event, null),
+    title: milestoneLabel(event, graph),
     subtitle: eventType,
     tone: tone === "idle" ? "info" : tone,
     eventCount: 1,

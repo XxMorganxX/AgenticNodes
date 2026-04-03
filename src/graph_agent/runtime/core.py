@@ -9,6 +9,7 @@ import re
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
+from graph_agent.providers.discord import DiscordMessageSender
 from graph_agent.providers.base import (
     ModelMessage,
     ModelProvider,
@@ -17,6 +18,10 @@ from graph_agent.providers.base import (
     api_decision_response_schema,
     normalize_api_decision_output,
     validate_api_decision_output,
+)
+from graph_agent.runtime.event_contract import (
+    RUNTIME_EVENT_SCHEMA_VERSION,
+    normalize_runtime_event_dict,
 )
 from graph_agent.runtime.node_providers import (
     NodeCategory,
@@ -38,6 +43,8 @@ MCP_TERMINAL_OUTPUT_HANDLE_ID = "mcp-terminal-output"
 PROMPT_BLOCK_PROVIDER_ID = "core.prompt_block"
 PROMPT_BLOCK_MODE = "prompt_block"
 PROMPT_BLOCK_ROLES = {"system", "user", "assistant"}
+DISCORD_END_PROVIDER_ID = "end.discord_message"
+DEFAULT_DISCORD_BOT_TOKEN_ENV_VAR = "{DISCORD_BOT_TOKEN}"
 
 
 def _json_safe(value: Any) -> str:
@@ -308,12 +315,13 @@ class RuntimeEvent:
     summary: str
     payload: dict[str, Any]
     run_id: str
+    schema_version: str = RUNTIME_EVENT_SCHEMA_VERSION
     agent_id: str | None = None
     parent_run_id: str | None = None
     timestamp: str = field(default_factory=utc_now_iso)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return normalize_runtime_event_dict(asdict(self))
 
 
 @dataclass
@@ -405,6 +413,32 @@ def _model_has_exposed_tool_context(graph: GraphDefinition, node: BaseNode) -> b
 
 def _node_supports_mcp_tool_context(node: BaseNode | None) -> bool:
     return isinstance(node, ModelNode)
+
+
+def _canonicalize_api_decision_tool_names(
+    decision_output: Mapping[str, Any],
+    tool_registry: ToolRegistry,
+) -> dict[str, Any]:
+    normalized_output = dict(decision_output)
+    raw_tool_calls = decision_output.get("tool_calls", [])
+    if not isinstance(raw_tool_calls, Sequence) or isinstance(raw_tool_calls, (str, bytes)):
+        return normalized_output
+    normalized_tool_calls: list[dict[str, Any]] = []
+    for candidate in raw_tool_calls:
+        if not isinstance(candidate, Mapping):
+            continue
+        tool_name = str(candidate.get("tool_name", "")).strip()
+        if not tool_name:
+            continue
+        try:
+            tool_name = tool_registry.canonical_name_for(tool_name)
+        except (KeyError, ValueError):
+            pass
+        normalized_candidate = dict(candidate)
+        normalized_candidate["tool_name"] = tool_name
+        normalized_tool_calls.append(normalized_candidate)
+    normalized_output["tool_calls"] = normalized_tool_calls
+    return normalized_output
 
 
 def _model_has_tool_output_route(graph: GraphDefinition, node: BaseNode) -> bool:
@@ -581,6 +615,7 @@ class RuntimeServices:
     node_provider_registry: NodeProviderRegistry = field(default_factory=NodeProviderRegistry)
     tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
     mcp_server_manager: McpServerManager | None = None
+    discord_message_sender: DiscordMessageSender | None = None
     config: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -677,6 +712,25 @@ class NodeContext:
             definitions.append(self._apply_tool_node_overrides(tool.name, tool.to_dict()))
         return definitions
 
+    def _resolved_tool_definition(self, tool_name: str) -> ToolDefinition | None:
+        try:
+            return self.services.tool_registry.get_optional(tool_name)
+        except ValueError:
+            return None
+
+    def _resolved_tool_name(self, tool_name: str) -> str:
+        resolved = self._resolved_tool_definition(tool_name)
+        if resolved is None:
+            return str(tool_name).strip()
+        return resolved.canonical_name
+
+    def _tool_reference_matches(self, candidate_name: str, target_name: str) -> bool:
+        resolved_candidate = self._resolved_tool_name(candidate_name)
+        resolved_target = self._resolved_tool_name(target_name)
+        if not resolved_candidate or not resolved_target:
+            return False
+        return resolved_candidate == resolved_target
+
     def _candidate_mcp_context_nodes_for_model(self, node_id: str | None = None) -> list[McpContextProviderNode]:
         target_node_id = node_id or self.node_id
         target_node = self.graph.nodes.get(target_node_id)
@@ -739,7 +793,7 @@ class NodeContext:
         for node in self.graph.nodes.values():
             if node.kind not in {"tool", "mcp_context_provider"}:
                 continue
-            if tool_name in self._configured_tool_names(node):
+            if any(self._tool_reference_matches(configured_tool_name, tool_name) for configured_tool_name in self._configured_tool_names(node)):
                 return node
         return None
 
@@ -748,20 +802,25 @@ class NodeContext:
         if tool_node is None:
             return dict(definition)
 
+        resolved_name = self._resolved_tool_name(tool_name)
+        resolved_definition = dict(definition)
+        resolved_definition["name"] = resolved_name
+        resolved_definition.setdefault("canonical_name", resolved_name)
+
         user_description_text = self.resolve_graph_env_value(
-            str(tool_node.config.get("tool_user_description") or definition.get("description", ""))
+            str(tool_node.config.get("tool_user_description") or resolved_definition.get("description", ""))
         )
         agent_description_text = self.resolve_graph_env_value(
             str(
                 tool_node.config.get("tool_agent_description")
                 or tool_node.config.get("tool_model_description")
-                or definition.get("description", "")
+                or resolved_definition.get("description", "")
             )
         )
         schema_text = self.resolve_graph_env_value(
             str(
                 tool_node.config.get("tool_model_schema_text")
-                or json.dumps(definition.get("input_schema", {}), indent=2, sort_keys=True)
+                or json.dumps(resolved_definition.get("input_schema", {}), indent=2, sort_keys=True)
             )
         )
         template = self.resolve_graph_env_value(
@@ -771,7 +830,7 @@ class NodeContext:
             )
         )
 
-        resolved_schema: Any = definition.get("input_schema", {})
+        resolved_schema: Any = resolved_definition.get("input_schema", {})
         try:
             parsed_schema = json.loads(schema_text)
             if isinstance(parsed_schema, Mapping):
@@ -780,12 +839,12 @@ class NodeContext:
             pass
 
         return {
-            **dict(definition),
+            **resolved_definition,
             "description": template.format_map(
                 SafeFormatDict(
                     self.template_variables(
                         {
-                            "tool_name": tool_name,
+                            "tool_name": resolved_name,
                             "tool_user_description": user_description_text,
                             "tool_agent_description": agent_description_text,
                             "tool_description": agent_description_text,
@@ -978,10 +1037,11 @@ class NodeContext:
         for candidate in self._candidate_mcp_context_nodes_for_model(target_node_id):
             if not self._mcp_tool_prompt_enabled(candidate):
                 continue
-            for tool_name in self._configured_tool_names(candidate):
-                registry_tool = self._exposable_mcp_tool(tool_name)
+            for configured_tool_name in self._configured_tool_names(candidate):
+                registry_tool = self._exposable_mcp_tool(configured_tool_name)
                 if registry_tool is None:
                     continue
+                tool_name = str(registry_tool.get("name", "")).strip() or self._resolved_tool_name(configured_tool_name)
                 model_tool_definition = self._apply_tool_node_overrides(tool_name, registry_tool)
                 prompt_blocks.append(str(model_tool_definition.get("description", "")).strip())
                 server = None
@@ -996,7 +1056,9 @@ class NodeContext:
                     {
                         "tool_node_id": candidate.id,
                         "tool_node_label": candidate.label,
+                        "configured_tool_name": configured_tool_name,
                         "tool_name": tool_name,
+                        "display_name": str(registry_tool.get("display_name", tool_name) or tool_name),
                         "tool": registry_tool,
                         "model_tool_definition": model_tool_definition,
                         "server": server,
@@ -1034,10 +1096,11 @@ class NodeContext:
         for candidate in self._candidate_mcp_context_nodes_for_model(node_id):
             if not self._mcp_tool_exposure_enabled(candidate):
                 continue
-            for tool_name in self._configured_tool_names(candidate):
-                registry_tool = self._exposable_mcp_tool(tool_name)
+            for configured_tool_name in self._configured_tool_names(candidate):
+                registry_tool = self._exposable_mcp_tool(configured_tool_name)
                 if registry_tool is None:
                     continue
+                tool_name = str(registry_tool.get("name", "")).strip() or self._resolved_tool_name(configured_tool_name)
                 definitions_by_name[tool_name] = self._apply_tool_node_overrides(tool_name, registry_tool)
         return list(definitions_by_name.values())
 
@@ -1675,10 +1738,14 @@ class ModelNode(BaseNode):
                 if str(tool.get("source_type", "")).strip() == "mcp" and str(tool.get("name", "")).strip()
             }
         )
+        preferred_tool_name = str(self.config.get("preferred_tool_name", "") or "").strip()
+        resolved_preferred_tool_name = (
+            context.services.tool_registry.canonical_name_for(preferred_tool_name) if preferred_tool_name else None
+        )
         metadata["available_tools"] = available_tool_payloads
         metadata["mcp_available_tool_names"] = mcp_available_tool_names
         metadata["mode"] = self.config.get("mode", self.prompt_name)
-        metadata["preferred_tool_name"] = self.config.get("preferred_tool_name")
+        metadata["preferred_tool_name"] = resolved_preferred_tool_name
         metadata["response_mode"] = response_mode
         system_prompt_template = str(self.config.get("system_prompt", ""))
         user_template = str(self.config.get("user_message_template", "{input_payload}"))
@@ -1727,7 +1794,7 @@ class ModelNode(BaseNode):
             response_schema=decision_response_schema,
             provider_config=provider_config,
             available_tools=available_tools,
-            preferred_tool_name=str(self.config.get("preferred_tool_name", "") or "") or None,
+            preferred_tool_name=resolved_preferred_tool_name,
             response_mode=response_mode,
             metadata=metadata,
         )
@@ -1754,12 +1821,16 @@ class ModelNode(BaseNode):
         }
         response = provider.generate(request)
         try:
-            decision_output = validate_api_decision_output(
+            normalized_decision_output = _canonicalize_api_decision_tool_names(
                 normalize_api_decision_output(
                     response.structured_output,
                     content=response.content,
                     tool_calls=response.tool_calls,
                 ),
+                context.services.tool_registry,
+            )
+            decision_output = validate_api_decision_output(
+                normalized_decision_output,
                 callable_tool_names=callable_tool_names,
                 response_mode=response_mode_hint,
             )
@@ -2257,15 +2328,16 @@ class McpToolExecutorNode(BaseNode):
             tool_definition = context.services.tool_registry.require_invocable(tool_name)
             if tool_definition.source_type != "mcp":
                 raise ValueError(f"Tool '{tool_name}' is not an MCP tool.")
+            resolved_tool_name = tool_definition.canonical_name
             tool_context = ToolContext(
                 run_id=context.state.run_id,
                 graph_id=context.state.graph_id,
                 node_id=context.node_id,
                 state_snapshot=context.state.snapshot(),
             )
-            tool_result = context.services.tool_registry.invoke(tool_name, payload_dict, tool_context)
+            tool_result = context.services.tool_registry.invoke(resolved_tool_name, payload_dict, tool_context)
             route_outputs: dict[str, Any] = {}
-            execution_summary = tool_result.summary or f"MCP tool '{tool_name}' completed."
+            execution_summary = tool_result.summary or f"MCP tool '{resolved_tool_name}' completed."
             tool_metadata = dict(tool_result.metadata)
             terminal_output = tool_metadata.pop("terminal_output", None)
             tool_artifacts: dict[str, Any] = {}
@@ -2275,7 +2347,7 @@ class McpToolExecutorNode(BaseNode):
                 if normalized_requested_tool_calls:
                     requested_tool_call, pending_tool_calls = self._split_requested_tool_calls(
                         normalized_requested_tool_calls,
-                        tool_name=tool_name,
+                        tool_name=resolved_tool_name,
                         arguments=payload_dict,
                     )
                     if requested_tool_call is not None:
@@ -2295,7 +2367,7 @@ class McpToolExecutorNode(BaseNode):
                     metadata={
                         "contract": "terminal_output_envelope",
                         "node_kind": self.kind,
-                        "tool_name": tool_name,
+                        "tool_name": resolved_tool_name,
                     },
                 )
                 route_outputs[MCP_TERMINAL_OUTPUT_HANDLE_ID] = terminal_envelope.to_dict()
@@ -2311,7 +2383,7 @@ class McpToolExecutorNode(BaseNode):
                 metadata={
                     "contract": "tool_result_envelope",
                     "node_kind": self.kind,
-                    "tool_name": tool_name,
+                    "tool_name": resolved_tool_name,
                     **tool_metadata,
                     "tool_status": tool_result.status,
                     "tool_summary": execution_summary,
@@ -2493,13 +2565,17 @@ class McpToolExecutorNode(BaseNode):
                 if str(tool.get("source_type", "")).strip() == "mcp" and str(tool.get("name", "")).strip()
             }
         )
+        preferred_tool_name = str(self.config.get("preferred_tool_name", "") or "").strip()
+        resolved_preferred_tool_name = (
+            context.services.tool_registry.canonical_name_for(preferred_tool_name) if preferred_tool_name else None
+        )
         if response_mode != "message" and not available_tools:
             response_mode = "message"
         metadata["available_tools"] = available_tool_payloads
         metadata["mcp_available_tool_names"] = mcp_available_tool_names
         metadata["forbidden_tool_call_signatures"] = sorted(forbidden_signatures)
         metadata["mode"] = self.config.get("mode", self.config.get("prompt_name", "mcp_executor_follow_up"))
-        metadata["preferred_tool_name"] = self.config.get("preferred_tool_name")
+        metadata["preferred_tool_name"] = resolved_preferred_tool_name
         metadata["response_mode"] = response_mode
         metadata["original_input_payload"] = normalized_payload.get("original_input_payload")
         metadata["tool_history"] = normalized_payload.get("tool_history", [])
@@ -2556,7 +2632,7 @@ class McpToolExecutorNode(BaseNode):
             response_schema=decision_response_schema,
             provider_config=self._provider_config(context),
             available_tools=available_tools,
-            preferred_tool_name=str(self.config.get("preferred_tool_name", "") or "") or None,
+            preferred_tool_name=resolved_preferred_tool_name,
             response_mode=response_mode,
             metadata=metadata,
         )
@@ -2807,12 +2883,16 @@ class McpToolExecutorNode(BaseNode):
             }
             response = provider.generate(request)
             try:
-                decision_output = validate_api_decision_output(
+                normalized_decision_output = _canonicalize_api_decision_tool_names(
                     normalize_api_decision_output(
                         response.structured_output,
                         content=response.content,
                         tool_calls=response.tool_calls,
                     ),
+                    context.services.tool_registry,
+                )
+                decision_output = validate_api_decision_output(
+                    normalized_decision_output,
                     callable_tool_names=callable_tool_names,
                     response_mode=response_mode,
                 )
@@ -2912,6 +2992,26 @@ class McpToolExecutorNode(BaseNode):
         }
 
 
+def _resolve_output_payload(context: NodeContext, binding: Mapping[str, Any] | None) -> Any:
+    bound_value = context.resolve_binding(binding)
+    if isinstance(bound_value, Mapping) and "payload" in bound_value:
+        return bound_value.get("payload")
+    return bound_value
+
+
+def _coerce_discord_message_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, Mapping):
+        for key in ("message", "content", "text", "summary"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return _json_safe(value).strip()
+
+
 class OutputNode(BaseNode):
     kind = "output"
 
@@ -2937,18 +3037,88 @@ class OutputNode(BaseNode):
         )
 
     def execute(self, context: NodeContext) -> NodeExecutionResult:
-        bound_value = context.resolve_binding(self.config.get("source_binding"))
-        if isinstance(bound_value, Mapping) and "payload" in bound_value:
-            output = bound_value.get("payload")
-        else:
-            output = bound_value
+        output = _resolve_output_payload(context, self.config.get("source_binding"))
         return NodeExecutionResult(status="success", output=output, summary="Output prepared.")
 
     def runtime_input_preview(self, context: NodeContext) -> Any:
-        bound_value = context.resolve_binding(self.config.get("source_binding"))
-        if isinstance(bound_value, Mapping) and "payload" in bound_value:
-            return bound_value.get("payload")
-        return bound_value
+        return _resolve_output_payload(context, self.config.get("source_binding"))
+
+
+class DiscordOutputNode(OutputNode):
+    def __init__(
+        self,
+        node_id: str,
+        label: str,
+        provider_id: str = DISCORD_END_PROVIDER_ID,
+        provider_label: str = "Discord Message End",
+        description: str = "",
+        config: Mapping[str, Any] | None = None,
+        position: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            node_id=node_id,
+            label=label,
+            provider_id=provider_id,
+            provider_label=provider_label,
+            description=description,
+            config=config,
+            position=position,
+        )
+
+    def _resolved_channel_id(self, context: NodeContext) -> str:
+        return str(context.resolve_graph_env_value(self.config.get("discord_channel_id", ""))).strip()
+
+    def _resolved_bot_token(self, context: NodeContext) -> str:
+        token_reference = str(self.config.get("discord_bot_token_env_var", DEFAULT_DISCORD_BOT_TOKEN_ENV_VAR))
+        return resolve_graph_process_env(token_reference, context.graph_env_vars())
+
+    def _render_message_content(self, context: NodeContext, payload: Any) -> str:
+        template = str(self.config.get("message_template", "") or "").strip()
+        if template:
+            rendered = context.render_template(
+                template,
+                {
+                    "message_payload": payload,
+                    "message_json": _json_safe(payload),
+                    "discord_channel_id": self._resolved_channel_id(context),
+                },
+            ).strip()
+            if rendered:
+                return rendered
+        content = _coerce_discord_message_text(payload)
+        if content:
+            return content
+        raise ValueError("Discord output node could not derive message content from the resolved payload.")
+
+    def execute(self, context: NodeContext) -> NodeExecutionResult:
+        payload = _resolve_output_payload(context, self.config.get("source_binding"))
+        channel_id = self._resolved_channel_id(context)
+        sender = context.services.discord_message_sender or DiscordMessageSender()
+        delivery = sender.send_message(
+            token=self._resolved_bot_token(context),
+            channel_id=channel_id,
+            content=self._render_message_content(context, payload),
+        )
+        return NodeExecutionResult(
+            status="success",
+            output={
+                "delivery_status": "sent",
+                "channel_id": delivery.channel_id,
+                "message_id": delivery.message_id,
+                "content": delivery.content,
+                "timestamp": delivery.timestamp,
+                "source_payload": payload,
+            },
+            summary=f"Sent Discord message to channel '{delivery.channel_id}'.",
+            metadata={"skip_final_output_promotion": True, "discord_delivery": True},
+        )
+
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        payload = _resolve_output_payload(context, self.config.get("source_binding"))
+        return {
+            "channel_id": self._resolved_channel_id(context),
+            "content": self._render_message_content(context, payload),
+        }
 
 
 class GraphValidationError(ValueError):
@@ -3019,9 +3189,17 @@ def _node_from_dict(payload: Mapping[str, Any]) -> BaseNode:
             **common,
         )
     if kind == "output":
+        provider_id = str(payload.get("provider_id", "core.output"))
+        provider_label = str(payload.get("provider_label", "Core Output Node"))
+        if provider_id == DISCORD_END_PROVIDER_ID:
+            return DiscordOutputNode(
+                provider_id=provider_id,
+                provider_label=provider_label,
+                **common,
+            )
         return OutputNode(
-            provider_id=str(payload.get("provider_id", "core.output")),
-            provider_label=str(payload.get("provider_label", "Core Output Node")),
+            provider_id=provider_id,
+            provider_label=provider_label,
             **common,
         )
     raise GraphValidationError(f"Unsupported node kind '{kind}'.")
@@ -3119,9 +3297,16 @@ class GraphDefinition:
                     continue
                 standard_edge_counts[edge.source_id] = standard_edge_counts.get(edge.source_id, 0) + 1
                 if standard_edge_counts[edge.source_id] > 1:
-                    raise GraphValidationError(
-                        f"Node '{edge.source_id}' has more than one standard outgoing edge."
-                    )
+                    standard_outgoing_edges = [
+                        candidate for candidate in self.get_outgoing_edges(edge.source_id) if candidate.kind == "standard"
+                    ]
+                    if not all(
+                        (target := self.nodes.get(candidate.target_id)) is not None and target.kind == "output"
+                        for candidate in standard_outgoing_edges
+                    ):
+                        raise GraphValidationError(
+                            f"Node '{edge.source_id}' has more than one standard outgoing edge."
+                        )
 
     def start_node(self) -> BaseNode:
         return self.nodes[self.start_node_id]
@@ -3170,11 +3355,13 @@ class GraphDefinition:
                         f"Model node '{node.id}' references unknown model provider '{model_provider_name}'."
                     )
                 allowed_tool_names = [str(tool_name) for tool_name in node.config.get("allowed_tool_names", [])]
+                resolved_allowed_tool_names: list[str] = []
                 for tool_name in allowed_tool_names:
                     try:
-                        services.tool_registry.require_graph_reference(str(tool_name))
+                        tool_definition = services.tool_registry.require_graph_reference(str(tool_name))
                     except (KeyError, ValueError) as exc:
                         raise GraphValidationError(str(exc)) from exc
+                    resolved_allowed_tool_names.append(tool_definition.canonical_name)
                 mcp_context_tool_names: list[str] = []
                 response_mode = infer_model_response_mode(self, node)
                 candidate_context_nodes: list[McpContextProviderNode] = []
@@ -3235,17 +3422,25 @@ class GraphDefinition:
                                 f"MCP context provider '{target_node.id}' references non-MCP tool '{tool_name_str}'."
                             )
                         if bool(target_node.config.get("expose_mcp_tools", True)):
-                            mcp_context_tool_names.append(tool_name_str)
-                combined_tool_names = [*allowed_tool_names, *[tool_name for tool_name in mcp_context_tool_names if tool_name not in allowed_tool_names]]
+                            mcp_context_tool_names.append(tool_definition.canonical_name)
+                combined_tool_names = [
+                    *resolved_allowed_tool_names,
+                    *[tool_name for tool_name in mcp_context_tool_names if tool_name not in resolved_allowed_tool_names],
+                ]
                 if response_mode == "tool_call" and not combined_tool_names and not isinstance(node.config.get("response_schema"), Mapping):
                     raise GraphValidationError(
                         f"Model node '{node.id}' uses tool_call mode but does not expose any allowed tools."
                     )
                 preferred_tool_name = str(node.config.get("preferred_tool_name", "") or "").strip()
-                if preferred_tool_name and combined_tool_names and preferred_tool_name not in combined_tool_names:
-                    raise GraphValidationError(
-                        f"Model node '{node.id}' prefers tool '{preferred_tool_name}', but it is not exposed to the node."
-                    )
+                if preferred_tool_name and combined_tool_names:
+                    try:
+                        resolved_preferred_tool_name = services.tool_registry.canonical_name_for(preferred_tool_name)
+                    except (KeyError, ValueError) as exc:
+                        raise GraphValidationError(str(exc)) from exc
+                    if resolved_preferred_tool_name not in combined_tool_names:
+                        raise GraphValidationError(
+                            f"Model node '{node.id}' prefers tool '{preferred_tool_name}', but it is not exposed to the node."
+                        )
                 model_outgoing_edges = [edge for edge in self.get_outgoing_edges(node.id) if edge.kind != "binding"]
                 for edge in model_outgoing_edges:
                     target_node = self.nodes.get(edge.target_id)
@@ -3428,26 +3623,33 @@ class GraphDefinition:
                             f"MCP tool executor '{node.id}' uses unsupported follow-up response_mode '{response_mode}'."
                         )
                     allowed_tool_names = [str(tool_name) for tool_name in node.config.get("allowed_tool_names", [])]
+                    resolved_allowed_tool_names: list[str] = []
                     for tool_name in allowed_tool_names:
                         try:
                             tool_definition = services.tool_registry.require_graph_reference(str(tool_name))
                         except (KeyError, ValueError) as exc:
                             raise GraphValidationError(str(exc)) from exc
+                        resolved_allowed_tool_names.append(tool_definition.canonical_name)
                     for tool_name in allowed_tool_names:
                         tool_definition = services.tool_registry.require_graph_reference(str(tool_name))
                         if tool_definition.source_type != "mcp":
                             raise GraphValidationError(
                                 f"MCP tool executor '{node.id}' references non-MCP tool '{tool_name}'."
                             )
-                    if response_mode == "tool_call" and not allowed_tool_names and not isinstance(node.config.get("response_schema"), Mapping):
+                    if response_mode == "tool_call" and not resolved_allowed_tool_names and not isinstance(node.config.get("response_schema"), Mapping):
                         raise GraphValidationError(
                             f"MCP tool executor '{node.id}' uses tool_call follow-up mode but does not expose any allowed tools."
                         )
                     preferred_tool_name = str(node.config.get("preferred_tool_name", "") or "").strip()
-                    if preferred_tool_name and allowed_tool_names and preferred_tool_name not in allowed_tool_names:
-                        raise GraphValidationError(
-                            f"MCP tool executor '{node.id}' prefers tool '{preferred_tool_name}', but it is not exposed to the node."
-                        )
+                    if preferred_tool_name and resolved_allowed_tool_names:
+                        try:
+                            resolved_preferred_tool_name = services.tool_registry.canonical_name_for(preferred_tool_name)
+                        except (KeyError, ValueError) as exc:
+                            raise GraphValidationError(str(exc)) from exc
+                        if resolved_preferred_tool_name not in resolved_allowed_tool_names:
+                            raise GraphValidationError(
+                                f"MCP tool executor '{node.id}' prefers tool '{preferred_tool_name}', but it is not exposed to the node."
+                            )
             if node.kind == "data" and node.provider_id == "core.context_builder":
                 raw_bindings = node.config.get("input_bindings", [])
                 if not isinstance(raw_bindings, Sequence) or isinstance(raw_bindings, (str, bytes)):

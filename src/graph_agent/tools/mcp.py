@@ -22,6 +22,9 @@ MCP_PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_MCP_TRANSPORTS = {"stdio", "http"}
 USER_MCP_SOURCE = "user"
 BUILTIN_MCP_SOURCE = "builtin"
+MCP_CAPABILITY_TOOL = "tool"
+MCP_CAPABILITY_RESOURCE = "resource"
+MCP_CAPABILITY_PROMPT = "prompt"
 
 
 def _utc_now_iso() -> str:
@@ -51,6 +54,10 @@ def _merge_env(overrides: Mapping[str, str]) -> dict[str, str]:
 def _mcp_error(message: str, *, details: Mapping[str, Any] | None = None) -> RuntimeError:
     suffix = f" Details: {json.dumps(details, sort_keys=True)}" if details else ""
     return RuntimeError(f"MCP server error: {message}{suffix}")
+
+
+def canonical_mcp_tool_name(server_id: str, tool_name: str) -> str:
+    return f"{str(server_id).strip()}.{str(tool_name).strip()}"
 
 
 @dataclass(frozen=True)
@@ -244,6 +251,98 @@ class McpServerState:
         }
 
 
+@dataclass
+class McpCapabilityDefinition:
+    canonical_name: str
+    server_id: str
+    capability_type: str
+    name: str
+    description: str = ""
+    display_name: str = ""
+    input_schema: dict[str, Any] = field(default_factory=dict)
+    aliases: list[str] = field(default_factory=list)
+    enabled: bool = True
+    available: bool = True
+    availability_error: str = ""
+    schema_origin: str = "discovered"
+    schema_warning: str = ""
+    managed: bool = True
+
+    def __post_init__(self) -> None:
+        canonical_name = str(self.canonical_name).strip()
+        name = str(self.name).strip()
+        display_name = str(self.display_name or self.name).strip()
+        aliases = [str(alias).strip() for alias in self.aliases if str(alias).strip()]
+        normalized_aliases: list[str] = []
+        seen: set[str] = {canonical_name}
+        for alias in aliases:
+            if alias in seen:
+                continue
+            seen.add(alias)
+            normalized_aliases.append(alias)
+        self.canonical_name = canonical_name
+        self.name = name
+        self.display_name = display_name or name or canonical_name
+        self.aliases = normalized_aliases
+
+    @classmethod
+    def from_tool_definition(cls, tool: ToolDefinition) -> McpCapabilityDefinition:
+        return cls(
+            canonical_name=tool.canonical_name,
+            server_id=str(tool.server_id or ""),
+            capability_type=str(tool.capability_type or MCP_CAPABILITY_TOOL),
+            name=tool.display_name or tool.name,
+            description=tool.description,
+            display_name=tool.display_name or tool.name,
+            input_schema=dict(tool.input_schema),
+            aliases=list(tool.aliases),
+            enabled=tool.enabled,
+            available=tool.available,
+            availability_error=tool.availability_error,
+            schema_origin=tool.schema_origin,
+            schema_warning=tool.schema_warning,
+            managed=tool.managed,
+        )
+
+    def to_tool_definition(self, executor: Any) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.canonical_name,
+            canonical_name=self.canonical_name,
+            display_name=self.display_name,
+            aliases=list(self.aliases),
+            description=self.description,
+            input_schema=dict(self.input_schema),
+            executor=executor,
+            source_type="mcp",
+            capability_type=self.capability_type,
+            server_id=self.server_id,
+            enabled=self.enabled,
+            available=self.available,
+            availability_error=self.availability_error,
+            schema_origin=self.schema_origin,
+            schema_warning=self.schema_warning,
+            managed=self.managed,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "canonical_name": self.canonical_name,
+            "name": self.name,
+            "display_name": self.display_name,
+            "aliases": list(self.aliases),
+            "capability_type": self.capability_type,
+            "description": self.description,
+            "input_schema": dict(self.input_schema),
+            "server_id": self.server_id,
+            "enabled": self.enabled,
+            "available": self.available,
+            "availability_error": self.availability_error,
+            "schema_origin": self.schema_origin,
+            "schema_warning": self.schema_warning,
+            "managed": self.managed,
+        }
+
+
 class _BaseMcpSession(ABC):
     def __init__(self, definition: McpServerDefinition) -> None:
         self.definition = definition
@@ -304,6 +403,28 @@ class _BaseMcpSession(ABC):
                 }
             )
         return normalized
+
+    def discover_capabilities(self) -> list[McpCapabilityDefinition]:
+        capabilities: list[McpCapabilityDefinition] = []
+        for tool in self.list_tools():
+            raw_name = str(tool.get("name", "")).strip()
+            if not raw_name:
+                continue
+            capabilities.append(
+                McpCapabilityDefinition(
+                    canonical_name=canonical_mcp_tool_name(self.definition.server_id, raw_name),
+                    server_id=self.definition.server_id,
+                    capability_type=MCP_CAPABILITY_TOOL,
+                    name=raw_name,
+                    display_name=raw_name,
+                    description=str(tool.get("description", "")),
+                    input_schema=dict(tool.get("input_schema", {})),
+                    aliases=[raw_name],
+                    schema_origin="discovered",
+                    managed=True,
+                )
+            )
+        return capabilities
 
     def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> ToolResult:
         diagnostics_cursor = self._before_tool_call()
@@ -412,11 +533,11 @@ class _McpStdioSession(_BaseMcpSession):
             if process.poll() is None:
                 try:
                     self.request("shutdown", {})
-                except RuntimeError:
+                except (OSError, RuntimeError):
                     pass
                 try:
                     self.notify("exit", {})
-                except RuntimeError:
+                except (OSError, RuntimeError):
                     pass
                 try:
                     process.wait(timeout=3)
@@ -429,11 +550,20 @@ class _McpStdioSession(_BaseMcpSession):
             self._started = False
             self._process = None
             if process.stdin is not None:
-                process.stdin.close()
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
             if process.stdout is not None:
-                process.stdout.close()
+                try:
+                    process.stdout.close()
+                except OSError:
+                    pass
             if process.stderr is not None:
-                process.stderr.close()
+                try:
+                    process.stderr.close()
+                except OSError:
+                    pass
 
     def last_stderr(self) -> str:
         with self._stderr_lock:
@@ -602,6 +732,7 @@ class McpServerManager:
         self._definitions: dict[str, McpServerDefinition] = {}
         self._states: dict[str, McpServerState] = {}
         self._sessions: dict[str, _BaseMcpSession] = {}
+        self._capabilities: dict[str, McpCapabilityDefinition] = {}
         self._lock = Lock()
         self._state_path = state_path or Path(__file__).resolve().parents[3] / ".graph-agent" / "mcp_servers_state.json"
         persisted_state = self._load_store_payload()
@@ -618,6 +749,7 @@ class McpServerManager:
                 self._persisted_user_servers.append(McpServerDefinition.from_dict(payload, source=USER_MCP_SOURCE))
             except ValueError:
                 continue
+        self._bootstrap_capability_catalog()
 
     def load_user_servers(self) -> None:
         for definition in self._persisted_user_servers:
@@ -651,7 +783,7 @@ class McpServerManager:
             should_restart = server_id in self._sessions
             if should_restart:
                 self.stop_server(server_id, preserve_desired_running=True)
-            self._tool_registry.remove_server_tools(server_id)
+            self._remove_server_capabilities(server_id)
             self._definitions[server_id] = definition
             state = self._states[server_id]
             state.apply_definition(definition)
@@ -673,7 +805,7 @@ class McpServerManager:
                 raise ValueError(f"Built-in MCP server '{server_id}' cannot be deleted.")
         self.stop_server(server_id, preserve_desired_running=False)
         with self._lock:
-            self._tool_registry.remove_server_tools(server_id)
+            self._remove_server_capabilities(server_id)
             self._definitions.pop(server_id, None)
             self._states.pop(server_id, None)
             self._sessions.pop(server_id, None)
@@ -684,12 +816,12 @@ class McpServerManager:
         session = self._create_session(definition)
         try:
             session.start()
-            tools = session.list_tools()
+            tools = session.discover_capabilities()
             return {
                 "ok": True,
                 "server": definition.to_dict(),
-                "tool_names": [tool["name"] for tool in tools],
-                "tools": tools,
+                "tool_names": [tool.canonical_name for tool in tools],
+                "tools": [tool.to_dict() for tool in tools],
                 "message": f"Connected to MCP server '{definition.display_name}'.",
             }
         finally:
@@ -699,6 +831,7 @@ class McpServerManager:
         if tool.source_type != "mcp" or not tool.server_id:
             raise ValueError("MCP-managed tools must declare source_type='mcp' and a server_id.")
         self._tool_registry.register(tool)
+        self._sync_capability_catalog_for_server(tool.server_id)
         state = self._states.get(tool.server_id)
         if state is not None and tool.name not in state.tool_names:
             state.tool_names.append(tool.name)
@@ -729,7 +862,7 @@ class McpServerManager:
                 self._sessions[server_id] = session
             try:
                 session.start()
-                self._sync_server_tools(server_id, session.list_tools())
+                self._sync_server_capabilities(server_id, session.discover_capabilities())
                 state.running = True
                 state.pid = session.pid
                 state.error = ""
@@ -740,6 +873,7 @@ class McpServerManager:
                 state.pid = None
                 state.error = str(exc)
                 self._tool_registry.mark_server_tools_unavailable(server_id, str(exc))
+                self._sync_capability_catalog_for_server(server_id)
                 self._set_desired_running(server_id, False)
                 session.close()
                 self._sessions.pop(server_id, None)
@@ -759,6 +893,7 @@ class McpServerManager:
             state.pid = None
             state.error = ""
             self._tool_registry.mark_server_tools_unavailable(server_id, "MCP server is offline.")
+            self._sync_capability_catalog_for_server(server_id)
             if not preserve_desired_running:
                 self._set_desired_running(server_id, False)
             return state.to_dict()
@@ -771,7 +906,7 @@ class McpServerManager:
             if session is None:
                 raise RuntimeError(f"MCP server '{server_id}' is not running.")
             state = self._states[server_id]
-            self._sync_server_tools(server_id, session.list_tools())
+            self._sync_server_capabilities(server_id, session.discover_capabilities())
             state.running = True
             state.pid = session.pid
             state.error = ""
@@ -784,6 +919,8 @@ class McpServerManager:
 
     def set_tool_enabled(self, tool_name: str, enabled: bool) -> dict[str, Any]:
         tool = self._tool_registry.set_tool_enabled(tool_name, enabled)
+        if tool.server_id:
+            self._sync_capability_catalog_for_server(tool.server_id)
         return tool.to_dict()
 
     def _create_session(self, definition: McpServerDefinition) -> _BaseMcpSession:
@@ -793,39 +930,58 @@ class McpServerManager:
             return _McpHttpSession(definition)
         raise ValueError(f"Unsupported MCP transport '{definition.transport}'.")
 
-    def _sync_server_tools(self, server_id: str, discovered_tools: Sequence[Mapping[str, Any]]) -> None:
+    def list_capabilities(
+        self,
+        *,
+        capability_type: str | None = None,
+        server_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        capabilities = list(self._capabilities.values())
+        if capability_type is not None:
+            capabilities = [item for item in capabilities if item.capability_type == capability_type]
+        if server_id is not None:
+            capabilities = [item for item in capabilities if item.server_id == server_id]
+        return [item.to_dict() for item in sorted(capabilities, key=lambda item: item.canonical_name)]
+
+    def _sync_server_capabilities(
+        self,
+        server_id: str,
+        discovered_capabilities: Sequence[McpCapabilityDefinition],
+    ) -> None:
         discovered_names: set[str] = set()
-        for discovered in discovered_tools:
-            name = str(discovered.get("name", "")).strip()
-            if not name:
+        for discovered in discovered_capabilities:
+            canonical_name = discovered.canonical_name
+            if not canonical_name:
                 continue
-            discovered_names.add(name)
-            existing = self._tool_registry.get_optional(name)
+            discovered_names.add(canonical_name)
+            existing = self._tool_registry.get_optional(canonical_name)
             schema_warning = ""
             if existing is not None and (
-                dict(existing.input_schema) != dict(discovered.get("input_schema", {}))
-                or str(existing.description) != str(discovered.get("description", ""))
+                dict(existing.input_schema) != dict(discovered.input_schema)
+                or str(existing.description) != str(discovered.description)
             ):
                 schema_warning = "Live MCP schema differs from the preregistered tool metadata."
-            self._tool_registry.upsert(
-                ToolDefinition(
-                    name=name,
-                    description=str(discovered.get("description", "")),
-                    input_schema=dict(discovered.get("input_schema", {})),
-                    executor=self._executor_for(server_id, name),
-                    source_type="mcp",
-                    server_id=server_id,
-                    enabled=existing.enabled if existing is not None else True,
-                    available=True,
-                    availability_error="",
-                    schema_origin="discovered",
-                    schema_warning=schema_warning,
-                    managed=True,
-                )
+            capability = McpCapabilityDefinition(
+                canonical_name=canonical_name,
+                server_id=server_id,
+                capability_type=discovered.capability_type,
+                name=discovered.name,
+                display_name=discovered.display_name,
+                description=discovered.description,
+                input_schema=dict(discovered.input_schema),
+                aliases=list(existing.aliases) if existing is not None and existing.aliases else list(discovered.aliases),
+                enabled=existing.enabled if existing is not None else discovered.enabled,
+                available=True,
+                availability_error="",
+                schema_origin="discovered",
+                schema_warning=schema_warning,
+                managed=True,
             )
+            self._tool_registry.upsert(capability.to_tool_definition(self._executor_for(server_id, canonical_name)))
         for tool_name in self._tool_registry.list_server_tool_names(server_id):
             if tool_name not in discovered_names:
                 self._tool_registry.mark_tool_unavailable(tool_name, "Tool was not reported by the running MCP server.")
+        self._sync_capability_catalog_for_server(server_id)
 
     def _executor_for(self, server_id: str, tool_name: str):
         def _execute(payload: Mapping[str, Any], _context: ToolContext) -> ToolResult:
@@ -836,9 +992,31 @@ class McpServerManager:
                     error={"message": f"MCP server '{server_id}' is not running."},
                     summary=f"MCP tool '{tool_name}' is unavailable.",
                 )
-            return session.call_tool(tool_name, payload)
+            raw_tool_name = tool_name.removeprefix(f"{server_id}.")
+            return session.call_tool(raw_tool_name, payload)
 
         return _execute
+
+    def _bootstrap_capability_catalog(self) -> None:
+        for tool in self._tool_registry.list_definitions():
+            if tool.source_type != "mcp" or not tool.server_id:
+                continue
+            self._capabilities[tool.canonical_name] = McpCapabilityDefinition.from_tool_definition(tool)
+
+    def _remove_server_capabilities(self, server_id: str) -> None:
+        self._tool_registry.remove_server_tools(server_id)
+        for canonical_name in list(self._capabilities):
+            if self._capabilities[canonical_name].server_id == server_id:
+                self._capabilities.pop(canonical_name, None)
+
+    def _sync_capability_catalog_for_server(self, server_id: str) -> None:
+        for canonical_name in list(self._capabilities):
+            if self._capabilities[canonical_name].server_id == server_id:
+                self._capabilities.pop(canonical_name, None)
+        for tool in self._tool_registry.list_definitions():
+            if tool.source_type != "mcp" or tool.server_id != server_id:
+                continue
+            self._capabilities[tool.canonical_name] = McpCapabilityDefinition.from_tool_definition(tool)
 
     def _load_store_payload(self) -> dict[str, Any]:
         try:

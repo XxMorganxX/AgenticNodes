@@ -4,7 +4,7 @@ import { AgentRunSwimlanes } from "./components/AgentRunSwimlanes";
 import { EnvironmentRunSummary } from "./components/EnvironmentRunSummary";
 import { GraphCanvas } from "./components/GraphCanvas";
 import { GraphEnvEditor } from "./components/GraphEnvEditor";
-import { McpServerPanel } from "./components/McpServerPanel";
+import { McpServerModal } from "./components/McpServerModal";
 import { UserPreferencesModal } from "./components/UserPreferencesModal";
 import {
   bootMcpServer,
@@ -27,8 +27,10 @@ import {
   updateGraph,
 } from "./lib/api";
 import { createBlankGraph, layoutGraphDocument, layoutGraphLR, normalizeGraphDocument } from "./lib/editor";
+import type { GraphLayoutNodeDimensions } from "./lib/editor";
 import { filterEventsForAgent, getCanvasGraph, getDefaultAgentId, getSelectedRunId, getSelectedRunState, isTestEnvironment, updateSelectedAgentGraph } from "./lib/graphDocuments";
 import { clearAllPersistedRunSnapshots, clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
+import { isTerminalRuntimeEvent, normalizeRunState, normalizeRuntimeEvent } from "./lib/runtimeEvents";
 import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedRunProjection } from "./lib/runVisualization";
 import type { EditorCatalog, GraphDefinition, GraphDocument, McpServerDraft, McpServerStatus, RunState, RuntimeEvent, ToolDefinition } from "./lib/types";
 import { getUserPreferences, resetUserPreferences, saveUserPreferences } from "./lib/userPreferences";
@@ -37,6 +39,7 @@ import { useGraphHistory } from "./lib/useGraphHistory";
 
 const DEFAULT_INPUT = "Find graph-agent references for a schema repair workflow.";
 const DEFAULT_TEST_ENVIRONMENT_ID = "test-environment";
+const ENVIRONMENT_AGENT_SELECTION_STORAGE_KEY = "agentic-nodes-environment-agent-selection";
 
 function isTerminalRunStatus(status: string | null | undefined): boolean {
   return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
@@ -65,6 +68,46 @@ function getSelectedEnvironmentAgentIds(
     return [];
   }
   return graph.agents.filter((agent) => selection[agent.agent_id] !== false).map((agent) => agent.agent_id);
+}
+
+function loadPersistedEnvironmentAgentSelections(): Record<string, Record<string, boolean>> {
+  try {
+    const raw = localStorage.getItem(ENVIRONMENT_AGENT_SELECTION_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>).map(([graphId, selection]) => [
+        graphId,
+        Object.fromEntries(
+          Object.entries(selection && typeof selection === "object" && !Array.isArray(selection) ? selection : {}).map(([agentId, enabled]) => [
+            agentId,
+            enabled !== false,
+          ]),
+        ),
+      ]),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function loadEnvironmentAgentSelection(graphId: string): Record<string, boolean> {
+  return loadPersistedEnvironmentAgentSelections()[graphId] ?? {};
+}
+
+function saveEnvironmentAgentSelection(graphId: string, selection: Record<string, boolean>): void {
+  try {
+    const storedSelections = loadPersistedEnvironmentAgentSelections();
+    storedSelections[graphId] = selection;
+    localStorage.setItem(ENVIRONMENT_AGENT_SELECTION_STORAGE_KEY, JSON.stringify(storedSelections));
+  } catch {
+    // Ignore local persistence failures and keep the in-memory selection.
+  }
 }
 
 function createEmptyRunState(runId: string, graphId: string, input: string): RunState {
@@ -332,9 +375,10 @@ function mergeCatalogTool(catalog: EditorCatalog | null, toolDefinition: ToolDef
   if (!catalog) {
     return catalog;
   }
+  const nextToolName = toolDefinition.canonical_name ?? toolDefinition.name;
   return {
     ...catalog,
-    tools: catalog.tools.map((tool) => (tool.name === toolDefinition.name ? toolDefinition : tool)),
+    tools: catalog.tools.map((tool) => ((tool.canonical_name ?? tool.name) === nextToolName ? toolDefinition : tool)),
   };
 }
 
@@ -359,6 +403,7 @@ export default function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [isResettingRuntime, setIsResettingRuntime] = useState(false);
   const [mcpPendingKey, setMcpPendingKey] = useState<string | null>(null);
+  const [mcpPanelOpen, setMcpPanelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [userPreferences, setUserPreferences] = useState<UserPreferences>(() => getUserPreferences());
   const [userPreferencesOpen, setUserPreferencesOpen] = useState(false);
@@ -410,10 +455,11 @@ export default function App() {
   }, []);
 
   const applyFetchedRunState = useCallback((nextRunState: RunState) => {
-    setActiveRunId(nextRunState.run_id);
-    setRunState(nextRunState);
-    setEvents(nextRunState.event_history ?? []);
-    setIsRunning(!isTerminalRunStatus(nextRunState.status));
+    const normalizedRunState = normalizeRunState(nextRunState) as RunState;
+    setActiveRunId(normalizedRunState.run_id);
+    setRunState(normalizedRunState);
+    setEvents(normalizedRunState.event_history ?? []);
+    setIsRunning(!isTerminalRunStatus(normalizedRunState.status));
   }, []);
 
   const markRecoveredRunInterrupted = useCallback((
@@ -485,11 +531,11 @@ export default function App() {
     sourceRef.current = source;
 
     source.onmessage = (message) => {
-      const event = JSON.parse(message.data) as RuntimeEvent;
+      const event = normalizeRuntimeEvent(JSON.parse(message.data) as RuntimeEvent);
       setEvents((previous) => [...previous, event]);
       setRunState((previous) => applyEvent(previous, event, graphId, inputValue));
 
-      if (!event.agent_id && isTerminalRunStatus(event.event_type.replace(/^run\./, ""))) {
+      if (!event.agent_id && isTerminalRuntimeEvent(event)) {
         source.close();
         sourceRef.current = null;
         setIsRunning(false);
@@ -598,8 +644,21 @@ export default function App() {
   }, [resetHistory, restorePersistedRunSnapshot, selectedGraphId]);
 
   useEffect(() => {
-    setEnvironmentAgentSelection((current) => buildEnvironmentAgentSelection(draftGraph, current));
+    if (!isTestEnvironment(draftGraph) || !draftGraph.graph_id) {
+      setEnvironmentAgentSelection({});
+      return;
+    }
+    setEnvironmentAgentSelection(
+      buildEnvironmentAgentSelection(draftGraph, loadEnvironmentAgentSelection(draftGraph.graph_id)),
+    );
   }, [draftGraph]);
+
+  useEffect(() => {
+    if (!isTestEnvironment(draftGraph) || !draftGraph.graph_id) {
+      return;
+    }
+    saveEnvironmentAgentSelection(draftGraph.graph_id, buildEnvironmentAgentSelection(draftGraph, environmentAgentSelection));
+  }, [draftGraph, environmentAgentSelection]);
 
   useEffect(() => {
     setSelectedNodeId(null);
@@ -787,6 +846,7 @@ export default function App() {
     setActiveRunId(null);
     setEvents([]);
     setRunState(null);
+    setVisualizerResetVersion((current) => current + 1);
     setIsRunning(true);
     if (isTestEnvironment(savedGraph) && agentIdsToRun && agentIdsToRun.length > 0 && !agentIdsToRun.includes(selectedAgentId ?? "")) {
       setSelectedAgentId(agentIdsToRun[0] ?? null);
@@ -841,11 +901,11 @@ export default function App() {
     setDraftGraphQuiet(updateSelectedAgentGraph(draftGraph, selectedAgentId, nextGraph));
   }
 
-  function handleFormatGraph() {
+  function handleFormatGraph(nodeDimensions: Record<string, GraphLayoutNodeDimensions>) {
     if (!canvasGraph) {
       return;
     }
-    handleCanvasGraphChange(layoutGraphLR(canvasGraph));
+    handleCanvasGraphChange(layoutGraphLR(canvasGraph, { nodeDimensions }));
   }
 
   function handleUpdateUserPreferences(nextPreferences: UserPreferences) {
@@ -1006,44 +1066,6 @@ export default function App() {
               <h2>Environment</h2>
               <GraphEnvEditor graph={draftGraph} onGraphChange={setDraftGraph} />
             </div>
-
-            <div className="mosaic-tile panel mosaic-mcp">
-              <McpServerPanel
-                catalog={catalog}
-                onBootMcpServer={(serverId) =>
-                  void runMcpAction(`boot:${serverId}`, () => bootMcpServer(serverId), (serverStatus) => {
-                    setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
-                  })
-                }
-                onStopMcpServer={(serverId) =>
-                  void runMcpAction(`stop:${serverId}`, () => stopMcpServer(serverId), (serverStatus) => {
-                    setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
-                  })
-                }
-                onRefreshMcpServer={(serverId) =>
-                  void runMcpAction(`refresh:${serverId}`, () => refreshMcpServer(serverId), (serverStatus) => {
-                    setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
-                  })
-                }
-                onToggleMcpTool={(toolName, enabled) =>
-                  void runMcpAction(`tool:${toolName}`, () => setMcpToolEnabled(toolName, enabled), (toolDefinition) => {
-                    setCatalog((current) => mergeCatalogTool(current, toolDefinition));
-                  })
-                }
-                onCreateMcpServer={(server: McpServerDraft) => runMcpAction(`create:${server.server_id}`, () => createMcpServer(server))}
-                onUpdateMcpServer={(serverId: string, server: McpServerDraft) =>
-                  runMcpAction(`update:${serverId}`, () => updateMcpServer(serverId, server))
-                }
-                onDeleteMcpServer={(serverId: string) => runMcpAction(`delete:${serverId}`, () => deleteMcpServer(serverId))}
-                onTestMcpServer={async (server: McpServerDraft) => {
-                  const result = await runMcpAction(`test:${server.server_id || "draft"}`, () => testMcpServer(server));
-                  return result?.message ?? null;
-                }}
-                mcpPendingKey={mcpPendingKey}
-                title="Project MCP"
-                description="Manage project-level MCP servers. Tool and model nodes can consume these tools, but they do not own the server lifecycle."
-              />
-            </div>
           </div>
         </div>
 
@@ -1079,6 +1101,8 @@ export default function App() {
           onFormatGraph={handleFormatGraph}
           onRunGraph={() => void handleRun()}
           onScrollToTop={scrollToExecutionBox}
+          isMcpPanelOpen={mcpPanelOpen}
+          onToggleMcpPanel={() => setMcpPanelOpen((current) => !current)}
           backgroundDragSensitivity={userPreferences.backgroundDragSensitivityPercent / 100}
           onSelectionChange={(nodeId, edgeId) => {
             setSelectedNodeId(nodeId);
@@ -1106,6 +1130,44 @@ export default function App() {
           onUpdatePreferences={handleUpdateUserPreferences}
           onResetPreferences={handleResetUserPreferences}
           onClose={() => setUserPreferencesOpen(false)}
+        />
+      ) : null}
+      {mcpPanelOpen ? (
+        <McpServerModal
+          catalog={catalog}
+          onBootMcpServer={(serverId) =>
+            void runMcpAction(`boot:${serverId}`, () => bootMcpServer(serverId), (serverStatus) => {
+              setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
+            })
+          }
+          onStopMcpServer={(serverId) =>
+            void runMcpAction(`stop:${serverId}`, () => stopMcpServer(serverId), (serverStatus) => {
+              setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
+            })
+          }
+          onRefreshMcpServer={(serverId) =>
+            void runMcpAction(`refresh:${serverId}`, () => refreshMcpServer(serverId), (serverStatus) => {
+              setCatalog((current) => mergeCatalogServerStatus(current, serverStatus));
+            })
+          }
+          onToggleMcpTool={(toolName, enabled) =>
+            void runMcpAction(`tool:${toolName}`, () => setMcpToolEnabled(toolName, enabled), (toolDefinition) => {
+              setCatalog((current) => mergeCatalogTool(current, toolDefinition));
+            })
+          }
+          onCreateMcpServer={(server: McpServerDraft) => runMcpAction(`create:${server.server_id}`, () => createMcpServer(server))}
+          onUpdateMcpServer={(serverId: string, server: McpServerDraft) =>
+            runMcpAction(`update:${serverId}`, () => updateMcpServer(serverId, server))
+          }
+          onDeleteMcpServer={(serverId: string) => runMcpAction(`delete:${serverId}`, () => deleteMcpServer(serverId))}
+          onTestMcpServer={async (server: McpServerDraft) => {
+            const result = await runMcpAction(`test:${server.server_id || "draft"}`, () => testMcpServer(server));
+            return result?.message ?? null;
+          }}
+          mcpPendingKey={mcpPendingKey}
+          title="Project MCP"
+          description="Manage project-level MCP servers. Tool and model nodes can consume these tools, but they do not own the server lifecycle."
+          onClose={() => setMcpPanelOpen(false)}
         />
       ) : null}
     </main>

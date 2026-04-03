@@ -17,7 +17,13 @@ if str(SRC) not in sys.path:
 from graph_agent.api.graph_store import GraphStore
 from graph_agent.api.manager import GraphRunManager
 from graph_agent.examples.tool_schema_repair import build_example_graph_payload, build_example_services
-from graph_agent.providers.discord import DiscordMessageEvent, normalize_discord_message_payload
+from graph_agent.providers.discord import (
+    DiscordDeliveryResult,
+    DiscordMessageEvent,
+    normalize_discord_message_payload,
+)
+from graph_agent.runtime.core import GraphDefinition
+from graph_agent.runtime.engine import GraphRuntime
 
 
 class FakeDiscordService:
@@ -31,6 +37,30 @@ class FakeDiscordService:
 
     def stop(self) -> None:
         self.stop_calls += 1
+
+
+class FakeDiscordMessageSender:
+    def __init__(self, *, should_fail: bool = False) -> None:
+        self.should_fail = should_fail
+        self.sent_messages: list[dict[str, str]] = []
+
+    def send_message(self, *, token: str, channel_id: str, content: str) -> DiscordDeliveryResult:
+        if self.should_fail:
+            raise RuntimeError("Discord send failed.")
+        self.sent_messages.append(
+            {
+                "token": token,
+                "channel_id": channel_id,
+                "content": content,
+            }
+        )
+        return DiscordDeliveryResult(
+            channel_id=channel_id,
+            message_id=f"message-{len(self.sent_messages)}",
+            content=content,
+            timestamp="2026-04-02T12:00:00+00:00",
+            raw_response={"ok": True},
+        )
 
 
 def build_isolated_store(services) -> tuple[GraphStore, tempfile.TemporaryDirectory[str]]:
@@ -116,6 +146,84 @@ def build_discord_message(*, author_is_bot: bool = False, author_is_self: bool =
     )
 
 
+def build_discord_end_graph_payload(*, include_core_output: bool = True) -> dict[str, object]:
+    nodes: list[dict[str, object]] = [
+        {
+            "id": "start",
+            "kind": "input",
+            "category": "start",
+            "label": "Run Button Start",
+            "provider_id": "start.manual_run",
+            "provider_label": "Run Button Start",
+            "description": "",
+            "position": {"x": 0, "y": 0},
+            "config": {"input_binding": {"type": "input_payload"}},
+        },
+        {
+            "id": "discord_finish",
+            "kind": "output",
+            "category": "end",
+            "label": "Discord End",
+            "provider_id": "end.discord_message",
+            "provider_label": "Discord Message End",
+            "description": "",
+            "position": {"x": 280, "y": 120},
+            "config": {
+                "discord_bot_token_env_var": "{DISCORD_BOT_TOKEN}",
+                "discord_channel_id": "channel-456",
+                "message_template": "Discord says: {message_payload}",
+            },
+        },
+    ]
+    edges: list[dict[str, object]] = [
+        {
+            "id": "edge-start-discord",
+            "source_id": "start",
+            "target_id": "discord_finish",
+            "label": "send-discord",
+            "kind": "standard",
+            "priority": 100,
+            "condition": None,
+        }
+    ]
+    if include_core_output:
+        nodes.append(
+            {
+                "id": "finish",
+                "kind": "output",
+                "category": "end",
+                "label": "Finish",
+                "provider_id": "core.output",
+                "provider_label": "Core Output Node",
+                "description": "",
+                "position": {"x": 280, "y": -80},
+                "config": {},
+            }
+        )
+        edges.insert(
+            0,
+            {
+                "id": "edge-start-finish",
+                "source_id": "start",
+                "target_id": "finish",
+                "label": "complete",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            },
+        )
+    return {
+        "graph_id": "discord-end-agent",
+        "name": "Discord End Agent",
+        "description": "",
+        "version": "1.0",
+        "start_node_id": "start",
+        "env_vars": {"DISCORD_BOT_TOKEN": "DISCORD_BOT_TOKEN"},
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
 def wait_for_run_completion(manager: GraphRunManager, run_id: str, timeout_seconds: float = 5.0) -> dict[str, object]:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
@@ -134,6 +242,7 @@ class DiscordTriggerTests(unittest.TestCase):
         provider_ids = {provider.provider_id for provider in self.services.node_provider_registry.list_definitions()}
         self.assertIn("start.manual_run", provider_ids)
         self.assertIn("start.discord_message", provider_ids)
+        self.assertIn("end.discord_message", provider_ids)
 
     def test_normalize_discord_message_payload_shape(self) -> None:
         payload = normalize_discord_message_payload(build_discord_message())
@@ -193,6 +302,52 @@ class DiscordTriggerTests(unittest.TestCase):
             manager.start_background_services()
 
         self.assertEqual(fake_service.started_tokens, ["discord-token"])
+
+    def test_discord_end_runs_alongside_core_output_without_overwriting_final_output(self) -> None:
+        fake_sender = FakeDiscordMessageSender()
+        self.services.discord_message_sender = fake_sender
+        graph = GraphDefinition.from_dict(build_discord_end_graph_payload(include_core_output=True))
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        with patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "discord-token"}, clear=False):
+            state = runtime.run(graph, "Ship the result to Discord too.")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output, "Ship the result to Discord too.")
+        self.assertEqual(len(fake_sender.sent_messages), 1)
+        self.assertEqual(fake_sender.sent_messages[0]["channel_id"], "channel-456")
+        self.assertEqual(fake_sender.sent_messages[0]["content"], "Discord says: Ship the result to Discord too.")
+        self.assertEqual(state.node_outputs["finish"], "Ship the result to Discord too.")
+        self.assertEqual(state.node_outputs["discord_finish"]["delivery_status"], "sent")
+        self.assertEqual(state.node_outputs["discord_finish"]["source_payload"], "Ship the result to Discord too.")
+        self.assertEqual(state.event_history[-1].event_type, "run.completed")
+
+    def test_discord_end_failure_fails_the_run(self) -> None:
+        self.services.discord_message_sender = FakeDiscordMessageSender(should_fail=True)
+        graph = GraphDefinition.from_dict(build_discord_end_graph_payload(include_core_output=False))
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        with patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "discord-token"}, clear=False):
+            state = runtime.run(graph, "This run should fail.")
+
+        self.assertEqual(state.status, "failed")
+        self.assertIsNotNone(state.terminal_error)
+        assert state.terminal_error is not None
+        self.assertEqual(state.terminal_error["type"], "node_exception")
+        self.assertEqual(state.terminal_error["node_id"], "discord_finish")
+        self.assertEqual(state.terminal_error["message"], "Discord send failed.")
 
 
 if __name__ == "__main__":

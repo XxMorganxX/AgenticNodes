@@ -9,6 +9,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from graph_agent.api.run_state_reducer import build_run_state, replay_events
+from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
 from graph_agent.runtime.core import utc_now_iso
 
 
@@ -96,6 +97,7 @@ class SupabaseRunStore:
             self._sequence_cache.setdefault(run_id, 0)
 
     def append_event(self, run_id: str, event: dict[str, Any]) -> None:
+        event = normalize_runtime_event_dict(event)
         sequence_number = self._next_sequence_number(run_id)
         row = {
             "run_id": run_id,
@@ -110,25 +112,26 @@ class SupabaseRunStore:
         self._request_json("POST", self._table_path(self.events_table), payload=[row], prefer="return=minimal")
 
     def write_state(self, run_id: str, state: dict[str, Any]) -> None:
+        normalized_state = normalize_runtime_state_snapshot(state) or state
         row = {
             "run_id": run_id,
-            "graph_id": state.get("graph_id"),
-            "agent_id": state.get("agent_id"),
-            "agent_name": state.get("agent_name"),
-            "parent_run_id": state.get("parent_run_id"),
-            "status": state.get("status"),
-            "status_reason": state.get("status_reason"),
-            "started_at": state.get("started_at"),
-            "ended_at": state.get("ended_at"),
-            "runtime_instance_id": state.get("runtime_instance_id"),
-            "last_heartbeat_at": state.get("last_heartbeat_at"),
-            "input_payload": state.get("input_payload"),
-            "final_output": state.get("final_output"),
-            "terminal_error": state.get("terminal_error"),
-            "current_node_id": state.get("current_node_id"),
-            "current_edge_id": state.get("current_edge_id"),
-            "state_snapshot": state,
-            "created_at": state.get("started_at") or utc_now_iso(),
+            "graph_id": normalized_state.get("graph_id"),
+            "agent_id": normalized_state.get("agent_id"),
+            "agent_name": normalized_state.get("agent_name"),
+            "parent_run_id": normalized_state.get("parent_run_id"),
+            "status": normalized_state.get("status"),
+            "status_reason": normalized_state.get("status_reason"),
+            "started_at": normalized_state.get("started_at"),
+            "ended_at": normalized_state.get("ended_at"),
+            "runtime_instance_id": normalized_state.get("runtime_instance_id"),
+            "last_heartbeat_at": normalized_state.get("last_heartbeat_at"),
+            "input_payload": normalized_state.get("input_payload"),
+            "final_output": normalized_state.get("final_output"),
+            "terminal_error": normalized_state.get("terminal_error"),
+            "current_node_id": normalized_state.get("current_node_id"),
+            "current_edge_id": normalized_state.get("current_edge_id"),
+            "state_snapshot": normalized_state,
+            "created_at": normalized_state.get("started_at") or utc_now_iso(),
         }
         self._upsert_runs([row])
 
@@ -157,7 +160,7 @@ class SupabaseRunStore:
             },
         )
         return [
-            {
+            normalize_runtime_event_dict({
                 "run_id": row.get("run_id"),
                 "event_type": row.get("event_type"),
                 "timestamp": row.get("timestamp"),
@@ -165,7 +168,7 @@ class SupabaseRunStore:
                 "parent_run_id": row.get("parent_run_id"),
                 "summary": row.get("summary"),
                 "payload": row.get("payload", {}),
-            }
+            })
             for row in rows
         ]
 
@@ -174,7 +177,7 @@ class SupabaseRunStore:
         if row is None:
             return None
         snapshot = row.get("state_snapshot")
-        return snapshot if isinstance(snapshot, dict) else None
+        return normalize_runtime_state_snapshot(snapshot if isinstance(snapshot, dict) else None)
 
     def recover_run_state(self, run_id: str) -> dict[str, Any] | None:
         manifest = self.load_manifest(run_id) or {}

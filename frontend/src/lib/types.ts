@@ -108,9 +108,13 @@ export type NodeProviderDefinition = {
 
 export type ToolDefinition = {
   name: string;
+  canonical_name?: string;
+  display_name?: string;
+  aliases?: string[];
   description: string;
   input_schema: Record<string, unknown>;
   source_type?: string;
+  capability_type?: string;
   server_id?: string | null;
   enabled?: boolean;
   available?: boolean;
@@ -211,6 +215,7 @@ export type ProviderDiagnosticsResult = {
 };
 
 export type RuntimeEvent = {
+  schema_version: string;
   event_type: string;
   summary: string;
   payload: Record<string, unknown>;

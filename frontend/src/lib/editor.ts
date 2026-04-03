@@ -5,6 +5,15 @@ import { isTestEnvironment } from "./graphDocuments";
 import type { SavedNode } from "./savedNodes";
 import type { AgentDefinition, EditorCatalog, GraphDefinition, GraphDocument, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition } from "./types";
 
+export type GraphLayoutNodeDimensions = {
+  width: number;
+  height: number;
+};
+
+type GraphLayoutOptions = {
+  nodeDimensions?: Record<string, GraphLayoutNodeDimensions>;
+};
+
 function slugify(value: string): string {
   return value
     .toLowerCase()
@@ -106,6 +115,21 @@ function defaultStartConfig(provider: NodeProviderDefinition): GraphNode["config
   return {
     trigger_mode: "manual_run",
     input_binding: { type: "input_payload" },
+  };
+}
+
+function defaultEndConfig(provider: NodeProviderDefinition): GraphNode["config"] {
+  const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
+  if (provider.provider_id === "end.discord_message") {
+    return {
+      discord_bot_token_env_var: "{DISCORD_BOT_TOKEN}",
+      discord_channel_id: "",
+      message_template: "{message_payload}",
+      ...defaultConfig,
+    };
+  }
+  return {
+    ...defaultConfig,
   };
 }
 
@@ -262,6 +286,13 @@ export function createNodeFromProvider(
       ...baseNode,
       model_provider_name: providerName,
       config: providerDefaultConfig(provider),
+    };
+  }
+
+  if (provider.node_kind === "output") {
+    return {
+      ...baseNode,
+      config: defaultEndConfig(provider),
     };
   }
 
@@ -712,12 +743,24 @@ export function canConnectNodes(
 const NODE_WIDTH = 320;
 const NODE_HEIGHT = 178;
 const MCP_TOOL_EXECUTOR_NODE_HEIGHT = 244;
-const AUTO_LAYOUT_VERTICAL_GAP = NODE_HEIGHT + 120;
+const AUTO_LAYOUT_VERTICAL_GAP = 120;
 const AUTO_LAYOUT_DEPTH_SPREAD_MULTIPLIER = 8;  // ADD to user prefernce config
 const AUTO_LAYOUT_COLUMN_TOLERANCE = 120;
 
-function getNodeHeight(node: GraphNode): number {
-  return node.kind === "mcp_tool_executor" ? MCP_TOOL_EXECUTOR_NODE_HEIGHT : NODE_HEIGHT;
+function getFallbackNodeDimensions(node: GraphNode): GraphLayoutNodeDimensions {
+  return {
+    width: NODE_WIDTH,
+    height: node.kind === "mcp_tool_executor" ? MCP_TOOL_EXECUTOR_NODE_HEIGHT : NODE_HEIGHT,
+  };
+}
+
+function getLayoutNodeDimensions(node: GraphNode, options?: GraphLayoutOptions): GraphLayoutNodeDimensions {
+  const fallback = getFallbackNodeDimensions(node);
+  const measured = options?.nodeDimensions?.[node.id];
+  return {
+    width: typeof measured?.width === "number" && measured.width > 0 ? measured.width : fallback.width,
+    height: typeof measured?.height === "number" && measured.height > 0 ? measured.height : fallback.height,
+  };
 }
 
 function getNodeTargetAnchorRatio(node: GraphNode, targetHandleId: string | null | undefined): number {
@@ -777,7 +820,7 @@ function compareOrderedNodes(
   return left.nodeId.localeCompare(right.nodeId);
 }
 
-export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
+export function layoutGraphLR(graph: GraphDefinition, options: GraphLayoutOptions = {}): GraphDefinition {
   if (graph.nodes.length === 0) {
     return graph;
   }
@@ -787,7 +830,8 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
   g.setDefaultEdgeLabel(() => ({}));
 
   for (const node of graph.nodes) {
-    g.setNode(node.id, { width: NODE_WIDTH, height: getNodeHeight(node) });
+    const dimensions = getLayoutNodeDimensions(node, options);
+    g.setNode(node.id, { width: dimensions.width, height: dimensions.height });
   }
   for (const edge of graph.edges) {
     g.setEdge(edge.source_id, edge.target_id);
@@ -822,22 +866,35 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
     centerMap.set(id, { x: info.x, y: info.y });
   });
 
-  const allCenterYs = [...centerMap.values()].map((center) => center.y);
-  const graphMinCenterY = Math.min(...allCenterYs);
-  const graphMaxCenterY = Math.max(...allCenterYs);
-  const graphCenterY = average(allCenterYs);
+  const nodeVerticalBounds = [...centerMap.entries()]
+    .map(([id, center]) => {
+      const node = nodeMap.get(id);
+      if (!node) {
+        return null;
+      }
+      const dimensions = getLayoutNodeDimensions(node, options);
+      return {
+        top: center.y - dimensions.height / 2,
+        bottom: center.y + dimensions.height / 2,
+      };
+    })
+    .filter((bounds): bounds is { top: number; bottom: number } => bounds !== null);
+  const graphMinY = Math.min(...nodeVerticalBounds.map((bounds) => bounds.top));
+  const graphMaxY = Math.max(...nodeVerticalBounds.map((bounds) => bounds.bottom));
+  const graphCenterY = (graphMinY + graphMaxY) / 2;
   const columns = groupNodeIdsByColumn(centerMap);
   const layoutColumns = columns.slice(1);
 
-  function desiredCenterYForNode(nodeId: string): { nodeId: string; currentY: number; desiredY: number } | null {
+  function desiredCenterYForNode(nodeId: string): { nodeId: string; currentY: number; desiredY: number; height: number } | null {
     const node = nodeMap.get(nodeId);
     const center = centerMap.get(nodeId);
     if (!node || !center) {
       return null;
     }
 
+    const nodeDimensions = getLayoutNodeDimensions(node, options);
     const anchorTargets: number[] = [];
-    const targetOffset = (getNodeTargetAnchorRatio(node, null) - 0.5) * getNodeHeight(node);
+    const targetOffset = (getNodeTargetAnchorRatio(node, null) - 0.5) * nodeDimensions.height;
 
     (incomingEdgesByTarget.get(nodeId) ?? []).forEach((edge) => {
       const sourceNode = nodeMap.get(edge.source_id);
@@ -846,9 +903,10 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
         return;
       }
       const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
-      const sourceOffset = (getNodeSourceAnchorRatio(sourceNode, sourceHandleId) - 0.5) * getNodeHeight(sourceNode);
+      const sourceDimensions = getLayoutNodeDimensions(sourceNode, options);
+      const sourceOffset = (getNodeSourceAnchorRatio(sourceNode, sourceHandleId) - 0.5) * sourceDimensions.height;
       const edgeTargetOffset =
-        (getNodeTargetAnchorRatio(node, edge.target_handle_id ?? null) - 0.5) * getNodeHeight(node);
+        (getNodeTargetAnchorRatio(node, edge.target_handle_id ?? null) - 0.5) * nodeDimensions.height;
       anchorTargets.push(sourceCenter.y + sourceOffset - edgeTargetOffset);
     });
 
@@ -859,14 +917,15 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
         return;
       }
       const sourceHandleId = inferToolEdgeSourceHandle(edge, node);
-      const sourceOffset = (getNodeSourceAnchorRatio(node, sourceHandleId) - 0.5) * getNodeHeight(node);
+      const targetDimensions = getLayoutNodeDimensions(targetNode, options);
+      const sourceOffset = (getNodeSourceAnchorRatio(node, sourceHandleId) - 0.5) * nodeDimensions.height;
       const edgeTargetOffset =
-        (getNodeTargetAnchorRatio(targetNode, edge.target_handle_id ?? null) - 0.5) * getNodeHeight(targetNode);
+        (getNodeTargetAnchorRatio(targetNode, edge.target_handle_id ?? null) - 0.5) * targetDimensions.height;
       anchorTargets.push(targetCenter.y + edgeTargetOffset - sourceOffset);
     });
 
     const desiredY = anchorTargets.length > 0 ? average(anchorTargets) * 0.9 + center.y * 0.1 : center.y + targetOffset * 0;
-    return { nodeId, currentY: center.y, desiredY };
+    return { nodeId, currentY: center.y, desiredY, height: nodeDimensions.height };
   }
 
   function placeColumn(nodeIds: string[]): void {
@@ -875,7 +934,7 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
     }
 
     const orderedNodes = nodeIds.map((nodeId) => desiredCenterYForNode(nodeId)).filter(
-      (entry): entry is { nodeId: string; currentY: number; desiredY: number } => entry !== null,
+      (entry): entry is { nodeId: string; currentY: number; desiredY: number; height: number } => entry !== null,
     );
     orderedNodes.sort(compareOrderedNodes);
 
@@ -883,20 +942,37 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
       return;
     }
 
+    const totalNodeHeight = orderedNodes.reduce((sum, entry) => sum + entry.height, 0);
     const minimumSpan =
-      AUTO_LAYOUT_VERTICAL_GAP * AUTO_LAYOUT_DEPTH_SPREAD_MULTIPLIER * Math.max(1, orderedNodes.length - 1);
-    const preferredSpan = Math.max(graphMaxCenterY - graphMinCenterY, minimumSpan);
+      totalNodeHeight + AUTO_LAYOUT_VERTICAL_GAP * AUTO_LAYOUT_DEPTH_SPREAD_MULTIPLIER * Math.max(0, orderedNodes.length - 1);
+    const preferredSpan = Math.max(graphMaxY - graphMinY, minimumSpan);
     const columnCenterY = average(orderedNodes.map((entry) => entry.desiredY)) * 0.9 + graphCenterY * 0.1;
-    const topY = columnCenterY - preferredSpan / 2;
+    const interNodeSpan = orderedNodes.slice(1).reduce((sum, entry, index) => {
+      const previous = orderedNodes[index];
+      return sum + (previous.height + entry.height) / 2;
+    }, 0);
+    const requiredSpan =
+      (orderedNodes[0]?.height ?? 0) / 2 +
+      (orderedNodes[orderedNodes.length - 1]?.height ?? 0) / 2 +
+      interNodeSpan +
+      AUTO_LAYOUT_VERTICAL_GAP * Math.max(0, orderedNodes.length - 1);
+    const span = Math.max(preferredSpan, requiredSpan);
+    const topY = columnCenterY - span / 2;
+    const extraGap =
+      orderedNodes.length > 1 ? (span - requiredSpan) / (orderedNodes.length - 1) : 0;
+    let nextCenterY = topY + orderedNodes[0].height / 2;
     orderedNodes.forEach((entry, index) => {
       const current = centerMap.get(entry.nodeId);
       if (!current) {
         return;
       }
-      const slotRatio = normalizedDepthSlot(index, orderedNodes.length);
+      if (index > 0) {
+        const previous = orderedNodes[index - 1];
+        nextCenterY += (previous.height + entry.height) / 2 + AUTO_LAYOUT_VERTICAL_GAP + extraGap;
+      }
       centerMap.set(entry.nodeId, {
         x: current.x,
-        y: topY + preferredSpan * slotRatio,
+        y: nextCenterY,
       });
     });
   }
@@ -909,9 +985,10 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
   const positionMap = new Map<string, GraphPosition>();
   centerMap.forEach((center, id) => {
     const node = nodeMap.get(id);
+    const dimensions = node ? getLayoutNodeDimensions(node, options) : { width: NODE_WIDTH, height: NODE_HEIGHT };
     positionMap.set(id, {
-      x: center.x - NODE_WIDTH / 2,
-      y: center.y - (node ? getNodeHeight(node) : NODE_HEIGHT) / 2,
+      x: center.x - dimensions.width / 2,
+      y: center.y - dimensions.height / 2,
     });
   });
 
@@ -924,9 +1001,9 @@ export function layoutGraphLR(graph: GraphDefinition): GraphDefinition {
   };
 }
 
-export function layoutGraphDocument(graph: GraphDocument): GraphDocument {
+export function layoutGraphDocument(graph: GraphDocument, options: GraphLayoutOptions = {}): GraphDocument {
   if (!isTestEnvironment(graph)) {
-    return layoutGraphLR(graph);
+    return layoutGraphLR(graph, options);
   }
   return {
     ...graph,
@@ -941,7 +1018,7 @@ export function layoutGraphDocument(graph: GraphDocument): GraphDocument {
         env_vars: agent.env_vars,
         nodes: agent.nodes,
         edges: agent.edges,
-      });
+      }, options);
       return {
         ...agent,
         start_node_id: laidOutGraph.start_node_id,

@@ -338,11 +338,25 @@ class GraphRuntime:
             remaining_outgoing = [
                 edge for edge in outgoing if edge.source_handle_id != MCP_TERMINAL_OUTPUT_HANDLE_ID
             ]
-            selected_edges = self._select_matching_edges(state, node_id, remaining_outgoing, result)
+            selected_edges = self._select_matching_edges(
+                state,
+                node_id,
+                remaining_outgoing,
+                result,
+                allow_parallel=self._should_fan_out_to_multiple_end_nodes(graph, remaining_outgoing),
+            )
             route_result = self._route_result(result, MCP_TERMINAL_OUTPUT_HANDLE_ID)
             if route_result is not None:
                 handle_edges = [edge for edge in outgoing if edge.source_handle_id == MCP_TERMINAL_OUTPUT_HANDLE_ID]
-                selected_edges.extend(self._select_matching_edges(state, node_id, handle_edges, route_result))
+                selected_edges.extend(
+                    self._select_matching_edges(
+                        state,
+                        node_id,
+                        handle_edges,
+                        route_result,
+                        allow_parallel=self._should_fan_out_to_multiple_end_nodes(graph, handle_edges),
+                    )
+                )
             return selected_edges
         has_explicit_api_outputs = source_node.kind == "model" and any(
             edge.source_handle_id in {API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID} for edge in outgoing
@@ -366,7 +380,13 @@ class GraphRuntime:
             if selected_edges:
                 return selected_edges
             outgoing = [edge for edge in outgoing if edge.source_handle_id not in {API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID}]
-        return self._select_matching_edges(state, node_id, outgoing, result)
+        return self._select_matching_edges(
+            state,
+            node_id,
+            outgoing,
+            result,
+            allow_parallel=self._should_fan_out_to_multiple_end_nodes(graph, outgoing),
+        )
 
     def select_edge(
         self,
@@ -387,6 +407,8 @@ class GraphRuntime:
     ) -> bool:
         if result.output is None:
             return False
+        if result.metadata.get("skip_final_output_promotion") is True:
+            return False
         current_edge_id = state.current_edge_id
         if not current_edge_id:
             return True
@@ -403,6 +425,16 @@ class GraphRuntime:
                     metadata.get("should_call_tools") is True or metadata.get("need_tool") is True
                 ):
                     return state.final_output is None
+        return True
+
+    def _should_fan_out_to_multiple_end_nodes(self, graph: GraphDefinition, outgoing: list[Edge]) -> bool:
+        standard_edges = [edge for edge in outgoing if edge.kind == "standard"]
+        if len(standard_edges) < 2:
+            return False
+        for edge in standard_edges:
+            target = graph.nodes.get(edge.target_id)
+            if target is None or target.kind != "output":
+                return False
         return True
 
     def _select_matching_edges(

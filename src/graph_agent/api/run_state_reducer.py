@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 from uuid import uuid4
 
+from graph_agent.runtime.event_contract import normalize_runtime_event_dict
+
 
 _MISSING = object()
 
@@ -79,6 +81,7 @@ def _resolve_edge_output_from_event_history(
 
 
 def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    event = normalize_runtime_event_dict(event)
     next_state = {
         **previous,
         "event_history": [*previous.get("event_history", []), event],
@@ -187,6 +190,7 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
 
 
 def apply_event(previous: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    event = normalize_runtime_event_dict(event)
     event_type = str(event.get("event_type") or "")
     if not event_type.startswith("agent."):
         return apply_single_run_event(previous, event)
@@ -224,5 +228,5 @@ def apply_event(previous: dict[str, Any], event: dict[str, Any]) -> dict[str, An
 def replay_events(initial_state: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]:
     state = initial_state
     for event in events:
-        state = apply_event(state, event)
+        state = apply_event(state, normalize_runtime_event_dict(event))
     return state

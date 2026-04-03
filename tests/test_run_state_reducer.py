@@ -10,6 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from graph_agent.api.run_state_reducer import apply_event, apply_single_run_event, build_run_state
+from graph_agent.runtime.event_contract import RUNTIME_EVENT_SCHEMA_VERSION
 
 
 def _event(
@@ -21,6 +22,7 @@ def _event(
     timestamp: str = "2026-04-02T00:00:00Z",
 ) -> dict[str, object]:
     return {
+        "schema_version": RUNTIME_EVENT_SCHEMA_VERSION,
         "event_type": event_type,
         "summary": event_type,
         "payload": payload or {},
@@ -81,6 +83,7 @@ class RunStateReducerTests(unittest.TestCase):
         self.assertIsNone(state["current_node_id"])
         self.assertIsNone(state["current_edge_id"])
         self.assertEqual(state["final_output"], {"answer": "done"})
+        self.assertTrue(all(event["schema_version"] == RUNTIME_EVENT_SCHEMA_VERSION for event in state["event_history"]))
 
     def test_single_run_reducer_tracks_failure_and_cancellation(self) -> None:
         failed_state = build_run_state("run-failed", "graph-1", None)
@@ -186,6 +189,24 @@ class RunStateReducerTests(unittest.TestCase):
         self.assertEqual(child_state["current_node_id"], None)
         self.assertEqual(child_state["node_inputs"]["node-a"], "hello")
         self.assertEqual(len(state["event_history"]), 3)
+        self.assertTrue(all(event["schema_version"] == RUNTIME_EVENT_SCHEMA_VERSION for event in child_state["event_history"]))
+
+    def test_legacy_events_upgrade_to_runtime_v1_during_reduction(self) -> None:
+        state = build_run_state("legacy-run", "graph-1", None)
+        legacy_event = {
+            "event_type": "run.started",
+            "summary": "started",
+            "payload": {},
+            "run_id": "legacy-run",
+            "timestamp": "2026-04-02T00:00:00Z",
+            "agent_id": None,
+            "parent_run_id": None,
+        }
+
+        state = apply_single_run_event(state, legacy_event)
+
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["event_history"][0]["schema_version"], RUNTIME_EVENT_SCHEMA_VERSION)
 
 
 if __name__ == "__main__":

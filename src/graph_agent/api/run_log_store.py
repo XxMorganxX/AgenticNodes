@@ -6,6 +6,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from graph_agent.api.run_state_reducer import build_run_state, replay_events
+from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
 from graph_agent.runtime.core import utc_now_iso
 
 
@@ -56,13 +57,14 @@ class FilesystemRunStore:
         run_dir = self._run_dir(run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
         with (run_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True))
+            handle.write(json.dumps(normalize_runtime_event_dict(event), sort_keys=True))
             handle.write("\n")
 
     def write_state(self, run_id: str, state: Mapping[str, Any]) -> None:
         run_dir = self._run_dir(run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
-        self._write_json(run_dir / "state.json", state)
+        normalized_state = normalize_runtime_state_snapshot(state) or dict(state)
+        self._write_json(run_dir / "state.json", normalized_state)
 
     def load_manifest(self, run_id: str) -> dict[str, Any] | None:
         manifest_path = self._run_dir(run_id) / "manifest.json"
@@ -75,7 +77,7 @@ class FilesystemRunStore:
         if not events_path.exists():
             return []
         return [
-            json.loads(line)
+            normalize_runtime_event_dict(json.loads(line))
             for line in events_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
@@ -84,7 +86,7 @@ class FilesystemRunStore:
         state_path = self._run_dir(run_id) / "state.json"
         if not state_path.exists():
             return None
-        return json.loads(state_path.read_text(encoding="utf-8"))
+        return normalize_runtime_state_snapshot(json.loads(state_path.read_text(encoding="utf-8")))
 
     def recover_run_state(self, run_id: str) -> dict[str, Any] | None:
         manifest = self.load_manifest(run_id) or {}

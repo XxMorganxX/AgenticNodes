@@ -110,7 +110,10 @@ function isContextBooted(catalog: EditorCatalog | null, node: GraphNode): boolea
   if (!catalog || toolNames.length === 0) {
     return false;
   }
-  const selectedTools = catalog.tools.filter((tool) => toolNames.includes(tool.name));
+  const selectedTools = catalog.tools.filter((tool) => {
+    const identifiers = [tool.canonical_name ?? tool.name, tool.name, ...(tool.aliases ?? [])];
+    return toolNames.some((toolName) => identifiers.includes(toolName));
+  });
   if (selectedTools.length === 0) {
     return false;
   }

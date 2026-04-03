@@ -20,6 +20,7 @@ from graph_agent.providers.discord import DiscordMessageEvent, DiscordTriggerSer
 from graph_agent.runtime.core import GraphDefinition, resolve_graph_process_env, utc_now_iso
 from graph_agent.runtime.documents import AgentDefinition, TestEnvironmentDefinition, load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
+from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
 from graph_agent.tools.mcp import McpServerDefinition
 
 
@@ -239,11 +240,11 @@ class GraphRunManager:
         recovered = self._recover_run_state(run_id)
         if recovered is not None:
             reconciled = self._reconcile_run_state(run_id)
-            return reconciled if reconciled is not None else recovered
+            return normalize_runtime_state_snapshot(reconciled if reconciled is not None else recovered) or {}
         with self._lock:
             if run_id not in self._run_states:
                 raise KeyError(run_id)
-            return self._run_states[run_id]
+            return normalize_runtime_state_snapshot(self._run_states[run_id]) or {}
 
     def list_runs(self, graph_id: str | None = None, *, limit: int = 50) -> list[dict[str, Any]]:
         rows = self._run_store.list_runs(graph_id=graph_id, limit=limit)
@@ -551,6 +552,7 @@ class GraphRunManager:
         return snapshot
 
     def _record_event(self, run_id: str, event: dict[str, Any]) -> None:
+        event = normalize_runtime_event_dict(event)
         encoded = json.dumps(event)
         parent_snapshot: dict[str, Any] | None = None
         child_run_id: str | None = None

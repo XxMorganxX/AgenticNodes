@@ -52,6 +52,7 @@ import {
   TOOL_FAILURE_HANDLE_ID,
   TOOL_SUCCESS_HANDLE_ID,
 } from "../lib/editor";
+import type { GraphLayoutNodeDimensions } from "../lib/editor";
 import { logGraphDiagnostic, useGraphDiagnosticsEnabled, useRenderDiagnostics, warnGraphDiagnostic } from "../lib/dragDiagnostics";
 import { clearHotbarFavorite, getHotbarFavorites, setHotbarFavorite } from "../lib/hotbarFavorites";
 import type { HotbarFavorites } from "../lib/hotbarFavorites";
@@ -87,9 +88,11 @@ type GraphCanvasProps = {
   selectedEdgeId: string | null;
   onGraphChange: (graph: GraphDefinition) => void;
   onGraphDrag: (graph: GraphDefinition) => void;
-  onFormatGraph: () => void;
+  onFormatGraph: (nodeDimensions: Record<string, GraphLayoutNodeDimensions>) => void;
   onRunGraph: () => void;
   onScrollToTop: () => void;
+  isMcpPanelOpen?: boolean;
+  onToggleMcpPanel?: () => void;
   backgroundDragSensitivity?: number;
   onSelectionChange: (nodeId: string | null, edgeId: string | null) => void;
 };
@@ -635,7 +638,7 @@ const QUICK_ADD_SLOTS: QuickAddSlot[] = [
     label: "Output",
     description: "Create an end/output node.",
     category: "end",
-    preferredProviderIds: ["core.output"],
+    preferredProviderIds: ["core.output", "end.discord_message"],
   },
 ];
 
@@ -729,6 +732,8 @@ export function GraphCanvas({
   onFormatGraph,
   onRunGraph,
   onScrollToTop,
+  isMcpPanelOpen = false,
+  onToggleMcpPanel,
   backgroundDragSensitivity = DEFAULT_BACKGROUND_DRAG_SENSITIVITY,
   onSelectionChange,
 }: GraphCanvasProps) {
@@ -834,7 +839,9 @@ export function GraphCanvas({
   const milestoneChatEntries = useMemo(() => {
     const entries = environmentAgents
       .flatMap((agent) =>
-        agent.milestones.map((milestone) => {
+        agent.milestones
+          .filter((milestone) => milestone.eventType !== "edge.selected")
+          .map((milestone) => {
           const parsedTimestampMs = Date.parse(milestone.timestamp);
           const timestampMs = Number.isFinite(parsedTimestampMs) ? parsedTimestampMs : milestoneChatNow;
           const ageMs = Math.max(0, milestoneChatNow - timestampMs);
@@ -844,7 +851,7 @@ export function GraphCanvas({
             timestampMs,
             ageMs,
           };
-        }),
+          }),
       )
       .filter((entry) => entry.ageMs <= MILESTONE_CHAT_MAX_AGE_MS)
       .sort((left, right) => left.timestampMs - right.timestampMs)
@@ -3552,6 +3559,18 @@ export function GraphCanvas({
     tooltipNodeId,
   ]);
 
+  const handleFormatGraph = useCallback(() => {
+    if (!graph) {
+      onFormatGraph({});
+      return;
+    }
+    const nodeDimensions: Record<string, GraphLayoutNodeDimensions> = {};
+    graph.nodes.forEach((node) => {
+      nodeDimensions[node.id] = getFlowNodeDimensions(node, flowNodeCacheRef.current.get(node.id));
+    });
+    onFormatGraph(nodeDimensions);
+  }, [getFlowNodeDimensions, graph, onFormatGraph]);
+
   const edges = useMemo<FlowEdge<GraphCanvasEdgeData>[]>(() => {
     if (!graph) {
       cachedEdgesRef.current = [];
@@ -4095,6 +4114,29 @@ export function GraphCanvas({
 
   const [agentMenuOpen, setAgentMenuOpen] = useState(false);
 
+  const mcpButtonStatus = useMemo(() => {
+    const mcpTools = (catalog?.tools ?? []).filter((tool) => tool.source_type === "mcp");
+    const enabledMcpTools = mcpTools.filter((tool) => tool.enabled !== false);
+    const selectedServerIds = new Set(
+      enabledMcpTools
+        .map((tool) => (typeof tool.server_id === "string" ? tool.server_id : null))
+        .filter((serverId): serverId is string => Boolean(serverId)),
+    );
+    const selectedServers = (catalog?.mcp_servers ?? []).filter((server) => selectedServerIds.has(server.server_id));
+    const allSelectedServersRunning =
+      selectedServerIds.size > 0 &&
+      selectedServers.length === selectedServerIds.size &&
+      selectedServers.every((server) => server.running && !server.error);
+    const allEnabledToolsReady = enabledMcpTools.every((tool) => tool.available !== false);
+    const health: "idle" | "healthy" | "degraded" =
+      enabledMcpTools.length === 0 ? "idle" : allSelectedServersRunning && allEnabledToolsReady ? "healthy" : "degraded";
+    return {
+      enabledToolCount: enabledMcpTools.length,
+      totalToolCount: mcpTools.length,
+      health,
+    };
+  }, [catalog]);
+
   if (!graph) {
     return <div className="panel empty-panel">No graph selected.</div>;
   }
@@ -4156,6 +4198,26 @@ export function GraphCanvas({
           {editorMessage ? <p className="editor-message">{editorMessage}</p> : null}
         </div>
         <div className="graph-scroll-nav">
+          <button
+            type="button"
+            className={`secondary-button graph-scroll-nav-button${isMcpPanelOpen ? " is-active" : ""}`}
+            onClick={() => onToggleMcpPanel?.()}
+            aria-label={isMcpPanelOpen ? "Hide project MCP modal" : "Show project MCP modal"}
+            title={`${isMcpPanelOpen ? "Hide" : "Show"} project MCP modal (${mcpButtonStatus.enabledToolCount}/${mcpButtonStatus.totalToolCount} tools enabled)`}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 7.5h16M4 12h16M4 16.5h10" />
+              <rect x="15" y="14.5" width="5" height="4" rx="1" />
+              <path d="M17.5 10.5v4" />
+            </svg>
+            <span>MCP</span>
+            <span className="graph-scroll-nav-button-meta" aria-hidden="true">
+              <span className={`mcp-health-indicator mcp-health-indicator--${mcpButtonStatus.health}`} />
+              <span className="graph-scroll-nav-button-fraction">
+                {mcpButtonStatus.enabledToolCount}/{mcpButtonStatus.totalToolCount}
+              </span>
+            </span>
+          </button>
           <button type="button" className="secondary-button graph-scroll-nav-button" onClick={onScrollToTop}>
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M12 5 5 12M12 5l7 7M12 5v14" />
@@ -4249,7 +4311,7 @@ export function GraphCanvas({
             <button
               type="button"
               className="graph-toolbar-button"
-              onClick={onFormatGraph}
+              onClick={handleFormatGraph}
               aria-label="Format graph layout"
               title="Format graph layout"
               disabled={graph.nodes.length === 0}

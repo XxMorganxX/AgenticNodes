@@ -9,6 +9,7 @@ import type {
   StartRunOptions,
   ToolDefinition,
 } from "./types";
+import { normalizeRunState } from "./runtimeEvents";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -214,7 +215,7 @@ export async function testMcpServer(server: McpServerDraft): Promise<{
 }
 
 export async function setMcpToolEnabled(toolName: string, enabled: boolean): Promise<ToolDefinition> {
-  const response = await fetch(`${API_BASE_URL}/api/editor/mcp/tools/${toolName}/toggle`, {
+  const response = await fetch(`${API_BASE_URL}/api/editor/mcp/tools/${encodeURIComponent(toolName)}/toggle`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -274,7 +275,7 @@ export async function fetchRun(runId: string): Promise<RunState> {
   if (!response.ok) {
     throw new Error("Failed to load run state.");
   }
-  return (await response.json()) as RunState;
+  return normalizeRunState((await response.json()) as RunState) as RunState;
 }
 
 export function eventStreamUrl(runId: string): string {

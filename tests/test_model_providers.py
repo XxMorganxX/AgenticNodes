@@ -34,7 +34,7 @@ from graph_agent.runtime.core import GraphDefinition, GraphValidationError, Node
 from graph_agent.runtime.documents import load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.tools.base import ToolContext, ToolDefinition, ToolRegistry, ToolResult
-from graph_agent.tools.mcp import McpServerDefinition, McpServerManager, _McpStdioSession
+from graph_agent.tools.mcp import McpServerDefinition, McpServerManager, _McpStdioSession, canonical_mcp_tool_name
 
 
 SEARCH_CATALOG_TOOL = ModelToolDefinition(
@@ -49,6 +49,10 @@ SEARCH_CATALOG_TOOL = ModelToolDefinition(
         "required": ["query", "limit"],
     },
 )
+
+WEATHER_TOOL_ID = canonical_mcp_tool_name("weather_mcp", "weather_current")
+TIME_TOOL_ID = canonical_mcp_tool_name("time_mcp", "time_current_minute")
+REMOTE_HTTP_ECHO_TOOL_ID = canonical_mcp_tool_name("remote_http", "echo_http")
 
 
 def _decision(
@@ -1107,12 +1111,16 @@ class ModelProviderTests(unittest.TestCase):
         self.assertIn("mcp_servers", catalog)
         self.assertTrue(any(server["server_id"] == "weather_mcp" for server in catalog["mcp_servers"]))
         self.assertTrue(any(server["server_id"] == "time_mcp" for server in catalog["mcp_servers"]))
-        weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == "weather_current")
-        time_tool = next(tool for tool in catalog["tools"] if tool["name"] == "time_current_minute")
+        weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == WEATHER_TOOL_ID)
+        time_tool = next(tool for tool in catalog["tools"] if tool["name"] == TIME_TOOL_ID)
+        self.assertEqual(weather_tool["display_name"], "weather_current")
+        self.assertIn("weather_current", weather_tool["aliases"])
         self.assertEqual(weather_tool["source_type"], "mcp")
         self.assertTrue(weather_tool["enabled"])
         self.assertFalse(weather_tool["available"])
         self.assertEqual(weather_tool["schema_origin"], "static")
+        self.assertEqual(time_tool["display_name"], "time_current_minute")
+        self.assertIn("time_current_minute", time_tool["aliases"])
         self.assertEqual(time_tool["source_type"], "mcp")
         self.assertTrue(time_tool["enabled"])
         self.assertFalse(time_tool["available"])
@@ -1173,7 +1181,7 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertTrue(server["running"])
 
                     catalog = manager.get_catalog()
-                    weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == "weather_current")
+                    weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == WEATHER_TOOL_ID)
                     self.assertTrue(weather_tool["enabled"])
                     self.assertTrue(weather_tool["available"])
                     self.assertEqual(weather_tool["schema_origin"], "discovered")
@@ -1232,7 +1240,10 @@ class ModelProviderTests(unittest.TestCase):
         manager = GraphRunManager(services=services)
         services.tool_registry.upsert(
             ToolDefinition(
-                name="weather_current",
+                name=WEATHER_TOOL_ID,
+                canonical_name=WEATHER_TOOL_ID,
+                display_name="weather_current",
+                aliases=["weather_current"],
                 description="Outdated preregistered schema.",
                 input_schema={
                     "type": "object",
@@ -1250,7 +1261,7 @@ class ModelProviderTests(unittest.TestCase):
         try:
             manager.boot_mcp_server("weather_mcp")
             catalog = manager.get_catalog()
-            weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == "weather_current")
+            weather_tool = next(tool for tool in catalog["tools"] if tool["name"] == WEATHER_TOOL_ID)
             self.assertFalse(weather_tool["enabled"])
             self.assertEqual(weather_tool["schema_origin"], "discovered")
             self.assertIn("differs", weather_tool["schema_warning"])
@@ -1351,15 +1362,15 @@ class ModelProviderTests(unittest.TestCase):
                     assert isinstance(payload, dict)
                     self.assertIn("MCP Tool Guidance", payload["system_prompt"])
                     self.assertIn("MCP Tool Context", payload["system_prompt"])
-                    self.assertIn("Tool: weather_current", payload["system_prompt"])
+                    self.assertIn(f"Tool: {WEATHER_TOOL_ID}", payload["system_prompt"])
                     self.assertNotIn("MCP Tool Decision Output", payload["system_prompt"])
                     tool_context = payload["mcp_tool_context"]
                     assert isinstance(tool_context, dict)
-                    self.assertEqual(tool_context["tool_names"], ["weather_current"])
-                    self.assertEqual(tool_context["tool_nodes"][0]["tool_name"], "weather_current")
+                    self.assertEqual(tool_context["tool_names"], [WEATHER_TOOL_ID])
+                    self.assertEqual(tool_context["tool_nodes"][0]["tool_name"], WEATHER_TOOL_ID)
                     self.assertEqual(tool_context["tool_nodes"][0]["tool_node_id"], "weather_context")
                     self.assertEqual(tool_context["tool_nodes"][0]["server"]["server_id"], "weather_mcp")
-                    self.assertEqual(payload["available_tool_names"], ["weather_current"])
+                    self.assertEqual(payload["available_tool_names"], [WEATHER_TOOL_ID])
             finally:
                 manager.stop_background_services()
 
@@ -1468,7 +1479,7 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertEqual(payload["available_tool_names"], [])
                     self.assertEqual(payload["mcp_available_tool_names"], [])
                     assert isinstance(payload["mcp_tool_context"], dict)
-                    self.assertEqual(payload["mcp_tool_context"]["tool_names"], ["weather_current"])
+                    self.assertEqual(payload["mcp_tool_context"]["tool_names"], [WEATHER_TOOL_ID])
             finally:
                 manager.stop_background_services()
 
@@ -1719,7 +1730,7 @@ class ModelProviderTests(unittest.TestCase):
                     assert isinstance(model_output, dict)
                     self.assertEqual(model_output["metadata"]["contract"], "tool_call_envelope")
                     self.assertEqual(model_output["payload"], None)
-                    self.assertEqual(model_output["tool_calls"][0]["tool_name"], "weather_current")
+                    self.assertEqual(model_output["tool_calls"][0]["tool_name"], WEATHER_TOOL_ID)
                     tool_call_edge = next(edge for edge in graph_payload["edges"] if edge["id"] == "edge-model-executor")
                     self.assertEqual(tool_call_edge["source_handle_id"], "api-tool-call")
             finally:
@@ -1751,12 +1762,12 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertEqual(model_output["metadata"]["contract"], "tool_call_envelope")
                     self.assertEqual(model_output["metadata"]["response_mode"], "tool_call")
                     self.assertEqual(model_output["artifacts"]["source_input_payload"], {"request": "weather please"})
-                    self.assertEqual(model_output["tool_calls"][0]["tool_name"], "weather_current")
+                    self.assertEqual(model_output["tool_calls"][0]["tool_name"], WEATHER_TOOL_ID)
                     tool_route_output = state.edge_outputs["edge-model-executor"]
                     assert isinstance(tool_route_output, dict)
                     self.assertEqual(tool_route_output["metadata"]["contract"], "tool_call_envelope")
                     self.assertEqual(tool_route_output["artifacts"]["source_input_payload"], {"request": "weather please"})
-                    self.assertEqual(tool_route_output["tool_calls"][0]["tool_name"], "weather_current")
+                    self.assertEqual(tool_route_output["tool_calls"][0]["tool_name"], WEATHER_TOOL_ID)
                     message_route_output = state.edge_outputs["edge-model-finish"]
                     assert isinstance(message_route_output, dict)
                     self.assertEqual(message_route_output["metadata"]["contract"], "message_envelope")
@@ -1858,11 +1869,11 @@ class ModelProviderTests(unittest.TestCase):
                     display_edge_output = state.edge_outputs["edge-model-display"]
                     assert isinstance(display_edge_output, dict)
                     self.assertEqual(display_edge_output["metadata"]["contract"], "tool_call_envelope")
-                    self.assertEqual(display_edge_output["tool_calls"][0]["tool_name"], "weather_current")
+                    self.assertEqual(display_edge_output["tool_calls"][0]["tool_name"], WEATHER_TOOL_ID)
                     display_output = state.node_outputs["tool_display"]
                     assert isinstance(display_output, dict)
                     self.assertEqual(display_output["metadata"]["contract"], "tool_call_envelope")
-                    self.assertEqual(display_output["tool_calls"][0]["tool_name"], "weather_current")
+                    self.assertEqual(display_output["tool_calls"][0]["tool_name"], WEATHER_TOOL_ID)
             finally:
                 manager.stop_background_services()
 
@@ -1931,7 +1942,7 @@ class ModelProviderTests(unittest.TestCase):
                     executor_output = state.node_outputs["executor"]
                     assert isinstance(executor_output, dict)
                     self.assertEqual(executor_output["metadata"]["tool_status"], "success")
-                    self.assertEqual(executor_output["metadata"]["tool_name"], "weather_current")
+                    self.assertEqual(executor_output["metadata"]["tool_name"], WEATHER_TOOL_ID)
             finally:
                 manager.stop_background_services()
 
@@ -2161,7 +2172,7 @@ class ModelProviderTests(unittest.TestCase):
                     display_output = state.node_outputs["display"]
                     assert isinstance(display_output, dict)
                     self.assertEqual(display_output["metadata"]["contract"], "tool_call_envelope")
-                    self.assertEqual(display_output["tool_calls"][0]["tool_name"], "weather_current")
+                    self.assertEqual(display_output["tool_calls"][0]["tool_name"], WEATHER_TOOL_ID)
                     self.assertEqual(display_output["artifacts"]["display_envelope"]["metadata"]["contract"], "tool_call_envelope")
             finally:
                 manager.stop_background_services()
@@ -3414,7 +3425,7 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertFalse(payload["should_call_tool"])
                     self.assertEqual(payload["tool_calls"], [])
                     self.assertEqual(len(payload["tool_payloads"]), 1)
-                    self.assertEqual(payload["tool_payloads"][0]["tool_name"], "weather_current")
+                    self.assertEqual(payload["tool_payloads"][0]["tool_name"], WEATHER_TOOL_ID)
                     self.assertEqual(payload["tool_payloads"][0]["tool_arguments"], {"location": "Austin"})
                     self.assertEqual(payload["tool_payloads"][0]["tool_output"]["resolved_location"], "Testville")
                     self.assertEqual(payload["tool_payloads"][0]["tool_status"], "success")
@@ -3422,7 +3433,7 @@ class ModelProviderTests(unittest.TestCase):
                     executor_output = state.node_outputs["executor"]
                     assert isinstance(executor_output, dict)
                     self.assertEqual(executor_output["metadata"]["contract"], "tool_result_envelope")
-                    self.assertEqual(executor_output["payload"]["tool_payloads"][0]["tool_name"], "weather_current")
+                    self.assertEqual(executor_output["payload"]["tool_payloads"][0]["tool_name"], WEATHER_TOOL_ID)
                     self.assertEqual(
                         executor_output["artifacts"]["source_tool_call_envelope"]["metadata"]["contract"],
                         "tool_call_envelope",
@@ -3527,7 +3538,7 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertEqual(state.final_output["tool_calls"], [])
                     self.assertEqual(
                         [entry["tool_name"] for entry in state.final_output["tool_payloads"]],
-                        ["weather_current", "time_current_minute"],
+                        [WEATHER_TOOL_ID, TIME_TOOL_ID],
                     )
                     self.assertEqual(state.final_output["tool_payloads"][0]["tool_arguments"], {"location": "Austin"})
                     self.assertIn("local_iso_minute", state.final_output["tool_payloads"][1]["tool_output"])
@@ -3538,7 +3549,7 @@ class ModelProviderTests(unittest.TestCase):
                     assert isinstance(follow_up_payload, dict)
                     self.assertEqual(
                         [entry["tool_name"] for entry in follow_up_payload["tool_history"]],
-                        ["weather_current", "time_current_minute"],
+                        [WEATHER_TOOL_ID, TIME_TOOL_ID],
                     )
                     self.assertEqual(follow_up_payload["pending_tool_calls"], [])
 
@@ -3546,7 +3557,7 @@ class ModelProviderTests(unittest.TestCase):
                     echoed_payload = json.loads(followup_provider.last_request.messages[-1].content)
                     self.assertEqual(
                         [entry["tool_name"] for entry in echoed_payload["tool_history"]],
-                        ["weather_current", "time_current_minute"],
+                        [WEATHER_TOOL_ID, TIME_TOOL_ID],
                     )
             finally:
                 manager.stop_background_services()
@@ -4257,7 +4268,11 @@ class ModelProviderTests(unittest.TestCase):
 
             self.assertEqual(server_state["transport"], "http")
             self.assertTrue(server_state["running"])
-            self.assertIn("echo_http", server_state["tool_names"])
+            self.assertIn(REMOTE_HTTP_ECHO_TOOL_ID, server_state["tool_names"])
+            discovered_tool = registry.get("echo_http")
+            self.assertEqual(discovered_tool.canonical_name, REMOTE_HTTP_ECHO_TOOL_ID)
+            self.assertEqual(discovered_tool.display_name, "echo_http")
+            self.assertIn("echo_http", discovered_tool.aliases)
             manager.set_tool_enabled("echo_http", True)
 
             result = registry.invoke(
@@ -4269,6 +4284,43 @@ class ModelProviderTests(unittest.TestCase):
             self.assertEqual(result.output["arguments"], {"message": "hello"})
             self.assertEqual(_HttpMcpStubHandler.requests[0]["method"], "initialize")
             self.assertTrue(any(request["method"] == "tools/list" for request in _HttpMcpStubHandler.requests))
+
+    def test_unique_legacy_mcp_aliases_resolve_to_canonical_tools(self) -> None:
+        services = build_example_services()
+
+        weather_tool = services.tool_registry.require_graph_reference("weather_current")
+        time_tool = services.tool_registry.require_graph_reference("time_current_minute")
+
+        self.assertEqual(weather_tool.canonical_name, WEATHER_TOOL_ID)
+        self.assertEqual(weather_tool.display_name, "weather_current")
+        self.assertIn("weather_current", weather_tool.aliases)
+        self.assertEqual(time_tool.canonical_name, TIME_TOOL_ID)
+        self.assertEqual(time_tool.display_name, "time_current_minute")
+        self.assertIn("time_current_minute", time_tool.aliases)
+
+    def test_legacy_mcp_aliases_fail_when_multiple_servers_share_the_same_tool_name(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            registry = ToolRegistry()
+            manager = McpServerManager(registry, state_path=Path(tmp_dir) / "mcp_servers_state.json")
+            shared_tool_name = "shared_tool"
+            for server_id in ("server_one", "server_two"):
+                manager.register_tool(
+                    ToolDefinition(
+                        name=canonical_mcp_tool_name(server_id, shared_tool_name),
+                        canonical_name=canonical_mcp_tool_name(server_id, shared_tool_name),
+                        display_name=shared_tool_name,
+                        aliases=[shared_tool_name],
+                        description="Shared MCP tool.",
+                        input_schema={"type": "object", "properties": {}},
+                        executor=lambda _payload, _context: ToolResult(status="success", output={}),
+                        source_type="mcp",
+                        capability_type="tool",
+                        server_id=server_id,
+                    )
+                )
+
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                registry.require_graph_reference(shared_tool_name)
 
     def test_user_mcp_servers_persist_and_reload(self) -> None:
         with TemporaryDirectory() as tmp_dir:

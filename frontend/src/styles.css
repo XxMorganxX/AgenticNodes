@@ -740,10 +740,6 @@ pre {
   align-self: start;
   width: 100%;
 }
-.mosaic-mcp {
-  align-self: start;
-  width: 100%;
-}
 .mosaic-execution {
   width: 100%;
 }
@@ -975,17 +971,6 @@ pre {
   padding: 0.95rem 1rem;
 }
 
-.mosaic-mcp {
-  display: flex;
-  flex-direction: column;
-  max-height: fit-content;
-  padding: 0.95rem 1rem;
-}
-
-.mosaic-mcp .mcp-server-panel {
-  gap: 0.65rem;
-}
-
 .mosaic-env .env-tiles {
   flex: 1;
   flex-direction: column;
@@ -1030,7 +1015,7 @@ pre {
 .content-grid {
   display: grid;
   grid-template-columns: 1fr;
-  gap: 0;
+  gap: 1rem;
   margin-top: 1.5rem;
   min-height: 100vh;
   align-content: start;
@@ -1105,6 +1090,58 @@ pre {
 
 .graph-scroll-nav-button span {
   display: inline-block;
+}
+
+.graph-scroll-nav-button.is-active {
+  border-color: rgba(124, 108, 247, 0.78);
+  box-shadow: 0 0 0 1px rgba(124, 108, 247, 0.18), 0 12px 26px rgba(0, 0, 0, 0.22);
+}
+
+.graph-scroll-nav-button-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-left: 0.15rem;
+  padding-left: 0.55rem;
+  border-left: 1px solid rgba(120, 124, 166, 0.4);
+}
+
+.graph-scroll-nav-button-fraction {
+  margin-left: 0.1rem;
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: #f0f0ff;
+}
+
+.mcp-health-indicator {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 999px;
+  background: #7c849a;
+  box-shadow: 0 0 0 1px rgba(124, 132, 154, 0.3);
+  flex: 0 0 auto;
+}
+
+.mcp-health-indicator--idle {
+  background: #7c849a;
+  box-shadow:
+    0 0 0 1px rgba(124, 132, 154, 0.28),
+    0 0 8px rgba(124, 132, 154, 0.28);
+}
+
+.mcp-health-indicator--healthy {
+  background: #4ade80;
+  box-shadow:
+    0 0 0 1px rgba(74, 222, 128, 0.3),
+    0 0 12px rgba(74, 222, 128, 0.65);
+}
+
+.mcp-health-indicator--degraded {
+  background: #f59e0b;
+  box-shadow:
+    0 0 0 1px rgba(245, 158, 11, 0.32),
+    0 0 12px rgba(245, 158, 11, 0.62);
 }
 
 .graph-shell-actions {
@@ -1675,6 +1712,7 @@ pre {
   bottom: 1rem;
   z-index: 15001;
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: flex-start;
   gap: 0.55rem;
@@ -1688,13 +1726,16 @@ pre {
   backdrop-filter: blur(16px);
   transform: translateX(-50%);
   pointer-events: auto;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
 }
 
 .graph-quick-add-main {
   display: flex;
   align-items: center;
   gap: 0.55rem;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   min-width: 0;
   flex: 0 1 auto;
 }
@@ -1703,7 +1744,7 @@ pre {
   display: inline-flex;
   align-items: center;
   gap: 0.45rem;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-start;
   flex: 0 0 auto;
   padding-left: 0.15rem;
@@ -1713,6 +1754,7 @@ pre {
 .graph-quick-add-copy {
   display: inline-flex;
   align-items: center;
+  flex: 0 0 auto;
   min-width: 0;
   padding-inline: 0.15rem;
 }
@@ -1731,7 +1773,7 @@ pre {
 
 .graph-quick-add-list {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 0.55rem;
   min-width: 0;
 }
@@ -3182,6 +3224,18 @@ pre {
 
 .user-preferences-modal {
   width: min(680px, calc(100vw - 3rem));
+}
+
+.mcp-server-modal {
+  width: min(1120px, calc(100vw - 3rem));
+}
+
+.mcp-server-modal-body {
+  padding-top: 1rem;
+}
+
+.mcp-server-modal-body .mcp-server-panel {
+  gap: 0.85rem;
 }
 
 .user-preferences-modal-body {
@@ -4691,8 +4745,7 @@ pre {
     padding-bottom: 1.25rem;
   }
 
-  .mosaic-env,
-  .mosaic-mcp {
+  .mosaic-env {
     align-self: start;
     justify-self: stretch;
     width: 100%;
@@ -4750,12 +4803,12 @@ pre {
     bottom: 0.85rem;
     width: auto;
     transform: none;
-    align-items: stretch;
+    align-items: center;
   }
 
   .graph-quick-add-main {
-    flex-direction: column;
-    align-items: flex-start;
+    flex-direction: row;
+    align-items: center;
   }
 
   .graph-quick-add-actions {
@@ -4764,8 +4817,7 @@ pre {
   }
 
   .graph-quick-add-list {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    display: flex;
   }
 
   .graph-quick-add.is-minimized {

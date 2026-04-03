@@ -1,4 +1,5 @@
 import type { RunState, RuntimeEvent } from "./types";
+import { normalizeRunState, normalizeRuntimeEventHistory } from "./runtimeEvents";
 
 export type PersistedRunSnapshot = {
   graphId: string;
@@ -43,14 +44,27 @@ function writeSnapshotMap(snapshots: Record<string, PersistedRunSnapshot>): void
 
 export function loadPersistedRunSnapshot(graphId: string): PersistedRunSnapshot | null {
   const snapshots = readSnapshotMap();
-  return snapshots[graphId] ?? null;
+  const snapshot = snapshots[graphId];
+  if (!snapshot) {
+    return null;
+  }
+  return {
+    ...snapshot,
+    events: normalizeRuntimeEventHistory(snapshot.events),
+    runState: normalizeRunState(snapshot.runState),
+  };
 }
 
 export function savePersistedRunSnapshot(snapshot: PersistedRunSnapshot): PersistedRunSnapshot {
   const snapshots = readSnapshotMap();
-  snapshots[snapshot.graphId] = snapshot;
+  const normalizedSnapshot = {
+    ...snapshot,
+    events: normalizeRuntimeEventHistory(snapshot.events),
+    runState: normalizeRunState(snapshot.runState),
+  };
+  snapshots[snapshot.graphId] = normalizedSnapshot;
   writeSnapshotMap(snapshots);
-  return snapshot;
+  return normalizedSnapshot;
 }
 
 export function clearPersistedRunSnapshot(graphId: string): void {

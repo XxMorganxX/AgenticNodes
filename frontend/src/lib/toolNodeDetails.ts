@@ -67,7 +67,11 @@ export function resolveToolNodeDetails(
     : [];
   const toolName =
     (typeof node.config.tool_name === "string" && node.config.tool_name) || node.tool_name || configuredToolNames[0] || "";
-  const tool = catalog?.tools.find((candidate) => candidate.name === toolName) ?? null;
+  const tool =
+    catalog?.tools.find((candidate) => {
+      const identifiers = [candidate.canonical_name ?? candidate.name, candidate.name, ...(candidate.aliases ?? [])];
+      return identifiers.includes(toolName);
+    }) ?? null;
   const fallbackDescription = tool?.description ?? node.description ?? "";
   const fallbackSchemaText = JSON.stringify(tool?.input_schema ?? {}, null, 2);
   const legacyDescriptionText = getConfigString(node, LEGACY_TOOL_DESCRIPTION_CONFIG_KEY);
