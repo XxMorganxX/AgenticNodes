@@ -1104,6 +1104,17 @@ class ModelProviderTests(unittest.TestCase):
         self.assertEqual(claude_code_provider["model_provider_name"], "claude_code")
         self.assertTrue(claude_code_provider["config_fields"])
 
+    def test_manager_catalog_reuses_cached_provider_statuses_within_ttl(self) -> None:
+        manager = GraphRunManager(services=build_example_services())
+        with patch("graph_agent.providers.claude_code.subprocess.run") as run_mock:
+            run_mock.return_value = Mock(returncode=0, stdout="claude 1.0.0", stderr="")
+            first = manager.get_catalog()
+            second = manager.get_catalog()
+
+        self.assertIn("claude_code", first["provider_statuses"])
+        self.assertEqual(first["provider_statuses"], second["provider_statuses"])
+        self.assertEqual(run_mock.call_count, 1)
+
     def test_manager_catalog_includes_mcp_servers_and_tool_metadata(self) -> None:
         manager = GraphRunManager(services=build_example_services())
         catalog = manager.get_catalog()
@@ -2545,12 +2556,7 @@ class ModelProviderTests(unittest.TestCase):
                     state = runtime.run(graph, {"request": "weather please"}, run_id="run-invalid-structured")
                     self.assertEqual(state.status, "failed")
                     assert isinstance(state.terminal_error, dict)
-                    self.assertEqual(state.terminal_error["type"], "no_matching_edge")
-                    self.assertEqual(state.terminal_error["node_id"], "model")
-                    self.assertEqual(state.terminal_error["node_label"], graph.get_node("model").label)
-                    self.assertIn("no outgoing edge matched", state.terminal_error["message"].lower())
-                    self.assertEqual(state.terminal_error["result_contract"], "message_envelope")
-                    self.assertTrue(state.terminal_error["available_routes"])
+                    self.assertEqual(state.terminal_error["type"], "structured_api_output_error")
                     self.assertIn("model", state.node_errors)
                     self.assertEqual(state.node_errors["model"]["type"], "structured_api_output_error")
                     self.assertIn("must leave 'tool_calls' empty", state.node_errors["model"]["message"])
@@ -2590,12 +2596,7 @@ class ModelProviderTests(unittest.TestCase):
                     state = runtime.run(graph, {"request": "weather please"}, run_id="run-tool-call-bypass")
                     self.assertEqual(state.status, "failed")
                     assert isinstance(state.terminal_error, dict)
-                    self.assertEqual(state.terminal_error["type"], "no_matching_edge")
-                    self.assertEqual(state.terminal_error["node_id"], "model")
-                    self.assertEqual(state.terminal_error["node_label"], graph.get_node("model").label)
-                    self.assertIn("no outgoing edge matched", state.terminal_error["message"].lower())
-                    self.assertEqual(state.terminal_error["result_contract"], "message_envelope")
-                    self.assertTrue(state.terminal_error["available_routes"])
+                    self.assertEqual(state.terminal_error["type"], "structured_api_output_error")
                     self.assertIn("model", state.node_errors)
                     self.assertEqual(state.node_errors["model"]["type"], "structured_api_output_error")
                     self.assertIn("requires 'need_tool' to be true", state.node_errors["model"]["message"])

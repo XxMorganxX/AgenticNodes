@@ -559,6 +559,8 @@ class GraphRuntime:
         input_payload: Any,
         *,
         run_id: str | None = None,
+        agent_id: str | None = None,
+        parent_run_id: str | None = None,
         documents: list[dict[str, Any]] | None = None,
     ) -> RunState:
         state = RunState(
@@ -566,6 +568,8 @@ class GraphRuntime:
             input_payload=input_payload,
             documents=list(documents or []),
             run_id=run_id or str(uuid4()),
+            agent_id=agent_id,
+            parent_run_id=parent_run_id,
             status="running",
         )
         pending_nodes = deque([{"node_id": graph.start_node_id, "incoming_edge_id": None}])

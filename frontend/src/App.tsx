@@ -14,6 +14,8 @@ import {
   deleteGraph,
   eventStreamUrl,
   fetchEditorCatalog,
+  fetchRunFileContent,
+  fetchRunFiles,
   fetchGraph,
   fetchGraphs,
   fetchRun,
@@ -31,9 +33,22 @@ import { createBlankGraph, layoutGraphDocument, layoutGraphLR, normalizeGraphDoc
 import type { GraphLayoutNodeDimensions } from "./lib/editor";
 import { filterEventsForAgent, getCanvasGraph, getDefaultAgentId, getSelectedRunId, getSelectedRunState, isTestEnvironment, updateSelectedAgentGraph } from "./lib/graphDocuments";
 import { clearAllPersistedRunSnapshots, clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
+import type { PersistedRunSnapshot } from "./lib/runSnapshots";
 import { isTerminalRuntimeEvent, normalizeRunState, normalizeRuntimeEvent } from "./lib/runtimeEvents";
 import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedRunProjection } from "./lib/runVisualization";
-import type { EditorCatalog, GraphDefinition, GraphDocument, McpServerDraft, McpServerStatus, RunDocument, RunState, RuntimeEvent, ToolDefinition } from "./lib/types";
+import type {
+  EditorCatalog,
+  GraphDefinition,
+  GraphDocument,
+  McpServerDraft,
+  McpServerStatus,
+  RunDocument,
+  RunFilesystemFileContent,
+  RunFilesystemListing,
+  RunState,
+  RuntimeEvent,
+  ToolDefinition,
+} from "./lib/types";
 import { getUserPreferences, resetUserPreferences, saveUserPreferences } from "./lib/userPreferences";
 import type { UserPreferences } from "./lib/userPreferences";
 import { useGraphHistory } from "./lib/useGraphHistory";
@@ -78,6 +93,14 @@ function formatDocumentSize(sizeBytes: number): string {
     return `${(sizeBytes / 1024).toFixed(1)} KB`;
   }
   return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatTimestamp(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return parsed.toLocaleString();
 }
 
 function markTerminalNodeStatuses(
@@ -610,6 +633,13 @@ export default function App() {
     const persistedDocument = loadRecentRunDocument();
     return persistedDocument ? [persistedDocument] : [];
   });
+  const [runFileListing, setRunFileListing] = useState<RunFilesystemListing | null>(null);
+  const [selectedRunFilePath, setSelectedRunFilePath] = useState<string | null>(null);
+  const [selectedRunFileContent, setSelectedRunFileContent] = useState<RunFilesystemFileContent | null>(null);
+  const [isRunFilesLoading, setIsRunFilesLoading] = useState(false);
+  const [isRunFileContentLoading, setIsRunFileContentLoading] = useState(false);
+  const [runFilesError, setRunFilesError] = useState<string | null>(null);
+  const [runFileContentError, setRunFileContentError] = useState<string | null>(null);
   const [isUploadingDocuments, setIsUploadingDocuments] = useState(false);
   const [documentUploadError, setDocumentUploadError] = useState<string | null>(null);
   const [events, setEvents] = useState<RuntimeEvent[]>([]);
@@ -627,6 +657,8 @@ export default function App() {
   const runPollTimeoutRef = useRef<number | null>(null);
   const runStateRef = useRef<RunState | null>(null);
   const inputRef = useRef(input);
+  const pendingRunSnapshotRef = useRef<PersistedRunSnapshot | null>(null);
+  const persistRunSnapshotTimeoutRef = useRef<number | null>(null);
   const executionBoxRef = useRef<HTMLDivElement | null>(null);
 
   const canvasGraph = useMemo(() => getCanvasGraph(draftGraph, selectedAgentId), [draftGraph, selectedAgentId]);
@@ -657,6 +689,11 @@ export default function App() {
     () => ((selectedRunState?.documents?.length ?? 0) > 0 ? selectedRunState?.documents ?? [] : runDocuments),
     [runDocuments, selectedRunState],
   );
+  const visibleRunFiles = useMemo(() => runFileListing?.files ?? [], [runFileListing]);
+  const selectedRunFile = useMemo(
+    () => visibleRunFiles.find((file) => file.path === selectedRunFilePath) ?? null,
+    [visibleRunFiles, selectedRunFilePath],
+  );
 
   useEffect(() => {
     runStateRef.current = runState;
@@ -671,11 +708,91 @@ export default function App() {
     saveRecentRunDocument(mostRecentReadyDocument);
   }, [runDocuments]);
 
+  const refreshRunFiles = useCallback(async (runId: string) => {
+    setRunFilesError(null);
+    setIsRunFilesLoading(true);
+    try {
+      const listing = await fetchRunFiles(runId);
+      setRunFileListing(listing);
+      setSelectedRunFilePath((current) => {
+        if (current && listing.files.some((file) => file.path === current)) {
+          return current;
+        }
+        return listing.files[0]?.path ?? null;
+      });
+    } catch (loadError) {
+      const message = loadError instanceof Error ? loadError.message : "Unable to load run files.";
+      setRunFilesError(message);
+      setRunFileListing(null);
+      setSelectedRunFilePath(null);
+    } finally {
+      setIsRunFilesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!selectedRunId) {
+      setRunFileListing(null);
+      setSelectedRunFilePath(null);
+      setSelectedRunFileContent(null);
+      setRunFilesError(null);
+      setRunFileContentError(null);
+      return;
+    }
+    void refreshRunFiles(selectedRunId);
+  }, [refreshRunFiles, selectedRunId, selectedRunState?.event_history.length]);
+
+  useEffect(() => {
+    if (!selectedRunId || !selectedRunFilePath) {
+      setSelectedRunFileContent(null);
+      setRunFileContentError(null);
+      return;
+    }
+    let cancelled = false;
+    setRunFileContentError(null);
+    setIsRunFileContentLoading(true);
+    void fetchRunFileContent(selectedRunId, selectedRunFilePath)
+      .then((content) => {
+        if (!cancelled) {
+          setSelectedRunFileContent(content);
+        }
+      })
+      .catch((loadError) => {
+        if (cancelled) {
+          return;
+        }
+        const message = loadError instanceof Error ? loadError.message : "Unable to load file content.";
+        setRunFileContentError(message);
+        setSelectedRunFileContent(null);
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsRunFileContentLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedRunFilePath, selectedRunId]);
+
   const refreshCatalog = useCallback(async () => {
     const loadedCatalog = await fetchEditorCatalog();
     setCatalog(loadedCatalog);
     return loadedCatalog;
   }, []);
+
+  const hydrateSelectedGraph = useCallback((graph: GraphDocument) => {
+    const nextGraph = layoutGraphDocument(normalizeGraphDocument(graph));
+    resetHistory(nextGraph);
+    setSavedGraphSnapshot(serializeGraphSnapshot(nextGraph));
+    const nextInput = getSavedInputPrompt(nextGraph);
+    setInput(nextInput);
+    setSavedInputPrompt(nextInput);
+    setSelectedAgentId(loadSelectedAgentId(nextGraph));
+    setSelectedNodeId(null);
+    setSelectedEdgeId(null);
+    return nextGraph;
+  }, [resetHistory]);
 
   const handleDocumentUpload = useCallback(async (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) {
@@ -706,6 +823,44 @@ export default function App() {
     runPollTimeoutRef.current = null;
   }, []);
 
+  const cancelPersistedRunSnapshot = useCallback((graphId?: string) => {
+    if (persistRunSnapshotTimeoutRef.current !== null) {
+      window.clearTimeout(persistRunSnapshotTimeoutRef.current);
+      persistRunSnapshotTimeoutRef.current = null;
+    }
+    if (!graphId || pendingRunSnapshotRef.current?.graphId === graphId) {
+      pendingRunSnapshotRef.current = null;
+    }
+  }, []);
+
+  const flushPersistedRunSnapshot = useCallback((snapshot?: PersistedRunSnapshot | null) => {
+    if (persistRunSnapshotTimeoutRef.current !== null) {
+      window.clearTimeout(persistRunSnapshotTimeoutRef.current);
+      persistRunSnapshotTimeoutRef.current = null;
+    }
+    const nextSnapshot = snapshot ?? pendingRunSnapshotRef.current;
+    pendingRunSnapshotRef.current = null;
+    if (!nextSnapshot) {
+      return;
+    }
+    savePersistedRunSnapshot(nextSnapshot);
+  }, []);
+
+  const schedulePersistedRunSnapshot = useCallback((snapshot: PersistedRunSnapshot) => {
+    pendingRunSnapshotRef.current = snapshot;
+    if (persistRunSnapshotTimeoutRef.current !== null) {
+      return;
+    }
+    persistRunSnapshotTimeoutRef.current = window.setTimeout(() => {
+      persistRunSnapshotTimeoutRef.current = null;
+      const nextSnapshot = pendingRunSnapshotRef.current;
+      pendingRunSnapshotRef.current = null;
+      if (nextSnapshot) {
+        savePersistedRunSnapshot(nextSnapshot);
+      }
+    }, 250);
+  }, []);
+
   const applyFetchedRunState = useCallback((nextRunState: RunState) => {
     const normalizedRunState = normalizeRunState(nextRunState) as RunState;
     setActiveRunId(normalizedRunState.run_id);
@@ -724,6 +879,7 @@ export default function App() {
     sourceRef.current?.close();
     sourceRef.current = null;
     if (!nextRunState) {
+      cancelPersistedRunSnapshot(graphId);
       clearPersistedRunSnapshot(graphId);
       setActiveRunId(null);
       setEvents([]);
@@ -748,14 +904,14 @@ export default function App() {
     setRunState(interruptedState);
     setEvents(interruptedState.event_history ?? []);
     setIsRunning(false);
-    savePersistedRunSnapshot({
+    flushPersistedRunSnapshot({
       graphId,
       activeRunId: interruptedState.run_id,
       events: interruptedState.event_history ?? [],
       runState: interruptedState,
       savedAt: interruptedState.ended_at ?? new Date().toISOString(),
     });
-  }, [clearRunPolling]);
+  }, [cancelPersistedRunSnapshot, clearRunPolling, flushPersistedRunSnapshot]);
 
   const scheduleRunPoll = useCallback((runId: string, graphId: string) => {
     clearRunPolling();
@@ -764,6 +920,7 @@ export default function App() {
         .then((nextRunState) => {
           applyFetchedRunState(nextRunState);
           if (isTerminalRunStatus(nextRunState.status)) {
+            cancelPersistedRunSnapshot(graphId);
             clearPersistedRunSnapshot(graphId);
             clearRunPolling();
             return;
@@ -791,6 +948,7 @@ export default function App() {
         source.close();
         sourceRef.current = null;
         setIsRunning(false);
+        cancelPersistedRunSnapshot(graphId);
         clearPersistedRunSnapshot(graphId);
         void fetchRun(runId)
           .then((nextRunState) => {
@@ -828,6 +986,7 @@ export default function App() {
     try {
       const recoveredRunState = await fetchRun(snapshotRunId);
       if (isTerminalRunStatus(recoveredRunState.status)) {
+        cancelPersistedRunSnapshot(graphId);
         clearPersistedRunSnapshot(graphId);
         setActiveRunId(null);
         setEvents([]);
@@ -848,7 +1007,15 @@ export default function App() {
         setGraphs(loadedGraphs);
         setCatalog(loadedCatalog);
         if (loadedGraphs.length > 0) {
-          setSelectedGraphId(pickDefaultGraphId(loadedGraphs));
+          const defaultGraphId = pickDefaultGraphId(loadedGraphs);
+          const defaultGraph = loadedGraphs.find((graph) => graph.graph_id === defaultGraphId) ?? null;
+          if (defaultGraph) {
+            const nextGraph = hydrateSelectedGraph(defaultGraph);
+            setSelectedGraphId(defaultGraphId);
+            void restorePersistedRunSnapshot(nextGraph.graph_id);
+            return;
+          }
+          setSelectedGraphId(defaultGraphId);
         } else {
           const blankGraph = createBlankGraph();
           resetHistory(blankGraph);
@@ -864,36 +1031,32 @@ export default function App() {
       .catch((loadError: Error) => {
         setError(loadError.message);
       });
-  }, [refreshCatalog, resetHistory]);
+  }, [hydrateSelectedGraph, refreshCatalog, resetHistory, restorePersistedRunSnapshot]);
 
   useEffect(() => {
     return () => {
+      flushPersistedRunSnapshot();
       sourceRef.current?.close();
       if (runPollTimeoutRef.current !== null) {
         window.clearTimeout(runPollTimeoutRef.current);
       }
     };
-  }, []);
+  }, [flushPersistedRunSnapshot]);
 
   useEffect(() => {
     if (!selectedGraphId) {
       return;
     }
+    if (draftGraph?.graph_id === selectedGraphId) {
+      return;
+    }
     fetchGraph(selectedGraphId)
       .then((graph) => {
-        const nextGraph = layoutGraphDocument(normalizeGraphDocument(graph));
-        resetHistory(nextGraph);
-        setSavedGraphSnapshot(serializeGraphSnapshot(nextGraph));
-        const nextInput = getSavedInputPrompt(nextGraph);
-        setInput(nextInput);
-        setSavedInputPrompt(nextInput);
-        setSelectedAgentId(loadSelectedAgentId(nextGraph));
-        setSelectedNodeId(null);
-        setSelectedEdgeId(null);
+        const nextGraph = hydrateSelectedGraph(graph);
         void restorePersistedRunSnapshot(nextGraph.graph_id);
       })
       .catch((loadError: Error) => setError(loadError.message));
-  }, [resetHistory, restorePersistedRunSnapshot, selectedGraphId]);
+  }, [draftGraph?.graph_id, hydrateSelectedGraph, restorePersistedRunSnapshot, selectedGraphId]);
 
   useEffect(() => {
     if (!isTestEnvironment(draftGraph) || !draftGraph.graph_id) {
@@ -951,17 +1114,18 @@ export default function App() {
       return;
     }
     if (!activeRunId && !runState && events.length === 0) {
+      cancelPersistedRunSnapshot(draftGraph.graph_id);
       clearPersistedRunSnapshot(draftGraph.graph_id);
       return;
     }
-    savePersistedRunSnapshot({
+    schedulePersistedRunSnapshot({
       graphId: draftGraph.graph_id,
       activeRunId,
       events,
       runState,
       savedAt: new Date().toISOString(),
     });
-  }, [activeRunId, draftGraph?.graph_id, events, runState]);
+  }, [activeRunId, cancelPersistedRunSnapshot, draftGraph?.graph_id, events, runState, schedulePersistedRunSnapshot]);
 
   async function refreshGraphs(nextSelectedGraphId?: string) {
     const loadedGraphs = await fetchGraphs();
@@ -1065,6 +1229,7 @@ export default function App() {
       return;
     }
     try {
+      cancelPersistedRunSnapshot(selectedGraphId);
       clearPersistedRunSnapshot(selectedGraphId);
       await deleteGraph(selectedGraphId);
       const loadedGraphs = await fetchGraphs();
@@ -1114,6 +1279,7 @@ export default function App() {
     sourceRef.current = null;
     setError(null);
     setDocumentUploadError(null);
+    cancelPersistedRunSnapshot(savedGraph.graph_id);
     clearPersistedRunSnapshot(savedGraph.graph_id);
     setActiveRunId(null);
     setEvents([]);
@@ -1325,6 +1491,79 @@ export default function App() {
                     </p>
                   ) : null}
                   {documentUploadError ? <p className="error-text">{documentUploadError}</p> : null}
+                </div>
+                <div className="execution-files-panel">
+                  <div className="execution-documents-header">
+                    <strong>Agent Files</strong>
+                    <span>{visibleRunFiles.length} file{visibleRunFiles.length === 1 ? "" : "s"}</span>
+                  </div>
+                  <p>
+                    Browse files created inside the sandboxed workspace for the selected run
+                    {selectedRunState?.agent_name ? ` (${selectedRunState.agent_name})` : ""}.
+                  </p>
+                  <div className="execution-files-actions">
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => {
+                        if (selectedRunId) {
+                          void refreshRunFiles(selectedRunId);
+                        }
+                      }}
+                      disabled={!selectedRunId || isRunFilesLoading}
+                    >
+                      {isRunFilesLoading ? "Refreshing..." : "Refresh Files"}
+                    </button>
+                  </div>
+                  {runFileListing?.workspace_root ? (
+                    <p className="execution-documents-run-note">
+                      Workspace root: <code>{runFileListing.workspace_root}</code>
+                    </p>
+                  ) : null}
+                  {visibleRunFiles.length > 0 ? (
+                    <div className="execution-files-browser">
+                      <div className="execution-files-list" role="list" aria-label="Agent workspace files">
+                        {visibleRunFiles.map((file) => (
+                          <button
+                            key={file.path}
+                            type="button"
+                            className={`execution-file-row ${selectedRunFilePath === file.path ? "is-selected" : ""}`}
+                            onClick={() => setSelectedRunFilePath(file.path)}
+                          >
+                            <strong>{file.path}</strong>
+                            <span>
+                              {formatDocumentSize(file.size_bytes)} · {formatTimestamp(file.modified_at)}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                      <div className="execution-file-preview">
+                        {selectedRunFile ? (
+                          <>
+                            <div className="execution-document-card-header">
+                              <div>
+                                <strong>{selectedRunFile.name}</strong>
+                                <span>
+                                  {selectedRunFile.mime_type} · {formatDocumentSize(selectedRunFile.size_bytes)}
+                                </span>
+                              </div>
+                            </div>
+                            {isRunFileContentLoading ? <p>Loading file preview...</p> : null}
+                            {selectedRunFileContent ? <pre className="execution-document-excerpt">{selectedRunFileContent.content}</pre> : null}
+                            {selectedRunFileContent?.truncated ? (
+                              <p className="execution-documents-run-note">Preview truncated for large files.</p>
+                            ) : null}
+                          </>
+                        ) : (
+                          <p>Select a file to preview it.</p>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <p>{selectedRunId ? "No files have been written in this run yet." : "Run the graph to inspect workspace files."}</p>
+                  )}
+                  {runFilesError ? <p className="error-text">{runFilesError}</p> : null}
+                  {runFileContentError ? <p className="error-text">{runFileContentError}</p> : null}
                 </div>
                 <button
                   type="button"

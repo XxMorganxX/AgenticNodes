@@ -17,6 +17,7 @@ from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.api.run_state_reducer import apply_single_run_event, build_run_state
 from graph_agent.providers.base import ModelRequest, ModelResponse, ProviderPreflightResult
 from graph_agent.runtime.core import GraphDefinition
+from graph_agent.runtime.documents import load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.event_contract import normalize_runtime_state_snapshot
 from graph_agent.runtime.spreadsheets import parse_spreadsheet, resolve_spreadsheet_path_from_run_documents
@@ -102,8 +103,8 @@ class SpreadsheetRowTests(unittest.TestCase):
                     },
                     {
                         "id": "sheet",
-                        "kind": "data",
-                        "category": "data",
+                        "kind": "control_flow_unit",
+                        "category": "control_flow_unit",
                         "label": "Spreadsheet Rows",
                         "provider_id": "core.spreadsheet_rows",
                         "provider_label": "Spreadsheet Rows",
@@ -149,7 +150,15 @@ class SpreadsheetRowTests(unittest.TestCase):
                 ],
                 "edges": [
                     {"id": "e1", "source_id": "start", "target_id": "sheet", "label": "", "kind": "standard", "priority": 100},
-                    {"id": "e2", "source_id": "sheet", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                    {
+                        "id": "e2",
+                        "source_id": "sheet",
+                        "source_handle_id": "control-flow-loop-body",
+                        "target_id": "model",
+                        "label": "",
+                        "kind": "standard",
+                        "priority": 100,
+                    },
                     {"id": "e3", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
                 ],
             }
@@ -283,8 +292,8 @@ class SpreadsheetRowTests(unittest.TestCase):
                     },
                     {
                         "id": "sheet",
-                        "kind": "data",
-                        "category": "data",
+                        "kind": "control_flow_unit",
+                        "category": "control_flow_unit",
                         "label": "Spreadsheet Rows",
                         "provider_id": "core.spreadsheet_rows",
                         "provider_label": "Spreadsheet Rows",
@@ -394,8 +403,8 @@ class SpreadsheetRowTests(unittest.TestCase):
                     },
                     {
                         "id": "sheet",
-                        "kind": "data",
-                        "category": "data",
+                        "kind": "control_flow_unit",
+                        "category": "control_flow_unit",
                         "label": "Spreadsheet Rows",
                         "provider_id": "core.spreadsheet_rows",
                         "provider_label": "Spreadsheet Rows",
@@ -431,7 +440,15 @@ class SpreadsheetRowTests(unittest.TestCase):
                 ],
                 "edges": [
                     {"id": "e1", "source_id": "start", "target_id": "sheet", "label": "", "kind": "standard", "priority": 100},
-                    {"id": "e2", "source_id": "sheet", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                    {
+                        "id": "e2",
+                        "source_id": "sheet",
+                        "source_handle_id": "control-flow-loop-body",
+                        "target_id": "compose",
+                        "label": "",
+                        "kind": "standard",
+                        "priority": 100,
+                    },
                     {"id": "e3", "source_id": "compose", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
                 ],
             }
@@ -475,8 +492,8 @@ class SpreadsheetRowTests(unittest.TestCase):
                 },
                 {
                     "id": "sheet",
-                    "kind": "data",
-                    "category": "data",
+                    "kind": "control_flow_unit",
+                    "category": "control_flow_unit",
                     "label": "Spreadsheet Rows",
                     "provider_id": "core.spreadsheet_rows",
                     "provider_label": "Spreadsheet Rows",
@@ -512,7 +529,15 @@ class SpreadsheetRowTests(unittest.TestCase):
             ],
             "edges": [
                 {"id": "e1", "source_id": "start", "target_id": "sheet", "label": "", "kind": "standard", "priority": 100},
-                {"id": "e2", "source_id": "sheet", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "e2",
+                    "source_id": "sheet",
+                    "source_handle_id": "control-flow-loop-body",
+                    "target_id": "compose",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                },
                 {"id": "e3", "source_id": "compose", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
             ],
         }
@@ -528,6 +553,375 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertNotEqual(state.terminal_error.get("type"), "max_steps_exceeded")
         self.assertEqual(state.visit_counts.get("compose"), None)
         self.assertFalse(any(transition.target_id == "compose" for transition in state.transition_history))
+
+    def test_load_graph_document_migrates_legacy_spreadsheet_nodes(self) -> None:
+        legacy_graph = load_graph_document(
+            {
+                "graph_id": "legacy-spreadsheet-graph",
+                "name": "Legacy Spreadsheet Graph",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "sheet",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Spreadsheet Rows",
+                        "provider_id": "core.spreadsheet_rows",
+                        "provider_label": "Spreadsheet Rows",
+                        "config": {
+                            "mode": "spreadsheet_rows",
+                            "file_format": "csv",
+                            "file_path": "/tmp/rows.csv",
+                        },
+                        "position": {"x": 100, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {},
+                        "position": {"x": 220, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "e1", "source_id": "start", "target_id": "sheet", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e2", "source_id": "sheet", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+
+        graph = legacy_graph.as_graph()
+        sheet_node = next(node for node in graph.nodes.values() if node.id == "sheet")
+        self.assertEqual(sheet_node.kind, "control_flow_unit")
+        self.assertEqual(sheet_node.category.value, "control_flow_unit")
+
+    def test_logic_conditions_routes_if_and_else(self) -> None:
+        services = build_example_services()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "logic-conditions-graph",
+            "name": "Logic Conditions Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "branch",
+                    "kind": "control_flow_unit",
+                    "category": "control_flow_unit",
+                    "label": "Branch",
+                    "provider_id": "core.logic_conditions",
+                    "provider_label": "Logic Conditions",
+                    "config": {
+                        "mode": "logic_conditions",
+                        "clauses": [
+                            {
+                                "id": "if",
+                                "label": "If Approved",
+                                "path": "approved",
+                                "operator": "equals",
+                                "value": True,
+                                "source_contracts": ["message_envelope"],
+                                "output_handle_id": "control-flow-if",
+                            }
+                        ],
+                        "else_output_handle_id": "control-flow-else",
+                    },
+                    "position": {"x": 120, "y": 0},
+                },
+                {
+                    "id": "if_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "If Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {},
+                    "position": {"x": 260, "y": -60},
+                },
+                {
+                    "id": "else_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Else Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {},
+                    "position": {"x": 260, "y": 60},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "branch", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "e2",
+                    "source_id": "branch",
+                    "source_handle_id": "control-flow-if",
+                    "target_id": "if_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                },
+                {
+                    "id": "e3",
+                    "source_id": "branch",
+                    "source_handle_id": "control-flow-else",
+                    "target_id": "else_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                },
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(services)
+
+        matched_state = runtime.run(graph, {"approved": True}, run_id="logic-conditions-if")
+        self.assertEqual(matched_state.status, "completed")
+        self.assertEqual(matched_state.final_output, {"approved": True})
+        self.assertTrue(any(transition.target_id == "if_finish" for transition in matched_state.transition_history))
+        self.assertFalse(any(transition.target_id == "else_finish" for transition in matched_state.transition_history))
+        branch_output = matched_state.node_outputs["branch"]
+        self.assertEqual(branch_output["metadata"]["matched_clause_label"], "If Approved")
+        self.assertEqual(branch_output["metadata"]["matched_branch_label"], "If Approved")
+        self.assertEqual(branch_output["metadata"]["condition_evaluations"][0]["matched"], True)
+        self.assertEqual(branch_output["metadata"]["condition_evaluations"][0]["actual_value"], True)
+        self.assertEqual(branch_output["metadata"]["branch_evaluations"][0]["matched"], True)
+
+        else_state = runtime.run(graph, {"approved": False}, run_id="logic-conditions-else")
+        self.assertEqual(else_state.status, "completed")
+        self.assertEqual(else_state.final_output, {"approved": False})
+        self.assertTrue(any(transition.target_id == "else_finish" for transition in else_state.transition_history))
+        self.assertFalse(any(transition.target_id == "if_finish" for transition in else_state.transition_history))
+        else_branch_output = else_state.node_outputs["branch"]
+        self.assertEqual(else_branch_output["metadata"]["matched_clause_label"], "Else")
+        self.assertEqual(else_branch_output["metadata"]["matched_branch_label"], "Else")
+        self.assertEqual(else_branch_output["metadata"]["condition_evaluations"][0]["matched"], False)
+        self.assertEqual(else_branch_output["metadata"]["condition_evaluations"][0]["actual_value"], False)
+        self.assertEqual(else_branch_output["metadata"]["branch_evaluations"][0]["matched"], False)
+
+    def test_logic_conditions_support_nested_branch_groups(self) -> None:
+        services = build_example_services()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "logic-branches-graph",
+            "name": "Logic Branches Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "branch",
+                    "kind": "control_flow_unit",
+                    "category": "control_flow_unit",
+                    "label": "Branch",
+                    "provider_id": "core.logic_conditions",
+                    "provider_label": "Logic Conditions",
+                    "config": {
+                        "mode": "logic_conditions",
+                        "branches": [
+                            {
+                                "id": "qualified",
+                                "label": "Qualified",
+                                "output_handle_id": "qualified-handle",
+                                "root_group": {
+                                    "id": "qualified-root",
+                                    "type": "group",
+                                    "combinator": "all",
+                                    "children": [
+                                        {
+                                            "id": "approved-rule",
+                                            "type": "rule",
+                                            "path": "approved",
+                                            "operator": "equals",
+                                            "value": True,
+                                            "source_contracts": [],
+                                        },
+                                        {
+                                            "id": "score-group",
+                                            "type": "group",
+                                            "combinator": "any",
+                                            "children": [
+                                                {
+                                                    "id": "score-rule",
+                                                    "type": "rule",
+                                                    "path": "score",
+                                                    "operator": "gte",
+                                                    "value": 90,
+                                                    "source_contracts": [],
+                                                },
+                                                {
+                                                    "id": "priority-rule",
+                                                    "type": "rule",
+                                                    "path": "priority",
+                                                    "operator": "equals",
+                                                    "value": "high",
+                                                    "source_contracts": [],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            },
+                            {
+                                "id": "review",
+                                "label": "Needs Review",
+                                "output_handle_id": "review-handle",
+                                "root_group": {
+                                    "id": "review-root",
+                                    "type": "group",
+                                    "combinator": "any",
+                                    "children": [
+                                        {
+                                            "id": "flagged-rule",
+                                            "type": "rule",
+                                            "path": "flagged",
+                                            "operator": "equals",
+                                            "value": True,
+                                            "source_contracts": [],
+                                        }
+                                    ],
+                                },
+                            },
+                        ],
+                        "else_output_handle_id": "control-flow-else",
+                    },
+                    "position": {"x": 120, "y": 0},
+                },
+                {
+                    "id": "qualified_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Qualified Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {},
+                    "position": {"x": 260, "y": -90},
+                },
+                {
+                    "id": "review_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Review Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {},
+                    "position": {"x": 260, "y": 0},
+                },
+                {
+                    "id": "else_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Else Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {},
+                    "position": {"x": 260, "y": 90},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "branch", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "e2",
+                    "source_id": "branch",
+                    "source_handle_id": "qualified-handle",
+                    "target_id": "qualified_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                },
+                {
+                    "id": "e3",
+                    "source_id": "branch",
+                    "source_handle_id": "review-handle",
+                    "target_id": "review_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                },
+                {
+                    "id": "e4",
+                    "source_id": "branch",
+                    "source_handle_id": "control-flow-else",
+                    "target_id": "else_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                },
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(services)
+
+        qualified_state = runtime.run(
+            graph,
+            {"approved": True, "score": 95, "priority": "medium", "flagged": True},
+            run_id="logic-branches-qualified",
+        )
+        self.assertEqual(qualified_state.status, "completed")
+        self.assertTrue(any(transition.target_id == "qualified_finish" for transition in qualified_state.transition_history))
+        self.assertFalse(any(transition.target_id == "review_finish" for transition in qualified_state.transition_history))
+        qualified_output = qualified_state.node_outputs["branch"]
+        self.assertEqual(qualified_output["metadata"]["matched_branch_label"], "Qualified")
+        self.assertEqual(qualified_output["metadata"]["selected_handle_id"], "qualified-handle")
+        self.assertEqual(qualified_output["metadata"]["branch_evaluations"][0]["matched"], True)
+        qualified_trace = qualified_output["metadata"]["branch_evaluations"][0]["trace"]
+        self.assertEqual(qualified_trace["combinator"], "all")
+        self.assertEqual(qualified_trace["children"][1]["combinator"], "any")
+
+        else_state = runtime.run(
+            graph,
+            {"approved": False, "score": 70, "priority": "low", "flagged": False},
+            run_id="logic-branches-else",
+        )
+        self.assertEqual(else_state.status, "completed")
+        self.assertTrue(any(transition.target_id == "else_finish" for transition in else_state.transition_history))
+        else_output = else_state.node_outputs["branch"]
+        self.assertEqual(else_output["metadata"]["matched_branch_label"], "Else")
+        self.assertEqual(else_output["metadata"]["branch_evaluations"][0]["matched"], False)
+        self.assertEqual(else_output["metadata"]["branch_evaluations"][1]["matched"], False)
 
     def test_run_state_reducer_tracks_iterator_updates(self) -> None:
         state = build_run_state("run-iterator", "graph-1", None, execution_node_ids=["sheet"])

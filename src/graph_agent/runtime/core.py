@@ -23,6 +23,11 @@ from graph_agent.runtime.event_contract import (
     RUNTIME_EVENT_SCHEMA_VERSION,
     normalize_runtime_event_dict,
 )
+from graph_agent.runtime.agent_filesystem import (
+    resolve_agent_workspace,
+    resolve_agent_workspace_path,
+    write_agent_workspace_text_file,
+)
 from graph_agent.runtime.node_providers import (
     NodeCategory,
     NodeProviderRegistry,
@@ -56,6 +61,7 @@ DISCORD_END_PROVIDER_ID = "end.discord_message"
 DEFAULT_DISCORD_BOT_TOKEN_ENV_VAR = "{DISCORD_BOT_TOKEN}"
 SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows"
 LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions"
+WRITE_TEXT_FILE_PROVIDER_ID = "core.write_text_file"
 CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body"
 CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if"
 CONTROL_FLOW_ELSE_HANDLE_ID = "control-flow-else"
@@ -136,6 +142,18 @@ def _render_context_builder_value(value: Any) -> Any:
     if _is_spreadsheet_row_payload(value):
         return _render_spreadsheet_row_text(value)
     return value
+
+
+def _render_workspace_file_content(value: Any) -> str:
+    if _is_prompt_block_payload(value):
+        return _render_prompt_block_text(value)
+    if _is_spreadsheet_row_payload(value):
+        return _render_spreadsheet_row_text(value)
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return _json_safe(value)
 
 
 def _is_chat_message_payload(value: Any) -> bool:
@@ -754,6 +772,19 @@ class NodeContext:
 
     def graph_env_vars(self) -> dict[str, str]:
         return dict(self.graph.env_vars)
+
+    def workspace_dir(self, *, create: bool = False) -> str:
+        workspace = resolve_agent_workspace(self.state.run_id, self.state.agent_id, create=create)
+        return str(workspace.workspace_dir)
+
+    def resolve_workspace_path(self, relative_path: str, *, create_parent: bool = False) -> tuple[str, str]:
+        _, normalized_relative_path, target_path = resolve_agent_workspace_path(
+            self.state.run_id,
+            self.state.agent_id,
+            relative_path,
+            create_parent=create_parent,
+        )
+        return str(target_path), normalized_relative_path.as_posix()
 
     def resolve_graph_env_value(self, value: Any) -> Any:
         return resolve_graph_env_value(value, self.graph.env_vars)
@@ -1678,10 +1709,56 @@ class DataNode(BaseNode):
             },
         )
 
+    def _execute_write_text_file(self, context: NodeContext) -> NodeExecutionResult:
+        relative_path = str(self.config.get("relative_path", "response.txt") or "response.txt").strip() or "response.txt"
+        source_value = context.resolve_binding(self.config.get("input_binding"))
+        if isinstance(source_value, Mapping) and "payload" in source_value:
+            source_value = source_value.get("payload")
+        rendered_content = _render_workspace_file_content(source_value)
+        file_record = write_agent_workspace_text_file(
+            context.state.run_id,
+            context.state.agent_id,
+            relative_path,
+            rendered_content,
+        )
+        preview_limit = 500
+        content_preview = rendered_content if len(rendered_content) <= preview_limit else f"{rendered_content[:preview_limit].rstrip()}..."
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload={
+                "file": file_record,
+                "content_preview": content_preview,
+            },
+            artifacts={"workspace_file": file_record},
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "data_mode": "write_text_file",
+                "provider_id": self.provider_id,
+                "workspace_dir": context.workspace_dir(create=True),
+            },
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary=f"Wrote {file_record['path']} to the agent workspace.",
+        )
+
     def runtime_input_preview(self, context: NodeContext) -> Any:
         mode = "passthrough" if bool(self.config.get("lock_passthrough", False)) else self.config.get("mode", "passthrough")
         if self.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
             return self._spreadsheet_config(context)
+        if self.provider_id == WRITE_TEXT_FILE_PROVIDER_ID or mode == "write_text_file":
+            source_value = context.resolve_binding(self.config.get("input_binding"))
+            if isinstance(source_value, Mapping) and "payload" in source_value:
+                source_value = source_value.get("payload")
+            return {
+                "relative_path": str(self.config.get("relative_path", "response.txt") or "response.txt").strip() or "response.txt",
+                "workspace_dir": context.workspace_dir(create=True),
+                "content_preview": _render_workspace_file_content(source_value),
+            }
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return context.prompt_block_payload_for_node(self.id)
         if mode == "context_builder":
@@ -1716,6 +1793,8 @@ class DataNode(BaseNode):
         mode = "passthrough" if bool(self.config.get("lock_passthrough", False)) else self.config.get("mode", "passthrough")
         if self.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
             return self._execute_spreadsheet_rows(context)
+        if self.provider_id == WRITE_TEXT_FILE_PROVIDER_ID or mode == "write_text_file":
+            return self._execute_write_text_file(context)
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return self._execute_prompt_block(context)
         source_value = context.resolve_binding(self.config.get("input_binding"))
@@ -1955,48 +2034,229 @@ class ControlFlowNode(BaseNode):
             )
         return clauses
 
-    def _evaluate_logic_clause(self, payload: Any, clause: Mapping[str, Any], incoming_contract: str) -> bool:
-        source_contracts = clause.get("source_contracts", [])
+    def _logic_branches(self) -> list[dict[str, Any]]:
+        raw_branches = self.config.get("branches", [])
+        if isinstance(raw_branches, Sequence) and not isinstance(raw_branches, (str, bytes)):
+            branches: list[dict[str, Any]] = []
+            for index, raw_branch in enumerate(raw_branches):
+                if not isinstance(raw_branch, Mapping):
+                    continue
+                branch_id = str(raw_branch.get("id", f"branch-{index + 1}")).strip() or f"branch-{index + 1}"
+                branch_label = str(raw_branch.get("label", f"Branch {index + 1}"))
+                output_handle_id = (
+                    str(raw_branch.get("output_handle_id", CONTROL_FLOW_IF_HANDLE_ID) or CONTROL_FLOW_IF_HANDLE_ID).strip()
+                    or CONTROL_FLOW_IF_HANDLE_ID
+                )
+                branches.append(
+                    {
+                        "id": branch_id,
+                        "label": branch_label,
+                        "output_handle_id": output_handle_id,
+                        "root_group": self._normalize_logic_group(raw_branch.get("root_group"), fallback_id=f"group-{branch_id}"),
+                    }
+                )
+            if branches:
+                return branches
+
+        branches = []
+        for clause in self._logic_clauses():
+            branch_id = str(clause.get("id", "clause")).strip() or "clause"
+            branches.append(
+                {
+                    "id": branch_id,
+                    "label": clause.get("label", ""),
+                    "output_handle_id": clause.get("output_handle_id", CONTROL_FLOW_IF_HANDLE_ID),
+                    "root_group": {
+                        "id": f"group-{branch_id}",
+                        "type": "group",
+                        "combinator": "all",
+                        "negated": False,
+                        "children": [
+                            {
+                                "id": f"rule-{branch_id}",
+                                "type": "rule",
+                                "path": clause.get("path"),
+                                "operator": clause.get("operator", "equals"),
+                                "value": clause.get("value"),
+                                "source_contracts": list(clause.get("source_contracts", [])),
+                            }
+                        ],
+                    },
+                }
+            )
+        return branches
+
+    def _normalize_logic_group(self, candidate: Any, fallback_id: str) -> dict[str, Any]:
+        if not isinstance(candidate, Mapping):
+            return {
+                "id": fallback_id,
+                "type": "group",
+                "combinator": "all",
+                "negated": False,
+                "children": [self._normalize_logic_rule({}, fallback_id=f"{fallback_id}-rule-1")],
+            }
+        raw_children = candidate.get("children", [])
+        children = []
+        if isinstance(raw_children, Sequence) and not isinstance(raw_children, (str, bytes)):
+            for index, child in enumerate(raw_children):
+                if isinstance(child, Mapping) and child.get("type") == "group":
+                    children.append(self._normalize_logic_group(child, fallback_id=f"{fallback_id}-group-{index + 1}"))
+                else:
+                    children.append(self._normalize_logic_rule(child, fallback_id=f"{fallback_id}-rule-{index + 1}"))
+        return {
+            "id": str(candidate.get("id", fallback_id)).strip() or fallback_id,
+            "type": "group",
+            "combinator": "any" if candidate.get("combinator") == "any" else "all",
+            "negated": candidate.get("negated") is True,
+            "children": children or [self._normalize_logic_rule({}, fallback_id=f"{fallback_id}-rule-1")],
+        }
+
+    def _normalize_logic_rule(self, candidate: Any, fallback_id: str) -> dict[str, Any]:
+        record = candidate if isinstance(candidate, Mapping) else {}
+        raw_source_contracts = record.get("source_contracts", [])
+        source_contracts = (
+            [str(contract).strip() for contract in raw_source_contracts if str(contract).strip()]
+            if isinstance(raw_source_contracts, Sequence) and not isinstance(raw_source_contracts, (str, bytes))
+            else []
+        )
+        return {
+            "id": str(record.get("id", fallback_id)).strip() or fallback_id,
+            "type": "rule",
+            "path": None if record.get("path") in {None, ""} else str(record.get("path")),
+            "operator": str(record.get("operator", "equals") or "equals").strip(),
+            "value": record.get("value"),
+            "source_contracts": source_contracts,
+        }
+
+    def _evaluate_logic_rule(self, payload: Any, rule: Mapping[str, Any], incoming_contract: str) -> tuple[bool, dict[str, Any]]:
+        source_contracts = rule.get("source_contracts", [])
+        normalized_contracts: list[str] = []
         if isinstance(source_contracts, Sequence) and not isinstance(source_contracts, (str, bytes)):
             normalized_contracts = [str(contract).strip() for contract in source_contracts if str(contract).strip()]
             if normalized_contracts and incoming_contract not in normalized_contracts:
-                return False
-        actual_value = _deep_get(payload, clause.get("path")) if clause.get("path") not in {None, "", "$"} else payload
-        operator = str(clause.get("operator", "equals") or "equals").strip()
-        expected_value = clause.get("value")
+                return (
+                    False,
+                    {
+                        "id": rule.get("id"),
+                        "type": "rule",
+                        "path": rule.get("path"),
+                        "operator": rule.get("operator"),
+                        "expected_value": rule.get("value"),
+                        "actual_value": None,
+                        "matched": False,
+                        "skipped_for_contract": True,
+                        "incoming_contract": incoming_contract,
+                        "source_contracts": normalized_contracts,
+                    },
+                )
+        actual_value = _deep_get(payload, rule.get("path")) if rule.get("path") not in {None, "", "$"} else payload
+        operator = str(rule.get("operator", "equals") or "equals").strip()
+        expected_value = rule.get("value")
+        matched = False
         if operator == "exists":
-            return actual_value is not None
-        if operator == "equals":
-            return actual_value == expected_value
-        if operator == "not_equals":
-            return actual_value != expected_value
-        if operator == "contains":
+            matched = actual_value is not None
+        elif operator == "equals":
+            matched = actual_value == expected_value
+        elif operator == "not_equals":
+            matched = actual_value != expected_value
+        elif operator == "contains":
             if isinstance(actual_value, str):
-                return str(expected_value) in actual_value
-            if isinstance(actual_value, Sequence) and not isinstance(actual_value, (str, bytes)):
-                return expected_value in actual_value
-            return False
-        if operator == "gt":
-            return actual_value is not None and expected_value is not None and actual_value > expected_value
-        if operator == "gte":
-            return actual_value is not None and expected_value is not None and actual_value >= expected_value
-        if operator == "lt":
-            return actual_value is not None and expected_value is not None and actual_value < expected_value
-        if operator == "lte":
-            return actual_value is not None and expected_value is not None and actual_value <= expected_value
-        return False
+                matched = str(expected_value) in actual_value
+            elif isinstance(actual_value, Sequence) and not isinstance(actual_value, (str, bytes)):
+                matched = expected_value in actual_value
+            else:
+                matched = False
+        elif operator == "gt":
+            matched = actual_value is not None and expected_value is not None and actual_value > expected_value
+        elif operator == "gte":
+            matched = actual_value is not None and expected_value is not None and actual_value >= expected_value
+        elif operator == "lt":
+            matched = actual_value is not None and expected_value is not None and actual_value < expected_value
+        elif operator == "lte":
+            matched = actual_value is not None and expected_value is not None and actual_value <= expected_value
+        return (
+            matched,
+            {
+                "id": rule.get("id"),
+                "type": "rule",
+                "path": rule.get("path"),
+                "operator": operator,
+                "expected_value": expected_value,
+                "actual_value": actual_value,
+                "matched": matched,
+                "skipped_for_contract": False,
+                "incoming_contract": incoming_contract,
+                "source_contracts": normalized_contracts,
+            },
+        )
+
+    def _evaluate_logic_group(self, payload: Any, group: Mapping[str, Any], incoming_contract: str) -> tuple[bool, dict[str, Any]]:
+        child_evaluations: list[dict[str, Any]] = []
+        child_matches: list[bool] = []
+        raw_children = group.get("children", [])
+        if isinstance(raw_children, Sequence) and not isinstance(raw_children, (str, bytes)):
+            for child in raw_children:
+                if isinstance(child, Mapping) and child.get("type") == "group":
+                    matched, evaluation = self._evaluate_logic_group(payload, child, incoming_contract)
+                else:
+                    matched, evaluation = self._evaluate_logic_rule(payload, child if isinstance(child, Mapping) else {}, incoming_contract)
+                child_matches.append(matched)
+                child_evaluations.append(evaluation)
+        combinator = "any" if group.get("combinator") == "any" else "all"
+        matched = any(child_matches) if combinator == "any" else all(child_matches)
+        if group.get("negated") is True:
+            matched = not matched
+        return (
+            matched,
+            {
+                "id": group.get("id"),
+                "type": "group",
+                "combinator": combinator,
+                "negated": group.get("negated") is True,
+                "matched": matched,
+                "children": child_evaluations,
+            },
+        )
+
+    def _flatten_logic_evaluations(self, evaluation: Mapping[str, Any]) -> list[dict[str, Any]]:
+        evaluation_type = str(evaluation.get("type", "rule") or "rule").strip()
+        if evaluation_type != "group":
+            return [dict(evaluation)]
+        flattened: list[dict[str, Any]] = []
+        raw_children = evaluation.get("children", [])
+        if isinstance(raw_children, Sequence) and not isinstance(raw_children, (str, bytes)):
+            for child in raw_children:
+                if isinstance(child, Mapping):
+                    flattened.extend(self._flatten_logic_evaluations(child))
+        return flattened
+
+    def _evaluate_logic_clause(self, payload: Any, clause: Mapping[str, Any], incoming_contract: str) -> tuple[bool, dict[str, Any]]:
+        return self._evaluate_logic_rule(payload, clause, incoming_contract)
 
     def _execute_logic_conditions(self, context: NodeContext) -> NodeExecutionResult:
         source_envelope = self._source_envelope(context)
         incoming_contract = str(source_envelope.metadata.get("contract", "") or "").strip()
-        matched_clause: dict[str, Any] | None = None
-        for clause in self._logic_clauses():
-            if self._evaluate_logic_clause(source_envelope.payload, clause, incoming_contract):
-                matched_clause = clause
+        matched_branch: dict[str, Any] | None = None
+        clause_evaluations: list[dict[str, Any]] = []
+        branch_evaluations: list[dict[str, Any]] = []
+        for branch in self._logic_branches():
+            matched, evaluation = self._evaluate_logic_group(source_envelope.payload, branch.get("root_group", {}), incoming_contract)
+            clause_evaluations.extend(self._flatten_logic_evaluations(evaluation))
+            branch_evaluations.append(
+                {
+                    "id": branch.get("id"),
+                    "label": branch.get("label"),
+                    "output_handle_id": branch.get("output_handle_id"),
+                    "matched": matched,
+                    "trace": evaluation,
+                }
+            )
+            if matched:
+                matched_branch = branch
                 break
         selected_handle_id = (
-            str(matched_clause.get("output_handle_id", CONTROL_FLOW_IF_HANDLE_ID))
-            if matched_clause is not None
+            str(matched_branch.get("output_handle_id", CONTROL_FLOW_IF_HANDLE_ID))
+            if matched_branch is not None
             else str(self.config.get("else_output_handle_id", CONTROL_FLOW_ELSE_HANDLE_ID) or CONTROL_FLOW_ELSE_HANDLE_ID)
         ).strip() or CONTROL_FLOW_ELSE_HANDLE_ID
         forwarded_envelope = MessageEnvelope(
@@ -2013,8 +2273,12 @@ class ControlFlowNode(BaseNode):
                 "node_kind": self.kind,
                 "control_flow_mode": "logic_conditions",
                 "selected_handle_id": selected_handle_id,
-                "matched_clause_id": matched_clause.get("id") if matched_clause is not None else None,
-                "matched_clause_label": matched_clause.get("label") if matched_clause is not None else "Else",
+                "matched_branch_id": matched_branch.get("id") if matched_branch is not None else None,
+                "matched_branch_label": matched_branch.get("label") if matched_branch is not None else "Else",
+                "matched_clause_id": matched_branch.get("id") if matched_branch is not None else None,
+                "matched_clause_label": matched_branch.get("label") if matched_branch is not None else "Else",
+                "condition_evaluations": clause_evaluations,
+                "branch_evaluations": branch_evaluations,
             },
         )
         route_output = forwarded_envelope.to_dict()
@@ -2022,15 +2286,18 @@ class ControlFlowNode(BaseNode):
             status="success",
             output=route_output,
             summary=(
-                f"Logic conditions matched '{matched_clause.get('label', 'if')}'."
-                if matched_clause is not None
+                f"Logic conditions matched '{matched_branch.get('label', 'if')}'."
+                if matched_branch is not None
                 else "Logic conditions fell through to else."
             ),
             metadata={
                 "control_flow_mode": "logic_conditions",
                 "control_flow_handle_id": selected_handle_id,
                 "incoming_contract": incoming_contract or None,
-                "matched_clause_id": matched_clause.get("id") if matched_clause is not None else None,
+                "matched_branch_id": matched_branch.get("id") if matched_branch is not None else None,
+                "matched_clause_id": matched_branch.get("id") if matched_branch is not None else None,
+                "condition_evaluations": clause_evaluations,
+                "branch_evaluations": branch_evaluations,
             },
             route_outputs={selected_handle_id: route_output},
         )
@@ -3686,6 +3953,9 @@ class GraphValidationError(ValueError):
 
 def _node_from_dict(payload: Mapping[str, Any]) -> BaseNode:
     kind = str(payload["kind"])
+    provider_id = str(payload.get("provider_id", ""))
+    if provider_id == SPREADSHEET_ROW_PROVIDER_ID and kind == "data":
+        kind = "control_flow_unit"
     common = {
         "node_id": str(payload["id"]),
         "label": str(payload.get("label", payload["id"])),
@@ -4270,35 +4540,79 @@ class GraphDefinition:
                             f"Spreadsheet rows node '{node.id}' uses unsupported output handle(s): {', '.join(str(handle) for handle in invalid_handles)}."
                         )
                 if node.provider_id == LOGIC_CONDITIONS_PROVIDER_ID:
-                    raw_clauses = node.config.get("clauses", [])
-                    if not isinstance(raw_clauses, Sequence) or isinstance(raw_clauses, (str, bytes)):
-                        raise GraphValidationError(
-                            f"Logic conditions node '{node.id}' must declare clauses as a list."
-                        )
-                    clause_handles: set[str] = set()
-                    for index, raw_clause in enumerate(raw_clauses):
-                        if not isinstance(raw_clause, Mapping):
+                    branch_handles: set[str] = set()
+
+                    def validate_logic_group(raw_group: Any, branch_label: str, path: str) -> None:
+                        if not isinstance(raw_group, Mapping):
                             raise GraphValidationError(
-                                f"Logic conditions node '{node.id}' clause at index {index} must be an object."
+                                f"Logic conditions node '{node.id}' branch '{branch_label}' has invalid group at {path}."
                             )
-                        operator = str(raw_clause.get("operator", "equals") or "equals").strip()
-                        if operator not in {"exists", "equals", "not_equals", "contains", "gt", "gte", "lt", "lte"}:
+                        raw_children = raw_group.get("children", [])
+                        if not isinstance(raw_children, Sequence) or isinstance(raw_children, (str, bytes)):
                             raise GraphValidationError(
-                                f"Logic conditions node '{node.id}' uses unsupported operator '{operator}'."
+                                f"Logic conditions node '{node.id}' branch '{branch_label}' group at {path} must declare children as a list."
                             )
-                        output_handle_id = str(
-                            raw_clause.get("output_handle_id", CONTROL_FLOW_IF_HANDLE_ID) or CONTROL_FLOW_IF_HANDLE_ID
-                        ).strip()
-                        if not output_handle_id:
+                        for child_index, raw_child in enumerate(raw_children):
+                            child_path = f"{path}.{child_index + 1}"
+                            if not isinstance(raw_child, Mapping):
+                                raise GraphValidationError(
+                                    f"Logic conditions node '{node.id}' branch '{branch_label}' has invalid child at {child_path}."
+                                )
+                            if raw_child.get("type") == "group":
+                                validate_logic_group(raw_child, branch_label, child_path)
+                                continue
+                            operator = str(raw_child.get("operator", "equals") or "equals").strip()
+                            if operator not in {"exists", "equals", "not_equals", "contains", "gt", "gte", "lt", "lte"}:
+                                raise GraphValidationError(
+                                    f"Logic conditions node '{node.id}' branch '{branch_label}' uses unsupported operator '{operator}'."
+                                )
+
+                    raw_branches = node.config.get("branches")
+                    if isinstance(raw_branches, Sequence) and not isinstance(raw_branches, (str, bytes)):
+                        for index, raw_branch in enumerate(raw_branches):
+                            if not isinstance(raw_branch, Mapping):
+                                raise GraphValidationError(
+                                    f"Logic conditions node '{node.id}' branch at index {index} must be an object."
+                                )
+                            branch_label = str(raw_branch.get("label", f"Branch {index + 1}")).strip() or f"Branch {index + 1}"
+                            output_handle_id = str(
+                                raw_branch.get("output_handle_id", CONTROL_FLOW_IF_HANDLE_ID) or CONTROL_FLOW_IF_HANDLE_ID
+                            ).strip()
+                            if not output_handle_id:
+                                raise GraphValidationError(
+                                    f"Logic conditions node '{node.id}' branch '{branch_label}' must declare an output_handle_id."
+                                )
+                            branch_handles.add(output_handle_id)
+                            validate_logic_group(raw_branch.get("root_group", {}), branch_label, "root")
+                    else:
+                        raw_clauses = node.config.get("clauses", [])
+                        if not isinstance(raw_clauses, Sequence) or isinstance(raw_clauses, (str, bytes)):
                             raise GraphValidationError(
-                                f"Logic conditions node '{node.id}' clause at index {index} must declare an output_handle_id."
+                                f"Logic conditions node '{node.id}' must declare clauses as a list."
                             )
-                        clause_handles.add(output_handle_id)
-                    clause_handles.add(str(node.config.get("else_output_handle_id", CONTROL_FLOW_ELSE_HANDLE_ID) or CONTROL_FLOW_ELSE_HANDLE_ID))
+                        for index, raw_clause in enumerate(raw_clauses):
+                            if not isinstance(raw_clause, Mapping):
+                                raise GraphValidationError(
+                                    f"Logic conditions node '{node.id}' clause at index {index} must be an object."
+                                )
+                            operator = str(raw_clause.get("operator", "equals") or "equals").strip()
+                            if operator not in {"exists", "equals", "not_equals", "contains", "gt", "gte", "lt", "lte"}:
+                                raise GraphValidationError(
+                                    f"Logic conditions node '{node.id}' uses unsupported operator '{operator}'."
+                                )
+                            output_handle_id = str(
+                                raw_clause.get("output_handle_id", CONTROL_FLOW_IF_HANDLE_ID) or CONTROL_FLOW_IF_HANDLE_ID
+                            ).strip()
+                            if not output_handle_id:
+                                raise GraphValidationError(
+                                    f"Logic conditions node '{node.id}' clause at index {index} must declare an output_handle_id."
+                                )
+                            branch_handles.add(output_handle_id)
+                    branch_handles.add(str(node.config.get("else_output_handle_id", CONTROL_FLOW_ELSE_HANDLE_ID) or CONTROL_FLOW_ELSE_HANDLE_ID))
                     invalid_handles = [
                         edge.source_handle_id
                         for edge in self.get_outgoing_edges(node.id)
-                        if edge.kind != "binding" and edge.source_handle_id not in clause_handles
+                        if edge.kind != "binding" and edge.source_handle_id not in branch_handles
                     ]
                     if invalid_handles:
                         raise GraphValidationError(

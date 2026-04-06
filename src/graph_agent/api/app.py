@@ -342,6 +342,27 @@ def get_run(run_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Unknown run '{run_id}'.") from exc
 
 
+@app.get("/api/runs/{run_id}/files")
+def list_run_files(run_id: str) -> dict[str, Any]:
+    try:
+        return manager.list_run_files(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown run '{run_id}'.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/runs/{run_id}/files/content")
+def read_run_file(run_id: str, path: str) -> dict[str, Any]:
+    try:
+        return manager.read_run_file(run_id, path)
+    except KeyError as exc:
+        detail = str(exc).strip("'") or f"File '{path}' was not found."
+        raise HTTPException(status_code=404, detail=detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/runs/{run_id}/events")
 def stream_run_events(run_id: str) -> StreamingResponse:
     try:

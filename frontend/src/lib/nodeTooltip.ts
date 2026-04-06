@@ -1,5 +1,6 @@
 import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "./types";
 import { inferModelResponseMode } from "./editor";
+import { normalizeLogicConditionConfig, summarizeLogicGroup } from "./logicConditions";
 import { getNodeInstanceLabel } from "./nodeInstanceLabels";
 import { resolveResponseSchemaDetails } from "./responseSchema";
 import { resolveToolNodeDetails } from "./toolNodeDetails";
@@ -411,14 +412,16 @@ export function buildNodeTooltip(
     };
   }
 
-  if (node.kind === "data") {
+  if (node.kind === "control_flow_unit" || node.kind === "data") {
     const isDisplayNode = node.provider_id === "core.data_display";
     const isContextBuilderNode = node.provider_id === "core.context_builder";
     const isPromptBlockNode = node.provider_id === "core.prompt_block";
     const isSpreadsheetNode = node.provider_id === "core.spreadsheet_rows";
+    const isLogicConditionsNode = node.provider_id === "core.logic_conditions";
     const contextBuilderBindings = Array.isArray(node.config.input_bindings)
       ? node.config.input_bindings.filter((binding): binding is Record<string, unknown> => isRecord(binding))
       : [];
+    const logicConditionConfig = isLogicConditionsNode ? normalizeLogicConditionConfig(node.config).normalized : null;
     const configuredPlaceholders = uniqueStrings(
       contextBuilderBindings
         .map((binding) => asString(binding.placeholder) ?? "")
@@ -443,6 +446,8 @@ export function buildNodeTooltip(
                   ? "prompt block"
                 : isContextBuilderNode
                   ? "context builder"
+                  : isLogicConditionsNode
+                    ? "logic conditions"
                   : isSpreadsheetNode
                     ? "spreadsheet rows"
                   : (asString(node.config.mode) ?? "passthrough"),
@@ -455,6 +460,12 @@ export function buildNodeTooltip(
                   ? truncate(asString(node.config.content) ?? "")
                 : isContextBuilderNode
                   ? truncate(asString(node.config.template) ?? "Generated from connected placeholders")
+                  : isLogicConditionsNode
+                    ? truncate(
+                        logicConditionConfig?.branches[0]
+                          ? summarizeLogicGroup(logicConditionConfig.branches[0].root_group)
+                          : "Match the incoming envelope payload",
+                      )
                   : isSpreadsheetNode
                     ? truncate(asString(node.config.file_path) ?? "Select a CSV or XLSX file")
                   : truncate(asString(node.config.template) ?? "{input_payload}"),
@@ -482,6 +493,23 @@ export function buildNodeTooltip(
                   { label: "First Data Row", value: String(node.config.start_row_index ?? 2) },
                 ]
               : []),
+            ...(isLogicConditionsNode
+              ? [
+                  { label: "Branches", value: String(logicConditionConfig?.branches.length ?? 0) },
+                  {
+                    label: "Primary Operator",
+                    value: logicConditionConfig?.branches[0] ? truncate(summarizeLogicGroup(logicConditionConfig.branches[0].root_group), 42) : "equals",
+                  },
+                  {
+                    label: "Primary Handle",
+                    value: logicConditionConfig?.branches[0]?.output_handle_id ?? "control-flow-if",
+                  },
+                  {
+                    label: "Else Handle",
+                    value: logicConditionConfig?.else_output_handle_id ?? "control-flow-else",
+                  },
+                ]
+              : []),
           ],
         },
         ...baseSections,
@@ -492,6 +520,8 @@ export function buildNodeTooltip(
           ? "Add prompt content, then bind this node into a Context Builder or model."
           : isContextBuilderNode && connectedSourceCount === 0
           ? "Connect one or more upstream text nodes to start composing a shared prompt block."
+          : isLogicConditionsNode && (logicConditionConfig?.branches.length ?? 0) === 0
+          ? "Add a branch to route the incoming envelope into explicit control-flow paths."
           : isSpreadsheetNode && !(asString(node.config.file_path) ?? "").trim()
           ? "Set a local CSV or XLSX file path to parse row dictionaries sequentially."
           : undefined,

@@ -7,7 +7,7 @@
 
 .environment-run-summary,
 .agent-swimlanes-panel {
-  margin: 0 1.75rem 1.7rem;
+  margin: 0.75rem 1.75rem 1.7rem;
 }
 
 .agent-swimlanes-panel {
@@ -703,24 +703,25 @@ pre {
 
 .hero-mosaic {
   display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.72fr);
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.72fr);
   align-items: start;
   column-gap: 1.2rem;
-  padding: 1.2rem 0.75rem 0.5rem;
+  padding: 0.75rem 0.75rem 0.5rem;
+  overflow: hidden;
 }
 
 .hero-main-column,
 .hero-side-column {
   display: grid;
-  gap: 1.35rem;
+  gap: 0.85rem;
   min-width: 0;
 }
 
 .hero-main-row {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
   gap: 1.2rem;
-  align-items: stretch;
+  align-items: start;
 }
 
 .hero-main-column {
@@ -739,17 +740,13 @@ pre {
   width: 100%;
 }
 .mosaic-graph {
-  align-self: stretch;
+  align-self: start;
   width: 100%;
 }
 .mosaic-env {
   align-self: start;
   width: 100%;
 }
-.mosaic-execution {
-  width: 100%;
-}
-
 .mosaic-title h1,
 .panel-header h2 {
   margin: 0 0 0.4rem;
@@ -834,34 +831,29 @@ pre {
 
 .mosaic-execution-input {
   grid-template-rows: auto minmax(0, 1fr);
-  align-self: stretch;
-  height: 100%;
   min-height: 0;
 }
 
 .mosaic-execution {
-  grid-template-columns: minmax(0, 1fr) minmax(220px, 280px);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 280px);
   gap: 0.85rem;
-  align-items: stretch;
+  align-items: start;
+  min-width: 0;
   min-height: 0;
-  margin-top: 0.35rem;
-  margin-bottom: 1rem;
-  width: 100%;
-  justify-self: stretch;
 }
 
 .mosaic-execution-input textarea {
-  min-height: 33rem;
-  height: 100%;
+  min-height: 10rem;
   resize: vertical;
 }
 
 .mosaic-execution-run {
-  display: grid;
-  align-content: start;
+  display: flex;
+  flex-direction: column;
   align-self: start;
   gap: 0.55rem;
   padding: 0.15rem 0;
+  min-width: 0;
 }
 
 .mosaic-execution-run button {
@@ -888,6 +880,19 @@ pre {
   border: 1px solid rgba(88, 92, 132, 0.52);
   border-radius: 14px;
   background: rgba(16, 17, 29, 0.82);
+  max-height: 22rem;
+  overflow-y: auto;
+}
+
+.execution-files-panel {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.8rem;
+  border: 1px solid rgba(88, 92, 132, 0.52);
+  border-radius: 14px;
+  background: rgba(16, 17, 29, 0.82);
+  max-height: 18rem;
+  overflow-y: auto;
 }
 
 .execution-documents-header {
@@ -923,6 +928,62 @@ pre {
 .execution-documents-list {
   display: grid;
   gap: 0.55rem;
+}
+
+.execution-files-actions {
+  display: flex;
+  gap: 0.55rem;
+}
+
+.execution-files-actions .secondary-button {
+  width: auto !important;
+}
+
+.execution-files-browser {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.execution-files-list {
+  display: grid;
+  gap: 0.45rem;
+  max-height: 14rem;
+  overflow: auto;
+}
+
+.execution-file-row {
+  display: grid;
+  gap: 0.25rem;
+  justify-items: start;
+  padding: 0.65rem 0.7rem;
+  border: 1px solid rgba(73, 77, 117, 0.72);
+  border-radius: 12px;
+  background: rgba(20, 22, 37, 0.88);
+  color: #eef0ff;
+  text-align: left;
+}
+
+.execution-file-row strong {
+  font-size: 0.88rem;
+}
+
+.execution-file-row span {
+  color: #9fa4d5;
+  font-size: 0.8rem;
+}
+
+.execution-file-row.is-selected {
+  border-color: rgba(126, 138, 255, 0.75);
+  box-shadow: inset 0 0 0 1px rgba(126, 138, 255, 0.24);
+}
+
+.execution-file-preview {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.7rem;
+  border-radius: 12px;
+  border: 1px solid rgba(73, 77, 117, 0.72);
+  background: rgba(20, 22, 37, 0.88);
 }
 
 .execution-document-card {
@@ -1092,7 +1153,8 @@ pre {
 .mosaic-env {
   display: flex;
   flex-direction: column;
-  max-height: fit-content;
+  max-height: 70vh;
+  overflow-y: auto;
   padding: 0.95rem 1rem;
 }
 
@@ -1706,9 +1768,9 @@ pre {
 .graph-loop-region-layer {
   position: absolute;
   inset: 0;
-  z-index: 1;
+  z-index: -3;
   pointer-events: none;
-  overflow: visible;
+  overflow: hidden;
 }
 
 .graph-loop-region {
@@ -1845,6 +1907,189 @@ pre {
   font-size: 0.84rem;
   font-weight: 600;
   letter-spacing: 0.01em;
+}
+
+.condition-builder-toolbar,
+.condition-builder-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.condition-builder-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin-top: 0.75rem;
+}
+
+.condition-builder-chip {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.18rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid rgba(103, 115, 186, 0.42);
+  border-radius: 12px;
+  background: rgba(19, 22, 37, 0.82);
+  color: #eef2ff;
+}
+
+.condition-builder-chip:hover {
+  border-color: rgba(138, 149, 235, 0.62);
+  background: rgba(29, 33, 54, 0.92);
+}
+
+.condition-builder-chip small {
+  color: #a9b3db;
+  font-size: 0.74rem;
+  line-height: 1.35;
+}
+
+.condition-builder-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.85fr) minmax(420px, 1.4fr) minmax(260px, 0.9fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.condition-branch-sidebar,
+.condition-builder-center,
+.condition-builder-sidepanel {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.condition-branch-sidebar-item {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid rgba(71, 78, 126, 0.72);
+  border-radius: 14px;
+  background: rgba(17, 19, 32, 0.86);
+  color: #edf1ff;
+  text-align: left;
+}
+
+.condition-branch-sidebar-item:hover,
+.condition-branch-sidebar-item.is-active {
+  border-color: rgba(128, 142, 235, 0.9);
+  background: rgba(25, 29, 49, 0.94);
+}
+
+.condition-branch-sidebar-header,
+.condition-builder-row-actions,
+.condition-group-card-header,
+.condition-rule-row-header,
+.condition-group-card-controls,
+.condition-group-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.condition-branch-sidebar-header span,
+.condition-branch-sidebar-summary,
+.condition-group-card-summary {
+  color: #9ea5cd;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.condition-branch-header {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.condition-match-panel {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.condition-match-copy {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.condition-match-copy strong {
+  color: #eef1ff;
+  font-size: 0.9rem;
+}
+
+.condition-match-copy span {
+  color: #9ea5cd;
+  font-size: 0.8rem;
+}
+
+.condition-match-toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.condition-match-toggle {
+  border: 1px solid rgba(85, 92, 146, 0.8);
+  border-radius: 999px;
+  background: rgba(18, 21, 36, 0.86);
+  color: #cfd6ff;
+  padding: 0.4rem 0.8rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.condition-match-toggle.is-active {
+  border-color: rgba(128, 142, 235, 0.95);
+  background: rgba(44, 55, 103, 0.9);
+  color: #f4f6ff;
+}
+
+.condition-group-card {
+  display: grid;
+  gap: 0.85rem;
+  padding: 0.95rem;
+  border: 1px solid rgba(63, 69, 113, 0.78);
+  border-radius: 16px;
+  background: rgba(15, 17, 29, 0.88);
+}
+
+.condition-group-card.is-nested {
+  margin-left: 1rem;
+  background: rgba(18, 21, 35, 0.92);
+}
+
+.condition-group-negated {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.condition-group-negated--inline {
+  align-self: flex-start;
+  padding-top: 0.15rem;
+}
+
+.condition-group-card-body {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.condition-rule-row {
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.8rem;
+  border: 1px solid rgba(50, 56, 92, 0.86);
+  border-radius: 14px;
+  background: rgba(12, 14, 23, 0.9);
+}
+
+.condition-rule-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
 }
 
 .graph-milestone-chat {
@@ -2422,6 +2667,14 @@ pre {
   padding-right: calc(7.75rem * var(--graph-node-body-scale, 1));
 }
 
+.graph-node-card--control-flow .graph-node-card-inner {
+  padding-right: calc(7rem * var(--graph-node-body-scale, 1));
+}
+
+.graph-node-card--logic-conditions .graph-node-card-inner {
+  padding-right: calc(9rem * var(--graph-node-body-scale, 1));
+}
+
 .graph-node-card--model-outputs .graph-node-card-inner {
   padding-right: calc(6.25rem * var(--graph-node-body-scale, 1));
 }
@@ -2617,16 +2870,14 @@ pre {
 }
 
 .graph-node-card-actions {
-  position: absolute;
-  bottom: -5.55rem;
-  right: .9rem;
   display: flex;
   justify-content: flex-end;
   opacity: 0;
   transform: translateY(3px);
-  transition: opacity 0.14s ease, transform 0.14s ease;
+  transition: opacity 0.14s ease, transform 0.14s ease, max-height 0.14s ease;
   pointer-events: none;
-  z-index: 2;
+  overflow: hidden;
+  max-height: 0;
 }
 
 .graph-node-card-button {
@@ -2641,11 +2892,13 @@ pre {
   opacity: 1;
   transform: translateY(0);
   pointer-events: auto;
+  max-height: 4rem;
 }
 
 .graph-canvas.is-connecting .graph-node-card-actions,
 .graph-canvas.is-routing-wire .graph-node-card-actions {
   opacity: 0 !important;
+  max-height: 0 !important;
   pointer-events: none !important;
   transition: none !important;
 }
@@ -2682,6 +2935,11 @@ pre {
 .graph-node-inline-display--compact {
   gap: 0.34rem;
   padding: 0.58rem 0.68rem;
+}
+
+.graph-node-inline-display--narrow {
+  width: min(100%, 20rem);
+  max-width: min(100%, 20rem);
 }
 
 .graph-node-inline-display:hover,
@@ -3306,6 +3564,10 @@ pre {
     0 0 0 1px rgba(255, 255, 255, 0.04);
 }
 
+.tool-details-modal--wide {
+  width: min(1320px, calc(100vw - 2.5rem));
+}
+
 .provider-details-modal-shell {
   width: min(1240px, calc(100vw - 2.5rem));
   background:
@@ -3859,6 +4121,24 @@ pre {
   color: #e5e7ff;
   font-size: 0.8rem;
   line-height: 1.45;
+}
+
+.context-builder-value-sections {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.context-builder-value-section {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.context-builder-value-section-label {
+  color: #c7cced;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
 }
 
 .provider-details-summary {
@@ -4646,6 +4926,10 @@ pre {
 
 .provider-kind-pill--tool {
   background: rgba(167, 139, 250, 0.18);
+}
+
+.provider-kind-pill--control_flow_unit {
+  background: rgba(249, 115, 22, 0.18);
 }
 
 .provider-kind-pill--data {
@@ -5503,16 +5787,15 @@ pre {
   }
 
   .mosaic-execution {
-    margin-top: 0.85rem;
-    margin-bottom: 1.65rem;
-    padding-top: 1.25rem;
-    padding-bottom: 1.25rem;
+    padding-top: 0.75rem;
+    padding-bottom: 0.75rem;
   }
 
   .mosaic-env {
     align-self: start;
     justify-self: stretch;
     width: 100%;
+    max-height: none;
     margin-bottom: 1.4rem;
     padding-top: 0.95rem;
     padding-bottom: 0.95rem;

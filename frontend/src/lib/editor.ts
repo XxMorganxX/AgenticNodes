@@ -2,6 +2,7 @@ import dagre from "dagre";
 
 import { DEFAULT_GRAPH_ENV_VARS, getGraphEnvVars } from "./graphEnv";
 import { isTestEnvironment } from "./graphDocuments";
+import { createLogicConditionBranch, normalizeLogicConditionConfig } from "./logicConditions";
 import type { SavedNode } from "./savedNodes";
 import type { AgentDefinition, EditorCatalog, GraphDefinition, GraphDocument, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition } from "./types";
 
@@ -268,17 +269,7 @@ export function createNodeFromProvider(
         ...baseNode,
         config: {
           mode: "logic_conditions",
-          clauses: [
-            {
-              id: "if",
-              label: "If",
-              path: "",
-              operator: "equals",
-              value: "",
-              source_contracts: [],
-              output_handle_id: CONTROL_FLOW_IF_HANDLE_ID,
-            },
-          ],
+          branches: [createLogicConditionBranch(0, "If")],
           else_output_handle_id: CONTROL_FLOW_ELSE_HANDLE_ID,
           ...defaultConfig,
         },
@@ -706,11 +697,16 @@ export function getApiToolContextTargetAnchorRatio(handleId: string | null | und
 }
 
 export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
+  const logicConditionHandleRemaps = new Map<string, Map<string, string[]>>();
   const normalizedNodes = graph.nodes.map((node) => {
     const nextNode: GraphNode = {
       ...node,
       config: { ...node.config },
     };
+    if (node.provider_id === "core.spreadsheet_rows" && (node.kind === "data" || node.category === "data")) {
+      nextNode.kind = "control_flow_unit";
+      nextNode.category = "control_flow_unit";
+    }
     if (node.kind === "tool" && nextNode.config.include_mcp_tool_context === true) {
       const legacyToolName = String(node.config.tool_name ?? node.tool_name ?? "").trim();
       nextNode.kind = "mcp_context_provider";
@@ -733,6 +729,15 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
       nextNode.config.tool_names = toolNames.map((toolName) => String(toolName)).filter((toolName) => toolName.trim().length > 0);
       nextNode.config.expose_mcp_tools = nextNode.config.expose_mcp_tools !== false;
     }
+    if (node.provider_id === "core.logic_conditions") {
+      const { normalized, handleRemap } = normalizeLogicConditionConfig(nextNode.config);
+      nextNode.config.branches = normalized.branches as unknown as Record<string, unknown>[];
+      nextNode.config.else_output_handle_id = normalized.else_output_handle_id;
+      delete nextNode.config.clauses;
+      if (handleRemap.size > 0) {
+        logicConditionHandleRemaps.set(node.id, handleRemap);
+      }
+    }
     return nextNode;
   });
 
@@ -746,21 +751,24 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
   normalizedGraph.edges = graph.edges.map((edge) => {
     const sourceNode = normalizedNodes.find((node) => node.id === edge.source_id) ?? null;
     const inferredSourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, normalizedGraph);
+    const logicHandleRemap = logicConditionHandleRemaps.get(edge.source_id);
+    const remappedSourceHandleId =
+      logicHandleRemap?.get(inferredSourceHandleId ?? "")?.shift() ?? inferredSourceHandleId;
     return {
       ...edge,
-      source_handle_id: inferredSourceHandleId,
+      source_handle_id: remappedSourceHandleId,
       target_handle_id: edge.target_handle_id ?? null,
       waypoints: edge.waypoints?.map((waypoint) => ({ ...waypoint })),
       kind:
-        inferredSourceHandleId === API_TOOL_CALL_HANDLE_ID || inferredSourceHandleId === API_FINAL_MESSAGE_HANDLE_ID
+        remappedSourceHandleId === API_TOOL_CALL_HANDLE_ID || remappedSourceHandleId === API_FINAL_MESSAGE_HANDLE_ID
           ? "conditional"
           : edge.kind,
       condition:
-        inferredSourceHandleId === API_TOOL_CALL_HANDLE_ID
+        remappedSourceHandleId === API_TOOL_CALL_HANDLE_ID
           ? edge.condition ?? defaultApiToolCallCondition(edge.id)
-          : inferredSourceHandleId === API_FINAL_MESSAGE_HANDLE_ID
+          : remappedSourceHandleId === API_FINAL_MESSAGE_HANDLE_ID
             ? edge.condition ?? defaultApiMessageCondition(edge.id)
-            : inferredSourceHandleId === MCP_TERMINAL_OUTPUT_HANDLE_ID
+            : remappedSourceHandleId === MCP_TERMINAL_OUTPUT_HANDLE_ID
               ? edge.condition ?? defaultMcpTerminalOutputCondition(edge.id)
               : edge.kind === "conditional"
                 ? edge.condition ?? defaultConditionalCondition(edge.id)

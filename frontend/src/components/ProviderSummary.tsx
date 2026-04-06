@@ -27,21 +27,32 @@ type ProviderSummaryProps = {
 type HotbarItem = NonNullable<ProviderSummaryProps["hotbarItems"]>[number];
 type VisibleHotbarItem = Omit<HotbarItem, "provider"> & { provider: NodeProviderDefinition };
 
+const CATEGORY_TITLES: Record<string, string> = {
+  start: "Start",
+  api: "API",
+  tool: "Tool",
+  control_flow_unit: "Control Flow",
+  data: "Data",
+  end: "End",
+};
+
 const CATEGORY_DESCRIPTIONS: Record<string, string> = {
   start: "Start nodes are entry points that inject run-button input or external events such as Discord messages into a graph run.",
   api: "API nodes call external or provider-backed services such as LLM endpoints while keeping a stable graph role.",
   tool: "Tool nodes perform structured actions with validated inputs and routable success or failure results.",
+  control_flow_unit: "Control-flow nodes decide how the graph advances, including branching and repeated iteration.",
   data: "Data nodes gather, transform, or enrich deterministic context inside the graph.",
   end: "End nodes terminate the run and shape the final output returned by the system.",
 };
 
-const CATEGORY_ORDER = ["all", "saved", "start", "api", "tool", "data", "end"] as const;
+const CATEGORY_ORDER = ["all", "saved", "start", "api", "tool", "control_flow_unit", "data", "end"] as const;
 
 const KIND_LABELS: Record<string, string> = {
   input: "IN",
   model: "API",
   provider: "PROV",
   tool: "TOOL",
+  control_flow_unit: "FLOW",
   data: "DATA",
   output: "END",
 };
@@ -51,6 +62,7 @@ const KIND_GLYPHS: Record<string, string> = {
   model: "AI",
   provider: "PR",
   tool: "FX",
+  control_flow_unit: "FL",
   data: "DB",
   output: "OUT",
 };
@@ -336,7 +348,7 @@ export function ProviderSummary({
           groupedProviders.map(([category, categoryProviders]) => (
             <article key={category} className={`provider-group${variant === "drawer" ? " provider-group--drawer" : ""}`}>
               <div className="provider-section-heading">
-                <strong>{category}</strong>
+                <strong>{CATEGORY_TITLES[category] ?? category}</strong>
                 <span>{CATEGORY_DESCRIPTIONS[category] ?? "Custom node category."}</span>
               </div>
               {catalog?.contracts[category] ? (

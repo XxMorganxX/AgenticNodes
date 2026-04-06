@@ -7,6 +7,8 @@ import type {
   ProviderDiagnosticsResult,
   ProviderPreflightResult,
   RunDocument,
+  RunFilesystemFileContent,
+  RunFilesystemListing,
   RunState,
   SpreadsheetPreviewResult,
   StartRunOptions,
@@ -108,9 +110,7 @@ export async function deleteGraph(graphId: string): Promise<void> {
 }
 
 export async function fetchEditorCatalog(): Promise<EditorCatalog> {
-  const response = await fetch(`${API_BASE_URL}/api/editor/catalog`, {
-    cache: "no-store",
-  });
+  const response = await fetch(`${API_BASE_URL}/api/editor/catalog`);
   if (!response.ok) {
     throw new Error("Failed to load editor catalog.");
   }
@@ -194,6 +194,27 @@ export async function uploadRunDocuments(files: File[]): Promise<RunDocument[]> 
   }
   const payload = (await response.json()) as { documents?: RunDocument[] };
   return Array.isArray(payload.documents) ? payload.documents : [];
+}
+
+export async function fetchRunFiles(runId: string): Promise<RunFilesystemListing> {
+  const response = await fetch(`${API_BASE_URL}/api/runs/${runId}/files`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to load run files."));
+  }
+  return (await response.json()) as RunFilesystemListing;
+}
+
+export async function fetchRunFileContent(runId: string, path: string): Promise<RunFilesystemFileContent> {
+  const params = new URLSearchParams({ path });
+  const response = await fetch(`${API_BASE_URL}/api/runs/${runId}/files/content?${params.toString()}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to load file content."));
+  }
+  return (await response.json()) as RunFilesystemFileContent;
 }
 
 export async function bootMcpServer(serverId: string): Promise<McpServerStatus> {

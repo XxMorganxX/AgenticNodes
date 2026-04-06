@@ -222,6 +222,188 @@ class RunLogStoreTests(unittest.TestCase):
         stale_row = next(row for row in history if row["run_id"] == "stale-run")
         self.assertEqual(stale_row["status"], "interrupted")
 
+    def test_record_event_flushes_state_only_for_terminal_events(self) -> None:
+        class CountingRunStore:
+            def __init__(self) -> None:
+                self.appended_events: list[dict[str, object]] = []
+                self.written_states: list[dict[str, object]] = []
+
+            def initialize_run(self, state: dict[str, object]) -> None:
+                return None
+
+            def append_event(self, run_id: str, event: dict[str, object]) -> None:
+                self.appended_events.append(dict(event))
+
+            def write_state(self, run_id: str, state: dict[str, object]) -> None:
+                self.written_states.append(dict(state))
+
+            def load_manifest(self, run_id: str) -> dict[str, object] | None:
+                return None
+
+            def load_events(self, run_id: str) -> list[dict[str, object]]:
+                return []
+
+            def load_state(self, run_id: str) -> dict[str, object] | None:
+                return None
+
+            def recover_run_state(self, run_id: str) -> dict[str, object] | None:
+                return None
+
+            def list_runs(self, *, graph_id: str | None = None, limit: int = 50) -> list[dict[str, object]]:
+                return []
+
+        run_store = CountingRunStore()
+        manager = GraphRunManager(
+            services=self.services,
+            store=GraphStore(
+                self.services,
+                path=self.temp_path / "graphs.json",
+                bundled_path=self.temp_path / "bundled_graphs.json",
+            ),
+            run_log_store=run_store,
+        )
+        state = build_run_state("perf-run", "graph-1", {"prompt": "run"})
+        manager._run_states["perf-run"] = state
+        manager._event_backlog["perf-run"] = []
+        manager._subscribers["perf-run"] = []
+
+        manager._record_event(
+            "perf-run",
+            {
+                "event_type": "node.started",
+                "summary": "started node",
+                "payload": {"node_id": "node-1"},
+                "run_id": "perf-run",
+                "timestamp": "2026-04-02T00:00:00Z",
+                "agent_id": None,
+                "parent_run_id": None,
+            },
+        )
+        self.assertEqual(len(run_store.written_states), 0)
+
+        manager._record_event(
+            "perf-run",
+            {
+                "event_type": "run.completed",
+                "summary": "done",
+                "payload": {"final_output": {"message": "ok"}},
+                "run_id": "perf-run",
+                "timestamp": "2026-04-02T00:00:01Z",
+                "agent_id": None,
+                "parent_run_id": None,
+            },
+        )
+        self.assertEqual(len(run_store.written_states), 1)
+
+    def test_recover_run_state_uses_snapshot_event_history_for_backlog(self) -> None:
+        class SnapshotOnlyRunStore:
+            def initialize_run(self, state: dict[str, object]) -> None:
+                return None
+
+            def append_event(self, run_id: str, event: dict[str, object]) -> None:
+                return None
+
+            def write_state(self, run_id: str, state: dict[str, object]) -> None:
+                return None
+
+            def load_manifest(self, run_id: str) -> dict[str, object] | None:
+                return None
+
+            def load_events(self, run_id: str) -> list[dict[str, object]]:
+                raise AssertionError("load_events should not be called during recovery hydration")
+
+            def load_state(self, run_id: str) -> dict[str, object] | None:
+                return None
+
+            def recover_run_state(self, run_id: str) -> dict[str, object] | None:
+                return {
+                    **build_run_state(run_id, "graph-1", {"prompt": "resume"}),
+                    "event_history": [
+                        {
+                            "schema_version": RUNTIME_EVENT_SCHEMA_VERSION,
+                            "event_type": "run.started",
+                            "summary": "started",
+                            "payload": {},
+                            "run_id": run_id,
+                            "timestamp": "2026-04-02T00:00:00Z",
+                            "agent_id": None,
+                            "parent_run_id": None,
+                        }
+                    ],
+                }
+
+            def list_runs(self, *, graph_id: str | None = None, limit: int = 50) -> list[dict[str, object]]:
+                return []
+
+        manager = GraphRunManager(
+            services=self.services,
+            store=GraphStore(
+                self.services,
+                path=self.temp_path / "graphs-2.json",
+                bundled_path=self.temp_path / "bundled-2.json",
+            ),
+            run_log_store=SnapshotOnlyRunStore(),
+        )
+
+        recovered = manager._recover_run_state("snapshot-run")
+
+        self.assertIsNotNone(recovered)
+        self.assertEqual(len(manager._event_backlog["snapshot-run"]), 1)
+
+    def test_list_runs_skips_recovery_for_terminal_rows(self) -> None:
+        class ListOnlyRunStore:
+            def initialize_run(self, state: dict[str, object]) -> None:
+                return None
+
+            def append_event(self, run_id: str, event: dict[str, object]) -> None:
+                return None
+
+            def write_state(self, run_id: str, state: dict[str, object]) -> None:
+                return None
+
+            def load_manifest(self, run_id: str) -> dict[str, object] | None:
+                return None
+
+            def load_events(self, run_id: str) -> list[dict[str, object]]:
+                return []
+
+            def load_state(self, run_id: str) -> dict[str, object] | None:
+                return None
+
+            def recover_run_state(self, run_id: str) -> dict[str, object] | None:
+                raise AssertionError("recover_run_state should not be called for terminal rows")
+
+            def list_runs(self, *, graph_id: str | None = None, limit: int = 50) -> list[dict[str, object]]:
+                return [
+                    {
+                        "run_id": "terminal-run",
+                        "graph_id": "graph-1",
+                        "status": "completed",
+                        "status_reason": None,
+                        "started_at": "2026-04-02T00:00:00Z",
+                        "ended_at": "2026-04-02T00:00:01Z",
+                        "agent_id": None,
+                        "agent_name": None,
+                        "parent_run_id": None,
+                        "runtime_instance_id": None,
+                        "last_heartbeat_at": None,
+                    }
+                ]
+
+        manager = GraphRunManager(
+            services=self.services,
+            store=GraphStore(
+                self.services,
+                path=self.temp_path / "graphs-3.json",
+                bundled_path=self.temp_path / "bundled-3.json",
+            ),
+            run_log_store=ListOnlyRunStore(),
+        )
+
+        history = manager.list_runs(limit=10)
+
+        self.assertEqual(history[0]["run_id"], "terminal-run")
+
 
 if __name__ == "__main__":
     unittest.main()

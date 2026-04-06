@@ -5,19 +5,6 @@ import type { ContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import type { GraphDefinition, GraphNode, RunState } from "../lib/types";
 
-function resolveContextBuilderPayload(node: GraphNode, runState: RunState | null): unknown {
-  const nodeOutput = runState?.node_outputs?.[node.id];
-  if (
-    nodeOutput &&
-    typeof nodeOutput === "object" &&
-    !Array.isArray(nodeOutput) &&
-    "payload" in nodeOutput
-  ) {
-    return nodeOutput.payload;
-  }
-  return nodeOutput ?? null;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -36,15 +23,53 @@ function formatContextBuilderSourceValue(value: unknown): string {
   }
 }
 
+type ContextValueSection = {
+  label: string;
+  value: unknown;
+};
+
+function formatContextBuilderValueSections(value: unknown, fallbackLabel = "Value"): ContextValueSection[] {
+  if (!isRecord(value)) {
+    return [{ label: fallbackLabel, value }];
+  }
+
+  const sections: ContextValueSection[] = [];
+  const hasPayload = Object.prototype.hasOwnProperty.call(value, "payload");
+  const hasMetadata = Object.prototype.hasOwnProperty.call(value, "metadata");
+  const hasArtifacts = Object.prototype.hasOwnProperty.call(value, "artifacts");
+  const hasErrors = Object.prototype.hasOwnProperty.call(value, "errors");
+  const hasToolCalls = Object.prototype.hasOwnProperty.call(value, "tool_calls");
+
+  if (hasPayload || hasMetadata || hasArtifacts || hasErrors || hasToolCalls) {
+    if (hasPayload) {
+      sections.push({ label: "Payload", value: value.payload });
+    }
+    if (hasMetadata && isRecord(value.metadata) && Object.keys(value.metadata).length > 0) {
+      sections.push({ label: "Metadata", value: value.metadata });
+    }
+    if (hasArtifacts && isRecord(value.artifacts) && Object.keys(value.artifacts).length > 0) {
+      sections.push({ label: "Artifacts", value: value.artifacts });
+    }
+    if (hasErrors && Array.isArray(value.errors) && value.errors.length > 0) {
+      sections.push({ label: "Errors", value: value.errors });
+    }
+    if (hasToolCalls && Array.isArray(value.tool_calls) && value.tool_calls.length > 0) {
+      sections.push({ label: "Tool Calls", value: value.tool_calls });
+    }
+  }
+
+  if (sections.length > 0) {
+    return sections;
+  }
+  return [{ label: fallbackLabel, value }];
+}
+
 function resolveContextBuilderSourceValue(runState: RunState | null, sourceNodeId: string): unknown {
   const sourceError = runState?.node_errors?.[sourceNodeId];
   if (sourceError !== undefined) {
     return sourceError;
   }
   const sourceOutput = runState?.node_outputs?.[sourceNodeId];
-  if (isRecord(sourceOutput) && Object.prototype.hasOwnProperty.call(sourceOutput, "payload")) {
-    return sourceOutput.payload;
-  }
   return sourceOutput;
 }
 
@@ -71,8 +96,11 @@ export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView,
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [onClose]);
 
-  const payload = useMemo(() => resolveContextBuilderPayload(node, runState), [node, runState]);
-  const formattedPayload = useMemo(() => JSON.stringify(payload, null, 2), [payload]);
+  const mergedOutput = useMemo(() => runState?.node_outputs?.[node.id] ?? null, [node, runState]);
+  const mergedOutputSections = useMemo(
+    () => formatContextBuilderValueSections(mergedOutput, "Merged payload"),
+    [mergedOutput],
+  );
 
   useEffect(() => {
     if (!runtimeView || runtimeView.sources.length === 0) {
@@ -174,7 +202,17 @@ export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView,
                           <div className="context-builder-input-detail-label">
                             {slot.status === "error" ? "Captured error" : "Captured context"}
                           </div>
-                          <pre>{formatContextBuilderSourceValue(contextValue)}</pre>
+                          <div className="context-builder-value-sections">
+                            {formatContextBuilderValueSections(
+                              contextValue,
+                              slot.status === "error" ? "Error" : "Value",
+                            ).map((section) => (
+                              <div key={`${slot.sourceNodeId}-${section.label}`} className="context-builder-value-section">
+                                <div className="context-builder-value-section-label">{section.label}</div>
+                                <pre>{formatContextBuilderSourceValue(section.value)}</pre>
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       ) : null}
                     </li>
@@ -186,16 +224,23 @@ export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView,
 
           <section className="tool-details-modal-preview display-response-modal-preview">
             <div className="tool-details-modal-preview-header">
-              <strong>Current merged payload</strong>
+              <strong>Current merged result</strong>
               <span>
                 {runState?.current_node_id === node.id
                   ? "This node is executing."
-                  : payload != null
+                  : mergedOutput != null
                     ? "Latest snapshot from the active or most recent run."
-                    : "No payload yet for this run."}
+                    : "No merged output yet for this run."}
               </span>
             </div>
-            <pre>{formattedPayload}</pre>
+            <div className="context-builder-value-sections">
+              {mergedOutputSections.map((section) => (
+                <div key={`merged-${section.label}`} className="context-builder-value-section">
+                  <div className="context-builder-value-section-label">{section.label}</div>
+                  <pre>{formatContextBuilderSourceValue(section.value)}</pre>
+                </div>
+              ))}
+            </div>
           </section>
         </div>
       </section>

@@ -30,6 +30,16 @@ from graph_agent.tools.mcp import McpServerDefinition
 LOGGER = logging.getLogger(__name__)
 DISCORD_START_PROVIDER_ID = "start.discord_message"
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
+STATE_FLUSH_EVENT_TYPES = {
+    "run.completed",
+    "run.failed",
+    "run.cancelled",
+    "run.interrupted",
+    "agent.run.completed",
+    "agent.run.failed",
+    "agent.run.cancelled",
+    "agent.run.interrupted",
+}
 BUNDLED_MCP_TEMPLATE_PATH = Path(__file__).resolve().with_name("mcp_server_templates.json")
 DEFAULT_MCP_TEMPLATE_DIR = Path(__file__).resolve().parents[3] / ".graph-agent" / "mcp-server-templates"
 
@@ -186,12 +196,17 @@ class GraphRunManager:
         self._runtime_instance_id = str(uuid4())
         self._heartbeat_interval_seconds = _read_interval_env("GRAPH_AGENT_RUN_HEARTBEAT_INTERVAL_SECONDS", 1.0)
         self._heartbeat_timeout_seconds = _read_interval_env("GRAPH_AGENT_RUN_HEARTBEAT_TIMEOUT_SECONDS", 5.0)
+        self._catalog_status_ttl_seconds = _read_interval_env("GRAPH_AGENT_CATALOG_STATUS_TTL_SECONDS", 15.0)
+        self._catalog_status_cache: tuple[float, dict[str, Any]] | None = None
+        self._node_provider_payloads = [
+            provider.to_dict() for provider in self._services.node_provider_registry.list_definitions()
+        ]
         self._heartbeat_stop = Event()
         self._heartbeat_thread: Thread | None = None
         self._start_heartbeat_loop()
 
     def list_graphs(self) -> list[dict[str, Any]]:
-        return [self._graph_payload(graph["graph_id"]) for graph in self._store.list_graphs()]
+        return [self._decorate_graph(graph) for graph in self._store.list_graphs()]
 
     def get_graph(self, graph_id: str) -> dict[str, Any]:
         return self._graph_payload(graph_id)
@@ -211,19 +226,9 @@ class GraphRunManager:
         self._sync_discord_service()
 
     def get_catalog(self) -> dict[str, Any]:
-        provider_statuses: dict[str, Any] = {}
-        for provider_name, provider in self._services.model_providers.items():
-            result = provider.preflight()
-            provider_statuses[provider_name] = {
-                "status": result.status,
-                "ok": result.ok,
-                "message": result.message,
-                "warnings": result.warnings,
-                "details": result.details,
-            }
         return {
             **self._store.catalog(),
-            "provider_statuses": provider_statuses,
+            "provider_statuses": self._get_provider_statuses(),
             "mcp_servers": (
                 self._services.mcp_server_manager.list_servers() if self._services.mcp_server_manager is not None else []
             ),
@@ -363,6 +368,33 @@ class GraphRunManager:
     def upload_run_documents(self, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return ingest_run_documents(documents)
 
+    def list_run_files(self, run_id: str) -> dict[str, Any]:
+        from graph_agent.runtime.agent_filesystem import list_agent_workspace_files
+
+        state = self.get_run(run_id)
+        resolved_run_id, resolved_agent_id = self._resolve_filesystem_run_target(run_id, state)
+        listing = list_agent_workspace_files(resolved_run_id, resolved_agent_id)
+        return {
+            **listing,
+            "requested_run_id": run_id,
+        }
+
+    def read_run_file(self, run_id: str, relative_path: str) -> dict[str, Any]:
+        from graph_agent.runtime.agent_filesystem import AgentFilesystemError, read_agent_workspace_file
+
+        state = self.get_run(run_id)
+        resolved_run_id, resolved_agent_id = self._resolve_filesystem_run_target(run_id, state)
+        try:
+            content = read_agent_workspace_file(resolved_run_id, resolved_agent_id, relative_path)
+        except FileNotFoundError as exc:
+            raise KeyError(str(exc)) from exc
+        except AgentFilesystemError:
+            raise
+        return {
+            **content,
+            "requested_run_id": run_id,
+        }
+
     def get_run(self, run_id: str) -> dict[str, Any]:
         recovered = self._recover_run_state(run_id)
         if recovered is not None:
@@ -379,6 +411,9 @@ class GraphRunManager:
         for row in rows:
             run_id = str(row.get("run_id") or "")
             if not run_id:
+                continue
+            if row.get("status") != "running":
+                history.append(row)
                 continue
             state = self._recover_run_state(run_id)
             state = self._reconcile_run_state(run_id) if state is not None else None
@@ -463,7 +498,7 @@ class GraphRunManager:
             )
             thread = Thread(
                 target=self._execute_run,
-                args=(runtime, graph, input_payload, run_id, normalized_documents),
+                args=(runtime, graph, input_payload, run_id, normalized_documents, default_agent.agent_id),
                 daemon=True,
             )
 
@@ -561,9 +596,10 @@ class GraphRunManager:
         input_payload: Any,
         run_id: str,
         documents: list[dict[str, Any]] | None,
+        agent_id: str | None,
     ) -> None:
         try:
-            runtime.run(graph, input_payload, run_id=run_id, documents=documents)
+            runtime.run(graph, input_payload, run_id=run_id, agent_id=agent_id, documents=documents)
             with self._lock:
                 snapshot = deepcopy(self._run_states[run_id])
             self._run_store.write_state(run_id, snapshot)
@@ -693,7 +729,14 @@ class GraphRunManager:
             cancel_requested=lambda current_run_id=parent_run_id: self._cancel_requested(current_run_id),
         )
         graph = agent.to_graph(graph_id=document.graph_id, shared_env_vars=document.env_vars)
-        runtime.run(graph, input_payload, run_id=child_run_id, documents=documents)
+        runtime.run(
+            graph,
+            input_payload,
+            run_id=child_run_id,
+            agent_id=agent.agent_id,
+            parent_run_id=parent_run_id,
+            documents=documents,
+        )
 
         with self._lock:
             snapshot = deepcopy(self._run_states[parent_run_id]["agent_runs"][agent.agent_id])
@@ -705,6 +748,7 @@ class GraphRunManager:
     def _record_event(self, run_id: str, event: dict[str, Any]) -> None:
         event = normalize_runtime_event_dict(event)
         encoded = json.dumps(event)
+        should_flush_state = event["event_type"] in STATE_FLUSH_EVENT_TYPES
         parent_snapshot: dict[str, Any] | None = None
         child_run_id: str | None = None
         child_event: dict[str, Any] | None = None
@@ -715,7 +759,8 @@ class GraphRunManager:
             if state is not None:
                 next_state = apply_event(state, event)
                 self._run_states[run_id] = next_state
-                parent_snapshot = deepcopy(next_state)
+                if should_flush_state:
+                    parent_snapshot = deepcopy(next_state)
                 if event["event_type"].startswith("agent."):
                     payload = event.get("payload", {})
                     agent_id = str(event.get("agent_id") or payload.get("agent_id") or "")
@@ -728,14 +773,16 @@ class GraphRunManager:
                             "event_type": event["event_type"].removeprefix("agent."),
                             "run_id": child_run_id,
                         }
-                        child_snapshot = deepcopy(agent_state)
+                        if should_flush_state:
+                            child_snapshot = deepcopy(agent_state)
             subscribers = list(self._subscribers.get(run_id, []))
 
         self._run_store.append_event(run_id, event)
         if parent_snapshot is not None:
             self._run_store.write_state(run_id, parent_snapshot)
-        if child_run_id is not None and child_event is not None and child_snapshot is not None:
+        if child_run_id is not None and child_event is not None:
             self._run_store.append_event(child_run_id, child_event)
+        if child_run_id is not None and child_snapshot is not None:
             self._run_store.write_state(child_run_id, child_snapshot)
 
         for subscriber in subscribers:
@@ -974,10 +1021,28 @@ class GraphRunManager:
     def _decorate_graph(self, graph: dict[str, Any]) -> dict[str, Any]:
         return {
             **graph,
-            "node_providers": [
-                provider.to_dict() for provider in self._services.node_provider_registry.list_definitions()
-            ],
+            "node_providers": deepcopy(self._node_provider_payloads),
         }
+
+    def _get_provider_statuses(self) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).timestamp()
+        if self._catalog_status_cache is not None:
+            cached_at, cached_payload = self._catalog_status_cache
+            if now - cached_at < self._catalog_status_ttl_seconds:
+                return deepcopy(cached_payload)
+
+        provider_statuses: dict[str, Any] = {}
+        for provider_name, provider in self._services.model_providers.items():
+            result = provider.preflight()
+            provider_statuses[provider_name] = {
+                "status": result.status,
+                "ok": result.ok,
+                "message": result.message,
+                "warnings": result.warnings,
+                "details": result.details,
+            }
+        self._catalog_status_cache = (now, provider_statuses)
+        return deepcopy(provider_statuses)
 
     def _iter_discord_trigger_graphs(self) -> list[GraphDefinition]:
         graphs: list[GraphDefinition] = []
@@ -1103,6 +1168,19 @@ class GraphRunManager:
             agent_name=agent_name,
         )
 
+    def _resolve_filesystem_run_target(self, run_id: str, state: dict[str, Any]) -> tuple[str, str | None]:
+        agent_id = str(state.get("agent_id") or "").strip() or None
+        if agent_id:
+            return run_id, agent_id
+        agent_runs = state.get("agent_runs")
+        if isinstance(agent_runs, dict) and len(agent_runs) == 1:
+            child_state = next(iter(agent_runs.values()))
+            if isinstance(child_state, dict):
+                child_run_id = str(child_state.get("run_id") or "").strip() or run_id
+                child_agent_id = str(child_state.get("agent_id") or "").strip() or None
+                return child_run_id, child_agent_id
+        return run_id, None
+
     def _recover_run_state(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
             existing = self._run_states.get(run_id)
@@ -1111,7 +1189,7 @@ class GraphRunManager:
         snapshot = self._run_store.recover_run_state(run_id)
         if snapshot is None:
             return None
-        backlog = self._run_store.load_events(run_id)
+        backlog = list(snapshot.get("event_history", [])) if isinstance(snapshot.get("event_history"), list) else []
         with self._lock:
             existing = self._run_states.get(run_id)
             if existing is not None:
@@ -1123,6 +1201,11 @@ class GraphRunManager:
                 child_run_id = str(agent_state.get("run_id") or "")
                 if child_run_id:
                     self._run_states.setdefault(child_run_id, deepcopy(agent_state))
-                    self._event_backlog.setdefault(child_run_id, self._run_store.load_events(child_run_id))
+                    child_backlog = (
+                        list(agent_state.get("event_history", []))
+                        if isinstance(agent_state.get("event_history"), list)
+                        else []
+                    )
+                    self._event_backlog.setdefault(child_run_id, child_backlog)
                     self._subscribers.setdefault(child_run_id, [])
             return self._run_states[run_id]

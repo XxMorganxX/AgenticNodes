@@ -396,6 +396,28 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="core.write_text_file",
+            display_name="Write Text File",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Writes the incoming payload into a sandboxed text file inside the active agent workspace for this run.",
+            capabilities=["sandboxed file output", "text serialization", "agent workspace artifacts"],
+            default_config={
+                "mode": "write_text_file",
+                "relative_path": "response.txt",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="relative_path",
+                    label="Relative File Path",
+                    help_text="Saved inside the agent workspace for this run. Nested folders like outputs/response.txt are allowed.",
+                    placeholder="response.txt",
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.spreadsheet_rows",
             display_name="Spreadsheet Rows",
             category=NodeCategory.CONTROL_FLOW_UNIT,

@@ -2,9 +2,11 @@ import { useEffect, useState } from "react";
 
 import { previewSpreadsheetRows } from "../lib/api";
 import {
+  CONTROL_FLOW_ELSE_HANDLE_ID,
   defaultModelName,
   findProviderDefinition,
   inferModelResponseMode,
+  isControlFlowNode,
   isPromptBlockNode,
   isWireJunctionNode,
   modelProviderDefinitions,
@@ -13,6 +15,7 @@ import {
   providerModelName,
 } from "../lib/editor";
 import { getGraphEnvVars, resolveGraphEnvReferences } from "../lib/graphEnv";
+import { normalizeLogicConditionConfig, summarizeLogicGroup } from "../lib/logicConditions";
 import {
   parseResponseSchemaText,
   resolveResponseSchemaDetails,
@@ -103,6 +106,8 @@ function uniqueStrings(values: string[]): string[] {
 
 const CONTEXT_BUILDER_PROVIDER_ID = "core.context_builder";
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
+const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
+const WRITE_TEXT_FILE_PROVIDER_ID = "core.write_text_file";
 const CONTEXT_BUILDER_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONTEXT_BUILDER_TOKEN_PATTERN = /\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 const CONTEXT_BUILDER_BASE_VARIABLES = ["current_node_id", "documents", "graph_id", "input_payload", "run_id"];
@@ -137,6 +142,42 @@ function stringifyPreviewValue(value: unknown): string {
 
 function truncatePreview(value: string, limit = 180): string {
   return value.length > limit ? `${value.slice(0, limit - 1)}...` : value;
+}
+
+function incomingEdgeContractLabel(graph: GraphDefinition, node: GraphNode): string {
+  const incomingEdges = graph.edges.filter((edge) => edge.target_id === node.id && edge.kind !== "binding");
+  if (incomingEdges.length === 0) {
+    return "No incoming execution edge";
+  }
+  if (incomingEdges.length > 1) {
+    return "Multiple possible incoming contracts";
+  }
+  const incomingEdge = incomingEdges[0];
+  const sourceNode = graph.nodes.find((candidate) => candidate.id === incomingEdge.source_id);
+  if (!sourceNode) {
+    return "Unknown source";
+  }
+  if (
+    incomingEdge.condition?.type === "result_payload_path_equals" &&
+    incomingEdge.condition.path === "metadata.contract" &&
+    typeof incomingEdge.condition.value === "string"
+  ) {
+    return incomingEdge.condition.value;
+  }
+  if (sourceNode.kind === "model" && incomingEdge.source_handle_id === "api-message") {
+    return "message_envelope";
+  }
+  if (sourceNode.kind === "model" && incomingEdge.source_handle_id === "api-tool-call") {
+    return "tool_call_envelope";
+  }
+  if (sourceNode.kind === "tool" || sourceNode.kind === "mcp_tool_executor") {
+    return "tool_result_envelope";
+  }
+  return graph.node_providers?.find((provider) => provider.provider_id === sourceNode.provider_id)?.category === "start"
+    ? "message_envelope"
+    : sourceNode.category === "data" || sourceNode.category === "control_flow_unit"
+      ? "data_envelope"
+      : "Envelope inferred from source node";
 }
 
 function getContextBuilderSourcePreview(runState: RunState | null, sourceNodeId: string): string | null {
@@ -762,8 +803,13 @@ export function GraphInspector({
       (selectedNode.provider_id === "start.manual_run" || selectedNode.provider_id === "core.input");
     const isContextBuilderNode = selectedNode.kind === "data" && selectedNode.provider_id === CONTEXT_BUILDER_PROVIDER_ID;
     const isPromptBlockDataNode = selectedNode.kind === "data" && selectedNode.provider_id === PROMPT_BLOCK_PROVIDER_ID;
-    const isSpreadsheetRowNode = selectedNode.kind === "data" && selectedNode.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
+    const isWriteTextFileNode = selectedNode.kind === "data" && selectedNode.provider_id === WRITE_TEXT_FILE_PROVIDER_ID;
+    const isControlFlowUnitNode = isControlFlowNode(selectedNode);
+    const isSpreadsheetRowNode = isControlFlowUnitNode && selectedNode.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
+    const isLogicConditionsNode = isControlFlowUnitNode && selectedNode.provider_id === LOGIC_CONDITIONS_PROVIDER_ID;
     const spreadsheetNode = isSpreadsheetRowNode ? selectedNode : null;
+    const logicConditionConfig = isLogicConditionsNode ? normalizeLogicConditionConfig(selectedNode.config).normalized : null;
+    const logicIncomingContractLabel = isLogicConditionsNode ? incomingEdgeContractLabel(graph, selectedNode) : "";
     const spreadsheetIteratorState =
       isSpreadsheetRowNode && runState?.iterator_states
         ? (runState.iterator_states[selectedNode.id] as Record<string, unknown> | undefined)
@@ -1995,7 +2041,173 @@ export function GraphInspector({
               </div>
             </>
           ) : null}
-          {selectedNode.kind === "data" ? (
+          {selectedNode.kind === "control_flow_unit" ? (
+            <>
+              {isSpreadsheetRowNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Spreadsheet Rows</strong>
+                    <span>Reads a CSV or XLSX file, maps each row to a header-keyed dictionary, and runs downstream nodes once per row in strict sequence.</span>
+                    <span>Each row is emitted through the `loop-body` handle as `payload.row_data` plus row and sheet metadata.</span>
+                  </div>
+                  <label>
+                    File Format
+                    <select
+                      value={String(selectedNode.config.file_format ?? "auto")}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, file_format: event.target.value, mode: "spreadsheet_rows" },
+                          })),
+                        )
+                      }
+                    >
+                      <option value="auto">Auto Detect</option>
+                      <option value="csv">CSV</option>
+                      <option value="xlsx">Excel (.xlsx)</option>
+                    </select>
+                  </label>
+                  <label>
+                    File Path
+                    <input
+                      value={String(selectedNode.config.file_path ?? "")}
+                      placeholder="Path, env var, or leave empty if exactly one CSV/XLSX is attached to the run"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, file_path: event.target.value, mode: "spreadsheet_rows" },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Sheet Name
+                    <input
+                      value={String(selectedNode.config.sheet_name ?? "")}
+                      placeholder="Leave blank to use the first sheet"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, sheet_name: event.target.value, mode: "spreadsheet_rows" },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="checkbox-grid">
+                    <label>
+                      Empty Row Policy
+                      <select
+                        value={String(selectedNode.config.empty_row_policy ?? "skip")}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: { ...node.config, empty_row_policy: event.target.value, mode: "spreadsheet_rows" },
+                            })),
+                          )
+                        }
+                      >
+                        <option value="skip">Skip empty rows</option>
+                        <option value="include">Include empty rows</option>
+                      </select>
+                    </label>
+                  </div>
+                  <p className="node-help-text">
+                    Row 1 is always treated as the header row. Each later row is emitted as one iteration using those
+                    header titles as the parsed row keys.
+                  </p>
+                  <div className="context-builder-binding-actions">
+                    <button
+                      type="button"
+                      className="secondary-button context-builder-inline-button"
+                      onClick={() => void handleSpreadsheetPreview()}
+                      disabled={isSpreadsheetPreviewLoading || spreadsheetResolvedFilePath.trim().length === 0}
+                    >
+                      {isSpreadsheetPreviewLoading ? "Loading Preview..." : "Preview Rows"}
+                    </button>
+                  </div>
+                  <div className="inspector-meta">
+                    <span>Resolved file path: {spreadsheetResolvedFilePath || "Enter a file path or graph env reference."}</span>
+                    <span>Execution mode: sequential per-row loop through downstream nodes</span>
+                    <span>Output handle: `loop-body`</span>
+                    <span>Recommended shape for downstream prompts/tools: `payload.row_data` key-value pairs</span>
+                  </div>
+                  {spreadsheetIteratorState ? (
+                    <div className="contract-card">
+                      <strong>Iterator Progress</strong>
+                      <span>Status: {String(spreadsheetIteratorState.status ?? "unknown")}</span>
+                      <span>
+                        Row progress: {String(spreadsheetIteratorState.current_row_index ?? 0)} / {String(spreadsheetIteratorState.total_rows ?? 0)}
+                      </span>
+                      <span>Sheet: {String(spreadsheetIteratorState.sheet_name ?? "first sheet")}</span>
+                      {spreadsheetLoopRegion ? (
+                        <span>
+                          Loop region members: {String(spreadsheetLoopRegion.member_node_ids?.length ?? 0)}
+                          {spreadsheetLoopMemberLabels.length > 0 ? ` (${spreadsheetLoopMemberLabels.join(", ")})` : ""}
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {spreadsheetPreviewError ? <div className="tool-details-modal-help">{spreadsheetPreviewError}</div> : null}
+                  <div className="contract-card">
+                    <strong>Parsed Preview</strong>
+                    <span>
+                      {spreadsheetPreview
+                        ? `${spreadsheetPreview.row_count} row(s) parsed from ${spreadsheetPreview.file_format.toUpperCase()}`
+                        : "Run a preview to inspect headers and sample rows before execution."}
+                    </span>
+                    <pre className="context-builder-preview">
+                      {spreadsheetPreview
+                        ? JSON.stringify(
+                            {
+                              headers: spreadsheetPreview.headers,
+                              sheet_name: spreadsheetPreview.sheet_name,
+                              row_count: spreadsheetPreview.row_count,
+                              sample_rows: spreadsheetPreview.sample_rows,
+                            },
+                            null,
+                            2,
+                          )
+                        : "Preview output will appear here."}
+                    </pre>
+                  </div>
+                </>
+              ) : isLogicConditionsNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Logic Conditions</strong>
+                    <span>Evaluates the incoming envelope and routes execution through the first matching named branch or `Else`.</span>
+                    <span>Each branch owns a boolean rule group that can combine rules with `ALL` and `ANY` logic.</span>
+                  </div>
+                  <div className="contract-card">
+                    <strong>Incoming Contract</strong>
+                    <span>Resolved incoming contract: {logicIncomingContractLabel}</span>
+                    <span>Accepted node contracts: {contract?.accepted_inputs.join(", ") ?? "message_envelope, tool_result_envelope, data_envelope"}</span>
+                  </div>
+                  <div className="contract-card">
+                    <strong>Configured Branches</strong>
+                    <span>{logicConditionConfig?.branches.length ?? 0} branch{logicConditionConfig?.branches.length === 1 ? "" : "es"} configured before `Else`.</span>
+                    <span>Else handle: {String(logicConditionConfig?.else_output_handle_id ?? CONTROL_FLOW_ELSE_HANDLE_ID)}</span>
+                    {(logicConditionConfig?.branches ?? []).map((branch, index) => (
+                      <span key={branch.id}>
+                        {branch.label.trim() || `Branch ${index + 1}`}: {summarizeLogicGroup(branch.root_group)}
+                      </span>
+                    ))}
+                    {onOpenProviderDetails ? (
+                      <button type="button" className="secondary-button" onClick={() => onOpenProviderDetails(selectedNode.id)}>
+                        Open Condition Builder
+                      </button>
+                    ) : null}
+                  </div>
+                </>
+              ) : null}
+            </>
+          ) : selectedNode.kind === "data" ? (
             <>
               {isSpreadsheetRowNode ? (
                 <>
@@ -2128,6 +2340,38 @@ export function GraphInspector({
                           )
                         : "Preview output will appear here."}
                     </pre>
+                  </div>
+                </>
+              ) : isWriteTextFileNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Write Text File</strong>
+                    <span>Writes the incoming payload into a sandboxed file for this run and selected agent.</span>
+                    <span>Only relative paths inside the workspace are allowed.</span>
+                  </div>
+                  <label>
+                    Relative File Path
+                    <input
+                      value={String(selectedNode.config.relative_path ?? "response.txt")}
+                      placeholder="outputs/response.txt"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "write_text_file",
+                              relative_path: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="inspector-meta">
+                    <span>Sandbox: per-run, per-agent workspace under `.graph-agent/`</span>
+                    <span>Default file: {String(selectedNode.config.relative_path ?? "response.txt") || "response.txt"}</span>
+                    <span>Input source: latest incoming payload unless a binding overrides it</span>
                   </div>
                 </>
               ) : selectedNode.provider_id === "core.data_display" ? (

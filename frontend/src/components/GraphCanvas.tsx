@@ -19,6 +19,8 @@ import { GraphInspector } from "./GraphInspector";
 import { GraphCanvasNode } from "./GraphCanvasNode";
 import type { GraphCanvasNodeData } from "./GraphCanvasNode";
 import { ContextBuilderPayloadModal } from "./ContextBuilderPayloadModal";
+import { ConditionDetailsModal } from "./ConditionDetailsModal";
+import { ConditionResultsModal } from "./ConditionResultsModal";
 import { DisplayResponseModal } from "./DisplayResponseModal";
 import { PromptBlockDetailsModal } from "./PromptBlockDetailsModal";
 import { ProviderSummary } from "./ProviderSummary";
@@ -206,6 +208,7 @@ const KIND_COLORS: Record<string, string> = {
   tool: "#a78bfa",
   mcp_context_provider: "#5aa7ff",
   mcp_tool_executor: "#a78bfa",
+  control_flow_unit: "#f97316",
   data: "#2dd4bf",
   output: "#4ade80",
 };
@@ -217,6 +220,7 @@ const KIND_LABELS: Record<string, string> = {
   tool: "FX",
   mcp_context_provider: "MC",
   mcp_tool_executor: "MX",
+  control_flow_unit: "CF",
   data: "DB",
   output: "OUT",
 };
@@ -332,6 +336,114 @@ type JunctionDragState = {
 type GraphCanvasRuntimeNodeData = GraphCanvasNodeData & {
   isConnectionMagnetized?: boolean;
 };
+
+function formatConditionResultsText(value: unknown): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return "No condition results recorded.";
+  }
+  const metadata = "metadata" in value && value.metadata && typeof value.metadata === "object" && !Array.isArray(value.metadata)
+    ? (value.metadata as Record<string, unknown>)
+    : null;
+  const branchLabel =
+    typeof metadata?.matched_branch_label === "string"
+      ? metadata.matched_branch_label
+      : typeof metadata?.matched_clause_label === "string"
+        ? metadata.matched_clause_label
+        : "Else";
+  const branchEvaluations = Array.isArray(metadata?.branch_evaluations) ? metadata.branch_evaluations : [];
+  const legacyEvaluations = Array.isArray(metadata?.condition_evaluations) ? metadata.condition_evaluations : [];
+  function formatScalar(candidate: unknown): string {
+    if (typeof candidate === "string") {
+      return candidate;
+    }
+    if (typeof candidate === "number" || typeof candidate === "boolean") {
+      return String(candidate);
+    }
+    if (candidate === null) {
+      return "null";
+    }
+    if (candidate === undefined) {
+      return "undefined";
+    }
+    try {
+      return JSON.stringify(candidate);
+    } catch {
+      return String(candidate);
+    }
+  }
+  function formatActualValue(candidate: unknown): string[] {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      return [formatScalar(candidate)];
+    }
+    const record = candidate as Record<string, unknown>;
+    const lines: string[] = [];
+    if (typeof record.row_index === "number") {
+      lines.push(`row_index: ${record.row_index}`);
+    }
+    if (typeof record.row_number === "number") {
+      lines.push(`row_number: ${record.row_number}`);
+    }
+    if (typeof record.sheet_name === "string" || record.sheet_name === null) {
+      lines.push(`sheet_name: ${formatScalar(record.sheet_name)}`);
+    }
+    if (typeof record.source_file === "string" && record.source_file.length > 0) {
+      const sourceFileParts = record.source_file.split("/");
+      const sourceFile = sourceFileParts[sourceFileParts.length - 1] ?? record.source_file;
+      lines.push(`source_file: ${sourceFile}`);
+    }
+    if (record.row_data && typeof record.row_data === "object" && !Array.isArray(record.row_data)) {
+      lines.push("row_data:");
+      for (const [key, entryValue] of Object.entries(record.row_data as Record<string, unknown>)) {
+        lines.push(`  ${key}: ${formatScalar(entryValue)}`);
+      }
+    }
+    if (lines.length > 0) {
+      return lines;
+    }
+    return [formatScalar(candidate)];
+  }
+
+  function formatTrace(trace: unknown, depth = 0): string[] {
+    if (!trace || typeof trace !== "object" || Array.isArray(trace)) {
+      return [];
+    }
+    const record = trace as Record<string, unknown>;
+    const indent = "  ".repeat(depth);
+    if (record.type === "group") {
+      const combinator = record.combinator === "any" ? "ANY" : "ALL";
+      const groupLines = [`${indent}${record.negated === true ? "NOT " : ""}${combinator}: ${record.matched === true ? "true" : "false"}`];
+      const children = Array.isArray(record.children) ? record.children : [];
+      return groupLines.concat(children.flatMap((child) => formatTrace(child, depth + 1)));
+    }
+    const label = typeof record.path === "string" && record.path.trim().length > 0 ? record.path : "payload";
+    const matched = record.matched === true ? "true" : "false";
+    const lines = [`${indent}${label}: ${matched}`];
+    if (Object.prototype.hasOwnProperty.call(record, "actual_value")) {
+      lines.push(...formatActualValue(record.actual_value).map((actualLine) => `${indent}  ${actualLine}`));
+    }
+    return lines;
+  }
+
+  const lines = (branchEvaluations.length > 0
+    ? branchEvaluations
+    : legacyEvaluations)
+    .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null && !Array.isArray(entry))
+    .flatMap((entry) => {
+      if (branchEvaluations.length === 0) {
+        const label = typeof entry.label === "string" && entry.label.trim().length > 0 ? entry.label : "Clause";
+        const matched = entry.matched === true ? "true" : "false";
+        if (!Object.prototype.hasOwnProperty.call(entry, "actual_value")) {
+          return [`${label}: ${matched}`];
+        }
+        return [`${label}: ${matched}`, ...formatActualValue(entry.actual_value).map((actualLine) => `  ${actualLine}`)];
+      }
+      const label = typeof entry.label === "string" && entry.label.trim().length > 0 ? entry.label : "Branch";
+      const matched = entry.matched === true ? "true" : "false";
+      const header = `${label}: ${matched}`;
+      return entry.trace ? [header, ...formatTrace(entry.trace, 1)] : [header];
+    });
+  return [`branch: ${branchLabel}`, ...lines].join("\n");
+}
 
 type DragDiagnosticSession = {
   active: boolean;
@@ -655,13 +767,20 @@ const QUICK_ADD_SLOTS: QuickAddSlot[] = [
   },
   {
     hotkey: "4",
+    label: "Flow",
+    description: "Create a control-flow node.",
+    category: "control_flow_unit",
+    preferredProviderIds: ["core.logic_conditions", "core.spreadsheet_rows"],
+  },
+  {
+    hotkey: "5",
     label: "Data",
     description: "Create a data node.",
     category: "data",
     preferredProviderIds: [],
   },
   {
-    hotkey: "5",
+    hotkey: "6",
     label: "Output",
     description: "Create an end/output node.",
     category: "end",
@@ -734,7 +853,7 @@ const MILESTONE_CHAT_MAX_VISIBLE = 6;
 /** Max age before a line is dropped; opacity eases over this window (not linear). */
 const MILESTONE_CHAT_MAX_AGE_MS = 14_000;
 /** Ticks + CSS transition interpolate smoothly between updates. */
-const MILESTONE_CHAT_TICK_MS = 300;
+const MILESTONE_CHAT_TICK_MS = 1000;
 
 export function GraphCanvas({
   graph,
@@ -768,6 +887,8 @@ export function GraphCanvas({
   const [editorMessage, setEditorMessage] = useState<string | null>(null);
   const [toolDetailsNodeId, setToolDetailsNodeId] = useState<string | null>(null);
   const [providerDetailsNodeId, setProviderDetailsNodeId] = useState<string | null>(null);
+  const [conditionDetailsNodeId, setConditionDetailsNodeId] = useState<string | null>(null);
+  const [conditionResultsNodeId, setConditionResultsNodeId] = useState<string | null>(null);
   const [promptBlockDetailsNodeId, setPromptBlockDetailsNodeId] = useState<string | null>(null);
   const [displayResponseNodeId, setDisplayResponseNodeId] = useState<string | null>(null);
   const [contextBuilderPayloadNodeId, setContextBuilderPayloadNodeId] = useState<string | null>(null);
@@ -785,6 +906,9 @@ export function GraphCanvas({
   const [showHotkeys, setShowHotkeys] = useState(false);
   const [quickAddMinimized, setQuickAddMinimized] = useState(false);
   const [milestoneChatNow, setMilestoneChatNow] = useState(() => Date.now());
+  const [isDocumentVisible, setIsDocumentVisible] = useState(() =>
+    typeof document === "undefined" ? true : document.visibilityState !== "hidden",
+  );
   const [junctionDrag, setJunctionDrag] = useState<JunctionDragState | null>(null);
   const [waypointDrag, setWaypointDrag] = useState<WaypointDragState | null>(null);
   const [isNodeDragActive, setIsNodeDragActive] = useState(false);
@@ -842,9 +966,17 @@ export function GraphCanvas({
     () => graph?.nodes.find((node) => node.id === providerDetailsNodeId && node.kind === "model") ?? null,
     [graph, providerDetailsNodeId],
   );
+  const conditionDetailsNode = useMemo(
+    () => graph?.nodes.find((node) => node.id === conditionDetailsNodeId && node.provider_id === "core.logic_conditions") ?? null,
+    [conditionDetailsNodeId, graph],
+  );
   const promptBlockDetailsNode = useMemo(
     () => graph?.nodes.find((node) => node.id === promptBlockDetailsNodeId && node.provider_id === "core.prompt_block") ?? null,
     [graph, promptBlockDetailsNodeId],
+  );
+  const conditionResultsNode = useMemo(
+    () => graph?.nodes.find((node) => node.id === conditionResultsNodeId && node.provider_id === "core.logic_conditions") ?? null,
+    [conditionResultsNodeId, graph],
   );
   const displayResponseNode = useMemo(
     () => graph?.nodes.find((node) => node.id === displayResponseNodeId && node.provider_id === "core.data_display") ?? null,
@@ -896,6 +1028,17 @@ export function GraphCanvas({
       };
     });
   }, [environmentAgents, milestoneChatNow]);
+  const nodeColorById = useMemo(
+    () =>
+      new Map(
+        (graph?.nodes ?? []).map((node) => [node.id, KIND_COLORS[node.kind] ?? "#8486a5"] as const),
+      ),
+    [graph?.nodes],
+  );
+  const miniMapNodeColor = useCallback(
+    (node: { id: string }) => nodeColorById.get(node.id) ?? "#8486a5",
+    [nodeColorById],
+  );
 
   useRenderDiagnostics(
     "GraphCanvas",
@@ -913,8 +1056,16 @@ export function GraphCanvas({
   );
 
   useEffect(() => {
+    const updateVisibility = () => setIsDocumentVisible(document.visibilityState !== "hidden");
+    document.addEventListener("visibilitychange", updateVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", updateVisibility);
+    };
+  }, []);
+
+  useEffect(() => {
     const hasMilestones = environmentAgents.some((agent) => agent.milestones.length > 0);
-    if (!hasMilestones) {
+    if (!hasMilestones || !isDocumentVisible) {
       return;
     }
     setMilestoneChatNow(Date.now());
@@ -924,7 +1075,7 @@ export function GraphCanvas({
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [environmentAgents]);
+  }, [environmentAgents, isDocumentVisible]);
 
   const requestPrimarySelectionChange = useCallback(
     (nodeId: string | null, edgeId: string | null) => {
@@ -1169,6 +1320,7 @@ export function GraphCanvas({
   const handleOpenToolDetails = useCallback(
     (nodeId: string) => {
       onSelectionChange(nodeId, null);
+      setConditionDetailsNodeId(null);
       setPromptBlockDetailsNodeId(null);
       setToolDetailsNodeId(nodeId);
     },
@@ -1473,10 +1625,22 @@ export function GraphCanvas({
   const handleOpenProviderDetails = useCallback(
     (nodeId: string) => {
       onSelectionChange(nodeId, null);
+      setToolDetailsNodeId(null);
+      setPromptBlockDetailsNodeId(null);
+      setDisplayResponseNodeId(null);
+      setContextBuilderPayloadNodeId(null);
+      setConditionResultsNodeId(null);
+      const selectedNode = graph?.nodes.find((node) => node.id === nodeId) ?? null;
+      if (selectedNode?.provider_id === "core.logic_conditions") {
+        setProviderDetailsNodeId(null);
+        setConditionDetailsNodeId(nodeId);
+        return;
+      }
+      setConditionDetailsNodeId(null);
       setPromptBlockDetailsNodeId(null);
       setProviderDetailsNodeId(nodeId);
     },
-    [onSelectionChange],
+    [graph, onSelectionChange],
   );
 
   const handleOpenPromptBlockDetails = useCallback(
@@ -1485,6 +1649,8 @@ export function GraphCanvas({
       setTooltipNodeId(null);
       setToolDetailsNodeId(null);
       setProviderDetailsNodeId(null);
+      setConditionDetailsNodeId(null);
+      setConditionResultsNodeId(null);
       setPromptBlockDetailsNodeId(nodeId);
       setDisplayResponseNodeId(null);
       setContextBuilderPayloadNodeId(null);
@@ -1497,6 +1663,7 @@ export function GraphCanvas({
       onSelectionChange(nodeId, null);
       setPromptBlockDetailsNodeId(null);
       setContextBuilderPayloadNodeId(null);
+      setConditionResultsNodeId(null);
       setDisplayResponseNodeId(nodeId);
     },
     [onSelectionChange],
@@ -1507,7 +1674,22 @@ export function GraphCanvas({
       onSelectionChange(nodeId, null);
       setPromptBlockDetailsNodeId(null);
       setDisplayResponseNodeId(null);
+      setConditionResultsNodeId(null);
       setContextBuilderPayloadNodeId(nodeId);
+    },
+    [onSelectionChange],
+  );
+
+  const handleOpenConditionResults = useCallback(
+    (nodeId: string) => {
+      onSelectionChange(nodeId, null);
+      setPromptBlockDetailsNodeId(null);
+      setDisplayResponseNodeId(null);
+      setContextBuilderPayloadNodeId(null);
+      setToolDetailsNodeId(null);
+      setProviderDetailsNodeId(null);
+      setConditionDetailsNodeId(null);
+      setConditionResultsNodeId(nodeId);
     },
     [onSelectionChange],
   );
@@ -3411,6 +3593,7 @@ export function GraphCanvas({
                 onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
                 onOpenDisplayResponse: handleOpenDisplayResponse,
                 onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
+                onOpenConditionResults: handleOpenConditionResults,
                 onHandlePointerDown: handleNodeHandlePointerDown,
                 onJunctionPointerDown: handleJunctionPointerDown,
               },
@@ -3509,6 +3692,7 @@ export function GraphCanvas({
         previousData.onOpenPromptBlockDetails === handleOpenPromptBlockDetails &&
         previousData.onOpenDisplayResponse === handleOpenDisplayResponse &&
         previousData.onOpenContextBuilderPayload === handleOpenContextBuilderPayload &&
+        previousData.onOpenConditionResults === handleOpenConditionResults &&
         previousData.onHandlePointerDown === handleNodeHandlePointerDown &&
         previousData.onJunctionPointerDown === handleJunctionPointerDown
           ? previousData
@@ -3533,6 +3717,7 @@ export function GraphCanvas({
               onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
               onOpenDisplayResponse: handleOpenDisplayResponse,
               onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
+              onOpenConditionResults: handleOpenConditionResults,
               onHandlePointerDown: handleNodeHandlePointerDown,
               onJunctionPointerDown: handleJunctionPointerDown,
             };
@@ -3588,6 +3773,7 @@ export function GraphCanvas({
     handleOpenDisplayResponse,
     handleOpenPromptBlockDetails,
     handleOpenProviderDetails,
+    handleOpenConditionResults,
     handleToggleExecutorRetries,
     handleOpenToolDetails,
     handleToggleTooltip,
@@ -4448,7 +4634,7 @@ export function GraphCanvas({
           {graph.nodes.length === 0 ? (
             <div className="graph-empty-state">
               <strong>Start building your graph</strong>
-              <p>Use the quick-add bar, press `1-5`, or drag nodes directly into the canvas.</p>
+              <p>Use the quick-add bar, press `1-6`, or drag nodes directly into the canvas.</p>
               <button type="button" onClick={() => openDrawerTab("add")}>
                 Add Your First Node
               </button>
@@ -4603,10 +4789,7 @@ export function GraphCanvas({
             <MiniMap
               zoomable
               pannable
-              nodeColor={(node) => {
-                const kindMatch = graph?.nodes.find((n) => n.id === node.id);
-                return kindMatch ? (KIND_COLORS[kindMatch.kind] ?? "#8486a5") : "#8486a5";
-              }}
+              nodeColor={miniMapNodeColor}
               maskColor="rgba(13, 14, 24, 0.7)"
             />
             <Controls onZoomIn={handleZoomIn} onZoomOut={handleZoomOut} onFitView={handleFitView} />
@@ -4616,7 +4799,7 @@ export function GraphCanvas({
             <div className="graph-quick-add-main">
               <div className="graph-quick-add-copy">
                 <strong>Quick Add</strong>
-                <span>{quickAddMinimized ? "1-5" : "Press 1-5 or click a node to insert it near center."}</span>
+                <span>{quickAddMinimized ? "1-6" : "Press 1-6 or click a node to insert it near center."}</span>
               </div>
               <div id="graph-quick-add-list" className="graph-quick-add-list">
                 {quickAddItems.map((item) => (
@@ -4672,7 +4855,7 @@ export function GraphCanvas({
           {showHotkeys ? (
             <div className="graph-hotkey-guide" role="note" aria-label="Canvas keyboard shortcuts">
               <span>
-                <strong>1-5</strong> quick add
+                <strong>1-6</strong> quick add
               </span>
               <span>
                 <strong>G</strong> add drawer
@@ -4831,6 +5014,24 @@ export function GraphCanvas({
           catalog={catalog}
           onGraphChange={onGraphChange}
           onClose={() => setProviderDetailsNodeId(null)}
+        />
+      ) : null}
+      {conditionDetailsNode ? (
+        <ConditionDetailsModal
+          graph={graph}
+          node={conditionDetailsNode}
+          catalog={catalog}
+          runtimeOutput={runState?.node_outputs?.[conditionDetailsNode.id]}
+          onGraphChange={onGraphChange}
+          onClose={() => setConditionDetailsNodeId(null)}
+        />
+      ) : null}
+      {conditionResultsNode && runState?.node_outputs?.[conditionResultsNode.id] ? (
+        <ConditionResultsModal
+          graph={graph}
+          node={conditionResultsNode}
+          conditionText={formatConditionResultsText(runState.node_outputs[conditionResultsNode.id])}
+          onClose={() => setConditionResultsNodeId(null)}
         />
       ) : null}
       {promptBlockDetailsNode ? (

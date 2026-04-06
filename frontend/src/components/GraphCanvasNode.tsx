@@ -7,10 +7,14 @@ import {
   API_FINAL_MESSAGE_HANDLE_ID,
   API_TOOL_CALL_HANDLE_ID,
   API_TOOL_CONTEXT_HANDLE_ID,
+  CONTROL_FLOW_ELSE_HANDLE_ID,
+  CONTROL_FLOW_IF_HANDLE_ID,
+  CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
   inferModelResponseMode,
   getApiToolContextTargetAnchorRatio,
   getToolSourceHandleAnchorRatio,
   isApiModelNode,
+  isControlFlowNode,
   isMcpContextProviderNode,
   isPromptBlockNode,
   isRoutableToolNode,
@@ -21,6 +25,7 @@ import {
   TOOL_SUCCESS_HANDLE_ID,
 } from "../lib/editor";
 import { warnGraphDiagnostic } from "../lib/dragDiagnostics";
+import { normalizeLogicConditionConfig } from "../lib/logicConditions";
 import { buildNodeTooltip } from "../lib/nodeTooltip";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import type { NodeTooltipData } from "../lib/nodeTooltip";
@@ -50,11 +55,13 @@ export type GraphCanvasNodeData = {
   onOpenPromptBlockDetails: (nodeId: string) => void;
   onOpenDisplayResponse: (nodeId: string) => void;
   onOpenContextBuilderPayload: (nodeId: string) => void;
+  onOpenConditionResults: (nodeId: string) => void;
   onHandlePointerDown: (nodeId: string, handleType: "source" | "target", handleId: string | null) => boolean;
   onJunctionPointerDown: (nodeId: string, clientPosition: { x: number; y: number }) => void;
 };
 
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
+const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 
 const KIND_LABELS: Record<string, string> = {
   input: "IN",
@@ -62,6 +69,7 @@ const KIND_LABELS: Record<string, string> = {
   tool: "FX",
   mcp_context_provider: "MC",
   mcp_tool_executor: "MX",
+  control_flow_unit: "CF",
   data: "DB",
   output: "OUT",
 };
@@ -84,6 +92,26 @@ function formatInlineDisplayValue(value: unknown): string {
   }
   try {
     return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatLogicEvaluationValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (value === null) {
+    return "null";
+  }
+  if (value === undefined) {
+    return "undefined";
+  }
+  try {
+    return JSON.stringify(value);
   } catch {
     return String(value);
   }
@@ -175,14 +203,17 @@ function GraphCanvasNodeComponent({
     onOpenPromptBlockDetails,
     onOpenDisplayResponse,
     onOpenContextBuilderPayload,
+    onOpenConditionResults,
     onJunctionPointerDown,
   } = data;
   const isWireJunction = isWireJunctionNode(node);
   const isRoutableTool = isRoutableToolNode(node);
   const isContextProviderNode = isMcpContextProviderNode(node);
   const isModelNode = isApiModelNode(node);
+  const isControlFlowUnitNode = isControlFlowNode(node);
   const isDisplayNode = node.provider_id === "core.data_display";
   const isContextBuilderNode = node.provider_id === "core.context_builder";
+  const isLogicConditionsNode = node.provider_id === LOGIC_CONDITIONS_PROVIDER_ID;
   const displayLabel = getNodeInstanceLabel(graph, node);
   const displayEnvelope =
     isDisplayNode &&
@@ -267,6 +298,32 @@ function GraphCanvasNodeComponent({
   const mcpTerminalHandleStyle = {
     top: `${getToolSourceHandleAnchorRatio(MCP_TERMINAL_OUTPUT_HANDLE_ID) * 100}%`,
   } satisfies CSSProperties;
+  const controlFlowLoopHandleStyle = {
+    top: `${getToolSourceHandleAnchorRatio(CONTROL_FLOW_LOOP_BODY_HANDLE_ID) * 100}%`,
+  } satisfies CSSProperties;
+  const logicConditionConfig = isLogicConditionsNode ? normalizeLogicConditionConfig(node.config).normalized : null;
+  const logicConditionOutputHandles = isLogicConditionsNode
+    ? [
+        ...(logicConditionConfig?.branches ?? []).map((branch, index) => ({
+          id: String(branch.output_handle_id ?? `${CONTROL_FLOW_IF_HANDLE_ID}-${index + 1}`),
+          label: branch.label.trim() || `Branch ${index + 1}`,
+          toneClassName: "graph-node-output-port--success",
+        })),
+        {
+          id: String(logicConditionConfig?.else_output_handle_id ?? node.config.else_output_handle_id ?? CONTROL_FLOW_ELSE_HANDLE_ID),
+          label: "Else",
+          toneClassName: "graph-node-output-port--failure",
+        },
+      ]
+    : [];
+  const logicConditionHandleStyles = logicConditionOutputHandles.map((_, index) => {
+    const totalHandles = logicConditionOutputHandles.length;
+    const topRatio =
+      totalHandles <= 1 ? 0.5 : 0.28 + (index / Math.max(1, totalHandles - 1)) * 0.52;
+    return {
+      top: `${topRatio * 100}%`,
+    } satisfies CSSProperties;
+  });
   const primaryTargetHandleStyle = {
     top: `${getApiToolContextTargetAnchorRatio(null) * 100}%`,
   } satisfies CSSProperties;
@@ -312,6 +369,69 @@ function GraphCanvasNodeComponent({
         return `Row ${current} / ${total}`;
       })()
     : null;
+  const logicBranchSummary =
+    isLogicConditionsNode &&
+    runtimeOutput &&
+    typeof runtimeOutput === "object" &&
+    runtimeOutput !== null &&
+    "metadata" in runtimeOutput &&
+    typeof runtimeOutput.metadata === "object" &&
+    runtimeOutput.metadata !== null
+      ? String(
+          (runtimeOutput.metadata as Record<string, unknown>).matched_branch_label ??
+            (runtimeOutput.metadata as Record<string, unknown>).matched_clause_label ??
+            "Else",
+        )
+      : null;
+  const logicMetadata =
+    isLogicConditionsNode &&
+    runtimeOutput &&
+    typeof runtimeOutput === "object" &&
+    runtimeOutput !== null &&
+    "metadata" in runtimeOutput &&
+    typeof runtimeOutput.metadata === "object" &&
+    runtimeOutput.metadata !== null
+      ? (runtimeOutput.metadata as Record<string, unknown>)
+      : null;
+  const logicConditionSummary =
+    logicMetadata && Array.isArray(logicMetadata.branch_evaluations)
+      ? (logicMetadata.branch_evaluations as unknown[])
+          .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null && !Array.isArray(entry))
+          .map((entry) => {
+            const label = typeof entry.label === "string" && entry.label.trim().length > 0 ? entry.label : "Branch";
+            const matched = entry.matched === true ? "true" : "false";
+            const trace =
+              typeof entry.trace === "object" && entry.trace !== null && !Array.isArray(entry.trace)
+                ? (entry.trace as Record<string, unknown>)
+                : null;
+            const sampleChild =
+              trace && Array.isArray(trace.children)
+                ? trace.children.find((child) => typeof child === "object" && child !== null && !Array.isArray(child)) as Record<string, unknown> | undefined
+                : undefined;
+            const actualValue =
+              sampleChild && Object.prototype.hasOwnProperty.call(sampleChild, "actual_value")
+                ? ` (${formatLogicEvaluationValue(sampleChild.actual_value)})`
+                : "";
+            return `${label}: ${matched}${actualValue}`;
+          })
+          .join("\n")
+      : logicMetadata && Array.isArray(logicMetadata.condition_evaluations)
+        ? (logicMetadata.condition_evaluations as unknown[])
+            .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null && !Array.isArray(entry))
+            .map((entry) => {
+              const label = typeof entry.label === "string" && entry.label.trim().length > 0 ? entry.label : "Clause";
+              const matched = entry.matched === true ? "true" : "false";
+              const actualValue = Object.prototype.hasOwnProperty.call(entry, "actual_value")
+                ? ` (${formatLogicEvaluationValue(entry.actual_value)})`
+                : "";
+              return `${label}: ${matched}${actualValue}`;
+            })
+            .join("\n")
+      : null;
+  const logicConditionDisplayText =
+    logicConditionSummary != null
+      ? `branch: ${logicBranchSummary ?? "Else"}\n${logicConditionSummary}`
+      : null;
   const contextBindingLabel = isContextProviderNode
     ? contextBooted && isContextConnected
       ? "Bound and MCP booted"
@@ -326,6 +446,10 @@ function GraphCanvasNodeComponent({
     : formatRunStatusLabel(displayStatus);
   const nodeCardClassName = `graph-node-card graph-node-card--${displayStatus} ${isRoutableTool ? "graph-node-card--tool-outputs" : ""} ${
     isContextProviderNode ? "graph-node-card--tool-context-provider" : ""
+  } ${
+    isControlFlowUnitNode ? "graph-node-card--control-flow" : ""
+  } ${
+    isLogicConditionsNode ? "graph-node-card--logic-conditions" : ""
   } ${
     isModelNode ? "graph-node-card--model-inputs" : ""
   } ${
@@ -484,6 +608,30 @@ function GraphCanvasNodeComponent({
             {spreadsheetRowSummary}
           </div>
         ) : null}
+        {logicConditionDisplayText ? (
+          <div
+            role="button"
+            tabIndex={preview ? -1 : 0}
+            className="graph-node-inline-display graph-node-inline-display--compact graph-node-inline-display--narrow"
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenConditionResults(node.id);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                event.stopPropagation();
+                onOpenConditionResults(node.id);
+              }
+            }}
+            aria-label={`Open full condition results for ${displayLabel}`}
+          >
+            <div className="graph-node-inline-display-header">Condition Results</div>
+            <pre className="graph-node-inline-display-body">{logicConditionDisplayText}</pre>
+            <span className="graph-node-inline-display-hint">Click to expand full evaluation</span>
+          </div>
+        ) : null}
         {isContextBuilderNode ? (
           <div
             role="button"
@@ -532,7 +680,7 @@ function GraphCanvasNodeComponent({
             <span className="graph-node-inline-display-hint">Click to expand</span>
           </div>
         ) : null}
-        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node)) ? (
+        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode) ? (
           <div className="graph-node-card-actions" aria-hidden="false">
             <button
               type="button"
@@ -553,6 +701,8 @@ function GraphCanvasNodeComponent({
             >
               {node.category === "tool"
                 ? "Learn More"
+                : isLogicConditionsNode
+                  ? "Learn More"
                 : isPromptBlockNode(node)
                   ? "More Info"
                   : "Provider Info"}
@@ -679,7 +829,45 @@ function GraphCanvasNodeComponent({
           />
         </>
       ) : null}
-      {showSourceHandle && !isRoutableTool && !isContextProviderNode && !isModelNode ? (
+      {showSourceHandle && isControlFlowUnitNode && node.provider_id === SPREADSHEET_ROW_PROVIDER_ID ? (
+        <>
+          <div className="graph-node-output-port graph-node-output-port--success" style={controlFlowLoopHandleStyle} aria-hidden="true">
+            <span className="graph-node-output-port-label">Loop Body</span>
+          </div>
+          <Handle
+            id={CONTROL_FLOW_LOOP_BODY_HANDLE_ID}
+            type="source"
+            position={Position.Right}
+            className="graph-node-handle graph-node-handle-source graph-node-handle-source--success"
+            style={controlFlowLoopHandleStyle}
+          />
+        </>
+      ) : null}
+      {showSourceHandle && isControlFlowUnitNode && isLogicConditionsNode ? (
+        <>
+          {logicConditionOutputHandles.map((handle, index) => {
+            const style = logicConditionHandleStyles[index];
+            const isElseHandle = handle.id === String(logicConditionConfig?.else_output_handle_id ?? node.config.else_output_handle_id ?? CONTROL_FLOW_ELSE_HANDLE_ID);
+            return (
+              <div key={handle.id}>
+                <div className={`graph-node-output-port ${handle.toneClassName}`} style={style} aria-hidden="true">
+                  <span className="graph-node-output-port-label">{handle.label}</span>
+                </div>
+                <Handle
+                  id={handle.id}
+                  type="source"
+                  position={Position.Right}
+                  className={`graph-node-handle graph-node-handle-source ${
+                    isElseHandle ? "graph-node-handle-source--failure" : "graph-node-handle-source--success"
+                  }`}
+                  style={style}
+                />
+              </div>
+            );
+          })}
+        </>
+      ) : null}
+      {showSourceHandle && !isRoutableTool && !isContextProviderNode && !isModelNode && !isControlFlowUnitNode ? (
         <Handle
           type="source"
           position={Position.Right}

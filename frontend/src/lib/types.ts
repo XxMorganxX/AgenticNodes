@@ -290,6 +290,29 @@ export type RunDocument = {
   error?: string | null;
 };
 
+export type RunFilesystemFile = {
+  path: string;
+  name: string;
+  size_bytes: number;
+  modified_at: string;
+  mime_type: string;
+};
+
+export type RunFilesystemListing = {
+  requested_run_id: string;
+  run_id: string;
+  agent_id: string;
+  workspace_root: string;
+  files: RunFilesystemFile[];
+};
+
+export type RunFilesystemFileContent = RunFilesystemFile & {
+  requested_run_id: string;
+  content: string;
+  truncated: boolean;
+  encoding: string;
+};
+
 export type RuntimeEvent = {
   schema_version: string;
   event_type: string;

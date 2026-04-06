@@ -123,7 +123,6 @@ class FilesystemRunStore:
             if not run_dir.is_dir():
                 continue
             state = self.load_state(run_dir.name)
-            recovered = self.recover_run_state(run_dir.name)
             manifest = self.load_manifest(run_dir.name)
             if state is None and manifest is None:
                 continue
@@ -132,18 +131,18 @@ class FilesystemRunStore:
                 continue
             rows.append(
                 {
-                    "run_id": str((recovered or state or {}).get("run_id") or (manifest or {}).get("run_id") or run_dir.name),
+                    "run_id": str((state or {}).get("run_id") or (manifest or {}).get("run_id") or run_dir.name),
                     "graph_id": graph_value,
-                    "status": (recovered or state or {}).get("status"),
-                    "status_reason": (recovered or state or {}).get("status_reason"),
-                    "started_at": (recovered or state or {}).get("started_at"),
-                    "ended_at": (recovered or state or {}).get("ended_at"),
+                    "status": (state or {}).get("status"),
+                    "status_reason": (state or {}).get("status_reason"),
+                    "started_at": (state or {}).get("started_at"),
+                    "ended_at": (state or {}).get("ended_at"),
                     "created_at": (manifest or {}).get("created_at"),
-                    "agent_id": (recovered or state or {}).get("agent_id", (manifest or {}).get("agent_id")),
-                    "agent_name": (recovered or state or {}).get("agent_name", (manifest or {}).get("agent_name")),
-                    "parent_run_id": (recovered or state or {}).get("parent_run_id", (manifest or {}).get("parent_run_id")),
-                    "runtime_instance_id": (recovered or state or {}).get("runtime_instance_id"),
-                    "last_heartbeat_at": (recovered or state or {}).get("last_heartbeat_at"),
+                    "agent_id": (state or {}).get("agent_id", (manifest or {}).get("agent_id")),
+                    "agent_name": (state or {}).get("agent_name", (manifest or {}).get("agent_name")),
+                    "parent_run_id": (state or {}).get("parent_run_id", (manifest or {}).get("parent_run_id")),
+                    "runtime_instance_id": (state or {}).get("runtime_instance_id"),
+                    "last_heartbeat_at": (state or {}).get("last_heartbeat_at"),
                 }
             )
             if len(rows) >= limit:
