@@ -398,8 +398,8 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
         NodeProviderDefinition(
             provider_id="core.spreadsheet_rows",
             display_name="Spreadsheet Rows",
-            category=NodeCategory.DATA,
-            node_kind="data",
+            category=NodeCategory.CONTROL_FLOW_UNIT,
+            node_kind="control_flow_unit",
             description="Reads a CSV or XLSX file, normalizes each row into a header-keyed dictionary, and iterates rows sequentially through downstream execution steps.",
             capabilities=["csv parsing", "xlsx parsing", "header normalization", "sequential row iteration"],
             default_config={
@@ -454,6 +454,31 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                     ],
                 ),
             ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="core.logic_conditions",
+            display_name="Logic Conditions",
+            category=NodeCategory.CONTROL_FLOW_UNIT,
+            node_kind="control_flow_unit",
+            description="Evaluates the incoming envelope against ordered clause rules and routes execution into an explicit if or else branch.",
+            capabilities=["envelope inspection", "contract-aware branching", "conditional routing"],
+            default_config={
+                "mode": "logic_conditions",
+                "clauses": [
+                    {
+                        "id": "if",
+                        "label": "If",
+                        "path": "",
+                        "operator": "equals",
+                        "value": "",
+                        "source_contracts": [],
+                        "output_handle_id": "control-flow-if",
+                    }
+                ],
+                "else_output_handle_id": "control-flow-else",
+            },
         )
     )
     node_providers.register(

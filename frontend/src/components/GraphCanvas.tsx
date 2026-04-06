@@ -63,6 +63,7 @@ import {
   formatRunStatusLabel,
   type AgentRunLane,
   type FocusedEventGroup,
+  type FocusedLoopRegion,
   type FocusedRunProjection,
   type FocusedRunSummary,
 } from "../lib/runVisualization";
@@ -138,6 +139,14 @@ type NodeRegionBounds = {
 type NodeMeasuredDimensions = {
   width: number;
   height: number;
+};
+
+type CanvasLoopRegionOverlay = {
+  id: string;
+  label: string;
+  metaLabel: string | null;
+  status: string | null;
+  style: CSSProperties;
 };
 
 type WaypointDragState = {
@@ -223,14 +232,19 @@ const NODE_STYLE = {
   boxShadow: "none",
 } as const;
 const NODE_WIDTH = 320;
+const MODEL_NODE_WIDTH = 380;
 const NODE_HEIGHT = 178;
 const NODE_REGION_HEIGHT = 198;
-const MODEL_NODE_HEIGHT = 228;
-const MODEL_NODE_REGION_HEIGHT = 252;
+const MODEL_NODE_HEIGHT = 264;
+const MODEL_NODE_REGION_HEIGHT = 288;
 const JUNCTION_NODE_SIZE = 24;
 const DEFAULT_BACKGROUND_DRAG_SENSITIVITY = 0.28;
 const VIEWPORT_SYNC_EPSILON = 0.25;
 const MIN_GRAPH_ZOOM = 0.1;
+const LOOP_REGION_PADDING = 28;
+const LOOP_REGION_TOP_PADDING = 44;
+const LOOP_REGION_TRAILING_PADDING_RATIO = 0.16;
+const LOOP_REGION_MAX_TRAILING_PADDING = 72;
 const EDGE_STROKE_WIDTH = 3.6;
 const SELECTED_EDGE_STROKE_WIDTH = 4.3;
 const DRAFT_WIRE_STROKE_WIDTH = 4.6;
@@ -382,6 +396,19 @@ function selectionRectWidth(rect: SelectionRect) {
 
 function selectionRectHeight(rect: SelectionRect) {
   return rect.maxY - rect.minY;
+}
+
+function formatLoopRegionProgress(region: FocusedLoopRegion): string | null {
+  if (typeof region.totalRows !== "number") {
+    return null;
+  }
+  if (region.totalRows === 0) {
+    return "0 rows";
+  }
+  if (typeof region.currentRowIndex === "number" && region.currentRowIndex > 0) {
+    return `Row ${Math.min(region.currentRowIndex, region.totalRows)} / ${region.totalRows}`;
+  }
+  return `${region.totalRows} row${region.totalRows === 1 ? "" : "s"}`;
 }
 
 function pointInsideSelectionRect(point: GraphPosition, rect: SelectionRect) {
@@ -1114,7 +1141,11 @@ export function GraphCanvas({
       return;
     }
     canvasZoomRef.current = nextZoom;
+    const titleScale = Math.max(0.92, Math.min(2.35, 1 + (1 - nextZoom) * 1.8));
+    const bodyScale = Math.max(0.97, Math.min(1.18, 1 + (1 - nextZoom) * 0.24));
     canvasRef.current?.style.setProperty("--graph-viewport-zoom", String(nextZoom));
+    canvasRef.current?.style.setProperty("--graph-node-title-scale", String(titleScale));
+    canvasRef.current?.style.setProperty("--graph-node-body-scale", String(bodyScale));
   }, []);
 
   const openDrawerTab = useCallback((tab: DrawerTab) => {
@@ -1179,7 +1210,7 @@ export function GraphCanvas({
       return { width: JUNCTION_NODE_SIZE, height: JUNCTION_NODE_SIZE, regionHeight: JUNCTION_NODE_SIZE };
     }
     if (node.kind === "model") {
-      return { width: NODE_WIDTH, height: MODEL_NODE_HEIGHT, regionHeight: MODEL_NODE_REGION_HEIGHT };
+      return { width: MODEL_NODE_WIDTH, height: MODEL_NODE_HEIGHT, regionHeight: MODEL_NODE_REGION_HEIGHT };
     }
     return { width: NODE_WIDTH, height: NODE_HEIGHT, regionHeight: NODE_REGION_HEIGHT };
   }, []);
@@ -3569,6 +3600,79 @@ export function GraphCanvas({
     tooltipNodeId,
   ]);
 
+  const loopRegionOverlays = useMemo<CanvasLoopRegionOverlay[]>(() => {
+    const projectedLoopRegions = runProjection?.loopRegions ?? [];
+    if (!graph || projectedLoopRegions.length === 0) {
+      return [];
+    }
+    const nodeLookup = new Map(nodes.map((node) => [node.id, node] as const));
+    return projectedLoopRegions.flatMap((region) => {
+      const memberNodes = region.memberNodeIds
+        .map((nodeId) => nodeLookup.get(nodeId))
+        .filter((node): node is FlowNode<GraphCanvasRuntimeNodeData> => Boolean(node));
+      if (memberNodes.length === 0) {
+        return [];
+      }
+      const bounds = memberNodes.reduce(
+        (result, node) => ({
+          minX: Math.min(result.minX, node.position.x),
+          minY: Math.min(result.minY, node.position.y),
+          maxX: Math.max(
+            result.maxX,
+            node.position.x + (typeof node.width === "number" ? node.width : node.data.node.kind === "model" ? MODEL_NODE_WIDTH : NODE_WIDTH),
+          ),
+          maxY: Math.max(result.maxY, node.position.y + (typeof node.height === "number" ? node.height : NODE_HEIGHT)),
+        }),
+        {
+          minX: Number.POSITIVE_INFINITY,
+          minY: Number.POSITIVE_INFINITY,
+          maxX: Number.NEGATIVE_INFINITY,
+          maxY: Number.NEGATIVE_INFINITY,
+        },
+      );
+      if (!Number.isFinite(bounds.minX) || !Number.isFinite(bounds.minY) || !Number.isFinite(bounds.maxX) || !Number.isFinite(bounds.maxY)) {
+        return [];
+      }
+      const largestNodeWidth = memberNodes.reduce(
+        (maxWidth, node) =>
+          Math.max(maxWidth, typeof node.width === "number" ? node.width : node.data.node.kind === "model" ? MODEL_NODE_WIDTH : NODE_WIDTH),
+        0,
+      );
+      const largestNodeHeight = memberNodes.reduce(
+        (maxHeight, node) => Math.max(maxHeight, typeof node.height === "number" ? node.height : NODE_HEIGHT),
+        0,
+      );
+      const trailingPaddingX = Math.min(
+        LOOP_REGION_MAX_TRAILING_PADDING,
+        Math.max(LOOP_REGION_PADDING, largestNodeWidth * LOOP_REGION_TRAILING_PADDING_RATIO),
+      );
+      const trailingPaddingY = Math.min(
+        LOOP_REGION_MAX_TRAILING_PADDING,
+        Math.max(LOOP_REGION_PADDING, largestNodeHeight * LOOP_REGION_TRAILING_PADDING_RATIO),
+      );
+      const left = viewportState.x + (bounds.minX - LOOP_REGION_PADDING) * viewportState.zoom;
+      const top = viewportState.y + (bounds.minY - LOOP_REGION_TOP_PADDING) * viewportState.zoom;
+      const width = (bounds.maxX - bounds.minX + LOOP_REGION_PADDING + trailingPaddingX) * viewportState.zoom;
+      const height = (bounds.maxY - bounds.minY + LOOP_REGION_TOP_PADDING + trailingPaddingY) * viewportState.zoom;
+      const progressLabel = formatLoopRegionProgress(region);
+      const statusLabel = region.status ? formatRunStatusLabel(region.status) : null;
+      return [
+        {
+          id: region.id,
+          label: `${region.iteratorNodeLabel} loop`,
+          metaLabel: [progressLabel, statusLabel].filter((value): value is string => Boolean(value)).join(" · ") || null,
+          status: region.status,
+          style: {
+            left,
+            top,
+            width,
+            height,
+          },
+        },
+      ];
+    });
+  }, [graph, nodes, runProjection?.loopRegions, viewportState.x, viewportState.y, viewportState.zoom]);
+
   const handleFormatGraph = useCallback(() => {
     if (!graph) {
       onFormatGraph({});
@@ -4411,6 +4515,24 @@ export function GraphCanvas({
               <path ref={draftWirePathRef} d="" className={`graph-draft-wire-path${draftConnectionToneClass}`} />
             </svg>
           ) : null}
+          {loopRegionOverlays.length > 0 ? (
+            <div className="graph-loop-region-layer" aria-hidden="true">
+              {loopRegionOverlays.map((region) => (
+                <div
+                  key={region.id}
+                  className={`graph-loop-region${
+                    region.status === "running" ? " is-running" : region.status === "failed" ? " is-failed" : " is-completed"
+                  }`}
+                  style={region.style}
+                >
+                  <div className="graph-loop-region-header">
+                    <span className="graph-loop-region-title">{region.label}</span>
+                    {region.metaLabel ? <span className="graph-loop-region-meta">{region.metaLabel}</span> : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
           {marqueeSelectionStyle ? <div className="graph-selection-marquee" style={marqueeSelectionStyle} aria-hidden="true" /> : null}
           <ReactFlow
             nodes={nodes}
@@ -4715,6 +4837,7 @@ export function GraphCanvas({
         <PromptBlockDetailsModal
           graph={graph}
           node={promptBlockDetailsNode}
+          catalog={catalog}
           runState={runState}
           onGraphChange={onGraphChange}
           onClose={() => setPromptBlockDetailsNodeId(null)}

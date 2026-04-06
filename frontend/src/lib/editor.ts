@@ -246,6 +246,52 @@ export function createNodeFromProvider(
     };
   }
 
+  if (provider.node_kind === "control_flow_unit") {
+    const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
+    if (provider.provider_id === "core.spreadsheet_rows") {
+      return {
+        ...baseNode,
+        config: {
+          mode: "spreadsheet_rows",
+          file_format: "auto",
+          file_path: "",
+          sheet_name: "",
+          header_row_index: 1,
+          start_row_index: 2,
+          empty_row_policy: "skip",
+          ...defaultConfig,
+        },
+      };
+    }
+    if (provider.provider_id === "core.logic_conditions") {
+      return {
+        ...baseNode,
+        config: {
+          mode: "logic_conditions",
+          clauses: [
+            {
+              id: "if",
+              label: "If",
+              path: "",
+              operator: "equals",
+              value: "",
+              source_contracts: [],
+              output_handle_id: CONTROL_FLOW_IF_HANDLE_ID,
+            },
+          ],
+          else_output_handle_id: CONTROL_FLOW_ELSE_HANDLE_ID,
+          ...defaultConfig,
+        },
+      };
+    }
+    return {
+      ...baseNode,
+      config: {
+        ...defaultConfig,
+      },
+    };
+  }
+
   if (provider.node_kind === "data") {
     const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
     if (provider.provider_id === "core.context_builder") {
@@ -399,6 +445,10 @@ export function isPromptBlockNode(node: GraphNode | null | undefined): boolean {
   return Boolean(node && node.kind === "data" && node.provider_id === "core.prompt_block");
 }
 
+export function isControlFlowNode(node: GraphNode | null | undefined): boolean {
+  return Boolean(node && node.kind === "control_flow_unit");
+}
+
 export function isApiModelNode(node: GraphNode | null | undefined): boolean {
   return Boolean(node && node.kind === "model");
 }
@@ -412,6 +462,9 @@ export const API_FINAL_MESSAGE_HANDLE_ID = "api-message";
 export const API_MESSAGE_HANDLE_ID = API_FINAL_MESSAGE_HANDLE_ID;
 export const MCP_TERMINAL_OUTPUT_HANDLE_ID = "mcp-terminal-output";
 export const PROMPT_BLOCK_PROVIDER_ID = "core.prompt_block";
+export const CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body";
+export const CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if";
+export const CONTROL_FLOW_ELSE_HANDLE_ID = "control-flow-else";
 
 export function defaultToolFailureCondition(edgeId: string): GraphEdge["condition"] {
   return {
@@ -523,7 +576,12 @@ function hasMessageOutputRoute(graph: GraphDefinition, node: GraphNode): boolean
     ) {
       return true;
     }
-    return targetNode.category === "api" || targetNode.category === "data" || targetNode.category === "end";
+    return (
+      targetNode.category === "api" ||
+      targetNode.category === "control_flow_unit" ||
+      targetNode.category === "data" ||
+      targetNode.category === "end"
+    );
   });
 }
 
@@ -596,6 +654,15 @@ export function inferToolEdgeSourceHandle(
   if (isMcpContextProviderNode(sourceNode)) {
     return TOOL_CONTEXT_HANDLE_ID;
   }
+  if (isControlFlowNode(sourceNode)) {
+    if (edge.source_handle_id) {
+      return edge.source_handle_id;
+    }
+    if (sourceNode.provider_id === "core.spreadsheet_rows") {
+      return CONTROL_FLOW_LOOP_BODY_HANDLE_ID;
+    }
+    return edge.source_handle_id ?? null;
+  }
   if (!isRoutableToolNode(sourceNode)) {
     return edge.source_handle_id ?? null;
   }
@@ -621,6 +688,15 @@ export function getToolSourceHandleAnchorRatio(handleId: string | null | undefin
   }
   if (handleId === MCP_TERMINAL_OUTPUT_HANDLE_ID) {
     return 0.86;
+  }
+  if (handleId === CONTROL_FLOW_LOOP_BODY_HANDLE_ID) {
+    return 0.5;
+  }
+  if (handleId === CONTROL_FLOW_IF_HANDLE_ID) {
+    return 0.4;
+  }
+  if (handleId === CONTROL_FLOW_ELSE_HANDLE_ID) {
+    return 0.68;
   }
   return handleId === TOOL_FAILURE_HANDLE_ID ? 0.68 : 0.4;
 }

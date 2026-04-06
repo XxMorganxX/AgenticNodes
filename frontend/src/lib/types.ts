@@ -301,6 +301,20 @@ export type RuntimeEvent = {
   timestamp: string;
 };
 
+export type LoopRegionState = {
+  iterator_node_id: string;
+  iterator_type?: string | null;
+  status?: string | null;
+  current_row_index?: number | null;
+  total_rows?: number | null;
+  active_iteration_id?: string | null;
+  member_node_ids: string[];
+  iteration_ids?: string[];
+  sheet_name?: string | null;
+  source_file?: string | null;
+  file_format?: string | null;
+};
+
 export type RunState = {
   run_id: string;
   graph_id: string;
@@ -323,6 +337,7 @@ export type RunState = {
   node_errors: Record<string, unknown>;
   node_statuses?: Record<string, string>;
   iterator_states?: Record<string, Record<string, unknown>>;
+  loop_regions?: Record<string, LoopRegionState>;
   visit_counts: Record<string, number>;
   transition_history: Array<Record<string, unknown>>;
   event_history: RuntimeEvent[];

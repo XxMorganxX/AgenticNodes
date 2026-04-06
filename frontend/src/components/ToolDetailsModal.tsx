@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { ChangeEvent, MouseEvent } from "react";
 
 import {
@@ -8,6 +8,7 @@ import {
   TOOL_TEMPLATE_CONFIG_KEY,
   TOOL_USER_DESCRIPTION_CONFIG_KEY,
 } from "../lib/toolNodeDetails";
+import { NodeDetailsForm } from "./NodeDetailsForm";
 import { getGraphEnvVars } from "../lib/graphEnv";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import type { EditorCatalog, GraphDefinition, GraphNode } from "../lib/types";
@@ -19,6 +20,8 @@ type ToolDetailsModalProps = {
   onGraphChange: (graph: GraphDefinition) => void;
   onClose: () => void;
 };
+
+type ToolDetailsModalTab = "node" | "descriptions" | "schema" | "preview";
 
 function updateToolNode(
   graph: GraphDefinition,
@@ -41,6 +44,7 @@ export function ToolDetailsModal({
   const details = resolveToolNodeDetails(node, catalog, graph);
   const nodeLabel = getNodeInstanceLabel(graph, node);
   const envVarEntries = Object.entries(getGraphEnvVars(graph));
+  const [activeTab, setActiveTab] = useState<ToolDetailsModalTab>("node");
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -52,6 +56,10 @@ export function ToolDetailsModal({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [onClose]);
+
+  useEffect(() => {
+    setActiveTab("node");
+  }, [node.id]);
 
   function updateToolConfig(key: string, value: string) {
     onGraphChange(
@@ -103,75 +111,116 @@ export function ToolDetailsModal({
         </div>
 
         <div className="tool-details-modal-body">
-          <label>
-            User Description
-            <textarea
-              rows={6}
-              value={details.userDescriptionText}
-              onChange={handleTextAreaChange(TOOL_USER_DESCRIPTION_CONFIG_KEY)}
-            />
-          </label>
-
-          <label>
-            Agent Description
-            <textarea
-              rows={6}
-              value={details.agentDescriptionText}
-              onChange={handleTextAreaChange(TOOL_AGENT_DESCRIPTION_CONFIG_KEY)}
-            />
-          </label>
-
-          <label>
-            Schema JSON Passed To The Model
-            <textarea
-              rows={12}
-              className="tool-details-modal-code"
-              value={details.schemaText}
-              onChange={handleTextAreaChange(TOOL_SCHEMA_TEXT_CONFIG_KEY)}
-              spellCheck={false}
-            />
-          </label>
-
-          <label>
-            Template Used For The Model-Facing Tool Block
-            <textarea
-              rows={8}
-              className="tool-details-modal-code"
-              value={details.templateText}
-              onChange={handleTextAreaChange(TOOL_TEMPLATE_CONFIG_KEY)}
-              spellCheck={false}
-            />
-          </label>
-
-          <div className="tool-details-modal-help">
-            Variables available in the template: <code>{"{tool_name}"}</code>, <code>{"{tool_user_description}"}</code>
-            , <code>{"{tool_agent_description}"}</code>, <code>{"{tool_description}"}</code>,{" "}
-            <code>{"{tool_schema}"}</code>
+          <div className="modal-folder-tabs" role="tablist" aria-label="Tool details sections">
+            {[
+              ["node", "Node"],
+              ["descriptions", "Descriptions"],
+              ["schema", "Schema + Template"],
+              ["preview", "Preview"],
+            ].map(([tabId, label]) => (
+              <button
+                key={tabId}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tabId}
+                className={`modal-folder-tab ${activeTab === tabId ? "modal-folder-tab--active" : ""}`}
+                onClick={() => setActiveTab(tabId as ToolDetailsModalTab)}
+              >
+                {label}
+              </button>
+            ))}
           </div>
 
-          <div className="tool-details-modal-help">
-            Graph env refs can be used in any text field here:
-            <div className="graph-env-reference-list">
-              {envVarEntries.map(([key, value]) => (
-                <code key={key} title={value}>
-                  {`{${key}}`}
-                </code>
-              ))}
-            </div>
+          <div className="modal-folder-panel">
+            {activeTab === "node" ? (
+              <NodeDetailsForm
+                graph={graph}
+                node={node}
+                catalog={catalog}
+                onGraphChange={onGraphChange}
+              />
+            ) : null}
+
+            {activeTab === "descriptions" ? (
+              <div className="modal-folder-section">
+                <label>
+                  User Description
+                  <textarea
+                    rows={6}
+                    value={details.userDescriptionText}
+                    onChange={handleTextAreaChange(TOOL_USER_DESCRIPTION_CONFIG_KEY)}
+                  />
+                </label>
+
+                <label>
+                  Agent Description
+                  <textarea
+                    rows={6}
+                    value={details.agentDescriptionText}
+                    onChange={handleTextAreaChange(TOOL_AGENT_DESCRIPTION_CONFIG_KEY)}
+                  />
+                </label>
+
+                <div className="tool-details-modal-help">
+                  Graph env refs can be used in any text field here:
+                  <div className="graph-env-reference-list">
+                    {envVarEntries.map(([key, value]) => (
+                      <code key={key} title={value}>
+                        {`{${key}}`}
+                      </code>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            {activeTab === "schema" ? (
+              <div className="modal-folder-section">
+                <label>
+                  Schema JSON Passed To The Model
+                  <textarea
+                    rows={12}
+                    className="tool-details-modal-code"
+                    value={details.schemaText}
+                    onChange={handleTextAreaChange(TOOL_SCHEMA_TEXT_CONFIG_KEY)}
+                    spellCheck={false}
+                  />
+                </label>
+
+                <label>
+                  Template Used For The Model-Facing Tool Block
+                  <textarea
+                    rows={8}
+                    className="tool-details-modal-code"
+                    value={details.templateText}
+                    onChange={handleTextAreaChange(TOOL_TEMPLATE_CONFIG_KEY)}
+                    spellCheck={false}
+                  />
+                </label>
+
+                <div className="tool-details-modal-help">
+                  Variables available in the template: <code>{"{tool_name}"}</code>, <code>{"{tool_user_description}"}</code>
+                  , <code>{"{tool_agent_description}"}</code>, <code>{"{tool_description}"}</code>,{" "}
+                  <code>{"{tool_schema}"}</code>
+                </div>
+
+                {details.schemaError ? <p className="error-text">Schema JSON error: {details.schemaError}</p> : null}
+              </div>
+            ) : null}
+
+            {activeTab === "preview" ? (
+              <section className="tool-details-modal-preview">
+                <div className="tool-details-modal-preview-header">
+                  <strong>Rendered Model-Facing Preview</strong>
+                  <span>
+                    This is the resolved block built from the template, description, and schema variables for this tool
+                    node.
+                  </span>
+                </div>
+                <pre>{details.renderedPromptText}</pre>
+              </section>
+            ) : null}
           </div>
-
-          {details.schemaError ? <p className="error-text">Schema JSON error: {details.schemaError}</p> : null}
-
-          <section className="tool-details-modal-preview">
-            <div className="tool-details-modal-preview-header">
-              <strong>Rendered Model-Facing Preview</strong>
-              <span>
-                This is the resolved block built from the template, description, and schema variables for this tool
-                node.
-              </span>
-            </div>
-            <pre>{details.renderedPromptText}</pre>
-          </section>
         </div>
       </section>
     </div>

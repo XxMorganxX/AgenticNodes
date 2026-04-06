@@ -54,6 +54,8 @@ export type GraphCanvasNodeData = {
   onJunctionPointerDown: (nodeId: string, clientPosition: { x: number; y: number }) => void;
 };
 
+const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
+
 const KIND_LABELS: Record<string, string> = {
   input: "IN",
   model: "AI",
@@ -294,6 +296,22 @@ function GraphCanvasNodeComponent({
   const modelConfiguredResponseMode = isModelNode ? configuredResponseMode(node) : null;
   const modelEffectiveResponseMode = isModelNode ? inferModelResponseMode(graph, node) : null;
   const executorConfiguredResponseMode = node.kind === "mcp_tool_executor" ? configuredResponseMode(node) : null;
+  const isSpreadsheetRowNode = node.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
+  const spreadsheetIteratorState = isSpreadsheetRowNode ? runState?.iterator_states?.[node.id] : undefined;
+  const spreadsheetIteratorStatus =
+    spreadsheetIteratorState && typeof spreadsheetIteratorState.status === "string" ? spreadsheetIteratorState.status : null;
+  const spreadsheetRowSummary = spreadsheetIteratorState != null
+    ? (() => {
+        const current = spreadsheetIteratorState.current_row_index;
+        const total = spreadsheetIteratorState.total_rows;
+        if (typeof total !== "number" || total === 0) return null;
+        if (typeof current !== "number") return null;
+        if (spreadsheetIteratorStatus === "running") return `Row ${current} / ${total}`;
+        if (spreadsheetIteratorStatus === "completed") return `${total} row${total === 1 ? "" : "s"} complete`;
+        if (spreadsheetIteratorStatus === "failed") return `Failed at row ${current} / ${total}`;
+        return `Row ${current} / ${total}`;
+      })()
+    : null;
   const contextBindingLabel = isContextProviderNode
     ? contextBooted && isContextConnected
       ? "Bound and MCP booted"
@@ -457,6 +475,15 @@ function GraphCanvasNodeComponent({
           </div>
         ) : null}
         {contextBuilderSummary ? <div className="graph-node-summary">{contextBuilderSummary}</div> : null}
+        {spreadsheetRowSummary ? (
+          <div
+            className={`graph-node-summary graph-node-summary--row-progress${
+              spreadsheetIteratorStatus === "running" ? " is-active" : ""
+            }`}
+          >
+            {spreadsheetRowSummary}
+          </div>
+        ) : null}
         {isContextBuilderNode ? (
           <div
             role="button"

@@ -1,6 +1,7 @@
 import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "./types";
 import { inferModelResponseMode } from "./editor";
 import { getNodeInstanceLabel } from "./nodeInstanceLabels";
+import { resolveResponseSchemaDetails } from "./responseSchema";
 import { resolveToolNodeDetails } from "./toolNodeDetails";
 
 type TooltipRow = {
@@ -337,6 +338,7 @@ export function buildNodeTooltip(
   if (node.kind === "mcp_tool_executor") {
     const followUpEnabled = node.config.enable_follow_up_decision === true;
     const retriesEnabled = node.config.allow_retries !== false;
+    const responseSchema = resolveResponseSchemaDetails(node.config as Record<string, unknown>);
     return {
       title: nodeTitle,
       eyebrow: `${node.category} / ${node.kind}`,
@@ -368,6 +370,7 @@ export function buildNodeTooltip(
               ? [
                   { label: "Model Provider", value: asString(node.config.provider_name) ?? "claude_code" },
                   { label: "Response Mode", value: describeResponseMode(asString(node.config.response_mode) ?? "auto") },
+                  { label: "Output Schema", value: responseSchema.statusLabel },
                 ]
               : []),
           ],
@@ -382,6 +385,7 @@ export function buildNodeTooltip(
     const allowedTools = asStringArray(node.config.allowed_tool_names);
     const preferredTool = asString(node.config.preferred_tool_name);
     const responseMode = inferModelResponseMode(graph, node);
+    const responseSchema = resolveResponseSchemaDetails(node.config as Record<string, unknown>);
     return {
       title: nodeTitle,
       eyebrow: `${node.category} / ${node.kind}`,
@@ -394,6 +398,7 @@ export function buildNodeTooltip(
             { label: "Model", value: asString(node.config.model) ?? "Default" },
             { label: "Prompt", value: asString(node.config.prompt_name) ?? node.prompt_name ?? "Not set" },
             { label: "Response", value: describeResponseMode(responseMode) },
+            { label: "Output Schema", value: responseSchema.statusLabel },
             { label: "Tool Calls Output", value: "Routes parsed tool-call envelopes to tool nodes whenever the decision object requests tools" },
             { label: "Message Output", value: "Routes the decision object's message payload to api, data, or end nodes, including alongside tool calls when both are present" },
             { label: "Allowed Tools", value: allowedTools.length > 0 ? formatList(allowedTools) : "None" },

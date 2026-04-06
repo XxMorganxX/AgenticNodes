@@ -347,6 +347,17 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertEqual(state.iterator_states["sheet"]["status"], "completed")
         self.assertEqual(state.iterator_states["sheet"]["current_row_index"], 2)
         self.assertEqual(state.iterator_states["sheet"]["total_rows"], 2)
+        model_started_events = [
+            event
+            for event in state.event_history
+            if event.event_type == "node.started" and isinstance(event.payload, dict) and event.payload.get("node_id") == "model"
+        ]
+        self.assertEqual(len(model_started_events), 2)
+        self.assertEqual(
+            [event.payload.get("iteration_id") for event in model_started_events],
+            ["sheet:row:1", "sheet:row:2"],
+        )
+        self.assertTrue(all(event.payload.get("iterator_node_id") == "sheet" for event in model_started_events))
         self.assertIsInstance(state.final_output, str)
         self.assertIn("Portland", state.final_output)
 
@@ -438,6 +449,86 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertIn("Summer_2026_Internships?: YES", state.final_output)
         self.assertNotIn('"row_data"', state.final_output)
 
+    def test_failed_spreadsheet_rows_do_not_traverse_standard_edges(self) -> None:
+        services = build_example_services()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "spreadsheet-row-failure-graph",
+            "name": "Spreadsheet Row Failure Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "sheet",
+                    "kind": "data",
+                    "category": "data",
+                    "label": "Spreadsheet Rows",
+                    "provider_id": "core.spreadsheet_rows",
+                    "provider_label": "Spreadsheet Rows",
+                    "config": {
+                        "mode": "spreadsheet_rows",
+                        "file_format": "csv",
+                        "file_path": "",
+                        "sheet_name": "",
+                        "empty_row_policy": "skip",
+                    },
+                    "position": {"x": 100, "y": 0},
+                },
+                {
+                    "id": "compose",
+                    "kind": "data",
+                    "category": "data",
+                    "label": "Compose",
+                    "provider_id": "core.context_builder",
+                    "provider_label": "Context Builder",
+                    "config": {"mode": "context_builder", "template": "", "input_bindings": [], "joiner": "\n\n"},
+                    "position": {"x": 220, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_payload", "source": "compose"}},
+                    "position": {"x": 340, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "sheet", "label": "", "kind": "standard", "priority": 100},
+                {"id": "e2", "source_id": "sheet", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                {"id": "e3", "source_id": "compose", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, {"request": "Process spreadsheet rows"}, run_id="spreadsheet-row-failure")
+
+        self.assertEqual(state.status, "failed")
+        self.assertEqual(state.terminal_error, state.node_errors.get("sheet"))
+        assert isinstance(state.terminal_error, dict)
+        self.assertEqual(state.terminal_error.get("type"), "spreadsheet_parse_error")
+        self.assertNotEqual(state.terminal_error.get("type"), "max_steps_exceeded")
+        self.assertEqual(state.visit_counts.get("compose"), None)
+        self.assertFalse(any(transition.target_id == "compose" for transition in state.transition_history))
+
     def test_run_state_reducer_tracks_iterator_updates(self) -> None:
         state = build_run_state("run-iterator", "graph-1", None, execution_node_ids=["sheet"])
         next_state = apply_single_run_event(
@@ -462,6 +553,76 @@ class SpreadsheetRowTests(unittest.TestCase):
         )
         self.assertEqual(next_state["iterator_states"]["sheet"]["current_row_index"], 1)
         self.assertEqual(next_state["iterator_states"]["sheet"]["total_rows"], 3)
+        self.assertEqual(next_state["loop_regions"]["sheet"]["active_iteration_id"], "sheet:row:1")
+
+    def test_run_state_reducer_tracks_loop_region_members(self) -> None:
+        state = build_run_state("run-loop", "graph-1", None, execution_node_ids=["sheet", "model", "finish"])
+        state = apply_single_run_event(
+            state,
+            {
+                "event_type": "node.iterator.updated",
+                "summary": "Iterator updated.",
+                "payload": {
+                    "node_id": "sheet",
+                    "iterator_node_id": "sheet",
+                    "iterator_type": "spreadsheet_rows",
+                    "status": "running",
+                    "current_row_index": 2,
+                    "iterator_row_index": 2,
+                    "total_rows": 3,
+                    "iterator_total_rows": 3,
+                    "iteration_id": "sheet:row:2",
+                },
+                "run_id": "run-loop",
+                "timestamp": "2026-04-02T00:00:00Z",
+            },
+        )
+        state = apply_single_run_event(
+            state,
+            {
+                "event_type": "node.started",
+                "summary": "Started node 'Model'.",
+                "payload": {
+                    "node_id": "model",
+                    "visit_count": 2,
+                    "received_input": {"payload": "row 2"},
+                    "iterator_node_id": "sheet",
+                    "iterator_row_index": 2,
+                    "iterator_total_rows": 3,
+                    "iteration_id": "sheet:row:2",
+                },
+                "run_id": "run-loop",
+                "timestamp": "2026-04-02T00:00:01Z",
+            },
+        )
+        state = apply_single_run_event(
+            state,
+            {
+                "event_type": "node.completed",
+                "summary": "Completed node 'Finish'.",
+                "payload": {
+                    "node_id": "finish",
+                    "status": "success",
+                    "output": "done",
+                    "route_outputs": {},
+                    "error": None,
+                    "metadata": {},
+                    "iterator_node_id": "sheet",
+                    "iterator_row_index": 2,
+                    "iterator_total_rows": 3,
+                    "iteration_id": "sheet:row:2",
+                },
+                "run_id": "run-loop",
+                "timestamp": "2026-04-02T00:00:02Z",
+            },
+        )
+
+        loop_region = state["loop_regions"]["sheet"]
+        self.assertEqual(loop_region["status"], "running")
+        self.assertEqual(loop_region["current_row_index"], 2)
+        self.assertEqual(loop_region["total_rows"], 3)
+        self.assertEqual(loop_region["active_iteration_id"], "sheet:row:2")
+        self.assertEqual(loop_region["member_node_ids"], ["model", "finish"])
 
     def test_runtime_state_snapshot_normalizes_iterator_states(self) -> None:
         normalized = normalize_runtime_state_snapshot(
@@ -478,11 +639,21 @@ class SpreadsheetRowTests(unittest.TestCase):
                         "total_rows": 2,
                     }
                 },
+                "loop_regions": {
+                    "sheet": {
+                        "iterator_node_id": "sheet",
+                        "status": "completed",
+                        "current_row_index": 2,
+                        "total_rows": 2,
+                        "member_node_ids": ["model", "finish"],
+                    }
+                },
                 "agent_runs": {},
             }
         )
         assert normalized is not None
         self.assertEqual(normalized["iterator_states"]["sheet"]["status"], "completed")
+        self.assertEqual(normalized["loop_regions"]["sheet"]["member_node_ids"], ["model", "finish"])
 
 
 if __name__ == "__main__":

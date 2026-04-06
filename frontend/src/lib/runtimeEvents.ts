@@ -33,6 +33,35 @@ function normalizeRunDocuments(value: unknown): RunDocument[] {
     }));
 }
 
+function normalizeLoopRegions(value: unknown): RunState["loop_regions"] {
+  if (!isRecord(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([iteratorNodeId, loopRegion]) => {
+      const normalizedRegion = isRecord(loopRegion) ? loopRegion : {};
+      const memberNodeIds = Array.isArray(normalizedRegion.member_node_ids)
+        ? normalizedRegion.member_node_ids.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+        : [];
+      const iterationIds = Array.isArray(normalizedRegion.iteration_ids)
+        ? normalizedRegion.iteration_ids.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+        : [];
+      return [
+        iteratorNodeId,
+        {
+          ...normalizedRegion,
+          iterator_node_id:
+            typeof normalizedRegion.iterator_node_id === "string" && normalizedRegion.iterator_node_id.length > 0
+              ? normalizedRegion.iterator_node_id
+              : iteratorNodeId,
+          member_node_ids: memberNodeIds,
+          iteration_ids: iterationIds,
+        },
+      ];
+    }),
+  );
+}
+
 export function normalizeRuntimeEvent(event: unknown): RuntimeEvent {
   const record = isRecord(event) ? event : {};
   return {
@@ -74,6 +103,7 @@ export function normalizeRunState(runState: RunState | null | undefined): RunSta
           ]),
         )
       : {},
+    loop_regions: normalizeLoopRegions(normalized.loop_regions),
     agent_runs:
       isRecord(normalized.agent_runs)
         ? Object.fromEntries(

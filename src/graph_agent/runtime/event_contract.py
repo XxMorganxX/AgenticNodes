@@ -12,6 +12,7 @@ BASE_RUNTIME_EVENT_TYPES = (
     "run.started",
     "node.started",
     "node.completed",
+    "node.iterator.updated",
     "edge.selected",
     "condition.evaluated",
     "retry.triggered",
@@ -26,8 +27,35 @@ TERMINAL_RUNTIME_EVENT_TYPES = {"run.completed", "run.failed", "run.cancelled", 
 
 REDUCER_CRITICAL_PAYLOAD_FIELDS: dict[str, tuple[str, ...]] = {
     "run.started": ("graph_id", "graph_name"),
-    "node.started": ("node_id", "visit_count", "received_input"),
-    "node.completed": ("node_id", "output", "route_outputs", "error"),
+    "node.started": (
+        "node_id",
+        "visit_count",
+        "received_input",
+        "iterator_node_id",
+        "iterator_row_index",
+        "iterator_total_rows",
+        "iteration_id",
+    ),
+    "node.completed": (
+        "node_id",
+        "output",
+        "route_outputs",
+        "error",
+        "iterator_node_id",
+        "iterator_row_index",
+        "iterator_total_rows",
+        "iteration_id",
+    ),
+    "node.iterator.updated": (
+        "node_id",
+        "status",
+        "current_row_index",
+        "total_rows",
+        "iterator_node_id",
+        "iterator_row_index",
+        "iterator_total_rows",
+        "iteration_id",
+    ),
     "edge.selected": ("id", "source_id", "target_id", "source_handle_id"),
     "run.completed": ("final_output", "terminal_node_id"),
     "run.failed": ("error", "final_output"),
@@ -82,6 +110,12 @@ def normalize_runtime_state_snapshot(state: Mapping[str, Any] | None) -> dict[st
     normalized["iterator_states"] = (
         {str(node_id): dict(iterator_state) for node_id, iterator_state in iterator_states.items() if isinstance(iterator_state, Mapping)}
         if isinstance(iterator_states, Mapping)
+        else {}
+    )
+    loop_regions = state.get("loop_regions")
+    normalized["loop_regions"] = (
+        {str(node_id): dict(loop_region) for node_id, loop_region in loop_regions.items() if isinstance(loop_region, Mapping)}
+        if isinstance(loop_regions, Mapping)
         else {}
     )
     normalized["documents"] = normalize_run_documents(state.get("documents"))

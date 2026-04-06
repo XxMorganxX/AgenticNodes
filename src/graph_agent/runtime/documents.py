@@ -50,6 +50,47 @@ def _normalize_legacy_mcp_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, A
     return normalized_nodes
 
 
+def _normalize_legacy_control_flow_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized_nodes = [dict(node) for node in nodes]
+    node_lookup = {str(node.get("id", "")): node for node in normalized_nodes}
+    control_flow_node_ids: set[str] = set()
+
+    for node_id, node in node_lookup.items():
+        provider_id = str(node.get("provider_id", "")).strip()
+        kind = str(node.get("kind", "")).strip()
+        category = str(node.get("category", "")).strip()
+        if provider_id == "core.spreadsheet_rows" and (kind == "data" or category == "data"):
+            node["kind"] = "control_flow_unit"
+            node["category"] = "control_flow_unit"
+            control_flow_node_ids.add(node_id)
+
+    for node_id in control_flow_node_ids:
+        for node in normalized_nodes:
+            config = node.get("config")
+            if not isinstance(config, Mapping):
+                continue
+            binding = config.get("input_binding")
+            if not isinstance(binding, Mapping):
+                continue
+            binding_source = str(binding.get("source", "")).strip()
+            if binding_source != node_id:
+                continue
+            binding_type = str(binding.get("type", "latest_output") or "latest_output").strip()
+            if binding_type == "latest_output":
+                next_binding = dict(binding)
+                next_binding["type"] = "latest_envelope"
+                next_config = dict(config)
+                next_config["input_binding"] = next_binding
+                node["config"] = next_config
+
+    return normalized_nodes
+
+
+def _normalize_legacy_graph_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized_nodes = _normalize_legacy_mcp_nodes(nodes)
+    return _normalize_legacy_control_flow_nodes(normalized_nodes)
+
+
 @dataclass
 class AgentDefinition:
     agent_id: str
@@ -63,7 +104,7 @@ class AgentDefinition:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> AgentDefinition:
-        normalized_nodes = _normalize_legacy_mcp_nodes(
+        normalized_nodes = _normalize_legacy_graph_nodes(
             [dict(node) for node in payload.get("nodes", []) if isinstance(node, Mapping)]
         )
         graph = GraphDefinition.from_dict(
@@ -143,7 +184,7 @@ class TestEnvironmentDefinition:
     def from_dict(cls, payload: Mapping[str, Any]) -> TestEnvironmentDefinition:
         if "agents" not in payload:
             normalized_payload = dict(payload)
-            normalized_payload["nodes"] = _normalize_legacy_mcp_nodes(
+            normalized_payload["nodes"] = _normalize_legacy_graph_nodes(
                 [dict(node) for node in payload.get("nodes", []) if isinstance(node, Mapping)]
             )
             legacy_graph = GraphDefinition.from_dict(normalized_payload)

@@ -10,6 +10,7 @@ class NodeCategory(str, Enum):
     API = "api"
     PROVIDER = "provider"
     TOOL = "tool"
+    CONTROL_FLOW_UNIT = "control_flow_unit"
     DATA = "data"
     END = "end"
 
@@ -138,6 +139,12 @@ DEFAULT_CATEGORY_CONTRACTS: dict[NodeCategory, CategoryContract] = {
         produced_outputs=["tool_result_envelope"],
         description="Executes a registered tool using a validated payload and returns a structured tool result envelope.",
     ),
+    NodeCategory.CONTROL_FLOW_UNIT: CategoryContract(
+        category=NodeCategory.CONTROL_FLOW_UNIT,
+        accepted_inputs=["message_envelope", "tool_result_envelope", "data_envelope"],
+        produced_outputs=["data_envelope", "control_flow_route"],
+        description="Consumes an incoming envelope, decides how traversal should continue, and forwards a normalized envelope along one or more explicit flow paths.",
+    ),
     NodeCategory.DATA: CategoryContract(
         category=NodeCategory.DATA,
         accepted_inputs=["message_envelope", "tool_result_envelope", "data_envelope"],
@@ -155,19 +162,28 @@ DEFAULT_CATEGORY_CONTRACTS: dict[NodeCategory, CategoryContract] = {
 
 DEFAULT_CONNECTION_RULES: list[ConnectionRule] = [
     ConnectionRule(NodeCategory.START, NodeCategory.API, "Input nodes can hand user requests to model providers."),
+    ConnectionRule(NodeCategory.START, NodeCategory.CONTROL_FLOW_UNIT, "Input nodes can enter explicit graph control-flow before reaching later execution steps."),
     ConnectionRule(NodeCategory.START, NodeCategory.DATA, "Input nodes can feed deterministic preprocessing steps."),
     ConnectionRule(NodeCategory.START, NodeCategory.TOOL, "Input nodes can route directly into tools when the input already satisfies a tool contract."),
     ConnectionRule(NodeCategory.START, NodeCategory.END, "Input nodes can terminate directly for passthrough or echo-style flows."),
     ConnectionRule(NodeCategory.PROVIDER, NodeCategory.API, "Provider nodes plug concrete vendor settings into model-agnostic API nodes."),
     ConnectionRule(NodeCategory.API, NodeCategory.API, "Model/API nodes can chain planning, routing, and synthesis steps."),
+    ConnectionRule(NodeCategory.API, NodeCategory.CONTROL_FLOW_UNIT, "Model/API nodes can hand envelopes into explicit branching or iteration steps."),
     ConnectionRule(NodeCategory.API, NodeCategory.TOOL, "Model/API nodes can route tool calls to executable tools."),
     ConnectionRule(NodeCategory.API, NodeCategory.DATA, "Model/API nodes can send outputs into deterministic processing steps."),
     ConnectionRule(NodeCategory.API, NodeCategory.END, "Model/API nodes can finalize a run directly."),
     ConnectionRule(NodeCategory.TOOL, NodeCategory.TOOL, "Tool nodes can chain execution and follow-up packaging steps before returning to an API node."),
     ConnectionRule(NodeCategory.TOOL, NodeCategory.API, "Tool results commonly return to a model for reasoning or repair."),
+    ConnectionRule(NodeCategory.TOOL, NodeCategory.CONTROL_FLOW_UNIT, "Tool results can feed branching or looping control-flow decisions."),
     ConnectionRule(NodeCategory.TOOL, NodeCategory.DATA, "Tool results can be normalized or enriched by data nodes."),
     ConnectionRule(NodeCategory.TOOL, NodeCategory.END, "Tool results can finalize a run without another model step."),
+    ConnectionRule(NodeCategory.CONTROL_FLOW_UNIT, NodeCategory.API, "Control-flow nodes can route envelopes into later model/API reasoning steps."),
+    ConnectionRule(NodeCategory.CONTROL_FLOW_UNIT, NodeCategory.CONTROL_FLOW_UNIT, "Control-flow nodes can chain into additional routing or iteration steps."),
+    ConnectionRule(NodeCategory.CONTROL_FLOW_UNIT, NodeCategory.TOOL, "Control-flow nodes can route envelopes into executable tools."),
+    ConnectionRule(NodeCategory.CONTROL_FLOW_UNIT, NodeCategory.DATA, "Control-flow nodes can hand the active envelope to deterministic transforms."),
+    ConnectionRule(NodeCategory.CONTROL_FLOW_UNIT, NodeCategory.END, "Control-flow nodes can terminate a run once a branch completes."),
     ConnectionRule(NodeCategory.DATA, NodeCategory.API, "Processed context can feed model/API nodes."),
+    ConnectionRule(NodeCategory.DATA, NodeCategory.CONTROL_FLOW_UNIT, "Deterministic transforms can hand envelopes into explicit branching or iteration steps."),
     ConnectionRule(NodeCategory.DATA, NodeCategory.TOOL, "Deterministic transforms can prepare payloads for tools."),
     ConnectionRule(NodeCategory.DATA, NodeCategory.DATA, "Data nodes can compose deterministic transforms."),
     ConnectionRule(NodeCategory.DATA, NodeCategory.END, "Data nodes can finalize a run after deterministic formatting."),

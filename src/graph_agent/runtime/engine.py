@@ -8,6 +8,7 @@ from uuid import uuid4
 from graph_agent.runtime.core import (
     API_MESSAGE_HANDLE_ID,
     API_TOOL_CALL_HANDLE_ID,
+    CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
     Edge,
     GraphDefinition,
     MCP_TERMINAL_OUTPUT_HANDLE_ID,
@@ -145,6 +146,34 @@ class GraphRuntime:
             context["iterator_row_index"] = iterator_row_index
         if isinstance(iterator_total_rows, int):
             context["iterator_total_rows"] = iterator_total_rows
+        iteration_id = self._build_iteration_id(
+            context.get("iterator_node_id"),
+            context.get("iterator_row_index"),
+        )
+        if iteration_id is not None:
+            context["iteration_id"] = iteration_id
+        return context
+
+    def _build_iteration_id(self, iterator_node_id: Any, iterator_row_index: Any) -> str | None:
+        if not isinstance(iterator_node_id, str) or not iterator_node_id:
+            return None
+        if not isinstance(iterator_row_index, int) or iterator_row_index <= 0:
+            return None
+        return f"{iterator_node_id}:row:{iterator_row_index}"
+
+    def _iterator_update_context(self, node_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "iterator_node_id": node_id,
+        }
+        current_row_index = payload.get("current_row_index")
+        total_rows = payload.get("total_rows")
+        if isinstance(current_row_index, int):
+            context["iterator_row_index"] = current_row_index
+        if isinstance(total_rows, int):
+            context["iterator_total_rows"] = total_rows
+        iteration_id = self._build_iteration_id(node_id, current_row_index)
+        if iteration_id is not None:
+            context["iteration_id"] = iteration_id
         return context
 
     def _scoped_visit_key(self, node_id: str, frame: dict[str, Any]) -> tuple[str, str | None, int | None]:
@@ -184,6 +213,7 @@ class GraphRuntime:
     def _emit_iterator_update(self, state: RunState, node_id: str, payload: dict[str, Any]) -> None:
         iterator_payload = {
             "node_id": node_id,
+            **self._iterator_update_context(node_id, payload),
             **payload,
         }
         self._update_iterator_state(state, node_id, iterator_payload)
@@ -287,10 +317,12 @@ class GraphRuntime:
                 output=row_envelope,
                 summary=f"Prepared spreadsheet row {row_index} of {total_rows}.",
                 metadata={
+                    "control_flow_handle_id": CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
                     "iterator_type": "spreadsheet_rows",
                     "current_row_index": row_index,
                     "total_rows": total_rows,
                 },
+                route_outputs={CONTROL_FLOW_LOOP_BODY_HANDLE_ID: row_envelope},
             )
             next_edges = self.select_edges(graph, state, node.id, row_result)
             binding_edges = self._binding_edges_for_node(graph, node.id)
@@ -394,6 +426,7 @@ class GraphRuntime:
                     "node_provider_label": node.provider_label,
                     "visit_count": visit_count,
                     "received_input": received_input,
+                    **self._frame_iteration_context(frame),
                 },
             )
 
@@ -431,6 +464,7 @@ class GraphRuntime:
                     "route_outputs": result.route_outputs,
                     "error": result.error,
                     "metadata": result.metadata,
+                    **self._frame_iteration_context(frame),
                 },
             )
 
@@ -478,6 +512,12 @@ class GraphRuntime:
                     state.current_edge_id = None
                     step_state["count"] += 1
                     continue
+                if result.status != "success" and result.error is not None:
+                    return self.fail_run(
+                        state,
+                        summary=result.summary or f"Node '{node.label}' failed.",
+                        error=result.error,
+                    )
                 failure_summary, failure_error = self._no_matching_edge_error(graph, node.id, result)
                 return self.fail_run(
                     state,
@@ -606,6 +646,32 @@ class GraphRuntime:
             if selected_edges:
                 return selected_edges
             outgoing = [edge for edge in outgoing if edge.source_handle_id not in {API_TOOL_CALL_HANDLE_ID, API_MESSAGE_HANDLE_ID}]
+        explicit_handle_ids = sorted(
+            {
+                edge.source_handle_id
+                for edge in outgoing
+                if isinstance(edge.source_handle_id, str) and edge.source_handle_id.strip()
+            }
+        )
+        if explicit_handle_ids and result.route_outputs:
+            selected_edges: list[tuple[Edge, NodeExecutionResult]] = []
+            for handle_id in explicit_handle_ids:
+                route_result = self._route_result(result, handle_id)
+                if route_result is None:
+                    continue
+                handle_edges = [edge for edge in outgoing if edge.source_handle_id == handle_id]
+                selected_edges.extend(
+                    self._select_matching_edges(
+                        state,
+                        node_id,
+                        handle_edges,
+                        route_result,
+                        allow_parallel=self._should_fan_out_to_multiple_end_nodes(graph, handle_edges),
+                    )
+                )
+            if selected_edges:
+                return selected_edges
+            outgoing = [edge for edge in outgoing if edge.source_handle_id not in explicit_handle_ids]
         return self._select_matching_edges(
             state,
             node_id,
@@ -702,6 +768,9 @@ class GraphRuntime:
 
         if matched_conditional_edges:
             return matched_conditional_edges
+
+        if result.status != "success":
+            return []
 
         if standard_edges:
             if allow_parallel:

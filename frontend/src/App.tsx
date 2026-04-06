@@ -42,6 +42,7 @@ const DEFAULT_INPUT = "Find graph-agent references for a schema repair workflow.
 const DEFAULT_TEST_ENVIRONMENT_ID = "test-environment";
 const ENVIRONMENT_AGENT_SELECTION_STORAGE_KEY = "agentic-nodes-environment-agent-selection";
 const SELECTED_AGENT_ID_STORAGE_KEY = "agentic-nodes-selected-agent-id";
+const RECENT_RUN_DOCUMENT_STORAGE_KEY = "agentic-nodes-recent-run-document";
 
 function isTerminalRunStatus(status: string | null | undefined): boolean {
   return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
@@ -218,6 +219,53 @@ function saveSelectedAgentId(graph: GraphDocument | null | undefined, selectedAg
     localStorage.setItem(SELECTED_AGENT_ID_STORAGE_KEY, JSON.stringify(storedSelections));
   } catch {
     // Ignore local persistence failures and keep the in-memory selection.
+  }
+}
+
+function normalizePersistedRunDocument(candidate: unknown): RunDocument | null {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return null;
+  }
+  const document = candidate as Partial<RunDocument>;
+  const documentId = typeof document.document_id === "string" ? document.document_id.trim() : "";
+  const name = typeof document.name === "string" ? document.name.trim() : "";
+  if (!documentId || !name) {
+    return null;
+  }
+  return {
+    document_id: documentId,
+    name,
+    mime_type: typeof document.mime_type === "string" ? document.mime_type : "application/octet-stream",
+    size_bytes: typeof document.size_bytes === "number" && Number.isFinite(document.size_bytes) ? Math.max(0, document.size_bytes) : 0,
+    storage_path: typeof document.storage_path === "string" ? document.storage_path : "",
+    text_content: typeof document.text_content === "string" ? document.text_content : "",
+    text_excerpt: typeof document.text_excerpt === "string" ? document.text_excerpt : "",
+    status: typeof document.status === "string" ? document.status : "ready",
+    error: typeof document.error === "string" ? document.error : null,
+  };
+}
+
+function loadRecentRunDocument(): RunDocument | null {
+  try {
+    const raw = localStorage.getItem(RECENT_RUN_DOCUMENT_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    return normalizePersistedRunDocument(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+function saveRecentRunDocument(document: RunDocument | null | undefined): void {
+  try {
+    if (!document) {
+      localStorage.removeItem(RECENT_RUN_DOCUMENT_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(RECENT_RUN_DOCUMENT_STORAGE_KEY, JSON.stringify(document));
+  } catch {
+    // Ignore local persistence failures and keep the in-memory document list.
   }
 }
 
@@ -558,7 +606,10 @@ export default function App() {
   const [visualizerResetVersion, setVisualizerResetVersion] = useState(0);
   const [input, setInput] = useState(DEFAULT_INPUT);
   const [savedInputPrompt, setSavedInputPrompt] = useState(DEFAULT_INPUT);
-  const [runDocuments, setRunDocuments] = useState<RunDocument[]>([]);
+  const [runDocuments, setRunDocuments] = useState<RunDocument[]>(() => {
+    const persistedDocument = loadRecentRunDocument();
+    return persistedDocument ? [persistedDocument] : [];
+  });
   const [isUploadingDocuments, setIsUploadingDocuments] = useState(false);
   const [documentUploadError, setDocumentUploadError] = useState<string | null>(null);
   const [events, setEvents] = useState<RuntimeEvent[]>([]);
@@ -575,6 +626,7 @@ export default function App() {
   const sourceRef = useRef<EventSource | null>(null);
   const runPollTimeoutRef = useRef<number | null>(null);
   const runStateRef = useRef<RunState | null>(null);
+  const inputRef = useRef(input);
   const executionBoxRef = useRef<HTMLDivElement | null>(null);
 
   const canvasGraph = useMemo(() => getCanvasGraph(draftGraph, selectedAgentId), [draftGraph, selectedAgentId]);
@@ -609,6 +661,15 @@ export default function App() {
   useEffect(() => {
     runStateRef.current = runState;
   }, [runState]);
+
+  useEffect(() => {
+    inputRef.current = input;
+  }, [input]);
+
+  useEffect(() => {
+    const mostRecentReadyDocument = [...runDocuments].reverse().find((document) => document.status === "ready") ?? null;
+    saveRecentRunDocument(mostRecentReadyDocument);
+  }, [runDocuments]);
 
   const refreshCatalog = useCallback(async () => {
     const loadedCatalog = await fetchEditorCatalog();
@@ -775,11 +836,11 @@ export default function App() {
         return;
       }
       applyFetchedRunState(recoveredRunState);
-      connectToRunStream(recoveredRunState.run_id, graphId, input, recoveredRunState.documents ?? []);
+      connectToRunStream(recoveredRunState.run_id, graphId, inputRef.current, recoveredRunState.documents ?? []);
     } catch {
       markRecoveredRunInterrupted(graphId, shouldHydrateLocalSnapshot ? snapshotRunState : null, snapshotRunId, snapshot?.savedAt);
     }
-  }, [applyFetchedRunState, clearRunPolling, connectToRunStream, input, markRecoveredRunInterrupted]);
+  }, [applyFetchedRunState, clearRunPolling, connectToRunStream, markRecoveredRunInterrupted]);
 
   useEffect(() => {
     Promise.all([fetchGraphs(), refreshCatalog()])
@@ -1212,7 +1273,10 @@ export default function App() {
                       {runDocuments.length !== readyRunDocuments.length ? ` / ${runDocuments.length} uploaded` : ""}
                     </span>
                   </div>
-                  <p>Upload reference files for this editor session. Ready documents are available during the run as <code>{"{documents}"}</code>.</p>
+                  <p>
+                    Upload reference files for this editor session. The most recent ready upload is cached locally and restored after
+                    refresh. Ready documents are available during the run as <code>{"{documents}"}</code>.
+                  </p>
                   <label className="execution-documents-picker">
                     <span>{isUploadingDocuments ? "Uploading..." : "Add Documents"}</span>
                     <input

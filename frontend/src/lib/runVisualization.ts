@@ -2,6 +2,7 @@ import type {
   GraphDefinition,
   GraphDocument,
   GraphNode,
+  LoopRegionState,
   RunState,
   RuntimeEvent,
   TestEnvironmentDefinition,
@@ -114,10 +115,27 @@ export type FocusedRunNodeState = {
   visitCount: number;
 };
 
+export type FocusedLoopRegion = {
+  id: string;
+  iteratorNodeId: string;
+  iteratorNodeLabel: string;
+  iteratorType: string | null;
+  status: string | null;
+  currentRowIndex: number | null;
+  totalRows: number | null;
+  activeIterationId: string | null;
+  memberNodeIds: string[];
+  iterationIds: string[];
+  sheetName: string | null;
+  sourceFile: string | null;
+  fileFormat: string | null;
+};
+
 export type FocusedRunProjection = {
   normalizedEvents: RuntimeEvent[];
   completedNodeIds: Set<string>;
   nodeStates: Record<string, FocusedRunNodeState>;
+  loopRegions: FocusedLoopRegion[];
   errorSummaries: AgentRunErrorSummary[];
   runSummary: FocusedRunSummary;
   eventGroups: FocusedEventGroup[];
@@ -273,6 +291,144 @@ function completedNodeIds(events: RuntimeEvent[]): Set<string> {
 
 function hasOwnRecordValue(record: Record<string, unknown> | null | undefined, key: string): boolean {
   return Boolean(record && Object.prototype.hasOwnProperty.call(record, key));
+}
+
+function appendUniqueString(values: string[], candidate: unknown): string[] {
+  if (typeof candidate !== "string" || candidate.length === 0 || values.includes(candidate)) {
+    return values;
+  }
+  return [...values, candidate];
+}
+
+function buildIterationId(iteratorNodeId: unknown, iteratorRowIndex: unknown): string | null {
+  if (typeof iteratorNodeId !== "string" || iteratorNodeId.length === 0) {
+    return null;
+  }
+  if (typeof iteratorRowIndex !== "number" || !Number.isInteger(iteratorRowIndex) || iteratorRowIndex <= 0) {
+    return null;
+  }
+  return `${iteratorNodeId}:row:${iteratorRowIndex}`;
+}
+
+function createFocusedLoopRegion(iteratorNodeId: string, labels: Map<string, string>): FocusedLoopRegion {
+  return {
+    id: iteratorNodeId,
+    iteratorNodeId,
+    iteratorNodeLabel: labels.get(iteratorNodeId) ?? iteratorNodeId,
+    iteratorType: null,
+    status: null,
+    currentRowIndex: null,
+    totalRows: null,
+    activeIterationId: null,
+    memberNodeIds: [],
+    iterationIds: [],
+    sheetName: null,
+    sourceFile: null,
+    fileFormat: null,
+  };
+}
+
+function upsertFocusedLoopRegion(
+  regions: Map<string, FocusedLoopRegion>,
+  iteratorNodeId: string,
+  labels: Map<string, string>,
+): FocusedLoopRegion {
+  const existing = regions.get(iteratorNodeId);
+  if (existing) {
+    return existing;
+  }
+  const nextRegion = createFocusedLoopRegion(iteratorNodeId, labels);
+  regions.set(iteratorNodeId, nextRegion);
+  return nextRegion;
+}
+
+function mergeLoopRegionState(
+  region: FocusedLoopRegion,
+  iteratorNodeId: string,
+  loopRegion: LoopRegionState | Record<string, unknown>,
+): FocusedLoopRegion {
+  const memberNodeIds = Array.isArray(loopRegion.member_node_ids)
+    ? loopRegion.member_node_ids.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+    : [];
+  const iterationIds = Array.isArray(loopRegion.iteration_ids)
+    ? loopRegion.iteration_ids.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+    : [];
+  return {
+    ...region,
+    id: iteratorNodeId,
+    iteratorNodeId,
+    iteratorType: typeof loopRegion.iterator_type === "string" ? loopRegion.iterator_type : region.iteratorType,
+    status: typeof loopRegion.status === "string" ? loopRegion.status : region.status,
+    currentRowIndex: typeof loopRegion.current_row_index === "number" ? loopRegion.current_row_index : region.currentRowIndex,
+    totalRows: typeof loopRegion.total_rows === "number" ? loopRegion.total_rows : region.totalRows,
+    activeIterationId: typeof loopRegion.active_iteration_id === "string" ? loopRegion.active_iteration_id : region.activeIterationId,
+    memberNodeIds: Array.from(new Set([...region.memberNodeIds, ...memberNodeIds])),
+    iterationIds: Array.from(new Set([...region.iterationIds, ...iterationIds])),
+    sheetName: typeof loopRegion.sheet_name === "string" ? loopRegion.sheet_name : region.sheetName,
+    sourceFile: typeof loopRegion.source_file === "string" ? loopRegion.source_file : region.sourceFile,
+    fileFormat: typeof loopRegion.file_format === "string" ? loopRegion.file_format : region.fileFormat,
+  };
+}
+
+function buildFocusedLoopRegions(
+  graph: GraphDefinition | null,
+  runState: RunState | null,
+  normalizedEvents: RuntimeEvent[],
+): FocusedLoopRegion[] {
+  const labels = nodeLabelMap(graph);
+  const regions = new Map<string, FocusedLoopRegion>();
+  for (const event of normalizedEvents) {
+    const eventType = event.event_type;
+    const iteratorNodeId = typeof event.payload.iterator_node_id === "string" ? event.payload.iterator_node_id : null;
+    if (!iteratorNodeId) {
+      continue;
+    }
+    let region = upsertFocusedLoopRegion(regions, iteratorNodeId, labels);
+    if (eventType === "node.started" || eventType === "node.completed") {
+      const nodeId = typeof event.payload.node_id === "string" ? event.payload.node_id : null;
+      const iterationId = typeof event.payload.iteration_id === "string"
+        ? event.payload.iteration_id
+        : buildIterationId(iteratorNodeId, event.payload.iterator_row_index);
+      region = {
+        ...region,
+        memberNodeIds:
+          nodeId && nodeId !== iteratorNodeId ? appendUniqueString(region.memberNodeIds, nodeId) : region.memberNodeIds,
+        iterationIds: appendUniqueString(region.iterationIds, iterationId),
+        currentRowIndex:
+          typeof event.payload.iterator_row_index === "number" ? event.payload.iterator_row_index : region.currentRowIndex,
+        totalRows:
+          typeof event.payload.iterator_total_rows === "number" ? event.payload.iterator_total_rows : region.totalRows,
+        activeIterationId: iterationId ?? region.activeIterationId,
+      };
+      regions.set(iteratorNodeId, region);
+      continue;
+    }
+    if (eventType === "node.iterator.updated") {
+      region = {
+        ...region,
+        iteratorType: typeof event.payload.iterator_type === "string" ? event.payload.iterator_type : region.iteratorType,
+        status: typeof event.payload.status === "string" ? event.payload.status : region.status,
+        currentRowIndex:
+          typeof event.payload.current_row_index === "number" ? event.payload.current_row_index : region.currentRowIndex,
+        totalRows: typeof event.payload.total_rows === "number" ? event.payload.total_rows : region.totalRows,
+        activeIterationId:
+          typeof event.payload.iteration_id === "string"
+            ? event.payload.iteration_id
+            : buildIterationId(iteratorNodeId, event.payload.current_row_index) ?? region.activeIterationId,
+        sheetName: typeof event.payload.sheet_name === "string" ? event.payload.sheet_name : region.sheetName,
+        sourceFile: typeof event.payload.source_file === "string" ? event.payload.source_file : region.sourceFile,
+        fileFormat: typeof event.payload.file_format === "string" ? event.payload.file_format : region.fileFormat,
+      };
+      regions.set(iteratorNodeId, region);
+    }
+  }
+
+  Object.entries(runState?.loop_regions ?? {}).forEach(([iteratorNodeId, loopRegion]) => {
+    const region = upsertFocusedLoopRegion(regions, iteratorNodeId, labels);
+    regions.set(iteratorNodeId, mergeLoopRegionState(region, iteratorNodeId, loopRegion));
+  });
+
+  return Array.from(regions.values()).filter((region) => region.memberNodeIds.length > 0);
 }
 
 function graphByAgent(environment: TestEnvironmentDefinition): Map<string, GraphDefinition> {
@@ -904,10 +1060,12 @@ export function buildFocusedRunProjection(
   const currentNodeId = deriveCurrentNodeId(runState, normalizedEvents);
   const errorSummaries = summarizeNodeErrors(runState?.node_errors ?? {}, labels);
   const nodeStates = buildFocusedNodeStates(graph, runState, normalizedEvents, completedNodeIdSet, currentNodeId);
+  const loopRegions = buildFocusedLoopRegions(graph, runState, normalizedEvents);
   return {
     normalizedEvents,
     completedNodeIds: completedNodeIdSet,
     nodeStates,
+    loopRegions,
     errorSummaries,
     runSummary: {
       runId: runState?.run_id ?? null,

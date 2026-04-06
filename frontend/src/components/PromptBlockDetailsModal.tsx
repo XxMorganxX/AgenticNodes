@@ -1,17 +1,21 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { ChangeEvent, MouseEvent } from "react";
 
+import { NodeDetailsForm } from "./NodeDetailsForm";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import { insertTokenAtEnd, listPromptBlockAvailableVariables, PROMPT_BLOCK_STARTERS, renderPromptBlockPreview } from "../lib/promptBlockEditor";
-import type { GraphDefinition, GraphNode, RunState } from "../lib/types";
+import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "../lib/types";
 
 type PromptBlockDetailsModalProps = {
   graph: GraphDefinition;
   node: GraphNode;
+  catalog: EditorCatalog | null;
   runState: RunState | null;
   onGraphChange: (graph: GraphDefinition) => void;
   onClose: () => void;
 };
+
+type PromptBlockDetailsModalTab = "node" | "content" | "preview";
 
 function updatePromptBlockNode(
   graph: GraphDefinition,
@@ -27,6 +31,7 @@ function updatePromptBlockNode(
 export function PromptBlockDetailsModal({
   graph,
   node,
+  catalog,
   runState,
   onGraphChange,
   onClose,
@@ -34,6 +39,7 @@ export function PromptBlockDetailsModal({
   const nodeLabel = getNodeInstanceLabel(graph, node);
   const availableVariables = listPromptBlockAvailableVariables(graph);
   const renderedPreview = renderPromptBlockPreview(node, graph, runState);
+  const [activeTab, setActiveTab] = useState<PromptBlockDetailsModalTab>("node");
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -45,6 +51,10 @@ export function PromptBlockDetailsModal({
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [onClose]);
+
+  useEffect(() => {
+    setActiveTab("node");
+  }, [node.id]);
 
   function updatePromptBlockConfig(updater: (config: GraphNode["config"]) => GraphNode["config"]) {
     onGraphChange(
@@ -126,61 +136,97 @@ export function PromptBlockDetailsModal({
         </div>
 
         <div className="tool-details-modal-body">
-          <div className="context-builder-placeholder-bar">
-            <button type="button" className="secondary-button context-builder-inline-button" onClick={handleInsertStarter}>
-              Insert Starter
-            </button>
-            {availableVariables.map((token) => (
+          <div className="modal-folder-tabs" role="tablist" aria-label="Prompt block sections">
+            {[
+              ["node", "Node"],
+              ["content", "Content"],
+              ["preview", "Preview"],
+            ].map(([tabId, label]) => (
               <button
-                key={token}
+                key={tabId}
                 type="button"
-                className="secondary-button context-builder-token-button"
-                onClick={() => handleInsertVariable(token)}
+                role="tab"
+                aria-selected={activeTab === tabId}
+                className={`modal-folder-tab ${activeTab === tabId ? "modal-folder-tab--active" : ""}`}
+                onClick={() => setActiveTab(tabId as PromptBlockDetailsModalTab)}
               >
-                {`{${token}}`}
+                {label}
               </button>
             ))}
           </div>
 
-          <label>
-            Message Role
-            <select value={String(node.config.role ?? "user")} onChange={handleRoleChange}>
-              <option value="system">system</option>
-              <option value="user">user</option>
-              <option value="assistant">assistant</option>
-            </select>
-          </label>
+          <div className="modal-folder-panel">
+            {activeTab === "node" ? (
+              <NodeDetailsForm
+                graph={graph}
+                node={node}
+                catalog={catalog}
+                onGraphChange={onGraphChange}
+              />
+            ) : null}
 
-          <label>
-            Message Name
-            <input
-              value={String(node.config.name ?? "")}
-              placeholder="Optional label for the message block"
-              onChange={handleNameChange}
-            />
-          </label>
+            {activeTab === "content" ? (
+              <div className="modal-folder-section">
+                <div className="context-builder-placeholder-bar">
+                  <button type="button" className="secondary-button context-builder-inline-button" onClick={handleInsertStarter}>
+                    Insert Starter
+                  </button>
+                  {availableVariables.map((token) => (
+                    <button
+                      key={token}
+                      type="button"
+                      className="secondary-button context-builder-token-button"
+                      onClick={() => handleInsertVariable(token)}
+                    >
+                      {`{${token}}`}
+                    </button>
+                  ))}
+                </div>
 
-          <label>
-            Message Content
-            <textarea
-              rows={8}
-              value={String(node.config.content ?? "")}
-              placeholder="Enter the message content to inject into downstream prompt assembly."
-              onChange={handleContentChange}
-            />
-          </label>
+                <label>
+                  Message Role
+                  <select value={String(node.config.role ?? "user")} onChange={handleRoleChange}>
+                    <option value="system">system</option>
+                    <option value="user">user</option>
+                    <option value="assistant">assistant</option>
+                  </select>
+                </label>
 
-          <div className="tool-details-modal-help">
-            Available variables: {availableVariables.length > 0 ? availableVariables.join(", ") : "None"}
+                <label>
+                  Message Name
+                  <input
+                    value={String(node.config.name ?? "")}
+                    placeholder="Optional label for the message block"
+                    onChange={handleNameChange}
+                  />
+                </label>
+
+                <label>
+                  Message Content
+                  <textarea
+                    rows={8}
+                    value={String(node.config.content ?? "")}
+                    placeholder="Enter the message content to inject into downstream prompt assembly."
+                    onChange={handleContentChange}
+                  />
+                </label>
+
+                <div className="tool-details-modal-help">
+                  Available variables: {availableVariables.length > 0 ? availableVariables.join(", ") : "None"}
+                </div>
+              </div>
+            ) : null}
+
+            {activeTab === "preview" ? (
+              <section className="tool-details-modal-preview">
+                <div className="tool-details-modal-preview-header">
+                  <strong>Rendered Preview</strong>
+                  <span>This shows how the prompt block resolves after variable substitution.</span>
+                </div>
+                <pre>{renderedPreview}</pre>
+              </section>
+            ) : null}
           </div>
-
-          <section className="tool-details-modal-preview">
-            <div className="tool-details-modal-preview-header">
-              <strong>Rendered Preview</strong>
-              <span>This shows how the prompt block resolves after variable substitution.</span>
-            </div>
-            <pre>{renderedPreview}</pre>
-          </section>
         </div>
       </section>
     </div>

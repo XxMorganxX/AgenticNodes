@@ -2,10 +2,18 @@ import { useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, MouseEvent } from "react";
 
 import { fetchProviderDiagnostics, preflightProvider } from "../lib/api";
-import { findProviderDefinition, modelProviderDefinitions, providerDefaultConfig, providerModelName } from "../lib/editor";
+import { findProviderDefinition, inferModelResponseMode, modelProviderDefinitions, providerDefaultConfig, providerModelName } from "../lib/editor";
 import { getGraphEnvVars, resolveGraphEnvReferences } from "../lib/graphEnv";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
+import { insertTokenAtEnd } from "../lib/promptBlockEditor";
+import {
+  parseResponseSchemaText,
+  resolveResponseSchemaDetails,
+  RESPONSE_SCHEMA_PRESETS,
+  RESPONSE_SCHEMA_TEXT_CONFIG_KEY,
+} from "../lib/responseSchema";
 import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
+import { NodeDetailsForm } from "./NodeDetailsForm";
 import type {
   EditorCatalog,
   GraphDefinition,
@@ -24,6 +32,8 @@ type ProviderDetailsModalProps = {
   onGraphChange: (graph: GraphDefinition) => void;
   onClose: () => void;
 };
+
+type ProviderDetailsModalTab = "node" | "overview" | "prompt" | "routing" | "config" | "preview";
 
 type PersistedProviderVerification = {
   preflightResult: ProviderPreflightResult;
@@ -142,6 +152,40 @@ function mcpToolPlaceholderToken(index: number): string {
   return `MCP_TOOL_${index + 1}`;
 }
 
+function buildMcpToolPlaceholderTemplate(
+  tools: Array<{
+    placeholderToken: string;
+    displayName: string;
+  }>,
+): string {
+  if (tools.length === 0) {
+    return "";
+  }
+  return [
+    "You are a tool calling assistant.",
+    "",
+    "{mcp_tool_guidance_block}",
+    "",
+    "You have these tools:",
+    "",
+    ...tools.map((tool) => `# ${tool.displayName}\n{${tool.placeholderToken}}`),
+  ].join("\n\n");
+}
+
+function getModelPromptBlockNodes(graph: GraphDefinition, modelNode: GraphNode): GraphNode[] {
+  const candidateNodeIds = new Set<string>();
+  const configuredNodeIds = Array.isArray(modelNode.config.prompt_block_node_ids)
+    ? modelNode.config.prompt_block_node_ids.map((nodeId) => String(nodeId))
+    : [];
+  configuredNodeIds.forEach((nodeId) => candidateNodeIds.add(nodeId));
+  graph.edges
+    .filter((edge) => edge.kind === "binding" && edge.target_id === modelNode.id)
+    .forEach((edge) => candidateNodeIds.add(edge.source_id));
+  return [...candidateNodeIds]
+    .map((nodeId) => graph.nodes.find((candidate) => candidate.id === nodeId) ?? null)
+    .filter((candidate): candidate is GraphNode => candidate !== null && candidate.provider_id === "core.prompt_block");
+}
+
 function readPersistedProviderVerifications(): Record<string, PersistedProviderVerification> {
   try {
     const raw = localStorage.getItem(LIVE_PROVIDER_VERIFICATION_STORAGE_KEY);
@@ -193,6 +237,10 @@ export function ProviderDetailsModal({
   const supportsLiveVerification = providerName !== "mock";
   const catalogTools = catalog?.tools ?? [];
   const mcpCatalogTools = catalogTools.filter((tool) => tool.source_type === "mcp");
+  const standardCatalogTools = catalogTools.filter((tool) => tool.source_type !== "mcp");
+  const allowedTools = Array.isArray(node.config.allowed_tool_names) ? (node.config.allowed_tool_names as string[]) : [];
+  const selectedModelResponseMode = inferModelResponseMode(graph, node);
+  const responseSchemaDetails = resolveResponseSchemaDetails(node.config as Record<string, unknown>);
   const mcpToolByName = new Map<string, ToolDefinition>();
   for (const tool of mcpCatalogTools) {
     for (const identifier of [toolCanonicalName(tool), tool.name, ...(tool.aliases ?? [])]) {
@@ -203,6 +251,16 @@ export function ProviderDetailsModal({
     }
   }
   const connectedMcpContextNodes = node.kind === "model" ? getModelMcpContextNodes(graph, node) : [];
+  const modelPromptBlockNodes = node.kind === "model" ? getModelPromptBlockNodes(graph, node) : [];
+  const modelTargetedMcpNodeIds =
+    node.kind === "model" && Array.isArray(node.config.tool_target_node_ids)
+      ? uniqueStrings(node.config.tool_target_node_ids.map((nodeId) => String(nodeId)))
+      : [];
+  const modelPromptContextProviders = uniqueStrings(
+    connectedMcpContextNodes
+      .filter((contextNode) => Boolean(contextNode.config.include_mcp_tool_context))
+      .map((contextNode) => getNodeInstanceLabel(graph, contextNode)),
+  );
   const findPromptOverrideNodeForTool = (toolName: string): GraphNode | null => {
     for (const candidate of graph.nodes) {
       if (candidate.kind !== "tool" && candidate.kind !== "mcp_context_provider") {
@@ -333,6 +391,7 @@ export function ProviderDetailsModal({
   const optionalSystemPromptPlaceholders = availableSystemPromptPlaceholders.filter(
     (token) => !requiredMcpPlaceholders.includes(token),
   );
+  const modelGeneratedMcpPlaceholderTemplate = buildMcpToolPlaceholderTemplate(promptContextToolSummaries);
   const systemPromptPreviewVariables: Record<string, string> = {
     documents: "[]",
     input_payload: "",
@@ -399,6 +458,7 @@ export function ProviderDetailsModal({
           .filter(Boolean)
           .join("\n\n")
       : "";
+  const [activeTab, setActiveTab] = useState<ProviderDetailsModalTab>("node");
   const [preflightResult, setPreflightResult] = useState<ProviderPreflightResult | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProviderDiagnosticsResult | null>(null);
   const [preflightError, setPreflightError] = useState<string | null>(null);
@@ -431,6 +491,10 @@ export function ProviderDetailsModal({
   useEffect(() => {
     setPersistedVerification(getPersistedProviderVerification(verificationStorageKey));
   }, [verificationStorageKey]);
+
+  useEffect(() => {
+    setActiveTab("node");
+  }, [node.id, providerName]);
 
   useEffect(() => {
     let cancelled = false;
@@ -508,6 +572,26 @@ export function ProviderDetailsModal({
           [key]: value,
         },
       })),
+    );
+  }
+
+  function updateResponseSchemaText(nextText: string) {
+    const { parsedSchema } = parseResponseSchemaText(nextText);
+    onGraphChange(
+      updateModelNode(graph, node.id, (currentNode) => {
+        const nextConfig = { ...currentNode.config } as Record<string, unknown>;
+        if (nextText.length > 0) {
+          nextConfig[RESPONSE_SCHEMA_TEXT_CONFIG_KEY] = nextText;
+        } else {
+          delete nextConfig[RESPONSE_SCHEMA_TEXT_CONFIG_KEY];
+        }
+        if (parsedSchema) {
+          nextConfig.response_schema = parsedSchema;
+        } else {
+          delete nextConfig.response_schema;
+        }
+        return { ...currentNode, config: nextConfig };
+      }),
     );
   }
 
@@ -594,13 +678,13 @@ export function ProviderDetailsModal({
   return (
     <div className="tool-details-modal-backdrop" onClick={handleOverlayClick} role="presentation">
       <section
-        className="tool-details-modal"
+        className="tool-details-modal provider-details-modal-shell"
         role="dialog"
         aria-modal="true"
         aria-labelledby="provider-details-modal-title"
       >
-        <div className="tool-details-modal-header">
-          <div>
+        <div className="tool-details-modal-header provider-details-modal-header">
+          <div className="provider-details-modal-title-block">
             <div className="tool-details-modal-eyebrow">API Provider Details</div>
             <h3 id="provider-details-modal-title">
               {nodeLabel}
@@ -610,6 +694,12 @@ export function ProviderDetailsModal({
               Required provider selection stays on the API node. Use this modal to review provider capabilities and tune
               optional provider parameters and prompt instructions for the selected API step.
             </p>
+            <div className="provider-details-modal-meta">
+              <span className="provider-details-modal-meta-pill">provider {provider?.display_name ?? providerName}</span>
+              <span className="provider-details-modal-meta-pill">node {node.kind}</span>
+              <span className="provider-details-modal-meta-pill">response {selectedModelResponseMode ?? "message"}</span>
+              <span className="provider-details-modal-meta-pill">{responseSchemaDetails.statusLabel}</span>
+            </div>
           </div>
           <button type="button" className="secondary-button" onClick={onClose}>
             Close
@@ -617,263 +707,628 @@ export function ProviderDetailsModal({
         </div>
 
         <div className="tool-details-modal-body">
-          <section className="provider-details-summary">
-            <div className="provider-details-summary-header">
-              <strong>Selected Provider</strong>
-              <span>{provider?.display_name ?? providerName}</span>
-            </div>
-            <p>{provider?.description ?? "No provider description is available for the current selection."}</p>
-            {provider?.capabilities.length ? (
-              <div className="provider-details-capabilities">
-                {provider.capabilities.map((capability) => (
-                  <span key={capability} className="provider-capability-chip">
-                    {capability}
-                  </span>
-                ))}
-              </div>
-            ) : null}
-            {displayedPreflightResult ? (
-              <div className="tool-details-modal-help">
-                <strong>Provider Health</strong>
-                <div>{displayedPreflightResult.message}</div>
-                {displayedPreflightResult.warnings?.map((warning) => (
-                  <div key={warning}>{warning}</div>
-                ))}
-              </div>
-            ) : null}
-            {displayedDiagnostics ? (
-              <div className="tool-details-modal-help">
-                <strong>Provider Diagnostics</strong>
-                <div className="provider-diagnostics-card">
-                  <div className="provider-diagnostics-section">
-                    <div className="provider-diagnostics-section-title">Backend</div>
-                    <div className="provider-diagnostics-row">
-                      <span>Active backend</span>
-                      <strong>{displayedDiagnostics.active_backend}</strong>
-                    </div>
-                    <div className="provider-diagnostics-row">
-                      <span>Authentication status</span>
-                      <strong>{displayedDiagnostics.authentication_status}</strong>
-                    </div>
-                  </div>
-                  {displayedDiagnostics.active_backend === "claude_code" ? (
-                    <div className="provider-diagnostics-section">
-                      <div className="provider-diagnostics-section-title">Claude Code</div>
-                      <div className="provider-diagnostics-row">
-                        <span>Claude binary</span>
-                        <strong>{displayedDiagnostics.claude_binary_exists ? "found" : "not found"}</strong>
-                      </div>
-                    </div>
-                  ) : null}
-                  {displayedDiagnostics.active_backend === "claude_code" || displayedDiagnostics.active_backend === "anthropic_api" ? (
-                    <div className="provider-diagnostics-section">
-                      <div className="provider-diagnostics-section-title">Environment</div>
-                      <div className="provider-diagnostics-row">
-                        <span>`ANTHROPIC_API_KEY` present</span>
-                        <strong>{displayedDiagnostics.anthropic_api_key_present ? "yes" : "no"}</strong>
-                      </div>
-                    </div>
-                  ) : null}
-                {displayedDiagnostics.child_env_sanitized ? (
-                    <div className="provider-diagnostics-section">
-                      <div className="provider-diagnostics-section-title">Child Process</div>
-                      <div className="provider-diagnostics-list">
-                        <div>Sanitized environment enabled.</div>
-                        <div>Strips: {displayedDiagnostics.sanitized_env_removed_vars.join(", ")}</div>
-                      </div>
-                    </div>
-                ) : null}
-                  {displayedDiagnostics.warning ? (
-                    <div className="provider-diagnostics-section">
-                      <div className="provider-diagnostics-section-title">Warning</div>
-                      <div className="provider-diagnostics-list">
-                        <div>{displayedDiagnostics.warning}</div>
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              </div>
-            ) : null}
-            {preflightError ? <div className="tool-details-modal-help">{preflightError}</div> : null}
-            {!supportsLiveVerification ? (
-              <div className="tool-details-modal-help">Live verification is not required for the mock provider.</div>
-            ) : null}
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={handleLiveVerification}
-              disabled={isPreflighting || !supportsLiveVerification}
-            >
-              {isPreflighting ? "Checking Provider..." : supportsLiveVerification ? "Run Live Verification" : "Live Verification Not Required"}
-            </button>
-          </section>
-
-          <div className="provider-details-grid">
-            <label>
-              Provider
-              <select
-                value={providerName}
-                onChange={(event) => handleProviderChange(event.target.value)}
+          <div className="modal-folder-tabs" role="tablist" aria-label="Provider details sections">
+            {[
+              ["node", "Node"],
+              ["overview", "Overview"],
+              ["prompt", "Prompt"],
+              ["routing", "Routing"],
+              ["config", "Config"],
+              ["preview", "Preview"],
+            ].map(([tabId, label]) => (
+              <button
+                key={tabId}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tabId}
+                className={`modal-folder-tab ${activeTab === tabId ? "modal-folder-tab--active" : ""}`}
+                onClick={() => setActiveTab(tabId as ProviderDetailsModalTab)}
               >
-                {availableProviders.map((candidate) => {
-                  const candidateName = providerModelName(candidate);
-                  return (
-                    <option key={candidate.provider_id} value={candidateName}>
-                      {candidate.display_name}
-                    </option>
-                  );
-                })}
-              </select>
-            </label>
-            <label className="provider-details-grid-full">
-              System Prompt
-              <textarea
-                rows={7}
-                value={String(node.config.system_prompt ?? "")}
-                placeholder="You are a helpful model node."
-                onChange={handleTextInputChange("system_prompt")}
-              />
-              <small>
-                Connected MCP edges already define which tools are in scope. MCP coverage is the only required part here;
-                all other placeholders are optional runtime values.
-              </small>
-              {node.kind === "model" ? (
-                <div className="tool-details-modal-help provider-details-placeholder-panel">
-                  <div className="provider-details-placeholder-header">
-                    <strong>Required MCP placeholders</strong>
-                    <span>Only needed if you want full inline MCP prompt control.</span>
-                  </div>
-                  <div className="graph-env-reference-list">
-                    {requiredMcpPlaceholders.map((token) => (
-                      <code key={token} className="placeholder-chip placeholder-chip--required">{`{${token}}`}</code>
-                    ))}
-                    {requiredMcpPlaceholders.length === 0 ? <span>None required.</span> : null}
-                  </div>
-                  <div className="provider-details-placeholder-rule">
-                    <span className="provider-details-placeholder-rule-label">Rule</span>
-                    <p>
-                      Include <code>{"{mcp_tool_guidance_block}"}</code> plus either <code>{"{mcp_tool_context_block}"}</code> or
-                      every ordered MCP tool placeholder for full inline MCP control. Missing MCP sections are appended
-                      automatically.
-                    </p>
-                  </div>
-                  {promptContextToolSummaries.length > 0 ? (
-                    <div className="provider-details-placeholder-subsection">
-                      <div className="provider-details-placeholder-subtitle">Ordered MCP tool placeholders</div>
-                      <div className="provider-details-placeholder-list">
-                        {promptContextToolSummaries.map((tool) => (
-                          <span key={tool.placeholderToken}>
-                            <code className="placeholder-chip placeholder-chip--optional">{`{${tool.placeholderToken}}`}</code> {tool.displayName} ({tool.status})
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                  {optionalSystemPromptPlaceholders.length > 0 ? (
-                    <div className="provider-details-placeholder-subsection">
-                      <div className="provider-details-placeholder-subtitle">Optional placeholders</div>
-                      <div className="graph-env-reference-list">
-                        {optionalSystemPromptPlaceholders.map((token) => (
-                          <code key={token} className="placeholder-chip placeholder-chip--optional">{`{${token}}`}</code>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
-            </label>
-            {providerConfigFields.map((field) => (
-              <label key={field.key}>
-                {field.label}
-                {(() => {
-                  const currentValue = String(node.config[field.key] ?? "");
-                  const isSelectField = field.input_type === "select" && (field.options?.length ?? 0) > 0;
-                  const isModelSelectField = isSelectField && field.key === "model";
-                  const selectOptions =
-                    isSelectField && currentValue && !field.options?.some((option) => option.value === currentValue)
-                      ? [...(field.options ?? []), { value: currentValue, label: `Custom: ${currentValue}` }]
-                      : (field.options ?? []);
-                  const datalistId = `${node.id}-${field.key}-modal-options`;
-                  return (
-                    <>
-                      {isModelSelectField ? (
-                        <>
-                          <input
-                            list={datalistId}
-                            value={currentValue}
-                            placeholder={field.placeholder || "Select or type a model id"}
-                            onChange={handleTextInputChange(field.key)}
-                          />
-                          <datalist id={datalistId}>
-                            {selectOptions.map((option) => (
-                              <option key={option.value} value={option.value}>
-                                {option.label}
-                              </option>
-                            ))}
-                          </datalist>
-                        </>
-                      ) : isSelectField ? (
-                        <select
-                          value={currentValue}
-                          onChange={handleTextInputChange(field.key)}
-                        >
-                          {selectOptions.map((option) => (
-                            <option key={option.value} value={option.value}>
-                              {option.label}
-                            </option>
-                          ))}
-                        </select>
-                      ) : (
-                        <input
-                          type={field.input_type === "number" ? "number" : "text"}
-                          value={currentValue}
-                          placeholder={field.placeholder || undefined}
-                          onChange={
-                            field.input_type === "number"
-                              ? handleNumberInputChange(field.key)
-                              : handleTextInputChange(field.key)
-                          }
-                        />
-                      )}
-                    </>
-                  );
-                })()}
-              </label>
+                {label}
+              </button>
             ))}
           </div>
 
-          <div className="tool-details-modal-help">
-            Required provider choice is controlled from the API node itself. These fields are optional overrides for the
-            selected provider.
-          </div>
-
-          <div className="tool-details-modal-help">
-            Graph env refs can be used in any text field here:
-            <div className="graph-env-reference-list">
-              {envVarEntries.map(([key, value]) => (
-                <code key={key} title={value}>
-                  {`{${key}}`}
-                </code>
-              ))}
-            </div>
-          </div>
-
-          <section className="tool-details-modal-preview">
-            <div className="tool-details-modal-preview-header">
-              <strong>Resolved Provider Config</strong>
-              <span>This preview shows provider settings after graph env references are substituted.</span>
-            </div>
-            <pre>{JSON.stringify(resolvedPreviewConfig, null, 2)}</pre>
-          </section>
-          {node.kind === "model" ? (
-            <section className="tool-details-modal-preview">
-              <div className="tool-details-modal-preview-header">
-                <strong>Final System Prompt Preview</strong>
-                <span>This is the complete prompt after placeholders, MCP guidance, and connected tool context are assembled.</span>
+          <div className={`modal-folder-panel provider-details-panel provider-details-panel--${activeTab}`}>
+            {activeTab === "node" ? (
+              <div className="modal-folder-section provider-details-node-layout">
+                <NodeDetailsForm
+                  graph={graph}
+                  node={node}
+                  catalog={catalog}
+                  onGraphChange={onGraphChange}
+                />
+                <label>
+                  Prompt Name
+                  <input
+                    value={String(node.config.prompt_name ?? node.prompt_name ?? "")}
+                    onChange={(event) =>
+                      onGraphChange(
+                        updateModelNode(graph, node.id, (currentNode) => ({
+                          ...currentNode,
+                          prompt_name: event.target.value,
+                          config: {
+                            ...currentNode.config,
+                            prompt_name: event.target.value,
+                            mode: event.target.value,
+                          },
+                        })),
+                      )
+                    }
+                  />
+                </label>
+                <label>
+                  Model Provider Name
+                  <input
+                    value={String(node.config.provider_name ?? node.model_provider_name ?? "")}
+                    onChange={(event) =>
+                      onGraphChange(
+                        updateModelNode(graph, node.id, (currentNode) => ({
+                          ...currentNode,
+                          model_provider_name: event.target.value,
+                          config: {
+                            ...currentNode.config,
+                            provider_name: event.target.value,
+                          },
+                        })),
+                      )
+                    }
+                  />
+                </label>
               </div>
-              <pre>{finalSystemPromptPreview || systemPromptTemplatePreview || "The final assembled system prompt will appear here."}</pre>
-            </section>
-          ) : null}
+            ) : null}
+
+            {activeTab === "overview" ? (
+              <div className="modal-folder-section provider-details-overview-layout">
+                <section className="provider-details-summary provider-details-summary--hero">
+                  <div className="provider-details-summary-header">
+                    <strong>Selected Provider</strong>
+                    <span>{provider?.display_name ?? providerName}</span>
+                  </div>
+                  <p>{provider?.description ?? "No provider description is available for the current selection."}</p>
+                  {provider?.capabilities.length ? (
+                    <div className="provider-details-capabilities">
+                      {provider.capabilities.map((capability) => (
+                        <span key={capability} className="provider-capability-chip">
+                          {capability}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </section>
+                <aside className="provider-details-overview-side">
+                  <section className="provider-details-status-card">
+                    <div className="provider-details-status-card-header">
+                      <strong>Health Check</strong>
+                      <span>{supportsLiveVerification ? "Live capable" : "Mock / local only"}</span>
+                    </div>
+                    {displayedPreflightResult ? (
+                      <div className="tool-details-modal-help">
+                        <strong>Provider Health</strong>
+                        <div>{displayedPreflightResult.message}</div>
+                        {displayedPreflightResult.warnings?.map((warning) => (
+                          <div key={warning}>{warning}</div>
+                        ))}
+                      </div>
+                    ) : null}
+                    {preflightError ? <div className="tool-details-modal-help">{preflightError}</div> : null}
+                    {!supportsLiveVerification ? (
+                      <div className="tool-details-modal-help">Live verification is not required for the mock provider.</div>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="secondary-button provider-details-verify-button"
+                      onClick={handleLiveVerification}
+                      disabled={isPreflighting || !supportsLiveVerification}
+                    >
+                      {isPreflighting
+                        ? "Checking Provider..."
+                        : supportsLiveVerification
+                          ? "Run Live Verification"
+                          : "Live Verification Not Required"}
+                    </button>
+                  </section>
+                  {displayedDiagnostics ? (
+                    <section className="provider-details-status-card provider-details-status-card--diagnostics">
+                      <div className="provider-details-status-card-header">
+                        <strong>Diagnostics</strong>
+                        <span>{displayedDiagnostics.active_backend}</span>
+                      </div>
+                      <div className="provider-diagnostics-card">
+                        <div className="provider-diagnostics-section">
+                          <div className="provider-diagnostics-section-title">Backend</div>
+                          <div className="provider-diagnostics-row">
+                            <span>Active backend</span>
+                            <strong>{displayedDiagnostics.active_backend}</strong>
+                          </div>
+                          <div className="provider-diagnostics-row">
+                            <span>Authentication status</span>
+                            <strong>{displayedDiagnostics.authentication_status}</strong>
+                          </div>
+                        </div>
+                        {displayedDiagnostics.active_backend === "claude_code" ? (
+                          <div className="provider-diagnostics-section">
+                            <div className="provider-diagnostics-section-title">Claude Code</div>
+                            <div className="provider-diagnostics-row">
+                              <span>Claude binary</span>
+                              <strong>{displayedDiagnostics.claude_binary_exists ? "found" : "not found"}</strong>
+                            </div>
+                          </div>
+                        ) : null}
+                        {displayedDiagnostics.active_backend === "claude_code" || displayedDiagnostics.active_backend === "anthropic_api" ? (
+                          <div className="provider-diagnostics-section">
+                            <div className="provider-diagnostics-section-title">Environment</div>
+                            <div className="provider-diagnostics-row">
+                              <span>`ANTHROPIC_API_KEY` present</span>
+                              <strong>{displayedDiagnostics.anthropic_api_key_present ? "yes" : "no"}</strong>
+                            </div>
+                          </div>
+                        ) : null}
+                        {displayedDiagnostics.child_env_sanitized ? (
+                          <div className="provider-diagnostics-section">
+                            <div className="provider-diagnostics-section-title">Child Process</div>
+                            <div className="provider-diagnostics-list">
+                              <div>Sanitized environment enabled.</div>
+                              <div>Strips: {displayedDiagnostics.sanitized_env_removed_vars.join(", ")}</div>
+                            </div>
+                          </div>
+                        ) : null}
+                        {displayedDiagnostics.warning ? (
+                          <div className="provider-diagnostics-section">
+                            <div className="provider-diagnostics-section-title">Warning</div>
+                            <div className="provider-diagnostics-list">
+                              <div>{displayedDiagnostics.warning}</div>
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    </section>
+                  ) : null}
+                </aside>
+              </div>
+            ) : null}
+
+            {activeTab === "prompt" ? (
+              <div className="modal-folder-section provider-details-prompt-layout">
+                <div className="provider-details-prompt-main">
+                <label>
+                  System Prompt
+                  <textarea
+                    rows={7}
+                    value={String(node.config.system_prompt ?? "")}
+                    placeholder="You are a helpful model node."
+                    onChange={handleTextInputChange("system_prompt")}
+                  />
+                  <small>
+                    Connected MCP edges already define which tools are in scope. MCP coverage is the only required part
+                    here; all other placeholders are optional runtime values.
+                  </small>
+                </label>
+
+                <label>
+                  User Message Template
+                  <textarea
+                    rows={5}
+                    value={String(node.config.user_message_template ?? "{input_payload}")}
+                    onChange={handleTextInputChange("user_message_template")}
+                  />
+                </label>
+                </div>
+
+                <aside className="provider-details-prompt-sidebar">
+                  {promptContextToolSummaries.length > 0 ? (
+                    <div className="context-builder-binding-actions">
+                      <button
+                        type="button"
+                        className="secondary-button context-builder-inline-button"
+                        onClick={() => updateProviderConfig("system_prompt", modelGeneratedMcpPlaceholderTemplate)}
+                      >
+                        Build From Connected MCP Tools
+                      </button>
+                    </div>
+                  ) : null}
+
+                  {node.kind === "model" ? (
+                    <div className="tool-details-modal-help provider-details-placeholder-panel provider-details-placeholder-panel--prompt">
+                    <div className="provider-details-placeholder-header">
+                      <strong>Required MCP placeholders</strong>
+                      <span>Only needed if you want full inline MCP prompt control.</span>
+                    </div>
+                    <div className="graph-env-reference-list">
+                      {requiredMcpPlaceholders.map((token) => (
+                        <code key={token} className="placeholder-chip placeholder-chip--required">{`{${token}}`}</code>
+                      ))}
+                      {requiredMcpPlaceholders.length === 0 ? <span>None required.</span> : null}
+                    </div>
+                    <div className="provider-details-placeholder-rule">
+                      <span className="provider-details-placeholder-rule-label">Rule</span>
+                      <p>
+                        Include <code>{"{mcp_tool_guidance_block}"}</code> plus either <code>{"{mcp_tool_context_block}"}</code> or
+                        every ordered MCP tool placeholder for full inline MCP control. Missing MCP sections are appended
+                        automatically.
+                      </p>
+                    </div>
+                    {promptContextToolSummaries.length > 0 ? (
+                      <div className="provider-details-placeholder-subsection">
+                        <div className="provider-details-placeholder-subtitle">Ordered MCP tool placeholders</div>
+                        <div className="provider-details-placeholder-list">
+                          {promptContextToolSummaries.map((tool) => (
+                            <span key={tool.placeholderToken}>
+                              <code className="placeholder-chip placeholder-chip--optional">{`{${tool.placeholderToken}}`}</code> {tool.displayName} ({tool.status})
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                    {optionalSystemPromptPlaceholders.length > 0 ? (
+                      <div className="provider-details-placeholder-subsection">
+                        <div className="provider-details-placeholder-subtitle">Optional placeholders</div>
+                        <div className="graph-env-reference-list">
+                          {optionalSystemPromptPlaceholders.map((token) => (
+                            <code key={token} className="placeholder-chip placeholder-chip--optional">{`{${token}}`}</code>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                    </div>
+                  ) : null}
+
+                  <div className="tool-details-modal-help provider-details-placeholder-panel provider-details-placeholder-panel--env">
+                    <div className="provider-details-placeholder-header">
+                      <strong>Graph Variables</strong>
+                      <span>Available in prompt fields and inserted at runtime.</span>
+                    </div>
+                    <div className="graph-env-reference-list">
+                      {envVarEntries.map(([key, value]) => (
+                        <code key={key} title={value}>
+                          {`{${key}}`}
+                        </code>
+                      ))}
+                    </div>
+                  </div>
+                </aside>
+              </div>
+            ) : null}
+
+            {activeTab === "routing" ? (
+              <div className="modal-folder-section provider-details-routing-layout">
+                <div className="provider-details-routing-main">
+                <label>
+                  Response Mode
+                  <select
+                    value={String(node.config.response_mode ?? "auto") || "auto"}
+                    onChange={handleTextInputChange("response_mode")}
+                  >
+                    <option value="auto">auto</option>
+                    <option value="tool_call">tool_call</option>
+                    <option value="message">message</option>
+                  </select>
+                  <small>
+                    Choose a fixed mode or leave it on <code>auto</code> to follow graph wiring. Current effective mode:{" "}
+                    <code>{selectedModelResponseMode ?? "message"}</code>.
+                  </small>
+                </label>
+
+                <label>
+                  Intended Output Schema
+                  <div className="tool-details-modal-help provider-details-placeholder-panel">
+                    <div className="provider-details-placeholder-header">
+                      <strong>Schema Boilerplate</strong>
+                      <span>Start from a common output shape, then customize the JSON schema below.</span>
+                    </div>
+                    <div className="provider-schema-boilerplate-list">
+                      <button
+                        type="button"
+                        className="secondary-button context-builder-inline-button"
+                        onClick={() => updateResponseSchemaText("")}
+                      >
+                        Clear
+                      </button>
+                      {RESPONSE_SCHEMA_PRESETS.map((preset) => (
+                        <button
+                          key={preset.id}
+                          type="button"
+                          className="provider-schema-boilerplate-card"
+                          onClick={() => updateResponseSchemaText(preset.schemaText)}
+                        >
+                          <strong>{preset.label}</strong>
+                          <span>{preset.description}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <textarea
+                    rows={10}
+                    className="tool-details-modal-code"
+                    value={responseSchemaDetails.schemaText}
+                    placeholder='Leave blank to allow any JSON value, or define a JSON Schema object like {"type":"object","properties":{...}}'
+                    onChange={(event) => updateResponseSchemaText(event.target.value)}
+                    spellCheck={false}
+                  />
+                  <small>
+                    Optional JSON Schema for the final <code>message</code> payload this API block emits.
+                  </small>
+                </label>
+                {responseSchemaDetails.schemaError ? (
+                  <p className="error-text">Schema JSON error: {responseSchemaDetails.schemaError}</p>
+                ) : null}
+
+                <div className="contract-card">
+                  <strong>Output Schema</strong>
+                  <span>Status: {responseSchemaDetails.statusLabel}</span>
+                  <span>Applies whenever this API block emits a final message.</span>
+                </div>
+
+                <div className="checkbox-grid provider-details-tool-grid">
+                  <strong>Direct Registry Tools</strong>
+                  {standardCatalogTools.map((tool) => {
+                    const canonicalName = toolCanonicalName(tool);
+                    const isChecked = allowedTools.some((name) => toolMatchesReference(tool, name));
+                    const canSelectTool = tool.enabled !== false && tool.available !== false;
+                    return (
+                      <label key={canonicalName} className="checkbox-option">
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          disabled={!isChecked && !canSelectTool}
+                          onChange={(event) => {
+                            const nextTools = event.target.checked
+                              ? [...allowedTools.filter((name) => !toolMatchesReference(tool, name)), canonicalName]
+                              : allowedTools.filter((name) => !toolMatchesReference(tool, name));
+                            onGraphChange(
+                              updateModelNode(graph, node.id, (currentNode) => ({
+                                ...currentNode,
+                                config: {
+                                  ...currentNode.config,
+                                  allowed_tool_names: nextTools,
+                                  preferred_tool_name:
+                                    nextTools.length > 0 ? String(currentNode.config.preferred_tool_name ?? nextTools[0]) : "",
+                                },
+                              })),
+                            );
+                          }}
+                        />
+                        <span>
+                          {toolLabel(tool)}
+                          {toolLabel(tool) !== canonicalName ? <small><code>{canonicalName}</code></small> : null}
+                          <small>{toolStatusLabel(tool)}</small>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+
+                <label>
+                  Preferred Tool Name
+                  <input
+                    value={String(node.config.preferred_tool_name ?? "")}
+                    onChange={handleTextInputChange("preferred_tool_name")}
+                  />
+                </label>
+                </div>
+
+                <aside className="provider-details-routing-sidebar">
+                <div className="contract-card provider-details-accent-card provider-details-accent-card--violet">
+                  <strong>MCP Tools From Context Providers</strong>
+                  <span>Callable MCP tools: {callableMcpToolNames.length > 0 ? callableMcpToolNames.join(", ") : "None"}</span>
+                  <span>Prompt context sources: {modelPromptContextProviders.length > 0 ? modelPromptContextProviders.join(", ") : "None"}</span>
+                  {modelTargetedMcpNodeIds.length > 0 ? (
+                    <span>Targeted MCP provider IDs: {modelTargetedMcpNodeIds.join(", ")}</span>
+                  ) : (
+                    <span>MCP tools are supplied through connected or targeted MCP Context Provider nodes.</span>
+                  )}
+                </div>
+
+                <div className="contract-card provider-details-accent-card provider-details-accent-card--blue">
+                  <strong>Bound Prompt Blocks</strong>
+                  <span>
+                    Direct prompt messages:{" "}
+                    {modelPromptBlockNodes.length > 0
+                      ? modelPromptBlockNodes.map((promptNode) => `${getNodeInstanceLabel(graph, promptNode)} (${String(promptNode.config.role ?? "user")})`).join(", ")
+                      : "None"}
+                  </span>
+                  <span>Bind Prompt Block nodes into the model to inject additional system, user, or assistant messages before the standard user template.</span>
+                </div>
+
+                <div className="contract-card provider-details-accent-card provider-details-accent-card--amber">
+                  <strong>System Prompt Assembly</strong>
+                  <span>Template placeholders: {systemPromptTokens.length > 0 ? systemPromptTokens.join(", ") : "None"}</span>
+                  <span>
+                    Required MCP guidance:{" "}
+                    {mcpToolGuidanceBlock.length > 0
+                      ? systemPromptTemplate.includes("{mcp_tool_guidance_block}")
+                        ? "inline"
+                        : "auto-appended"
+                      : "not needed"}
+                  </span>
+                  <span>
+                    Required MCP context:{" "}
+                    {promptContextToolSummaries.length > 0
+                      ? systemPromptTemplate.includes("{mcp_tool_context_block}")
+                        || systemPromptTemplate.includes("{mcp_tool_context_prompt}")
+                        || promptContextToolSummaries.every((tool) => systemPromptTemplate.includes(`{${tool.placeholderToken}}`))
+                        ? "inline"
+                        : "auto-appended"
+                      : "not needed"}
+                  </span>
+                  <span>
+                    Prompt block messages stay separate from the system prompt:{" "}
+                    {modelPromptBlockNodes.length > 0 ? `${modelPromptBlockNodes.length} bound block${modelPromptBlockNodes.length === 1 ? "" : "s"}` : "None"}
+                  </span>
+                </div>
+                </aside>
+
+                {modelGeneratedMcpPlaceholderTemplate ? (
+                  <section className="tool-details-modal-preview provider-details-routing-preview">
+                    <div className="tool-details-modal-preview-header">
+                      <strong>Generated MCP Placeholder Template</strong>
+                      <span>
+                        This scaffold is built from connected MCP prompt-context edges and can replace the system prompt
+                        with ordered placeholders before runtime.
+                      </span>
+                    </div>
+                    <pre>{modelGeneratedMcpPlaceholderTemplate}</pre>
+                  </section>
+                ) : null}
+
+                <div className="checkbox-grid provider-details-placeholder-strip">
+                  <strong>Insert Required MCP Placeholders</strong>
+                  <span className="inspector-meta">
+                    Necessary for full inline MCP control. If these are omitted, the runtime appends the missing MCP
+                    sections automatically.
+                  </span>
+                  <div className="context-builder-placeholder-bar">
+                    {mcpToolGuidanceBlock.length > 0 ? (
+                      <button
+                        type="button"
+                        className="secondary-button context-builder-token-button context-builder-token-button--required"
+                        onClick={() => updateProviderConfig("system_prompt", insertTokenAtEnd(String(node.config.system_prompt ?? ""), "{mcp_tool_guidance_block}"))}
+                      >
+                        mcp_tool_guidance_block
+                      </button>
+                    ) : null}
+                    {promptContextToolSummaries.length > 0 ? (
+                      <button
+                        type="button"
+                        className="secondary-button context-builder-token-button context-builder-token-button--required"
+                        onClick={() => updateProviderConfig("system_prompt", insertTokenAtEnd(String(node.config.system_prompt ?? ""), "{mcp_tool_context_block}"))}
+                      >
+                        mcp_tool_context_block
+                      </button>
+                    ) : null}
+                    {promptContextToolSummaries.map((tool) => (
+                      <button
+                        key={tool.placeholderToken}
+                        type="button"
+                        className="secondary-button context-builder-token-button context-builder-token-button--required"
+                        onClick={() => updateProviderConfig("system_prompt", insertTokenAtEnd(String(node.config.system_prompt ?? ""), `{${tool.placeholderToken}}`))}
+                      >
+                        {tool.placeholderToken}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            {activeTab === "config" ? (
+              <div className="modal-folder-section provider-details-config-layout">
+                <div className="provider-details-grid">
+                  <label>
+                    Provider
+                    <select
+                      value={providerName}
+                      onChange={(event) => handleProviderChange(event.target.value)}
+                    >
+                      {availableProviders.map((candidate) => {
+                        const candidateName = providerModelName(candidate);
+                        return (
+                          <option key={candidate.provider_id} value={candidateName}>
+                            {candidate.display_name}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </label>
+                  {providerConfigFields.map((field) => (
+                    <label key={field.key}>
+                      {field.label}
+                      {(() => {
+                        const currentValue = String(node.config[field.key] ?? "");
+                        const isSelectField = field.input_type === "select" && (field.options?.length ?? 0) > 0;
+                        const isModelSelectField = isSelectField && field.key === "model";
+                        const selectOptions =
+                          isSelectField && currentValue && !field.options?.some((option) => option.value === currentValue)
+                            ? [...(field.options ?? []), { value: currentValue, label: `Custom: ${currentValue}` }]
+                            : (field.options ?? []);
+                        const datalistId = `${node.id}-${field.key}-modal-options`;
+                        return (
+                          <>
+                            {isModelSelectField ? (
+                              <>
+                                <input
+                                  list={datalistId}
+                                  value={currentValue}
+                                  placeholder={field.placeholder || "Select or type a model id"}
+                                  onChange={handleTextInputChange(field.key)}
+                                />
+                                <datalist id={datalistId}>
+                                  {selectOptions.map((option) => (
+                                    <option key={option.value} value={option.value}>
+                                      {option.label}
+                                    </option>
+                                  ))}
+                                </datalist>
+                              </>
+                            ) : isSelectField ? (
+                              <select
+                                value={currentValue}
+                                onChange={handleTextInputChange(field.key)}
+                              >
+                                {selectOptions.map((option) => (
+                                  <option key={option.value} value={option.value}>
+                                    {option.label}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <input
+                                type={field.input_type === "number" ? "number" : "text"}
+                                value={currentValue}
+                                placeholder={field.placeholder || undefined}
+                                onChange={
+                                  field.input_type === "number"
+                                    ? handleNumberInputChange(field.key)
+                                    : handleTextInputChange(field.key)
+                                }
+                              />
+                            )}
+                          </>
+                        );
+                      })()}
+                    </label>
+                  ))}
+                </div>
+
+                <div className="tool-details-modal-help">
+                  Required provider choice is controlled from the API node itself. These fields are optional overrides for
+                  the selected provider.
+                </div>
+
+                <div className="tool-details-modal-help">
+                  Graph env refs can be used in any text field here:
+                  <div className="graph-env-reference-list">
+                    {envVarEntries.map(([key, value]) => (
+                      <code key={key} title={value}>
+                        {`{${key}}`}
+                      </code>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            {activeTab === "preview" ? (
+              <div className="modal-folder-section provider-details-preview-layout">
+                <section className="tool-details-modal-preview provider-details-preview-card">
+                  <div className="tool-details-modal-preview-header">
+                    <strong>Resolved Provider Config</strong>
+                    <span>This preview shows provider settings after graph env references are substituted.</span>
+                  </div>
+                  <pre>{JSON.stringify(resolvedPreviewConfig, null, 2)}</pre>
+                </section>
+                {node.kind === "model" ? (
+                  <section className="tool-details-modal-preview provider-details-preview-card provider-details-preview-card--prompt">
+                    <div className="tool-details-modal-preview-header">
+                      <strong>Final System Prompt Preview</strong>
+                      <span>This is the complete prompt after placeholders, MCP guidance, and connected tool context are assembled.</span>
+                    </div>
+                    <pre>{finalSystemPromptPreview || systemPromptTemplatePreview || "The final assembled system prompt will appear here."}</pre>
+                  </section>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
         </div>
       </section>
     </div>

@@ -43,6 +43,7 @@ def build_run_state(
         "node_errors": {},
         "node_statuses": {node_id: "idle" for node_id in normalized_execution_node_ids},
         "iterator_states": {},
+        "loop_regions": {},
         "visit_counts": {},
         "transition_history": [],
         "event_history": [],
@@ -111,6 +112,84 @@ def _mark_terminal_node_statuses(
     return next_statuses
 
 
+def _build_iteration_id(iterator_node_id: Any, iterator_row_index: Any) -> str | None:
+    if not isinstance(iterator_node_id, str) or not iterator_node_id:
+        return None
+    if not isinstance(iterator_row_index, int) or iterator_row_index <= 0:
+        return None
+    return f"{iterator_node_id}:row:{iterator_row_index}"
+
+
+def _append_unique_string(values: list[Any], candidate: Any) -> list[str]:
+    normalized_values = [value for value in values if isinstance(value, str) and value]
+    if isinstance(candidate, str) and candidate and candidate not in normalized_values:
+        normalized_values.append(candidate)
+    return normalized_values
+
+
+def _update_loop_region_state(
+    previous_regions: dict[str, Any] | None,
+    payload: dict[str, Any],
+    *,
+    include_status: bool = False,
+) -> dict[str, Any] | None:
+    iterator_node_id = payload.get("iterator_node_id")
+    if (
+        (not isinstance(iterator_node_id, str) or not iterator_node_id)
+        and isinstance(payload.get("node_id"), str)
+        and (
+            payload.get("iterator_type") is not None
+            or payload.get("current_row_index") is not None
+            or payload.get("total_rows") is not None
+        )
+    ):
+        iterator_node_id = payload.get("node_id")
+    if not isinstance(iterator_node_id, str) or not iterator_node_id:
+        return previous_regions
+    next_regions = dict(previous_regions or {})
+    existing_region = next_regions.get(iterator_node_id)
+    current_region = dict(existing_region) if isinstance(existing_region, dict) else {}
+    member_node_ids = [value for value in current_region.get("member_node_ids", []) if isinstance(value, str) and value]
+    iteration_ids = [value for value in current_region.get("iteration_ids", []) if isinstance(value, str) and value]
+
+    node_id = payload.get("node_id")
+    if isinstance(node_id, str) and node_id and node_id != iterator_node_id:
+        member_node_ids = _append_unique_string(member_node_ids, node_id)
+
+    iteration_row_index = payload.get("iterator_row_index")
+    if not isinstance(iteration_row_index, int):
+        iteration_row_index = payload.get("current_row_index")
+    iteration_id = payload.get("iteration_id")
+    if not isinstance(iteration_id, str) or not iteration_id:
+        iteration_id = _build_iteration_id(iterator_node_id, iteration_row_index)
+    iteration_ids = _append_unique_string(iteration_ids, iteration_id)
+
+    current_row_index = payload.get("current_row_index")
+    if not isinstance(current_row_index, int):
+        current_row_index = iteration_row_index if isinstance(iteration_row_index, int) else current_region.get("current_row_index")
+    total_rows = payload.get("total_rows")
+    if not isinstance(total_rows, int):
+        total_rows = payload.get("iterator_total_rows") if isinstance(payload.get("iterator_total_rows"), int) else current_region.get("total_rows")
+    status = current_region.get("status")
+    if include_status and isinstance(payload.get("status"), str) and payload.get("status"):
+        status = payload.get("status")
+
+    next_regions[iterator_node_id] = {
+        "iterator_node_id": iterator_node_id,
+        "iterator_type": payload.get("iterator_type") if payload.get("iterator_type") is not None else current_region.get("iterator_type"),
+        "status": status,
+        "current_row_index": current_row_index,
+        "total_rows": total_rows,
+        "active_iteration_id": iteration_id if isinstance(iteration_id, str) and iteration_id else current_region.get("active_iteration_id"),
+        "member_node_ids": member_node_ids,
+        "iteration_ids": iteration_ids,
+        "sheet_name": payload.get("sheet_name") if payload.get("sheet_name") is not None else current_region.get("sheet_name"),
+        "source_file": payload.get("source_file") if payload.get("source_file") is not None else current_region.get("source_file"),
+        "file_format": payload.get("file_format") if payload.get("file_format") is not None else current_region.get("file_format"),
+    }
+    return next_regions
+
+
 def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
     event = normalize_runtime_event_dict(event)
     next_state = {
@@ -146,6 +225,9 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
                 **next_state.get("node_statuses", {}),
                 node_id: "active",
             }
+        next_loop_regions = _update_loop_region_state(next_state.get("loop_regions"), payload)
+        if next_loop_regions is not None:
+            next_state["loop_regions"] = next_loop_regions
 
     if event_type == "node.completed":
         node_id = payload.get("node_id")
@@ -168,6 +250,9 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
                 **next_state.get("node_statuses", {}),
                 node_id: "failed" if payload.get("error") is not None else "success",
             }
+        next_loop_regions = _update_loop_region_state(next_state.get("loop_regions"), payload)
+        if next_loop_regions is not None:
+            next_state["loop_regions"] = next_loop_regions
 
     if event_type == "node.iterator.updated":
         node_id = payload.get("node_id")
@@ -185,6 +270,9 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
                     "file_format": payload.get("file_format"),
                 },
             }
+        next_loop_regions = _update_loop_region_state(next_state.get("loop_regions"), payload, include_status=True)
+        if next_loop_regions is not None:
+            next_state["loop_regions"] = next_loop_regions
 
     if event_type == "edge.selected":
         selected_edge_id = payload.get("id")

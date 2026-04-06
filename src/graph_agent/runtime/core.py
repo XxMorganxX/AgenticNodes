@@ -55,6 +55,10 @@ PROMPT_BLOCK_ROLES = {"system", "user", "assistant"}
 DISCORD_END_PROVIDER_ID = "end.discord_message"
 DEFAULT_DISCORD_BOT_TOKEN_ENV_VAR = "{DISCORD_BOT_TOKEN}"
 SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows"
+LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions"
+CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body"
+CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if"
+CONTROL_FLOW_ELSE_HANDLE_ID = "control-flow-else"
 
 
 def _json_safe(value: Any) -> str:
@@ -512,7 +516,7 @@ def _model_has_message_output_route(graph: GraphDefinition, node: BaseNode) -> b
             continue
         if _is_message_contract_condition(edge.condition):
             return True
-        if target_node.category in {NodeCategory.API, NodeCategory.DATA, NodeCategory.END}:
+        if target_node.category in {NodeCategory.API, NodeCategory.CONTROL_FLOW_UNIT, NodeCategory.DATA, NodeCategory.END}:
             return True
     return False
 
@@ -1771,6 +1775,288 @@ class DataNode(BaseNode):
         )
 
 
+class ControlFlowNode(BaseNode):
+    kind = "control_flow_unit"
+
+    def __init__(
+        self,
+        node_id: str,
+        label: str,
+        provider_id: str = SPREADSHEET_ROW_PROVIDER_ID,
+        provider_label: str = "Control Flow Unit",
+        description: str = "",
+        config: Mapping[str, Any] | None = None,
+        position: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            node_id=node_id,
+            label=label,
+            category=NodeCategory.CONTROL_FLOW_UNIT,
+            provider_id=provider_id,
+            provider_label=provider_label,
+            description=description,
+            config=config,
+            position=position,
+        )
+
+    def _spreadsheet_config(self, context: NodeContext) -> dict[str, Any]:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        file_format = str(resolved.get("file_format", "auto") or "auto").strip().lower() or "auto"
+        file_path = str(resolved.get("file_path", "") or "").strip()
+        if not file_path:
+            file_path = resolve_spreadsheet_path_from_run_documents(
+                context.state.documents,
+                run_document_id=str(resolved.get("run_document_id", "") or ""),
+                run_document_name=str(resolved.get("run_document_name", "") or ""),
+            )
+        sheet_name = str(resolved.get("sheet_name", "") or "").strip()
+        empty_row_policy = str(resolved.get("empty_row_policy", "skip") or "skip").strip().lower() or "skip"
+        return {
+            "file_format": file_format,
+            "file_path": file_path,
+            "sheet_name": sheet_name,
+            "header_row_index": SPREADSHEET_HEADER_ROW_INDEX,
+            "start_row_index": SPREADSHEET_FIRST_DATA_ROW_INDEX,
+            "empty_row_policy": empty_row_policy,
+        }
+
+    def _spreadsheet_iterator_state(self, parse_result: Any) -> dict[str, Any]:
+        return {
+            "iterator_type": "spreadsheet_rows",
+            "status": "ready" if parse_result.row_count > 0 else "completed",
+            "current_row_index": 0,
+            "total_rows": parse_result.row_count,
+            "headers": list(parse_result.headers),
+            "sheet_name": parse_result.sheet_name,
+            "source_file": parse_result.source_file,
+            "file_format": parse_result.file_format,
+        }
+
+    def _spreadsheet_row_envelopes(self, parse_result: Any) -> list[dict[str, Any]]:
+        row_envelopes: list[dict[str, Any]] = []
+        total_rows = parse_result.row_count
+        for position, row in enumerate(parse_result.rows, start=1):
+            envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id=self.id,
+                from_category=self.category.value,
+                payload={
+                    "row_index": position,
+                    "row_number": row.row_number,
+                    "row_data": dict(row.row_data),
+                    "sheet_name": parse_result.sheet_name,
+                    "source_file": parse_result.source_file,
+                },
+                metadata={
+                    "contract": "data_envelope",
+                    "node_kind": self.kind,
+                    "data_mode": "spreadsheet_row",
+                    "provider_id": self.provider_id,
+                    "iterator_type": "spreadsheet_rows",
+                    "row_index": position,
+                    "row_number": row.row_number,
+                    "total_rows": total_rows,
+                    "headers": list(parse_result.headers),
+                    "sheet_name": parse_result.sheet_name,
+                    "source_file": parse_result.source_file,
+                    "file_format": parse_result.file_format,
+                },
+            )
+            row_envelopes.append(envelope.to_dict())
+        return row_envelopes
+
+    def _execute_spreadsheet_rows(self, context: NodeContext) -> NodeExecutionResult:
+        resolved_config = self._spreadsheet_config(context)
+        try:
+            parse_result = parse_spreadsheet(**resolved_config)
+        except SpreadsheetParseError as exc:
+            return NodeExecutionResult(
+                status="failed",
+                error={"type": "spreadsheet_parse_error", "message": str(exc)},
+                summary=str(exc),
+            )
+        iterator_state = self._spreadsheet_iterator_state(parse_result)
+        summary_envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload={
+                "source_file": parse_result.source_file,
+                "file_format": parse_result.file_format,
+                "sheet_name": parse_result.sheet_name,
+                "headers": list(parse_result.headers),
+                "row_count": parse_result.row_count,
+            },
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "control_flow_mode": "spreadsheet_rows",
+                "provider_id": self.provider_id,
+                "iterator_type": "spreadsheet_rows",
+                "headers": list(parse_result.headers),
+                "sheet_name": parse_result.sheet_name,
+                "source_file": parse_result.source_file,
+                "file_format": parse_result.file_format,
+                "total_rows": parse_result.row_count,
+            },
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=summary_envelope.to_dict(),
+            summary=f"Prepared {parse_result.row_count} spreadsheet row(s).",
+            metadata={
+                "iterator_state": iterator_state,
+                "control_flow_handle_id": CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
+                "_internal": {
+                    "spreadsheet_row_envelopes": self._spreadsheet_row_envelopes(parse_result),
+                },
+            },
+        )
+
+    def _source_envelope(self, context: NodeContext) -> MessageEnvelope:
+        source_value = context.resolve_binding(self.config.get("input_binding"))
+        if isinstance(source_value, Mapping) and "schema_version" in source_value and "payload" in source_value:
+            return MessageEnvelope.from_dict(source_value)
+        return MessageEnvelope(
+            schema_version="1.0",
+            from_node_id="",
+            from_category="",
+            payload=source_value,
+            metadata={"contract": "data_envelope", "node_kind": self.kind},
+        )
+
+    def _logic_clauses(self) -> list[dict[str, Any]]:
+        raw_clauses = self.config.get("clauses", [])
+        if not isinstance(raw_clauses, Sequence) or isinstance(raw_clauses, (str, bytes)):
+            return []
+        clauses: list[dict[str, Any]] = []
+        for index, raw_clause in enumerate(raw_clauses):
+            if not isinstance(raw_clause, Mapping):
+                continue
+            raw_source_contracts = raw_clause.get("source_contracts", [])
+            source_contracts = (
+                [str(contract).strip() for contract in raw_source_contracts if str(contract).strip()]
+                if isinstance(raw_source_contracts, Sequence) and not isinstance(raw_source_contracts, (str, bytes))
+                else []
+            )
+            clauses.append(
+                {
+                    "id": str(raw_clause.get("id", f"clause-{index + 1}")).strip() or f"clause-{index + 1}",
+                    "label": str(raw_clause.get("label", "If")).strip() or "If",
+                    "path": None if raw_clause.get("path") in {None, ""} else str(raw_clause.get("path")),
+                    "operator": str(raw_clause.get("operator", "equals") or "equals").strip(),
+                    "value": raw_clause.get("value"),
+                    "source_contracts": source_contracts,
+                    "output_handle_id": str(
+                        raw_clause.get("output_handle_id", CONTROL_FLOW_IF_HANDLE_ID) or CONTROL_FLOW_IF_HANDLE_ID
+                    ).strip()
+                    or CONTROL_FLOW_IF_HANDLE_ID,
+                }
+            )
+        return clauses
+
+    def _evaluate_logic_clause(self, payload: Any, clause: Mapping[str, Any], incoming_contract: str) -> bool:
+        source_contracts = clause.get("source_contracts", [])
+        if isinstance(source_contracts, Sequence) and not isinstance(source_contracts, (str, bytes)):
+            normalized_contracts = [str(contract).strip() for contract in source_contracts if str(contract).strip()]
+            if normalized_contracts and incoming_contract not in normalized_contracts:
+                return False
+        actual_value = _deep_get(payload, clause.get("path")) if clause.get("path") not in {None, "", "$"} else payload
+        operator = str(clause.get("operator", "equals") or "equals").strip()
+        expected_value = clause.get("value")
+        if operator == "exists":
+            return actual_value is not None
+        if operator == "equals":
+            return actual_value == expected_value
+        if operator == "not_equals":
+            return actual_value != expected_value
+        if operator == "contains":
+            if isinstance(actual_value, str):
+                return str(expected_value) in actual_value
+            if isinstance(actual_value, Sequence) and not isinstance(actual_value, (str, bytes)):
+                return expected_value in actual_value
+            return False
+        if operator == "gt":
+            return actual_value is not None and expected_value is not None and actual_value > expected_value
+        if operator == "gte":
+            return actual_value is not None and expected_value is not None and actual_value >= expected_value
+        if operator == "lt":
+            return actual_value is not None and expected_value is not None and actual_value < expected_value
+        if operator == "lte":
+            return actual_value is not None and expected_value is not None and actual_value <= expected_value
+        return False
+
+    def _execute_logic_conditions(self, context: NodeContext) -> NodeExecutionResult:
+        source_envelope = self._source_envelope(context)
+        incoming_contract = str(source_envelope.metadata.get("contract", "") or "").strip()
+        matched_clause: dict[str, Any] | None = None
+        for clause in self._logic_clauses():
+            if self._evaluate_logic_clause(source_envelope.payload, clause, incoming_contract):
+                matched_clause = clause
+                break
+        selected_handle_id = (
+            str(matched_clause.get("output_handle_id", CONTROL_FLOW_IF_HANDLE_ID))
+            if matched_clause is not None
+            else str(self.config.get("else_output_handle_id", CONTROL_FLOW_ELSE_HANDLE_ID) or CONTROL_FLOW_ELSE_HANDLE_ID)
+        ).strip() or CONTROL_FLOW_ELSE_HANDLE_ID
+        forwarded_envelope = MessageEnvelope(
+            schema_version=source_envelope.schema_version,
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=source_envelope.payload,
+            artifacts=dict(source_envelope.artifacts),
+            errors=list(source_envelope.errors),
+            tool_calls=list(source_envelope.tool_calls),
+            metadata={
+                **dict(source_envelope.metadata),
+                "contract": incoming_contract or str(source_envelope.metadata.get("contract", "data_envelope")),
+                "node_kind": self.kind,
+                "control_flow_mode": "logic_conditions",
+                "selected_handle_id": selected_handle_id,
+                "matched_clause_id": matched_clause.get("id") if matched_clause is not None else None,
+                "matched_clause_label": matched_clause.get("label") if matched_clause is not None else "Else",
+            },
+        )
+        route_output = forwarded_envelope.to_dict()
+        return NodeExecutionResult(
+            status="success",
+            output=route_output,
+            summary=(
+                f"Logic conditions matched '{matched_clause.get('label', 'if')}'."
+                if matched_clause is not None
+                else "Logic conditions fell through to else."
+            ),
+            metadata={
+                "control_flow_mode": "logic_conditions",
+                "control_flow_handle_id": selected_handle_id,
+                "incoming_contract": incoming_contract or None,
+                "matched_clause_id": matched_clause.get("id") if matched_clause is not None else None,
+            },
+            route_outputs={selected_handle_id: route_output},
+        )
+
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        if self.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
+            return self._spreadsheet_config(context)
+        source_envelope = self._source_envelope(context)
+        return {
+            "incoming_contract": source_envelope.metadata.get("contract"),
+            "payload": source_envelope.payload,
+        }
+
+    def execute(self, context: NodeContext) -> NodeExecutionResult:
+        if self.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
+            return self._execute_spreadsheet_rows(context)
+        if self.provider_id == LOGIC_CONDITIONS_PROVIDER_ID:
+            return self._execute_logic_conditions(context)
+        envelope = self._source_envelope(context)
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary="Control flow node forwarded the incoming envelope.",
+        )
+
+
 class ProviderNode(BaseNode):
     kind = "provider"
 
@@ -1831,6 +2117,7 @@ class ModelNode(BaseNode):
         "provider_name",
         "response_mode",
         "response_schema",
+        "response_schema_text",
         "system_prompt",
         "tool_target_node_ids",
         "user_message_template",
@@ -2400,6 +2687,7 @@ class McpToolExecutorNode(BaseNode):
         "provider_name",
         "response_mode",
         "response_schema",
+        "response_schema_text",
         "system_prompt",
         "tool_target_node_ids",
         "user_message_template",
@@ -3417,6 +3705,12 @@ def _node_from_dict(payload: Mapping[str, Any]) -> BaseNode:
             provider_label=str(payload.get("provider_label", "Core Data Node")),
             **common,
         )
+    if kind == "control_flow_unit":
+        return ControlFlowNode(
+            provider_id=str(payload.get("provider_id", SPREADSHEET_ROW_PROVIDER_ID)),
+            provider_label=str(payload.get("provider_label", "Control Flow Unit")),
+            **common,
+        )
     if kind == "provider":
         return ProviderNode(
             provider_name=str(payload.get("model_provider_name") or payload.get("config", {}).get("provider_name", "")),
@@ -3565,6 +3859,8 @@ class GraphDefinition:
                 raise GraphValidationError(f"Edge '{edge.id}' is conditional but missing a condition.")
             if edge.kind not in {"conditional", "binding"}:
                 if source_node.category == NodeCategory.PROVIDER:
+                    continue
+                if edge.source_handle_id is not None:
                     continue
                 standard_edge_counts[edge.source_id] = standard_edge_counts.get(edge.source_id, 0) + 1
                 if standard_edge_counts[edge.source_id] > 1:
@@ -3729,9 +4025,14 @@ class GraphDefinition:
                                 f"Model node '{node.id}' tool-call output edge '{edge.id}' must match tool_call_envelope."
                             )
                     if edge.source_handle_id == API_MESSAGE_HANDLE_ID:
-                        if target_node.category not in {NodeCategory.API, NodeCategory.DATA, NodeCategory.END}:
+                        if target_node.category not in {
+                            NodeCategory.API,
+                            NodeCategory.CONTROL_FLOW_UNIT,
+                            NodeCategory.DATA,
+                            NodeCategory.END,
+                        }:
                             raise GraphValidationError(
-                                f"Model node '{node.id}' message output must route to api, data, or end nodes, but '{target_node.id}' is '{target_node.category.value}'."
+                                f"Model node '{node.id}' message output must route to api, control_flow_unit, data, or end nodes, but '{target_node.id}' is '{target_node.category.value}'."
                             )
                         if edge.kind != "conditional" or not _is_message_contract_condition(edge.condition):
                             raise GraphValidationError(
@@ -3956,6 +4257,53 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Prompt block '{node.id}' uses unsupported role '{raw_role}'."
                     )
+            if node.kind == "control_flow_unit":
+                if node.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
+                    allowed_handles = {CONTROL_FLOW_LOOP_BODY_HANDLE_ID, None}
+                    invalid_handles = [
+                        edge.source_handle_id
+                        for edge in self.get_outgoing_edges(node.id)
+                        if edge.kind != "binding" and edge.source_handle_id not in allowed_handles
+                    ]
+                    if invalid_handles:
+                        raise GraphValidationError(
+                            f"Spreadsheet rows node '{node.id}' uses unsupported output handle(s): {', '.join(str(handle) for handle in invalid_handles)}."
+                        )
+                if node.provider_id == LOGIC_CONDITIONS_PROVIDER_ID:
+                    raw_clauses = node.config.get("clauses", [])
+                    if not isinstance(raw_clauses, Sequence) or isinstance(raw_clauses, (str, bytes)):
+                        raise GraphValidationError(
+                            f"Logic conditions node '{node.id}' must declare clauses as a list."
+                        )
+                    clause_handles: set[str] = set()
+                    for index, raw_clause in enumerate(raw_clauses):
+                        if not isinstance(raw_clause, Mapping):
+                            raise GraphValidationError(
+                                f"Logic conditions node '{node.id}' clause at index {index} must be an object."
+                            )
+                        operator = str(raw_clause.get("operator", "equals") or "equals").strip()
+                        if operator not in {"exists", "equals", "not_equals", "contains", "gt", "gte", "lt", "lte"}:
+                            raise GraphValidationError(
+                                f"Logic conditions node '{node.id}' uses unsupported operator '{operator}'."
+                            )
+                        output_handle_id = str(
+                            raw_clause.get("output_handle_id", CONTROL_FLOW_IF_HANDLE_ID) or CONTROL_FLOW_IF_HANDLE_ID
+                        ).strip()
+                        if not output_handle_id:
+                            raise GraphValidationError(
+                                f"Logic conditions node '{node.id}' clause at index {index} must declare an output_handle_id."
+                            )
+                        clause_handles.add(output_handle_id)
+                    clause_handles.add(str(node.config.get("else_output_handle_id", CONTROL_FLOW_ELSE_HANDLE_ID) or CONTROL_FLOW_ELSE_HANDLE_ID))
+                    invalid_handles = [
+                        edge.source_handle_id
+                        for edge in self.get_outgoing_edges(node.id)
+                        if edge.kind != "binding" and edge.source_handle_id not in clause_handles
+                    ]
+                    if invalid_handles:
+                        raise GraphValidationError(
+                            f"Logic conditions node '{node.id}' uses unsupported output handle(s): {', '.join(str(handle) for handle in invalid_handles)}."
+                        )
 
     def _resolve_provider_binding(self, node: BaseNode) -> ProviderNode | None:
         binding_node_id = str(node.config.get("provider_binding_node_id", "")).strip()

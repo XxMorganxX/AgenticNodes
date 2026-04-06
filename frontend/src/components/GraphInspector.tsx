@@ -14,6 +14,12 @@ import {
 } from "../lib/editor";
 import { getGraphEnvVars, resolveGraphEnvReferences } from "../lib/graphEnv";
 import {
+  parseResponseSchemaText,
+  resolveResponseSchemaDetails,
+  RESPONSE_SCHEMA_PRESETS,
+  RESPONSE_SCHEMA_TEXT_CONFIG_KEY,
+} from "../lib/responseSchema";
+import {
   getContextBuilderBindings,
   slugifyContextBuilderPlaceholder,
   type ContextBuilderBindingRow,
@@ -296,6 +302,7 @@ export function GraphInspector({
   const [spreadsheetPreview, setSpreadsheetPreview] = useState<SpreadsheetPreviewResult | null>(null);
   const [spreadsheetPreviewError, setSpreadsheetPreviewError] = useState<string | null>(null);
   const [isSpreadsheetPreviewLoading, setIsSpreadsheetPreviewLoading] = useState(false);
+  const [contextBuilderPreviewFormatted, setContextBuilderPreviewFormatted] = useState(true);
 
   if (!graph) {
     return (
@@ -339,6 +346,8 @@ export function GraphInspector({
       : executorFollowUpEnabled
         ? String(selectedNode.config.response_mode ?? "auto")
         : null;
+  const responseSchemaDetails =
+    selectedNode && isPromptDrivenNode ? resolveResponseSchemaDetails(selectedNode.config as Record<string, unknown>) : null;
 
   if (selectedNode) {
     if (isWireJunctionNode(selectedNode)) {
@@ -759,6 +768,12 @@ export function GraphInspector({
       isSpreadsheetRowNode && runState?.iterator_states
         ? (runState.iterator_states[selectedNode.id] as Record<string, unknown> | undefined)
         : undefined;
+    const spreadsheetLoopRegion = isSpreadsheetRowNode ? runState?.loop_regions?.[selectedNode.id] : undefined;
+    const spreadsheetLoopMemberLabels = Array.isArray(spreadsheetLoopRegion?.member_node_ids)
+      ? spreadsheetLoopRegion.member_node_ids
+          .map((nodeId) => graph.nodes.find((candidate) => candidate.id === nodeId)?.label ?? nodeId)
+          .filter((label, index, values) => label.length > 0 && values.indexOf(label) === index)
+      : [];
     const spreadsheetResolvedFilePath =
       spreadsheetNode ? String(resolveGraphEnvReferences(String(spreadsheetNode.config.file_path ?? ""), graph) ?? "") : "";
     async function handleSpreadsheetPreview(): Promise<void> {
@@ -783,6 +798,28 @@ export function GraphInspector({
       } finally {
         setIsSpreadsheetPreviewLoading(false);
       }
+    }
+    function updateResponseSchemaText(nextText: string): void {
+      if (!isPromptDrivenNode || !graph) {
+        return;
+      }
+      const { parsedSchema } = parseResponseSchemaText(nextText);
+      onGraphChange(
+        updateNode(graph, selectedNode.id, (node) => {
+          const nextConfig = { ...node.config } as Record<string, unknown>;
+          if (nextText.length > 0) {
+            nextConfig[RESPONSE_SCHEMA_TEXT_CONFIG_KEY] = nextText;
+          } else {
+            delete nextConfig[RESPONSE_SCHEMA_TEXT_CONFIG_KEY];
+          }
+          if (parsedSchema) {
+            nextConfig.response_schema = parsedSchema;
+          } else {
+            delete nextConfig.response_schema;
+          }
+          return { ...node, config: nextConfig };
+        }),
+      );
     }
     const contextBuilderBindings = isContextBuilderNode ? getContextBuilderBindings(selectedNode, graph) : [];
     const generatedContextBuilderTemplate = buildContextBuilderTemplate(contextBuilderBindings);
@@ -1407,6 +1444,56 @@ export function GraphInspector({
                   </>
                 )}
               </label>
+              {isPromptDrivenNode ? (
+                <>
+                  <label>
+                    Intended Output Schema
+                    <div className="context-builder-placeholder-bar">
+                      <button
+                        type="button"
+                        className="secondary-button context-builder-inline-button"
+                        onClick={() => updateResponseSchemaText("")}
+                      >
+                        Clear
+                      </button>
+                      {RESPONSE_SCHEMA_PRESETS.map((preset) => (
+                        <button
+                          key={preset.id}
+                          type="button"
+                          className="secondary-button context-builder-inline-button"
+                          onClick={() => updateResponseSchemaText(preset.schemaText)}
+                        >
+                          {preset.label}
+                        </button>
+                      ))}
+                    </div>
+                    <textarea
+                      rows={10}
+                      className="tool-details-modal-code"
+                      value={responseSchemaDetails?.schemaText ?? ""}
+                      placeholder='Leave blank to allow any JSON value, or define a JSON Schema object like {"type":"object","properties":{...}}'
+                      onChange={(event) => updateResponseSchemaText(event.target.value)}
+                      spellCheck={false}
+                    />
+                    <small>
+                      Optional JSON Schema for the final <code>message</code> payload this API block emits. The surrounding
+                      decision envelope still includes <code>need_tool</code> and <code>tool_calls</code>.
+                    </small>
+                  </label>
+                  {responseSchemaDetails?.schemaError ? (
+                    <p className="error-text">Schema JSON error: {responseSchemaDetails.schemaError}</p>
+                  ) : null}
+                  <div className="contract-card">
+                    <strong>Output Schema</strong>
+                    <span>Status: {responseSchemaDetails?.statusLabel ?? "Default flexible payload"}</span>
+                    <span>
+                      {selectedNode.kind === "model"
+                        ? "Applies whenever this API block emits a final message."
+                        : "Applies whenever the follow-up model emits a final message instead of another MCP tool call."}
+                    </span>
+                  </div>
+                </>
+              ) : null}
               <div className="checkbox-grid">
                 <strong>{selectedNode.kind === "mcp_tool_executor" ? "Allowed MCP Tools" : "Direct Registry Tools"}</strong>
                 {followUpSelectableTools.map((tool) => {
@@ -2011,6 +2098,12 @@ export function GraphInspector({
                         Row progress: {String(spreadsheetIteratorState.current_row_index ?? 0)} / {String(spreadsheetIteratorState.total_rows ?? 0)}
                       </span>
                       <span>Sheet: {String(spreadsheetIteratorState.sheet_name ?? "first sheet")}</span>
+                      {spreadsheetLoopRegion ? (
+                        <span>
+                          Loop region members: {String(spreadsheetLoopRegion.member_node_ids?.length ?? 0)}
+                          {spreadsheetLoopMemberLabels.length > 0 ? ` (${spreadsheetLoopMemberLabels.join(", ")})` : ""}
+                        </span>
+                      ) : null}
                     </div>
                   ) : null}
                   {spreadsheetPreviewError ? <div className="tool-details-modal-help">{spreadsheetPreviewError}</div> : null}
@@ -2304,8 +2397,24 @@ export function GraphInspector({
                     ) : null}
                   </div>
                   <div className="contract-card">
-                    <strong>{contextBuilderHasPreviewData ? "Rendered Preview" : "Template Preview"}</strong>
-                    <pre className="context-builder-preview">{contextBuilderRenderedPreview || "Template output will appear here."}</pre>
+                    <div className="context-builder-preview-header">
+                      <strong>{contextBuilderHasPreviewData ? "Rendered Preview" : "Template Preview"}</strong>
+                      <button
+                        className="context-builder-preview-toggle"
+                        type="button"
+                        onClick={() => setContextBuilderPreviewFormatted((v) => !v)}
+                        title={contextBuilderPreviewFormatted ? "Switch to raw text" : "Switch to formatted view"}
+                      >
+                        {contextBuilderPreviewFormatted ? "Raw" : "Formatted"}
+                      </button>
+                    </div>
+                    <pre className="context-builder-preview">
+                      {contextBuilderRenderedPreview
+                        ? contextBuilderPreviewFormatted
+                          ? contextBuilderRenderedPreview.replace(/\\n/g, "\n").replace(/\\t/g, "\t")
+                          : contextBuilderRenderedPreview
+                        : "Template output will appear here."}
+                    </pre>
                     <span>
                       {contextBuilderHasPreviewData
                         ? "Preview uses the latest run outputs from connected nodes."
