@@ -5,125 +5,66 @@
   background: #23243b;
 }
 
-.environment-run-summary,
 .agent-swimlanes-panel {
   margin: 0.75rem 1.75rem 1.7rem;
-}
-
-.agent-swimlanes-panel {
   margin-top: 1.9rem;
 }
 
-.environment-run-summary-header {
+.swimlane-run-summary-bar {
   display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 1rem;
+  align-items: center;
+  gap: 0.75rem;
   flex-wrap: wrap;
+  padding: 0.65rem 1.1rem;
+  margin: 0 1.25rem;
+  border: 1px solid rgba(58, 59, 86, 0.88);
+  border-radius: 12px;
+  background: rgba(17, 18, 30, 0.74);
+  font-size: 0.82rem;
+  color: #a9add1;
 }
 
-.environment-run-summary-header > div {
-  flex: 1 1 320px;
-  min-width: 0;
+.swimlane-run-summary-bar span {
+  white-space: nowrap;
 }
 
-.environment-run-summary-header p {
-  max-width: 72ch;
-}
-
-.environment-run-summary-status {
+.swimlane-run-status {
   display: inline-flex;
   align-items: center;
-  align-self: flex-start;
-  padding: 0.35rem 0.7rem;
+  padding: 0.22rem 0.55rem;
   border-radius: 999px;
   background: rgba(148, 163, 184, 0.18);
   color: rgba(226, 232, 240, 0.84);
   text-transform: uppercase;
-  font-size: 0.75rem;
+  font-size: 0.72rem;
   font-weight: 700;
   letter-spacing: 0.04em;
-  white-space: nowrap;
 }
 
-.environment-run-summary-status--idle {
+.swimlane-run-status--idle {
   background: rgba(250, 204, 21, 0.12);
   color: #fde68a;
 }
 
-.environment-run-summary-status--running {
+.swimlane-run-status--running {
   background: rgba(96, 165, 250, 0.18);
   color: #93c5fd;
 }
 
-.environment-run-summary-status--completed {
+.swimlane-run-status--completed {
   background: rgba(74, 222, 128, 0.18);
   color: #86efac;
 }
 
-.environment-run-summary-status--failed {
+.swimlane-run-status--failed {
   background: rgba(248, 113, 113, 0.18);
   color: #fca5a5;
 }
 
-.environment-run-summary-status--cancelled,
-.environment-run-summary-status--interrupted {
+.swimlane-run-status--cancelled,
+.swimlane-run-status--interrupted {
   background: rgba(251, 146, 60, 0.18);
   color: #fdba74;
-}
-
-.environment-run-summary-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
-  gap: 0.8rem;
-  margin: 0;
-  padding: 0 1.25rem;
-}
-
-.environment-run-summary-grid div,
-.state-grid div {
-  min-width: 0;
-}
-
-.environment-run-summary-grid > div {
-  padding: 0.85rem 0.9rem;
-  border: 1px solid rgba(58, 59, 86, 0.88);
-  border-radius: 14px;
-  background: rgba(17, 18, 30, 0.74);
-}
-
-.environment-run-summary-grid dt {
-  margin-bottom: 0.2rem;
-  color: #9aa0c7;
-  font-size: 0.76rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.environment-run-summary-grid dd {
-  margin: 0;
-  color: #f0f0ff;
-  font-size: 1rem;
-  font-weight: 700;
-}
-
-.environment-run-summary-active {
-  display: grid;
-  gap: 0.2rem;
-  margin: 1rem 1.25rem 1.25rem;
-  padding: 0.85rem 0.95rem;
-  border: 1px solid rgba(58, 59, 86, 0.88);
-  border-radius: 14px;
-  background: rgba(17, 18, 30, 0.74);
-  color: #a9add1;
-}
-
-.environment-run-summary-active strong {
-  color: #f0f0ff;
-}
-
-.environment-run-summary-active span {
-  color: #a9add1;
 }
 
 .agent-swimlanes {
@@ -724,6 +665,13 @@ pre {
   align-items: start;
 }
 
+.hero-mosaic-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0.85rem;
+  align-items: start;
+}
+
 .hero-main-column {
   align-content: start;
 }
@@ -781,6 +729,37 @@ pre {
   margin-top: 0.85rem;
 }
 
+.mosaic-title-actions .primary-button {
+  background: linear-gradient(135deg, #6c5ce7 0%, #a78bfa 100%);
+  color: #fff;
+  font-weight: 700;
+  border: none;
+  padding: 0.55rem 1.2rem;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.mosaic-title-actions .primary-button:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.mosaic-title-actions .primary-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.mosaic-title-run-id {
+  display: block;
+  margin-top: 0.45rem;
+  color: #d8c8ff;
+  font-size: 0.82rem;
+}
+
+.mosaic-title-error {
+  margin-top: 0.35rem;
+}
+
 .mosaic-title-settings-button {
   display: inline-flex;
   align-items: center;
@@ -835,9 +814,6 @@ pre {
 }
 
 .mosaic-execution {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 280px);
-  gap: 0.85rem;
-  align-items: start;
   min-width: 0;
   min-height: 0;
 }
@@ -847,51 +823,31 @@ pre {
   resize: vertical;
 }
 
-.mosaic-execution-run {
-  display: flex;
-  flex-direction: column;
+.mosaic-documents,
+.mosaic-files,
+.mosaic-agents-toggle {
+  display: grid;
+  gap: 0.65rem;
   align-self: start;
-  gap: 0.55rem;
-  padding: 0.15rem 0;
-  min-width: 0;
 }
 
-.mosaic-execution-run button {
+.mosaic-documents button,
+.mosaic-files button {
   width: 100%;
 }
 
-.mosaic-execution-run code,
-.mosaic-execution-run p {
+.mosaic-documents p,
+.mosaic-files p {
   margin: 0;
 }
 
-.mosaic-execution-run code {
-  color: #d8c8ff;
-}
-
-.mosaic-execution-run p {
-  color: #8486a5;
-}
-
-.execution-documents-panel {
-  display: grid;
-  gap: 0.65rem;
-  padding: 0.8rem;
-  border: 1px solid rgba(88, 92, 132, 0.52);
-  border-radius: 14px;
-  background: rgba(16, 17, 29, 0.82);
-  max-height: 22rem;
+.mosaic-documents {
+  max-height: 28rem;
   overflow-y: auto;
 }
 
-.execution-files-panel {
-  display: grid;
-  gap: 0.65rem;
-  padding: 0.8rem;
-  border: 1px solid rgba(88, 92, 132, 0.52);
-  border-radius: 14px;
-  background: rgba(16, 17, 29, 0.82);
-  max-height: 18rem;
+.mosaic-files {
+  max-height: 24rem;
   overflow-y: auto;
 }
 
@@ -1061,13 +1017,8 @@ pre {
   font-size: 0.82rem;
 }
 
-.environment-run-toggle-panel {
-  display: grid;
-  gap: 0.65rem;
-  padding: 0.75rem;
-  border: 1px solid rgba(88, 92, 132, 0.52);
-  border-radius: 14px;
-  background: rgba(16, 17, 29, 0.82);
+.mosaic-agents-toggle {
+  align-content: start;
 }
 
 .environment-run-toggle-header {
@@ -2003,6 +1954,13 @@ pre {
 .condition-branch-header {
   display: grid;
   gap: 0.85rem;
+}
+
+.condition-modal-header-actions {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  flex-wrap: wrap;
 }
 
 .condition-match-panel {
@@ -5778,11 +5736,13 @@ pre {
 
   .hero-main-column,
   .hero-side-column,
-  .hero-main-row {
+  .hero-main-row,
+  .hero-mosaic-row {
     gap: 1.4rem;
   }
 
-  .hero-main-row {
+  .hero-main-row,
+  .hero-mosaic-row {
     grid-template-columns: 1fr;
   }
 
@@ -5914,9 +5874,6 @@ pre {
     grid-template-columns: 1fr;
   }
 
-  .environment-run-summary-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 
   .agent-swimlanes-panel {
     margin-top: 2rem;

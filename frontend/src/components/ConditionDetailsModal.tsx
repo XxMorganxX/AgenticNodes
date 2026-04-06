@@ -5,7 +5,6 @@ import { previewSpreadsheetRows } from "../lib/api";
 import { CONTROL_FLOW_ELSE_HANDLE_ID } from "../lib/editor";
 import { resolveGraphEnvReferences } from "../lib/graphEnv";
 import {
-  buildLogicBranchHandleId,
   createLogicConditionBranch,
   createLogicConditionGroup,
   createLogicConditionRule,
@@ -26,6 +25,8 @@ type ConditionDetailsModalProps = {
   node: GraphNode;
   catalog: EditorCatalog | null;
   runtimeOutput?: unknown;
+  onSaveGraph?: () => void | Promise<unknown>;
+  isSavingGraph?: boolean;
   onGraphChange: (graph: GraphDefinition) => void;
   onClose: () => void;
 };
@@ -406,6 +407,8 @@ export function ConditionDetailsModal({
   node,
   catalog,
   runtimeOutput,
+  onSaveGraph,
+  isSavingGraph = false,
   onGraphChange,
   onClose,
 }: ConditionDetailsModalProps) {
@@ -827,9 +830,20 @@ export function ConditionDetailsModal({
               execution falls through to `Else`.
             </p>
           </div>
-          <button type="button" className="secondary-button" onClick={requestClose}>
-            Close
-          </button>
+          <div className="condition-modal-header-actions">
+            {onSaveGraph ? (
+              <button type="button" className="secondary-button inspector-save-button" onClick={() => void onSaveGraph()} disabled={isSavingGraph}>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" />
+                  <path d="M17 21v-8H7v8M7 3v5h8" />
+                </svg>
+                {isSavingGraph ? "Saving..." : "Save Agent"}
+              </button>
+            ) : null}
+            <button type="button" className="secondary-button" onClick={requestClose}>
+              Close
+            </button>
+          </div>
         </div>
 
         <div className="tool-details-modal-body">
@@ -985,11 +999,6 @@ export function ConditionDetailsModal({
                                 updateBranch(selectedBranch.id, (branch) => ({
                                   ...branch,
                                   label: event.target.value,
-                                  output_handle_id: buildLogicBranchHandleId(
-                                    event.target.value,
-                                    branch.id,
-                                    branches.findIndex((candidate) => candidate.id === branch.id),
-                                  ),
                                 }))
                               }
                             />

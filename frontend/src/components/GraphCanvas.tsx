@@ -93,6 +93,8 @@ type GraphCanvasProps = {
   onGraphDrag: (graph: GraphDefinition) => void;
   onFormatGraph: (nodeDimensions: Record<string, GraphLayoutNodeDimensions>) => void;
   onRunGraph: () => void;
+  onSaveGraph?: () => Promise<unknown> | unknown;
+  isSavingGraph?: boolean;
   onScrollToTop: () => void;
   isMcpPanelOpen?: boolean;
   onToggleMcpPanel?: () => void;
@@ -877,6 +879,8 @@ export function GraphCanvas({
   onGraphDrag,
   onFormatGraph,
   onRunGraph,
+  onSaveGraph,
+  isSavingGraph = false,
   onScrollToTop,
   isMcpPanelOpen = false,
   onToggleMcpPanel,
@@ -3165,6 +3169,16 @@ export function GraphCanvas({
     [],
   );
 
+  const handleSaveCurrentGraph = useCallback(async () => {
+    if (!onSaveGraph) {
+      return;
+    }
+    const savedGraph = await onSaveGraph();
+    if (savedGraph != null) {
+      setEditorMessage("Saved changes to this agent.");
+    }
+  }, [onSaveGraph]);
+
   const copySelectedNodeToClipboard = useCallback(() => {
     if (!graph) {
       setEditorMessage("Select nodes to copy.");
@@ -5022,6 +5036,8 @@ export function GraphCanvas({
           node={conditionDetailsNode}
           catalog={catalog}
           runtimeOutput={runState?.node_outputs?.[conditionDetailsNode.id]}
+          onSaveGraph={handleSaveCurrentGraph}
+          isSavingGraph={isSavingGraph}
           onGraphChange={onGraphChange}
           onClose={() => setConditionDetailsNodeId(null)}
         />

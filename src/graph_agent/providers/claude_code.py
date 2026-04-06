@@ -32,6 +32,49 @@ def _is_mapping(value: Any) -> bool:
     return isinstance(value, Mapping)
 
 
+def _strict_json_schema(schema: Any) -> Any:
+    if isinstance(schema, Mapping):
+        normalized: dict[str, Any] = {}
+        for key, value in schema.items():
+            normalized[key] = _strict_json_schema(value)
+        type_value = normalized.get("type")
+        if isinstance(type_value, Sequence) and not isinstance(type_value, (str, bytes)):
+            union_types = [entry for entry in type_value if isinstance(entry, str) and entry.strip()]
+            if len(union_types) == 1:
+                normalized["type"] = union_types[0]
+            elif len(union_types) > 1:
+                normalized.pop("type", None)
+                normalized["anyOf"] = [{"type": union_type} for union_type in union_types]
+        return normalized
+    if isinstance(schema, Sequence) and not isinstance(schema, (str, bytes)):
+        return [_strict_json_schema(entry) for entry in schema]
+    return schema
+
+
+def _friendly_cli_error_detail(detail: str) -> str:
+    normalized_detail = detail.strip()
+    if not normalized_detail:
+        return detail
+    try:
+        parsed = json.loads(normalized_detail)
+    except json.JSONDecodeError:
+        return detail
+    if not _is_mapping(parsed):
+        return detail
+
+    result_text = parsed.get("result")
+    message_text = result_text.strip() if isinstance(result_text, str) else ""
+    if not message_text:
+        return detail
+
+    lowered = message_text.lower()
+    if "hit your limit" in lowered:
+        return f"Claude Code usage limit reached. {message_text}"
+    if parsed.get("is_error") is True:
+        return f"Claude Code request failed. {message_text}"
+    return detail
+
+
 def _string_config(config: Mapping[str, Any], key: str, default: str) -> str:
     value = config.get(key, default)
     return value if isinstance(value, str) and value.strip() else default
@@ -260,7 +303,7 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
             ModelToolDefinition(
                 name=tool_name,
                 description="Return the structured payload for this graph node.",
-                input_schema=request.response_schema,
+                input_schema=_strict_json_schema(request.response_schema),
             )
         ]
 
@@ -278,9 +321,9 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
         tools: list[ModelToolDefinition],
     ) -> Mapping[str, Any] | None:
         if _is_mapping(request.response_schema):
-            return request.response_schema
+            return _strict_json_schema(request.response_schema)
         if tools:
-            return api_decision_response_schema(available_tools=tools, allow_tool_calls=True)
+            return _strict_json_schema(api_decision_response_schema(available_tools=tools, allow_tool_calls=True))
         return None
 
     def _build_command(
@@ -497,7 +540,8 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
         )
         if completed != 0:
             detail = stderr or stdout or f"exit code {completed}"
-            raise RuntimeError(f"claude_code provider request failed: {detail}")
+            friendly_detail = _friendly_cli_error_detail(detail)
+            raise RuntimeError(f"claude_code provider request failed: {friendly_detail}")
 
         if not stdout:
             LOGGER.warning("claude_code subprocess returned no stdout")

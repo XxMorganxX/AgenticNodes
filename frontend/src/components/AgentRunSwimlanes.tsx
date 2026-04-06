@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import type { KeyboardEvent } from "react";
 
-import { formatRunStatusLabel, type AgentRunLane } from "../lib/runVisualization";
+import { formatRunStatusLabel, type AgentRunLane, type EnvironmentRunSummary as EnvironmentRunSummaryData } from "../lib/runVisualization";
 import { RunErrorHover } from "./RunErrorHover";
 
 type AgentRunSwimlanesProps = {
   lanes: AgentRunLane[];
   selectedAgentId: string | null;
+  environmentRunSummary?: EnvironmentRunSummaryData | null;
   onSelectAgent: (agentId: string) => void;
   onSelectNode?: (agentId: string, nodeId: string | null) => void;
 };
@@ -80,6 +81,7 @@ function formatStructuredValue(value: unknown): string {
 export function AgentRunSwimlanes({
   lanes,
   selectedAgentId,
+  environmentRunSummary,
   onSelectAgent,
   onSelectNode,
 }: AgentRunSwimlanesProps) {
@@ -124,6 +126,22 @@ export function AgentRunSwimlanes({
         <h2>Agent Run Swimlanes</h2>
         <p>Track each agent over time and click a milestone to focus its graph.</p>
       </div>
+      {environmentRunSummary ? (
+        <div className="swimlane-run-summary-bar">
+          <span className={`swimlane-run-status swimlane-run-status--${environmentRunSummary.status}`}>
+            {formatRunStatusLabel(environmentRunSummary.status)}
+          </span>
+          <span>{environmentRunSummary.totalAgents} agents</span>
+          {environmentRunSummary.runningAgents > 0 ? <span>{environmentRunSummary.runningAgents} running</span> : null}
+          {environmentRunSummary.completedAgents > 0 ? <span>{environmentRunSummary.completedAgents} completed</span> : null}
+          {environmentRunSummary.failedAgents > 0 ? <span className="error-text">{environmentRunSummary.failedAgents} failed</span> : null}
+          {environmentRunSummary.queuedAgents > 0 ? <span>{environmentRunSummary.queuedAgents} queued</span> : null}
+          <span>{environmentRunSummary.elapsedLabel}</span>
+          {environmentRunSummary.activeAgentNames.length > 0 ? (
+            <span>Active: {environmentRunSummary.activeAgentNames.join(", ")}</span>
+          ) : null}
+        </div>
+      ) : null}
       {eventTypeSummaries.length > 0 ? (
         <div className="agent-swimlane-filters" aria-label="Toggle milestone card types">
           <div className="agent-swimlane-filter-header">

@@ -915,6 +915,48 @@ class ModelProviderTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["tool_calls"]["items"]["properties"]["arguments"]["type"], "object")
         self.assertEqual(schema["required"], ["message", "need_tool", "tool_calls"])
 
+    def test_claude_code_provider_converts_union_types_for_strict_json_schema(self) -> None:
+        provider = StubClaudeCodeProvider()
+        request = ModelRequest(
+            prompt_name="nullable_schema",
+            messages=[ModelMessage(role="user", content="Return structured JSON.")],
+            provider_config={
+                "model": "sonnet",
+                "cli_path": "claude",
+                "working_directory": str(ROOT),
+                "timeout_seconds": 15,
+                "max_turns": 1,
+            },
+            response_mode="message",
+            response_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "message": {
+                        "type": ["string", "null"],
+                        "description": "Optional status message.",
+                    },
+                    "data": {
+                        "type": ["object", "array", "null"],
+                    },
+                },
+            },
+        )
+
+        provider.generate(request)
+        debug_payload = _extract_claude_code_debug_payload(provider.last_command)
+        json_schema = debug_payload["json_schema"]
+
+        assert isinstance(json_schema, dict)
+        message_schema = json_schema["properties"]["message"]
+        self.assertNotIn("type", message_schema)
+        self.assertEqual(message_schema["anyOf"], [{"type": "string"}, {"type": "null"}])
+        self.assertEqual(message_schema["description"], "Optional status message.")
+        self.assertEqual(
+            json_schema["properties"]["data"]["anyOf"],
+            [{"type": "object"}, {"type": "array"}, {"type": "null"}],
+        )
+
     def test_mock_provider_emits_tool_calls_for_tool_call_modes(self) -> None:
         provider = MockModelProvider()
 
@@ -1052,6 +1094,37 @@ class ModelProviderTests(unittest.TestCase):
             )
 
         self.assertIn("without output progress", str(context.exception))
+
+    def test_claude_code_provider_formats_usage_limit_errors(self) -> None:
+        provider = ClaudeCodeCLIModelProvider()
+        payload = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "result": "You've hit your limit · resets 8pm (America/New_York)",
+            }
+        )
+        with self.assertRaises(RuntimeError) as context:
+            provider._run_command(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys; "
+                        f"sys.stderr.write({payload!r}); "
+                        "raise SystemExit(1)"
+                    ),
+                ],
+                cwd=str(ROOT),
+                timeout_seconds=5,
+            )
+
+        self.assertEqual(
+            str(context.exception),
+            "claude_code provider request failed: Claude Code usage limit reached. "
+            "You've hit your limit · resets 8pm (America/New_York)",
+        )
 
     def test_manager_reports_claude_code_diagnostics_with_billing_warning(self) -> None:
         manager = GraphRunManager(services=build_example_services())

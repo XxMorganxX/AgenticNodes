@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AgentRunSwimlanes } from "./components/AgentRunSwimlanes";
-import { EnvironmentRunSummary } from "./components/EnvironmentRunSummary";
 import { GraphCanvas } from "./components/GraphCanvas";
 import { GraphEnvEditor } from "./components/GraphEnvEditor";
 import { McpServerModal } from "./components/McpServerModal";
@@ -1380,6 +1379,14 @@ export default function App() {
                   </button>
                 </div>
                 <div className="mosaic-title-actions">
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={() => void handleRun()}
+                    disabled={!draftGraph || isRunning || isSaving || isResettingRuntime || isUploadingDocuments}
+                  >
+                    {isRunning ? "Running..." : isEnvironment ? "Run Environment" : "Run Graph"}
+                  </button>
                   <button type="button" className="secondary-button" onClick={handleCreateGraph}>
                     New Agent
                   </button>
@@ -1399,6 +1406,10 @@ export default function App() {
                     Delete
                   </button>
                 </div>
+                {selectedRunId ? (
+                  <code className="mosaic-title-run-id">Run ID: {selectedRunId}</code>
+                ) : null}
+                {error ? <p className="error-text mosaic-title-error">{error}</p> : null}
               </div>
 
               <div className="mosaic-tile panel mosaic-graph">
@@ -1430,209 +1441,202 @@ export default function App() {
                 Input
                 <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={10} />
               </label>
-              <div className="mosaic-execution-run">
-                <div className="execution-documents-panel">
-                  <div className="execution-documents-header">
-                    <strong>Run Documents</strong>
+            </div>
+
+            <div className="hero-mosaic-row">
+              {isEnvironment && draftGraph ? (
+                <div className="mosaic-tile panel mosaic-agents-toggle">
+                  <div className="environment-run-toggle-header">
+                    <strong>Agents To Run</strong>
                     <span>
-                      {readyRunDocuments.length} ready
-                      {runDocuments.length !== readyRunDocuments.length ? ` / ${runDocuments.length} uploaded` : ""}
+                      {selectedEnvironmentAgentIds.length} of {draftGraph.agents.length} enabled
                     </span>
                   </div>
-                  <p>
-                    Upload reference files for this editor session. The most recent ready upload is cached locally and restored after
-                    refresh. Ready documents are available during the run as <code>{"{documents}"}</code>.
-                  </p>
-                  <label className="execution-documents-picker">
-                    <span>{isUploadingDocuments ? "Uploading..." : "Add Documents"}</span>
-                    <input
-                      type="file"
-                      accept=".txt,.md,.markdown,.json,.csv,.xlsx,.pdf,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                      multiple
-                      disabled={isRunning || isSaving || isResettingRuntime || isUploadingDocuments}
-                      onChange={(event) => {
-                        void handleDocumentUpload(event.target.files);
-                        event.target.value = "";
-                      }}
-                    />
-                  </label>
-                  {visibleRunDocuments.length > 0 ? (
-                    <div className="execution-documents-list">
-                      {visibleRunDocuments.map((document) => (
-                        <div key={document.document_id} className={`execution-document-card is-${document.status}`}>
-                          <div className="execution-document-card-header">
-                            <div>
-                              <strong>{document.name}</strong>
-                              <span>
-                                {formatDocumentSize(document.size_bytes)} · {document.mime_type || "document"}
-                              </span>
-                            </div>
-                            <button
-                              type="button"
-                              className="secondary-button execution-document-remove"
-                              onClick={() => removeRunDocument(document.document_id)}
-                              disabled={isRunning || isSaving || isResettingRuntime}
-                            >
-                              Remove
-                            </button>
-                          </div>
-                          <span className={`execution-document-status execution-document-status--${document.status}`}>{document.status}</span>
-                          {document.text_excerpt ? <pre className="execution-document-excerpt">{document.text_excerpt}</pre> : null}
-                          {document.error ? <span className="execution-document-error">{document.error}</span> : null}
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p>No documents attached yet.</p>
-                  )}
-                  {selectedRunState?.documents && selectedRunState.documents.length > 0 ? (
-                    <p className="execution-documents-run-note">
-                      Current run includes {selectedRunState.documents.length} document{selectedRunState.documents.length === 1 ? "" : "s"}.
-                    </p>
-                  ) : null}
-                  {documentUploadError ? <p className="error-text">{documentUploadError}</p> : null}
-                </div>
-                <div className="execution-files-panel">
-                  <div className="execution-documents-header">
-                    <strong>Agent Files</strong>
-                    <span>{visibleRunFiles.length} file{visibleRunFiles.length === 1 ? "" : "s"}</span>
-                  </div>
-                  <p>
-                    Browse files created inside the sandboxed workspace for the selected run
-                    {selectedRunState?.agent_name ? ` (${selectedRunState.agent_name})` : ""}.
-                  </p>
-                  <div className="execution-files-actions">
+                  <div className="environment-run-toggle-actions">
                     <button
                       type="button"
                       className="secondary-button"
-                      onClick={() => {
-                        if (selectedRunId) {
-                          void refreshRunFiles(selectedRunId);
-                        }
-                      }}
-                      disabled={!selectedRunId || isRunFilesLoading}
+                      onClick={() =>
+                        setEnvironmentAgentSelection(
+                          Object.fromEntries(draftGraph.agents.map((agent) => [agent.agent_id, true])),
+                        )
+                      }
+                      disabled={isRunning || isSaving || isResettingRuntime}
                     >
-                      {isRunFilesLoading ? "Refreshing..." : "Refresh Files"}
+                      All On
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() =>
+                        setEnvironmentAgentSelection(
+                          Object.fromEntries(draftGraph.agents.map((agent) => [agent.agent_id, false])),
+                        )
+                      }
+                      disabled={isRunning || isSaving || isResettingRuntime}
+                    >
+                      All Off
                     </button>
                   </div>
-                  {runFileListing?.workspace_root ? (
-                    <p className="execution-documents-run-note">
-                      Workspace root: <code>{runFileListing.workspace_root}</code>
-                    </p>
-                  ) : null}
-                  {visibleRunFiles.length > 0 ? (
-                    <div className="execution-files-browser">
-                      <div className="execution-files-list" role="list" aria-label="Agent workspace files">
-                        {visibleRunFiles.map((file) => (
-                          <button
-                            key={file.path}
-                            type="button"
-                            className={`execution-file-row ${selectedRunFilePath === file.path ? "is-selected" : ""}`}
-                            onClick={() => setSelectedRunFilePath(file.path)}
-                          >
-                            <strong>{file.path}</strong>
-                            <span>
-                              {formatDocumentSize(file.size_bytes)} · {formatTimestamp(file.modified_at)}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                      <div className="execution-file-preview">
-                        {selectedRunFile ? (
-                          <>
-                            <div className="execution-document-card-header">
-                              <div>
-                                <strong>{selectedRunFile.name}</strong>
-                                <span>
-                                  {selectedRunFile.mime_type} · {formatDocumentSize(selectedRunFile.size_bytes)}
-                                </span>
-                              </div>
-                            </div>
-                            {isRunFileContentLoading ? <p>Loading file preview...</p> : null}
-                            {selectedRunFileContent ? <pre className="execution-document-excerpt">{selectedRunFileContent.content}</pre> : null}
-                            {selectedRunFileContent?.truncated ? (
-                              <p className="execution-documents-run-note">Preview truncated for large files.</p>
-                            ) : null}
-                          </>
-                        ) : (
-                          <p>Select a file to preview it.</p>
-                        )}
-                      </div>
-                    </div>
-                  ) : (
-                    <p>{selectedRunId ? "No files have been written in this run yet." : "Run the graph to inspect workspace files."}</p>
-                  )}
-                  {runFilesError ? <p className="error-text">{runFilesError}</p> : null}
-                  {runFileContentError ? <p className="error-text">{runFileContentError}</p> : null}
+                  <div className="environment-run-toggle-list">
+                    {draftGraph.agents.map((agent) => {
+                      const enabled = environmentAgentSelection[agent.agent_id] !== false;
+                      return (
+                        <button
+                          key={agent.agent_id}
+                          type="button"
+                          className={`environment-run-toggle ${enabled ? "is-enabled" : "is-disabled"}`}
+                          aria-pressed={enabled}
+                          onClick={() =>
+                            setEnvironmentAgentSelection((current) => ({
+                              ...current,
+                              [agent.agent_id]: current[agent.agent_id] === false,
+                            }))
+                          }
+                          disabled={isRunning || isSaving || isResettingRuntime}
+                        >
+                          <span>{agent.name}</span>
+                          <strong>{enabled ? "On" : "Off"}</strong>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => void handleRun()}
-                  disabled={!draftGraph || isRunning || isSaving || isResettingRuntime || isUploadingDocuments}
-                >
-                  {isRunning ? "Running..." : isEnvironment ? "Run Environment" : "Run Graph"}
-                </button>
-                {isEnvironment && draftGraph ? (
-                  <div className="environment-run-toggle-panel">
-                    <div className="environment-run-toggle-header">
-                      <strong>Agents To Run</strong>
-                      <span>
-                        {selectedEnvironmentAgentIds.length} of {draftGraph.agents.length} enabled
-                      </span>
-                    </div>
-                    <div className="environment-run-toggle-actions">
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={() =>
-                          setEnvironmentAgentSelection(
-                            Object.fromEntries(draftGraph.agents.map((agent) => [agent.agent_id, true])),
-                          )
-                        }
-                        disabled={isRunning || isSaving || isResettingRuntime}
-                      >
-                        All On
-                      </button>
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={() =>
-                          setEnvironmentAgentSelection(
-                            Object.fromEntries(draftGraph.agents.map((agent) => [agent.agent_id, false])),
-                          )
-                        }
-                        disabled={isRunning || isSaving || isResettingRuntime}
-                      >
-                        All Off
-                      </button>
-                    </div>
-                    <div className="environment-run-toggle-list">
-                      {draftGraph.agents.map((agent) => {
-                        const enabled = environmentAgentSelection[agent.agent_id] !== false;
-                        return (
+              ) : null}
+              <div className="mosaic-tile panel mosaic-documents">
+                <div className="execution-documents-header">
+                  <strong>Run Documents</strong>
+                  <span>
+                    {readyRunDocuments.length} ready
+                    {runDocuments.length !== readyRunDocuments.length ? ` / ${runDocuments.length} uploaded` : ""}
+                  </span>
+                </div>
+                <p>
+                  Upload reference files for this editor session. The most recent ready upload is cached locally and restored after
+                  refresh. Ready documents are available during the run as <code>{"{documents}"}</code>.
+                </p>
+                <label className="execution-documents-picker">
+                  <span>{isUploadingDocuments ? "Uploading..." : "Add Documents"}</span>
+                  <input
+                    type="file"
+                    accept=".txt,.md,.markdown,.json,.csv,.xlsx,.pdf,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    multiple
+                    disabled={isRunning || isSaving || isResettingRuntime || isUploadingDocuments}
+                    onChange={(event) => {
+                      void handleDocumentUpload(event.target.files);
+                      event.target.value = "";
+                    }}
+                  />
+                </label>
+                {visibleRunDocuments.length > 0 ? (
+                  <div className="execution-documents-list">
+                    {visibleRunDocuments.map((document) => (
+                      <div key={document.document_id} className={`execution-document-card is-${document.status}`}>
+                        <div className="execution-document-card-header">
+                          <div>
+                            <strong>{document.name}</strong>
+                            <span>
+                              {formatDocumentSize(document.size_bytes)} · {document.mime_type || "document"}
+                            </span>
+                          </div>
                           <button
-                            key={agent.agent_id}
                             type="button"
-                            className={`environment-run-toggle ${enabled ? "is-enabled" : "is-disabled"}`}
-                            aria-pressed={enabled}
-                            onClick={() =>
-                              setEnvironmentAgentSelection((current) => ({
-                                ...current,
-                                [agent.agent_id]: current[agent.agent_id] === false,
-                              }))
-                            }
+                            className="secondary-button execution-document-remove"
+                            onClick={() => removeRunDocument(document.document_id)}
                             disabled={isRunning || isSaving || isResettingRuntime}
                           >
-                            <span>{agent.name}</span>
-                            <strong>{enabled ? "On" : "Off"}</strong>
+                            Remove
                           </button>
-                        );
-                      })}
+                        </div>
+                        <span className={`execution-document-status execution-document-status--${document.status}`}>{document.status}</span>
+                        {document.text_excerpt ? <pre className="execution-document-excerpt">{document.text_excerpt}</pre> : null}
+                        {document.error ? <span className="execution-document-error">{document.error}</span> : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p>No documents attached yet.</p>
+                )}
+                {selectedRunState?.documents && selectedRunState.documents.length > 0 ? (
+                  <p className="execution-documents-run-note">
+                    Current run includes {selectedRunState.documents.length} document{selectedRunState.documents.length === 1 ? "" : "s"}.
+                  </p>
+                ) : null}
+                {documentUploadError ? <p className="error-text">{documentUploadError}</p> : null}
+              </div>
+
+              <div className="mosaic-tile panel mosaic-files">
+                <div className="execution-documents-header">
+                  <strong>Agent Files</strong>
+                  <span>{visibleRunFiles.length} file{visibleRunFiles.length === 1 ? "" : "s"}</span>
+                </div>
+                <p>
+                  Browse files created inside the sandboxed workspace for the selected run
+                  {selectedRunState?.agent_name ? ` (${selectedRunState.agent_name})` : ""}.
+                </p>
+                <div className="execution-files-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => {
+                      if (selectedRunId) {
+                        void refreshRunFiles(selectedRunId);
+                      }
+                    }}
+                    disabled={!selectedRunId || isRunFilesLoading}
+                  >
+                    {isRunFilesLoading ? "Refreshing..." : "Refresh Files"}
+                  </button>
+                </div>
+                {runFileListing?.workspace_root ? (
+                  <p className="execution-documents-run-note">
+                    Workspace root: <code>{runFileListing.workspace_root}</code>
+                  </p>
+                ) : null}
+                {visibleRunFiles.length > 0 ? (
+                  <div className="execution-files-browser">
+                    <div className="execution-files-list" role="list" aria-label="Agent workspace files">
+                      {visibleRunFiles.map((file) => (
+                        <button
+                          key={file.path}
+                          type="button"
+                          className={`execution-file-row ${selectedRunFilePath === file.path ? "is-selected" : ""}`}
+                          onClick={() => setSelectedRunFilePath(file.path)}
+                        >
+                          <strong>{file.path}</strong>
+                          <span>
+                            {formatDocumentSize(file.size_bytes)} · {formatTimestamp(file.modified_at)}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="execution-file-preview">
+                      {selectedRunFile ? (
+                        <>
+                          <div className="execution-document-card-header">
+                            <div>
+                              <strong>{selectedRunFile.name}</strong>
+                              <span>
+                                {selectedRunFile.mime_type} · {formatDocumentSize(selectedRunFile.size_bytes)}
+                              </span>
+                            </div>
+                          </div>
+                          {isRunFileContentLoading ? <p>Loading file preview...</p> : null}
+                          {selectedRunFileContent ? <pre className="execution-document-excerpt">{selectedRunFileContent.content}</pre> : null}
+                          {selectedRunFileContent?.truncated ? (
+                            <p className="execution-documents-run-note">Preview truncated for large files.</p>
+                          ) : null}
+                        </>
+                      ) : (
+                        <p>Select a file to preview it.</p>
+                      )}
                     </div>
                   </div>
-                ) : null}
-                {selectedRunId ? <code>Run ID: {selectedRunId}</code> : <p>Ready to launch the selected graph.</p>}
-                {error ? <p className="error-text">{error}</p> : null}
+                ) : (
+                  <p>{selectedRunId ? "No files have been written in this run yet." : "Run the graph to inspect workspace files."}</p>
+                )}
+                {runFilesError ? <p className="error-text">{runFilesError}</p> : null}
+                {runFileContentError ? <p className="error-text">{runFileContentError}</p> : null}
               </div>
             </div>
           </div>
@@ -1645,7 +1649,6 @@ export default function App() {
           </div>
         </div>
 
-        {environmentRunSummary ? <EnvironmentRunSummary summary={environmentRunSummary} /> : null}
       </div>
 
       <section className="content-grid">
@@ -1676,6 +1679,8 @@ export default function App() {
           onGraphDrag={handleCanvasGraphDrag}
           onFormatGraph={handleFormatGraph}
           onRunGraph={() => void handleRun()}
+          onSaveGraph={() => saveCurrentGraph()}
+          isSavingGraph={isSaving}
           onScrollToTop={scrollToExecutionBox}
           isMcpPanelOpen={mcpPanelOpen}
           onToggleMcpPanel={() => setMcpPanelOpen((current) => !current)}
@@ -1692,6 +1697,7 @@ export default function App() {
           key={`agent-swimlanes-${selectedGraphId || "draft"}-${visualizerResetVersion}`}
           lanes={agentRunLanes}
           selectedAgentId={selectedAgentId}
+          environmentRunSummary={environmentRunSummary}
           onSelectAgent={(agentId) => setSelectedAgentId(agentId)}
           onSelectNode={(agentId, nodeId) => {
             setSelectedAgentId(agentId);
