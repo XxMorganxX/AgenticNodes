@@ -108,6 +108,24 @@ export function getSelectedRunId(runState: RunState | null, fallbackRunId: strin
   return selectedRun?.run_id ?? fallbackRunId;
 }
 
+export function getSelectedRunFilesRequest(
+  runState: RunState | null,
+  fallbackRunId: string | null,
+  selectedAgentId: string | null | undefined,
+): { runId: string | null; agentId: string | null } {
+  const selectedRun = getSelectedRunState(runState, selectedAgentId);
+  if (selectedRun?.parent_run_id && selectedRun.agent_id) {
+    return {
+      runId: selectedRun.parent_run_id,
+      agentId: selectedRun.agent_id,
+    };
+  }
+  return {
+    runId: selectedRun?.run_id ?? fallbackRunId,
+    agentId: null,
+  };
+}
+
 export function filterEventsForAgent(
   events: RuntimeEvent[],
   selectedAgentId: string | null | undefined,

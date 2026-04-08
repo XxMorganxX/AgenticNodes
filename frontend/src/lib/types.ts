@@ -308,12 +308,14 @@ export type RunFilesystemFile = {
   size_bytes: number;
   modified_at: string;
   mime_type: string;
+  agent_id?: string | null;
+  run_id?: string | null;
 };
 
 export type RunFilesystemListing = {
   requested_run_id: string;
   run_id: string;
-  agent_id: string;
+  agent_id: string | null;
   workspace_root: string;
   files: RunFilesystemFile[];
 };
@@ -323,6 +325,7 @@ export type RunFilesystemFileContent = RunFilesystemFile & {
   content: string;
   truncated: boolean;
   encoding: string;
+  workspace_path?: string;
 };
 
 export type RuntimeEvent = {

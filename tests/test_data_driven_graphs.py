@@ -166,6 +166,160 @@ class DataDrivenGraphTests(unittest.TestCase):
         self.assertEqual(recording_provider.last_request.provider_config["model"], "gpt-4.1-mini")
         self.assertEqual(recording_provider.last_request.provider_config["api_key_env_var"], "OPENAI_API_KEY")
 
+    def test_logic_conditions_resolve_graph_env_references_in_branch_values_and_handles(self) -> None:
+        payload: dict[str, Any] = {
+            "graph_id": "logic-conditions-env-graph",
+            "name": "Logic Conditions Env Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "env_vars": {
+                "EXPECTED_STATUS": "approved",
+                "MATCH_HANDLE": "branch-approved",
+                "ELSE_HANDLE": "branch-fallback",
+            },
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "description": "",
+                    "position": {"x": 0, "y": 0},
+                    "config": {"input_binding": {"type": "input_payload"}},
+                },
+                {
+                    "id": "branch",
+                    "kind": "control_flow_unit",
+                    "category": "control_flow_unit",
+                    "label": "Branch",
+                    "provider_id": "core.logic_conditions",
+                    "provider_label": "Logic Conditions",
+                    "description": "",
+                    "position": {"x": 240, "y": 0},
+                    "config": {
+                        "mode": "logic_conditions",
+                        "branches": [
+                            {
+                                "id": "status-branch",
+                                "label": "Approved Status",
+                                "output_handle_id": "{MATCH_HANDLE}",
+                                "root_group": {
+                                    "id": "group-1",
+                                    "type": "group",
+                                    "combinator": "all",
+                                    "negated": False,
+                                    "children": [
+                                        {
+                                            "id": "rule-1",
+                                            "type": "rule",
+                                            "path": "status",
+                                            "operator": "equals",
+                                            "value": "{EXPECTED_STATUS}",
+                                            "source_contracts": ["message_envelope"],
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                        "else_output_handle_id": "{ELSE_HANDLE}",
+                    },
+                },
+                {
+                    "id": "if_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "If Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "description": "",
+                    "position": {"x": 480, "y": -60},
+                    "config": {},
+                },
+                {
+                    "id": "else_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Else Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "description": "",
+                    "position": {"x": 480, "y": 60},
+                    "config": {},
+                },
+            ],
+            "edges": [
+                {
+                    "id": "e1",
+                    "source_id": "start",
+                    "target_id": "branch",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                    "condition": None,
+                },
+                {
+                    "id": "e2",
+                    "source_id": "branch",
+                    "source_handle_id": "branch-approved",
+                    "target_id": "if_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                    "condition": None,
+                },
+                {
+                    "id": "e3",
+                    "source_id": "branch",
+                    "source_handle_id": "branch-fallback",
+                    "target_id": "else_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                    "condition": None,
+                },
+            ],
+        }
+
+        graph = GraphDefinition.from_dict(payload)
+        graph.validate_against_services(self.services)
+
+        serialized_branch_config = graph.to_dict()["nodes"][1]["config"]
+        self.assertEqual(serialized_branch_config["branches"][0]["output_handle_id"], "{MATCH_HANDLE}")
+        self.assertEqual(
+            serialized_branch_config["branches"][0]["root_group"]["children"][0]["value"],
+            "{EXPECTED_STATUS}",
+        )
+        self.assertEqual(serialized_branch_config["else_output_handle_id"], "{ELSE_HANDLE}")
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        matched_state = runtime.run(graph, {"status": "approved"}, run_id="logic-conditions-env-if")
+        self.assertEqual(matched_state.status, "completed")
+        self.assertEqual(matched_state.final_output, {"status": "approved"})
+        self.assertTrue(any(transition.target_id == "if_finish" for transition in matched_state.transition_history))
+        self.assertFalse(any(transition.target_id == "else_finish" for transition in matched_state.transition_history))
+        branch_output = matched_state.node_outputs["branch"]
+        self.assertEqual(branch_output["metadata"]["selected_handle_id"], "branch-approved")
+        self.assertEqual(branch_output["metadata"]["condition_evaluations"][0]["expected_value"], "approved")
+        self.assertEqual(branch_output["metadata"]["condition_evaluations"][0]["matched"], True)
+
+        else_state = runtime.run(graph, {"status": "pending"}, run_id="logic-conditions-env-else")
+        self.assertEqual(else_state.status, "completed")
+        self.assertEqual(else_state.final_output, {"status": "pending"})
+        self.assertTrue(any(transition.target_id == "else_finish" for transition in else_state.transition_history))
+        self.assertFalse(any(transition.target_id == "if_finish" for transition in else_state.transition_history))
+        else_branch_output = else_state.node_outputs["branch"]
+        self.assertEqual(else_branch_output["metadata"]["selected_handle_id"], "branch-fallback")
+        self.assertEqual(else_branch_output["metadata"]["condition_evaluations"][0]["expected_value"], "approved")
+        self.assertEqual(else_branch_output["metadata"]["condition_evaluations"][0]["matched"], False)
+
     def test_graph_store_crud_and_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = GraphStore(self.services, path=Path(directory) / "graphs.json")

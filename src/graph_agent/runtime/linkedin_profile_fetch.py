@@ -16,6 +16,15 @@ from graph_agent.runtime.agent_filesystem import resolve_agent_filesystem_root, 
 
 LINKEDIN_PROFILE_URL_PATTERN = re.compile(r"^/(?:public-profile/)?in/([^/]+)/?$", re.IGNORECASE)
 SAFE_CACHE_KEY_SEGMENT_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+LINKEDIN_RAW_TEXT_FIELD_NAMES = {
+    "filteredtextlines",
+    "rawline",
+    "rawlines",
+    "rawtext",
+    "rawtexts",
+    "textline",
+    "textlines",
+}
 
 
 class LinkedInFetchError(RuntimeError):
@@ -44,6 +53,62 @@ class LinkedInProfileCacheInfo:
 class _SafeFormatDict(dict[str, Any]):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
+
+
+def _normalize_linkedin_field_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _is_linkedin_raw_text_field_name(value: Any) -> bool:
+    normalized = _normalize_linkedin_field_name(value)
+    if normalized in LINKEDIN_RAW_TEXT_FIELD_NAMES:
+        return True
+    return normalized.startswith("raw") and ("text" in normalized or "line" in normalized)
+
+
+def _linkedin_value_has_content(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        return any(_linkedin_value_has_content(candidate) for candidate in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_linkedin_value_has_content(candidate) for candidate in value)
+    if isinstance(value, bool):
+        return value
+    return True
+
+
+def _sanitize_linkedin_profile_value(value: Any, *, parent_key: str | None = None) -> Any:
+    if isinstance(value, Mapping):
+        sanitized_items = {
+            str(key): _sanitize_linkedin_profile_value(item, parent_key=str(key))
+            for key, item in value.items()
+        }
+        raw_text_keys = [key for key in sanitized_items if _is_linkedin_raw_text_field_name(key)]
+        if raw_text_keys:
+            has_structured_content = any(
+                _linkedin_value_has_content(item)
+                for key, item in sanitized_items.items()
+                if key not in raw_text_keys
+            )
+            if has_structured_content:
+                for key in raw_text_keys:
+                    sanitized_items.pop(key, None)
+        if "skills" in sanitized_items and _normalize_linkedin_field_name(parent_key) == "sections":
+            sanitized_items.pop("skills", None)
+        return sanitized_items
+    if isinstance(value, list):
+        return [_sanitize_linkedin_profile_value(item, parent_key=parent_key) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_linkedin_profile_value(item, parent_key=parent_key) for item in value)
+    return value
+
+
+def sanitize_linkedin_profile_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    sanitized = _sanitize_linkedin_profile_value(payload)
+    return dict(sanitized) if isinstance(sanitized, Mapping) else dict(payload)
 
 
 def extract_linkedin_profile_url(value: Any, *, url_field: str = "url") -> str | None:
@@ -141,7 +206,10 @@ def read_cached_linkedin_profile(cache_info: LinkedInProfileCacheInfo) -> tuple[
         return None, None
     if not isinstance(payload, dict):
         return None, None
-    return payload, describe_linkedin_cache_file(cache_info.shared_cache_path, root=cache_info.shared_cache_root)
+    return sanitize_linkedin_profile_payload(payload), describe_linkedin_cache_file(
+        cache_info.shared_cache_path,
+        root=cache_info.shared_cache_root,
+    )
 
 
 def write_cached_linkedin_profile(
@@ -280,7 +348,7 @@ def fetch_linkedin_profile_live(
         raise LinkedInFetchError("linkedin_fetch_invalid_response", "LinkedIn fetch bridge did not return a valid parsed payload.")
 
     return {
-        "extracted": dict(extracted),
+        "extracted": sanitize_linkedin_profile_payload(extracted),
         "final_page_url": str(bridge_response.get("finalPageUrl", "") or ""),
         "storage_state_path": str(bridge_response.get("storageStatePath", "") or ""),
     }

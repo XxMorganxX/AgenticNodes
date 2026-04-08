@@ -374,6 +374,7 @@ function GraphCanvasNodeComponent({
   const isSpreadsheetRowNode = node.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
   const isSpreadsheetMatrixDecisionNode = node.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID;
   const isSpreadsheetBackedNode = isSpreadsheetRowNode || isSpreadsheetMatrixDecisionNode;
+  const showsModelToolHandles = isModelNode && !isSpreadsheetMatrixDecisionNode;
   const spreadsheetIteratorState = isSpreadsheetRowNode ? runState?.iterator_states?.[node.id] : undefined;
   const spreadsheetIteratorStatus =
     spreadsheetIteratorState && typeof spreadsheetIteratorState.status === "string" ? spreadsheetIteratorState.status : null;
@@ -557,7 +558,7 @@ function GraphCanvasNodeComponent({
           style={isModelNode ? primaryTargetHandleStyle : undefined}
         />
       ) : null}
-      {showTargetHandle && isModelNode ? (
+      {showTargetHandle && showsModelToolHandles ? (
         <>
           <div className="graph-node-input-port graph-node-input-port--context" style={contextTargetHandleStyle} aria-hidden="true">
             <span className="graph-node-output-port-label">Tool Context</span>
@@ -659,6 +660,7 @@ function GraphCanvasNodeComponent({
                 onSelectSpreadsheetFile(node.id, nextFileId);
               }}
             >
+              {!hasManualSpreadsheetPath ? <option value="">Select spreadsheet</option> : null}
               {hasManualSpreadsheetPath ? <option value="__manual__">Manual: {spreadsheetSelectLabel}</option> : null}
               {availableSpreadsheetFiles.map((file) => (
                 <option key={file.file_id} value={file.file_id}>
@@ -867,7 +869,7 @@ function GraphCanvasNodeComponent({
           />
         </>
       ) : null}
-      {showSourceHandle && isModelNode ? (
+      {showSourceHandle && showsModelToolHandles ? (
         <>
           <div className="graph-node-output-port graph-node-output-port--tool-call" style={apiToolCallHandleStyle} aria-hidden="true">
             <span className="graph-node-output-port-label">Tool Calls</span>
@@ -948,7 +950,7 @@ function GraphCanvasNodeComponent({
           })}
         </>
       ) : null}
-      {showSourceHandle && !isRoutableTool && !isContextProviderNode && !isModelNode && !isControlFlowUnitNode ? (
+      {showSourceHandle && !isRoutableTool && !isContextProviderNode && !showsModelToolHandles && !isControlFlowUnitNode ? (
         <Handle
           type="source"
           position={Position.Right}

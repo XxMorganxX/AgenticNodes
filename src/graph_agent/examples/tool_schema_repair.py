@@ -303,7 +303,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 "model": "sonnet",
                 "cli_path": "claude",
                 "timeout_seconds": 60,
-                "max_turns": 1,
+                "max_turns": 2,
             },
             config_fields=[
                 ProviderConfigFieldDefinition(

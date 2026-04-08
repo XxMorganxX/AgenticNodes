@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping as MappingABC
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
 import os
+from pathlib import PurePosixPath
 import re
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
@@ -37,6 +39,7 @@ from graph_agent.runtime.linkedin_profile_fetch import (
     fetch_linkedin_profile_live,
     is_cacheable_linkedin_profile,
     read_cached_linkedin_profile,
+    sanitize_linkedin_profile_payload,
     write_cached_linkedin_profile,
     write_linkedin_profile_workspace_copy,
     workspace_cache_relative_path,
@@ -92,6 +95,7 @@ SPREADSHEET_MATRIX_DECISION_MODE = "spreadsheet_matrix_decision"
 CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body"
 CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if"
 CONTROL_FLOW_ELSE_HANDLE_ID = "control-flow-else"
+WORKSPACE_PATH_SUFFIX_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _json_safe(value: Any) -> str:
@@ -151,6 +155,36 @@ def _coerce_int(value: Any, *, default: int, minimum: int | None = None) -> int:
     if minimum is not None:
         return max(resolved, minimum)
     return resolved
+
+
+def _sanitize_workspace_path_suffix(value: str, *, fallback: str = "iteration") -> str:
+    normalized = WORKSPACE_PATH_SUFFIX_PATTERN.sub("-", str(value or "").strip()).strip("-.")
+    return normalized or fallback
+
+
+def _resolve_write_text_file_relative_path(relative_path: str, *, context: NodeContext) -> str:
+    resolved_path = str(relative_path or "response.txt").strip() or "response.txt"
+    if not context.is_loop_execution():
+        return resolved_path
+
+    iteration_context = context.current_iteration_context()
+    iteration_id = str(iteration_context.get("iteration_id", "") or "").strip()
+    if iteration_id:
+        suffix = _sanitize_workspace_path_suffix(iteration_id)
+    else:
+        row_index = iteration_context.get("iterator_row_index")
+        if not isinstance(row_index, int) or row_index <= 0:
+            return resolved_path
+        suffix = f"row-{row_index}"
+
+    normalized_path = PurePosixPath(resolved_path)
+    filename = normalized_path.name or "response.txt"
+    extension = normalized_path.suffix
+    stem = filename[: -len(extension)] if extension else filename
+    suffixed_name = f"{stem}-{suffix}{extension}"
+    if normalized_path.parent == PurePosixPath("."):
+        return suffixed_name
+    return (normalized_path.parent / suffixed_name).as_posix()
 
 
 def _is_prompt_block_payload(value: Any) -> bool:
@@ -470,6 +504,34 @@ def resolve_graph_process_env(value: str, env_vars: Mapping[str, str]) -> str:
     return os.environ.get(env_var_name, "")
 
 
+class ResolvedConfigMapping(MappingABC[str, Any]):
+    def __init__(self, raw_config: Mapping[str, Any] | None = None, env_vars: Mapping[str, str] | None = None) -> None:
+        self._raw_config = dict(raw_config or {})
+        self._env_vars = dict(env_vars or {})
+
+    def __getitem__(self, key: str) -> Any:
+        return resolve_graph_env_value(self._raw_config[key], self._env_vars)
+
+    def __iter__(self):
+        return iter(self._raw_config)
+
+    def __len__(self) -> int:
+        return len(self._raw_config)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._raw_config:
+            return self[key]
+        return resolve_graph_env_value(default, self._env_vars)
+
+    def items(self):
+        for key in self._raw_config:
+            yield key, self[key]
+
+    def values(self):
+        for key in self._raw_config:
+            yield self[key]
+
+
 @dataclass
 class MessageEnvelope:
     schema_version: str
@@ -678,6 +740,8 @@ def _model_has_message_output_route(graph: GraphDefinition, node: BaseNode) -> b
 
 
 def infer_model_response_mode(graph: GraphDefinition, node: BaseNode) -> str:
+    if getattr(node, "provider_id", "") == SPREADSHEET_MATRIX_DECISION_PROVIDER_ID:
+        return "message"
     configured_mode = str(node.config.get("response_mode", "") or "").strip()
     if configured_mode in {"message", "tool_call", "auto"}:
         return configured_mode
@@ -1384,11 +1448,15 @@ class BaseNode(ABC):
         self.provider_id = provider_id
         self.provider_label = provider_label or provider_id
         self.description = description
-        self.config = dict(config or {})
+        self.raw_config = dict(config or {})
+        self.config: Mapping[str, Any] = ResolvedConfigMapping(self.raw_config)
         self.position = {
             "x": float((position or {}).get("x", 0)),
             "y": float((position or {}).get("y", 0)),
         }
+
+    def attach_graph_env_vars(self, env_vars: Mapping[str, str]) -> None:
+        self.config = ResolvedConfigMapping(self.raw_config, env_vars)
 
     @abstractmethod
     def execute(self, context: NodeContext) -> NodeExecutionResult:
@@ -1410,7 +1478,7 @@ class BaseNode(ABC):
             "provider_label": self.provider_label,
             "description": self.description,
             "position": self.position,
-            "config": self.config,
+            "config": dict(self.raw_config),
         }
 
 
@@ -1856,7 +1924,8 @@ class DataNode(BaseNode):
         )
 
     def _execute_write_text_file(self, context: NodeContext) -> NodeExecutionResult:
-        relative_path = str(self.config.get("relative_path", "response.txt") or "response.txt").strip() or "response.txt"
+        configured_relative_path = str(self.config.get("relative_path", "response.txt") or "response.txt").strip() or "response.txt"
+        relative_path = _resolve_write_text_file_relative_path(configured_relative_path, context=context)
         source_value = context.resolve_binding(self.config.get("input_binding"))
         if isinstance(source_value, Mapping) and "payload" in source_value:
             source_value = source_value.get("payload")
@@ -1864,7 +1933,7 @@ class DataNode(BaseNode):
         is_loop_execution = context.is_loop_execution()
         resolved_exists_behavior = normalize_workspace_text_write_behavior(self.config.get("exists_behavior"))
         if resolved_exists_behavior is None:
-            resolved_exists_behavior = "append" if is_loop_execution else "overwrite"
+            resolved_exists_behavior = "overwrite"
         append_newline = bool(self.config.get("append_newline", True))
         file_record = write_agent_workspace_text_file(
             context.state.run_id,
@@ -1885,6 +1954,7 @@ class DataNode(BaseNode):
                 "file": file_record,
                 "content_preview": content_preview,
                 "write_mode": write_mode,
+                "configured_path": configured_relative_path,
             },
             artifacts={"workspace_file": file_record},
             metadata={
@@ -1897,6 +1967,7 @@ class DataNode(BaseNode):
                 "exists_behavior": resolved_exists_behavior,
                 "append_newline": append_newline,
                 "loop_execution": is_loop_execution,
+                "configured_path": configured_relative_path,
             },
         )
         action_label = {
@@ -2005,6 +2076,7 @@ class DataNode(BaseNode):
         if use_cache and not force_refresh:
             cached_payload, shared_cache_file = read_cached_linkedin_profile(cache_info)
             if cached_payload is not None:
+                cached_payload = sanitize_linkedin_profile_payload(cached_payload)
                 try:
                     workspace_relative_path, workspace_file = write_linkedin_profile_workspace_copy(
                         context.state.run_id,
@@ -2053,7 +2125,7 @@ class DataNode(BaseNode):
         except LinkedInFetchError as exc:
             return NodeExecutionResult(status="failed", error=exc.to_error_dict(), summary=str(exc))
 
-        profile_payload = dict(live_result["extracted"])
+        profile_payload = sanitize_linkedin_profile_payload(dict(live_result["extracted"]))
         try:
             workspace_relative_path, workspace_file = write_linkedin_profile_workspace_copy(
                 context.state.run_id,
@@ -2244,11 +2316,13 @@ class DataNode(BaseNode):
                 source_value = source_value.get("payload")
             is_loop_execution = context.is_loop_execution()
             resolved_exists_behavior = normalize_workspace_text_write_behavior(self.config.get("exists_behavior"))
+            configured_relative_path = str(self.config.get("relative_path", "response.txt") or "response.txt").strip() or "response.txt"
             return {
-                "relative_path": str(self.config.get("relative_path", "response.txt") or "response.txt").strip() or "response.txt",
+                "relative_path": _resolve_write_text_file_relative_path(configured_relative_path, context=context),
+                "configured_path": configured_relative_path,
                 "workspace_dir": context.workspace_dir(create=True),
                 "content_preview": _render_workspace_file_content(source_value),
-                "exists_behavior": resolved_exists_behavior or ("append" if is_loop_execution else "overwrite"),
+                "exists_behavior": resolved_exists_behavior or "overwrite",
                 "append_newline": bool(self.config.get("append_newline", True)),
                 "loop_execution": is_loop_execution,
             }
@@ -3541,6 +3615,11 @@ class SpreadsheetMatrixDecisionNode(ModelNode):
         matrix: SpreadsheetMatrixParseResult,
     ) -> dict[str, str]:
         candidate = response.structured_output
+        # Claude Code providers normalize structured outputs into the
+        # {message, need_tool, tool_calls} decision envelope. For spreadsheet
+        # matrix nodes, only the wrapped message payload is relevant.
+        if isinstance(candidate, Mapping) and isinstance(candidate.get("message"), Mapping):
+            candidate = candidate.get("message")
         if not isinstance(candidate, Mapping) and response.content.strip():
             try:
                 parsed = json.loads(response.content)
@@ -5093,6 +5172,8 @@ class GraphDefinition:
         self.default_input = default_input
         self.start_node_id = start_node_id
         self.env_vars = _normalize_graph_env_vars(env_vars)
+        for node in nodes:
+            node.attach_graph_env_vars(self.env_vars)
         self.nodes = {node.id: node for node in nodes}
         self.edges = edges
         self.validate()
@@ -5180,7 +5261,7 @@ class GraphDefinition:
         return self.nodes[self.start_node_id]
 
     def start_node_config(self) -> dict[str, Any]:
-        return dict(self.start_node().config)
+        return dict(self.start_node().raw_config)
 
     def resolved_start_node_config(self) -> dict[str, Any]:
         return resolve_graph_env_value(self.start_node_config(), self.env_vars)
@@ -5222,6 +5303,24 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Model node '{node.id}' references unknown model provider '{model_provider_name}'."
                     )
+                if node.provider_id == SPREADSHEET_MATRIX_DECISION_PROVIDER_ID:
+                    if node.config.get("tool_target_node_ids"):
+                        raise GraphValidationError(
+                            f"Spreadsheet matrix decision node '{node.id}' cannot declare tool_target_node_ids."
+                        )
+                    if any(str(tool_name).strip() for tool_name in node.config.get("allowed_tool_names", [])):
+                        raise GraphValidationError(
+                            f"Spreadsheet matrix decision node '{node.id}' cannot expose allowed_tool_names."
+                        )
+                    if str(node.config.get("preferred_tool_name", "") or "").strip():
+                        raise GraphValidationError(
+                            f"Spreadsheet matrix decision node '{node.id}' cannot declare preferred_tool_name."
+                        )
+                    response_mode = str(node.config.get("response_mode", "message") or "message").strip()
+                    if response_mode not in {"", "message"}:
+                        raise GraphValidationError(
+                            f"Spreadsheet matrix decision node '{node.id}' must use response_mode 'message'."
+                        )
                 allowed_tool_names = [str(tool_name) for tool_name in node.config.get("allowed_tool_names", [])]
                 resolved_allowed_tool_names: list[str] = []
                 for tool_name in allowed_tool_names:
@@ -5268,6 +5367,13 @@ class GraphDefinition:
                     if edge.kind != "binding":
                         continue
                     source_node = self.nodes.get(edge.source_id)
+                    if (
+                        node.provider_id == SPREADSHEET_MATRIX_DECISION_PROVIDER_ID
+                        and isinstance(source_node, McpContextProviderNode)
+                    ):
+                        raise GraphValidationError(
+                            f"Spreadsheet matrix decision node '{node.id}' cannot bind MCP context provider '{source_node.id}'."
+                        )
                     if isinstance(source_node, McpContextProviderNode) and source_node.id not in seen_context_node_ids:
                         candidate_context_nodes.append(source_node)
                         seen_context_node_ids.add(source_node.id)
@@ -5314,6 +5420,13 @@ class GraphDefinition:
                     target_node = self.nodes.get(edge.target_id)
                     if target_node is None:
                         continue
+                    if (
+                        node.provider_id == SPREADSHEET_MATRIX_DECISION_PROVIDER_ID
+                        and edge.source_handle_id == API_TOOL_CALL_HANDLE_ID
+                    ):
+                        raise GraphValidationError(
+                            f"Spreadsheet matrix decision node '{node.id}' cannot use tool-call output edge '{edge.id}'."
+                        )
                     if edge.source_handle_id == API_TOOL_CALL_HANDLE_ID:
                         if target_node.category != NodeCategory.TOOL and not (
                             target_node.category == NodeCategory.DATA and target_node.provider_id == "core.data_display"

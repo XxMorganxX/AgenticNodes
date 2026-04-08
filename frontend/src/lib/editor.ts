@@ -732,6 +732,9 @@ export function inferModelResponseMode(graph: GraphDefinition | null, node: Grap
   if (!graph || !node || node.kind !== "model") {
     return "message";
   }
+  if (node.provider_id === "core.spreadsheet_matrix_decision") {
+    return "message";
+  }
   const configuredMode = String(node.config.response_mode ?? "").trim();
   if (configuredMode === "message" || configuredMode === "tool_call" || configuredMode === "auto") {
     return configuredMode;

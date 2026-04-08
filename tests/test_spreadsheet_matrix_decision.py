@@ -29,9 +29,13 @@ class MatrixDecisionProvider:
         return ModelResponse(
             content="Selected a matrix cell.",
             structured_output={
-                "row_label": "High urgency",
-                "column_label": "Enterprise",
-                "reasoning": "High urgency enterprise requests should escalate immediately.",
+                "message": {
+                    "row_label": "High urgency",
+                    "column_label": "Enterprise",
+                    "reasoning": "High urgency enterprise requests should escalate immediately.",
+                },
+                "need_tool": False,
+                "tool_calls": [],
             },
         )
 
@@ -40,6 +44,37 @@ class MatrixDecisionProvider:
             status="available",
             ok=True,
             message="Matrix decision test provider is available.",
+            details={"backend_type": "test"},
+        )
+
+
+class WrappedMatrixDecisionProvider:
+    name = "wrapped_matrix_decision_test"
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            content="Selected a matrix cell.",
+            structured_output={
+                "message": {
+                    "row_label": "High urgency",
+                    "column_label": "Enterprise",
+                    "reasoning": "High urgency enterprise requests should escalate immediately.",
+                },
+                "need_tool": True,
+                "tool_calls": [
+                    {
+                        "tool_name": "ignored_tool",
+                        "arguments": {"note": "ignored by spreadsheet matrix node"},
+                    }
+                ],
+            },
+        )
+
+    def preflight(self, provider_config=None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(
+            status="available",
+            ok=True,
+            message="Wrapped matrix decision test provider is available.",
             details={"backend_type": "test"},
         )
 
@@ -148,6 +183,144 @@ class SpreadsheetMatrixDecisionTests(unittest.TestCase):
         self.assertIn("High urgency", provider.user_messages[0])
         self.assertIn("Enterprise", provider.user_messages[0])
         self.assertIn("Escalate to dedicated team", provider.user_messages[0])
+
+    def test_validation_rejects_tool_capable_matrix_node(self) -> None:
+        services = build_example_services()
+        with self.assertRaisesRegex(ValueError, "cannot expose allowed_tool_names"):
+            GraphDefinition.from_dict(
+                {
+                    "graph_id": "spreadsheet-matrix-invalid-tools",
+                    "name": "Spreadsheet Matrix Invalid Tools",
+                    "description": "",
+                    "version": "1.0",
+                    "start_node_id": "start",
+                    "nodes": [
+                        {
+                            "id": "start",
+                            "kind": "input",
+                            "category": "start",
+                            "label": "Start",
+                            "provider_id": "start.manual_run",
+                            "provider_label": "Run Button Start",
+                            "config": {},
+                            "position": {"x": 0, "y": 0},
+                        },
+                        {
+                            "id": "matrix",
+                            "kind": "model",
+                            "category": "api",
+                            "label": "Matrix Decision",
+                            "provider_id": "core.spreadsheet_matrix_decision",
+                            "provider_label": "Spreadsheet Matrix Decision",
+                            "config": {
+                                "provider_name": "mock",
+                                "mode": "spreadsheet_matrix_decision",
+                                "system_prompt": "Use the matrix to decide the next action.",
+                                "user_message_template": "{input_payload}",
+                                "response_mode": "tool_call",
+                                "allowed_tool_names": ["search_catalog"],
+                            },
+                            "position": {"x": 240, "y": 0},
+                        },
+                        {
+                            "id": "finish",
+                            "kind": "output",
+                            "category": "end",
+                            "label": "Finish",
+                            "provider_id": "core.output",
+                            "provider_label": "Core Output Node",
+                            "config": {},
+                            "position": {"x": 520, "y": 0},
+                        },
+                    ],
+                    "edges": [
+                        {"id": "e1", "source_id": "start", "target_id": "matrix", "label": "", "kind": "standard", "priority": 100},
+                        {"id": "e2", "source_id": "matrix", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                    ],
+                }
+            ).validate_against_services(services)
+
+    def test_runtime_ignores_wrapped_decision_control_fields(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "decision-matrix.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["Audience", "SMB", "Enterprise"])
+                writer.writerow(["Low urgency", "Send help article", "Queue for success team"])
+                writer.writerow(["High urgency", "Page support", "Escalate to dedicated team"])
+
+            services = build_example_services()
+            provider = WrappedMatrixDecisionProvider()
+            services.model_providers[provider.name] = provider
+            runtime = GraphRuntime(
+                services=services,
+                max_steps=services.config["max_steps"],
+                max_visits_per_node=services.config["max_visits_per_node"],
+            )
+            graph = GraphDefinition.from_dict(
+                {
+                    "graph_id": "spreadsheet-matrix-wrapped-runtime-graph",
+                    "name": "Spreadsheet Matrix Wrapped Runtime Graph",
+                    "description": "",
+                    "version": "1.0",
+                    "start_node_id": "start",
+                    "nodes": [
+                        {
+                            "id": "start",
+                            "kind": "input",
+                            "category": "start",
+                            "label": "Start",
+                            "provider_id": "start.manual_run",
+                            "provider_label": "Run Button Start",
+                            "config": {"input_binding": {"type": "input_payload"}},
+                            "position": {"x": 0, "y": 0},
+                        },
+                        {
+                            "id": "matrix",
+                            "kind": "model",
+                            "category": "api",
+                            "label": "Matrix Decision",
+                            "provider_id": "core.spreadsheet_matrix_decision",
+                            "provider_label": "Spreadsheet Matrix Decision",
+                            "model_provider_name": provider.name,
+                            "prompt_name": "spreadsheet_matrix_prompt",
+                            "config": {
+                                "provider_name": provider.name,
+                                "model": "test-model",
+                                "prompt_name": "spreadsheet_matrix_prompt",
+                                "mode": "spreadsheet_matrix_decision",
+                                "system_prompt": "Use the matrix to decide the next action.",
+                                "user_message_template": "{input_payload}",
+                                "file_format": "csv",
+                                "file_path": str(csv_path),
+                                "sheet_name": "",
+                            },
+                            "position": {"x": 240, "y": 0},
+                        },
+                        {
+                            "id": "finish",
+                            "kind": "output",
+                            "category": "end",
+                            "label": "Finish",
+                            "provider_id": "core.output",
+                            "provider_label": "Core Output Node",
+                            "config": {},
+                            "position": {"x": 520, "y": 0},
+                        },
+                    ],
+                    "edges": [
+                        {"id": "e1", "source_id": "start", "target_id": "matrix", "label": "", "kind": "standard", "priority": 100},
+                        {"id": "e2", "source_id": "matrix", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                    ],
+                }
+            )
+
+            state = runtime.run(graph, "An enterprise customer has a high urgency issue.", run_id="spreadsheet-matrix-wrapped-runtime")
+
+        self.assertEqual(state.final_output, "Escalate to dedicated team")
+        matrix_output = state.node_outputs["matrix"]
+        self.assertEqual(matrix_output["metadata"]["row_label"], "High urgency")
+        self.assertEqual(matrix_output["metadata"]["column_label"], "Enterprise")
 
 
 if __name__ == "__main__":

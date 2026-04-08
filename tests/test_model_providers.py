@@ -1106,6 +1106,8 @@ class ModelProviderTests(unittest.TestCase):
         self.assertIn("--json-schema", provider.last_command)
         self.assertIn("--system-prompt", provider.last_command)
         self.assertIn("--tools", provider.last_command)
+        turns_index = provider.last_command.index("--max-turns")
+        self.assertEqual(provider.last_command[turns_index + 1], "2")
         self.assertEqual(provider.last_cwd, str(ROOT))
         self.assertEqual(provider.last_timeout_seconds, 15.0)
 
@@ -1214,6 +1216,8 @@ class ModelProviderTests(unittest.TestCase):
             json_schema["properties"]["data"]["anyOf"],
             [{"type": "object"}, {"type": "array"}, {"type": "null"}],
         )
+        turns_index = provider.last_command.index("--max-turns")
+        self.assertEqual(provider.last_command[turns_index + 1], "2")
 
     def test_mock_provider_emits_tool_calls_for_tool_call_modes(self) -> None:
         provider = MockModelProvider()
@@ -1382,6 +1386,38 @@ class ModelProviderTests(unittest.TestCase):
             str(context.exception),
             "claude_code provider request failed: Claude Code usage limit reached. "
             "You've hit your limit · resets 8pm (America/New_York)",
+        )
+
+    def test_claude_code_provider_formats_max_turn_errors(self) -> None:
+        provider = ClaudeCodeCLIModelProvider()
+        payload = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_max_turns",
+                "is_error": True,
+                "result": "Reached maximum number of turns (1)",
+                "stop_reason": "tool_use",
+            }
+        )
+        with self.assertRaises(RuntimeError) as context:
+            provider._run_command(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys; "
+                        f"sys.stderr.write({payload!r}); "
+                        "raise SystemExit(1)"
+                    ),
+                ],
+                cwd=str(ROOT),
+                timeout_seconds=5,
+            )
+
+        self.assertEqual(
+            str(context.exception),
+            "claude_code provider request failed: Claude Code stopped after reaching the configured max turns. "
+            "Reached maximum number of turns (1) Increase max_turns to allow the CLI to finish after tool use.",
         )
 
     def test_manager_reports_claude_code_diagnostics_with_billing_warning(self) -> None:

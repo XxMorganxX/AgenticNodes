@@ -389,29 +389,31 @@ class GraphRunManager:
         self._project_file_store.delete_file(graph_id, file_id)
 
     def list_run_files(self, run_id: str) -> dict[str, Any]:
-        from graph_agent.runtime.agent_filesystem import list_agent_workspace_files
-
         state = self.get_run(run_id)
-        resolved_run_id, resolved_agent_id = self._resolve_filesystem_run_target(run_id, state)
-        listing = list_agent_workspace_files(resolved_run_id, resolved_agent_id)
+        listing = self._list_filesystem_run_target(run_id, state)
         return {
             **listing,
             "requested_run_id": run_id,
         }
 
     def read_run_file(self, run_id: str, relative_path: str) -> dict[str, Any]:
-        from graph_agent.runtime.agent_filesystem import AgentFilesystemError, read_agent_workspace_file
+        from graph_agent.runtime.agent_filesystem import AgentFilesystemError, normalize_workspace_relative_path, read_agent_workspace_file
 
         state = self.get_run(run_id)
-        resolved_run_id, resolved_agent_id = self._resolve_filesystem_run_target(run_id, state)
+        requested_relative_path = normalize_workspace_relative_path(relative_path).as_posix()
+        resolved_run_id, resolved_agent_id, resolved_relative_path = self._resolve_run_file_target(run_id, state, relative_path)
         try:
-            content = read_agent_workspace_file(resolved_run_id, resolved_agent_id, relative_path)
+            content = read_agent_workspace_file(resolved_run_id, resolved_agent_id, resolved_relative_path)
         except FileNotFoundError as exc:
             raise KeyError(str(exc)) from exc
         except AgentFilesystemError:
             raise
+        response_content = dict(content)
+        if str(content.get("path") or "") != requested_relative_path:
+            response_content["workspace_path"] = content.get("path")
+        response_content["path"] = requested_relative_path
         return {
-            **content,
+            **response_content,
             "requested_run_id": run_id,
         }
 
@@ -1253,6 +1255,60 @@ class GraphRunManager:
                 child_agent_id = str(child_state.get("agent_id") or "").strip() or None
                 return child_run_id, child_agent_id
         return run_id, None
+
+    def _list_filesystem_run_target(self, run_id: str, state: dict[str, Any]) -> dict[str, Any]:
+        from graph_agent.runtime.agent_filesystem import list_agent_workspace_files, resolve_agent_filesystem_root
+
+        agent_runs = state.get("agent_runs")
+        if isinstance(agent_runs, dict) and len(agent_runs) > 1:
+            files: list[dict[str, Any]] = []
+            for agent_key, child_state in agent_runs.items():
+                if not isinstance(child_state, dict):
+                    continue
+                child_run_id = str(child_state.get("run_id") or "").strip() or run_id
+                child_agent_id = str(child_state.get("agent_id") or agent_key).strip() or None
+                child_listing = list_agent_workspace_files(child_run_id, child_agent_id)
+                prefix = f"{child_agent_id}/" if child_agent_id else ""
+                for file_record in child_listing["files"]:
+                    files.append(
+                        {
+                            **file_record,
+                            "path": f"{prefix}{file_record['path']}",
+                            "agent_id": child_agent_id,
+                            "run_id": child_run_id,
+                        }
+                    )
+            files.sort(key=lambda item: (str(item.get("agent_id") or ""), str(item.get("path") or "")))
+            return {
+                "run_id": run_id,
+                "agent_id": None,
+                "workspace_root": str(resolve_agent_filesystem_root()),
+                "files": files,
+            }
+
+        resolved_run_id, resolved_agent_id = self._resolve_filesystem_run_target(run_id, state)
+        return list_agent_workspace_files(resolved_run_id, resolved_agent_id)
+
+    def _resolve_run_file_target(
+        self,
+        run_id: str,
+        state: dict[str, Any],
+        relative_path: str,
+    ) -> tuple[str, str | None, str]:
+        from graph_agent.runtime.agent_filesystem import normalize_workspace_relative_path
+
+        normalized_relative_path = normalize_workspace_relative_path(relative_path).as_posix()
+        agent_runs = state.get("agent_runs")
+        if isinstance(agent_runs, dict) and len(agent_runs) > 1:
+            agent_prefix, separator, child_relative_path = normalized_relative_path.partition("/")
+            child_state = agent_runs.get(agent_prefix)
+            if separator and child_relative_path and isinstance(child_state, dict):
+                child_run_id = str(child_state.get("run_id") or "").strip() or run_id
+                child_agent_id = str(child_state.get("agent_id") or agent_prefix).strip() or None
+                return child_run_id, child_agent_id, child_relative_path
+
+        resolved_run_id, resolved_agent_id = self._resolve_filesystem_run_target(run_id, state)
+        return resolved_run_id, resolved_agent_id, normalized_relative_path
 
     def _recover_run_state(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:

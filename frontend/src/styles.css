@@ -1022,6 +1022,40 @@ pre {
   min-height: 0;
 }
 
+.execution-files-summary-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+  gap: 0.85rem;
+}
+
+.execution-files-summary-card {
+  display: grid;
+  gap: 0.7rem;
+  min-height: 0;
+  padding: 0.9rem;
+  border-radius: 14px;
+  border: 1px solid rgba(73, 77, 117, 0.72);
+  background:
+    radial-gradient(circle at top right, rgba(94, 96, 185, 0.16), transparent 34%),
+    rgba(20, 22, 37, 0.9);
+}
+
+.execution-file-summary-meta {
+  display: grid;
+  gap: 0.24rem;
+  color: #9fa4d5;
+  font-size: 0.8rem;
+}
+
+.execution-file-summary-list {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.execution-files-open-button {
+  justify-self: start;
+}
+
 .execution-files-list-panel,
 .execution-file-preview {
   display: grid;
@@ -1135,6 +1169,146 @@ pre {
 .execution-file-preview-note {
   color: #9fa4d5;
   font-size: 0.8rem;
+}
+
+.run-files-explorer-modal {
+  width: min(1180px, calc(100vw - 2.5rem));
+  background:
+    radial-gradient(circle at top right, rgba(67, 56, 202, 0.18), transparent 26%),
+    radial-gradient(circle at top left, rgba(14, 165, 233, 0.1), transparent 20%),
+    linear-gradient(180deg, rgba(17, 20, 33, 0.99), rgba(12, 14, 24, 0.99));
+}
+
+.run-files-explorer-modal-header {
+  padding-bottom: 0.25rem;
+  border-bottom: 1px solid rgba(88, 94, 148, 0.35);
+}
+
+.run-files-explorer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.run-files-explorer-modal-body {
+  gap: 1.15rem;
+}
+
+.run-files-explorer-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(120px, 0.24fr)) minmax(0, 1fr);
+  gap: 0.75rem;
+}
+
+.run-files-explorer-stat,
+.run-files-explorer-workspace {
+  display: grid;
+  gap: 0.28rem;
+  padding: 0.85rem 0.9rem;
+  border-radius: 14px;
+  border: 1px solid rgba(73, 77, 117, 0.72);
+  background: rgba(20, 22, 37, 0.88);
+}
+
+.run-files-explorer-stat span,
+.run-files-explorer-workspace span,
+.run-files-explorer-search span {
+  color: #9fa4d5;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.run-files-explorer-stat strong {
+  color: #eef0ff;
+  font-size: 1.35rem;
+}
+
+.run-files-explorer-workspace code {
+  color: #d7dbff;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.run-files-explorer-toolbar {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.run-files-explorer-search {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.run-files-explorer-search input {
+  width: 100%;
+  padding: 0.72rem 0.82rem;
+  border-radius: 12px;
+  border: 1px solid rgba(73, 77, 117, 0.72);
+  background: rgba(14, 16, 28, 0.9);
+  color: #eef0ff;
+}
+
+.run-files-explorer-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.run-files-explorer-filter {
+  width: auto !important;
+  padding: 0.48rem 0.78rem;
+  border-radius: 999px;
+  border: 1px solid rgba(88, 92, 132, 0.65);
+  background: rgba(28, 30, 46, 0.86);
+  color: #aeb3d3;
+  font-size: 0.76rem;
+}
+
+.run-files-explorer-filter.is-active {
+  border-color: rgba(126, 138, 255, 0.82);
+  background: rgba(56, 61, 108, 0.82);
+  color: #f5f7ff;
+}
+
+.run-files-explorer-browser {
+  min-height: 26rem;
+}
+
+.run-files-explorer-browser.is-preview-expanded {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.run-files-explorer-browser.is-preview-expanded .run-files-explorer-list-panel {
+  display: none;
+}
+
+.run-files-explorer-list-panel,
+.run-files-explorer-preview {
+  min-height: 26rem;
+}
+
+.run-files-explorer-browser.is-preview-expanded .run-files-explorer-preview {
+  min-height: 38rem;
+}
+
+.run-files-explorer-preview-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.run-files-explorer-preview-toggle {
+  width: auto !important;
+  padding-inline: 0.8rem;
+}
+
+.run-files-explorer-browser.is-preview-expanded .execution-file-preview-content {
+  min-height: 34rem;
+  max-height: calc(100vh - 22rem);
+  font-size: 0.84rem;
 }
 
 .execution-document-card {
@@ -6352,6 +6526,11 @@ pre {
   .mosaic-files {
     min-height: auto;
     max-height: none;
+  }
+
+  .execution-files-summary-grid,
+  .run-files-explorer-summary {
+    grid-template-columns: 1fr;
   }
 
   .execution-files-browser {

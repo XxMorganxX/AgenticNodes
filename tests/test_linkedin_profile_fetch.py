@@ -16,7 +16,7 @@ from graph_agent.api.graph_store import GraphStore
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.runtime.core import GraphDefinition
 from graph_agent.runtime.engine import GraphRuntime
-from graph_agent.runtime.linkedin_profile_fetch import build_linkedin_profile_cache_info
+from graph_agent.runtime.linkedin_profile_fetch import build_linkedin_profile_cache_info, sanitize_linkedin_profile_payload
 
 
 def linkedin_graph_payload(
@@ -224,6 +224,7 @@ class LinkedInProfileFetchTests(unittest.TestCase):
         runtime = self._runtime()
         workspace_root = Path(tempfile.mkdtemp()) / ".graph-agent" / "runs"
         profile_payload = sample_profile("Taylor Doe")
+        sanitized_profile_payload = sanitize_linkedin_profile_payload(profile_payload)
         cache_info = build_linkedin_profile_cache_info("https://www.linkedin.com/in/taylor-doe/")
 
         with patch.dict("os.environ", {"GRAPH_AGENT_WORKSPACE_DIR": str(workspace_root)}, clear=False):
@@ -253,6 +254,9 @@ class LinkedInProfileFetchTests(unittest.TestCase):
         self.assertEqual(second_state.status, "completed")
         self.assertEqual(first_state.final_output["person"]["name"], "Taylor Doe")
         self.assertEqual(second_state.final_output["person"]["name"], "Taylor Doe")
+        self.assertNotIn("textLines", first_state.final_output)
+        self.assertNotIn("raw_lines", first_state.final_output["profile"])
+        self.assertNotIn("skills", first_state.final_output["sections"])
 
         first_output = first_state.node_outputs["linkedin"]
         second_output = second_state.node_outputs["linkedin"]
@@ -261,7 +265,7 @@ class LinkedInProfileFetchTests(unittest.TestCase):
 
         shared_cache_path = workspace_root.parent / "cache" / "linkedin" / f"{cache_info.cache_key}.json"
         self.assertTrue(shared_cache_path.exists())
-        self.assertEqual(json.loads(shared_cache_path.read_text()), profile_payload)
+        self.assertEqual(json.loads(shared_cache_path.read_text()), sanitized_profile_payload)
 
         first_workspace_copy = (
             workspace_root / "run-linkedin-1" / "agents" / "agent-alpha" / "workspace" / "cache" / "linkedin" / f"{cache_info.cache_key}.json"
@@ -271,8 +275,40 @@ class LinkedInProfileFetchTests(unittest.TestCase):
         )
         self.assertTrue(first_workspace_copy.exists())
         self.assertTrue(second_workspace_copy.exists())
-        self.assertEqual(json.loads(first_workspace_copy.read_text()), profile_payload)
-        self.assertEqual(json.loads(second_workspace_copy.read_text()), profile_payload)
+        self.assertEqual(json.loads(first_workspace_copy.read_text()), sanitized_profile_payload)
+        self.assertEqual(json.loads(second_workspace_copy.read_text()), sanitized_profile_payload)
+
+    def test_sanitize_linkedin_profile_payload_preserves_raw_text_only_as_fallback(self) -> None:
+        payload = {
+            "profile": {
+                "name": "Taylor Doe",
+                "headline": "Engineer",
+                "raw_lines": ["Taylor Doe", "Engineer"],
+            },
+            "experience": [
+                {
+                    "title": None,
+                    "subtitle": None,
+                    "description": None,
+                    "raw_lines": ["Independent Consultant", "Freelance"],
+                }
+            ],
+            "textLines": ["Taylor Doe", "Engineer"],
+            "sections": {
+                "skills": ["Python"],
+                "about": "Builds useful software.",
+            },
+        }
+
+        sanitized = sanitize_linkedin_profile_payload(payload)
+
+        self.assertNotIn("raw_lines", sanitized["profile"])
+        self.assertNotIn("textLines", sanitized)
+        self.assertNotIn("skills", sanitized["sections"])
+        self.assertEqual(
+            sanitized["experience"][0]["raw_lines"],
+            ["Independent Consultant", "Freelance"],
+        )
 
     def test_runtime_accepts_upstream_payload_extractor_output(self) -> None:
         graph = GraphDefinition.from_dict(linkedin_graph_with_payload_extractor())

@@ -4,6 +4,7 @@ import { AgentRunSwimlanes } from "./components/AgentRunSwimlanes";
 import { GraphCanvas } from "./components/GraphCanvas";
 import { GraphEnvEditor } from "./components/GraphEnvEditor";
 import { McpServerModal } from "./components/McpServerModal";
+import { RunFilesExplorerModal } from "./components/RunFilesExplorerModal";
 import { UserPreferencesModal } from "./components/UserPreferencesModal";
 import {
   bootMcpServer,
@@ -32,7 +33,16 @@ import {
 } from "./lib/api";
 import { createBlankGraph, layoutGraphLR, normalizeGraphDocument } from "./lib/editor";
 import type { GraphLayoutNodeDimensions } from "./lib/editor";
-import { filterEventsForAgent, getCanvasGraph, getDefaultAgentId, getSelectedRunId, getSelectedRunState, isTestEnvironment, updateSelectedAgentGraph } from "./lib/graphDocuments";
+import {
+  filterEventsForAgent,
+  getCanvasGraph,
+  getDefaultAgentId,
+  getSelectedRunFilesRequest,
+  getSelectedRunId,
+  getSelectedRunState,
+  isTestEnvironment,
+  updateSelectedAgentGraph,
+} from "./lib/graphDocuments";
 import { clearAllPersistedRunSnapshots, clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
 import type { PersistedRunSnapshot } from "./lib/runSnapshots";
 import { isTerminalRuntimeEvent, normalizeRunState, normalizeRuntimeEvent } from "./lib/runtimeEvents";
@@ -626,10 +636,12 @@ export default function App() {
   const [runFileListing, setRunFileListing] = useState<RunFilesystemListing | null>(null);
   const [selectedRunFilePath, setSelectedRunFilePath] = useState<string | null>(null);
   const [selectedRunFileContent, setSelectedRunFileContent] = useState<RunFilesystemFileContent | null>(null);
+  const [followLatestRunFile, setFollowLatestRunFile] = useState(true);
   const [isRunFilesLoading, setIsRunFilesLoading] = useState(false);
   const [isRunFileContentLoading, setIsRunFileContentLoading] = useState(false);
   const [runFilesError, setRunFilesError] = useState<string | null>(null);
   const [runFileContentError, setRunFileContentError] = useState<string | null>(null);
+  const [isRunFilesExplorerOpen, setIsRunFilesExplorerOpen] = useState(false);
   const [isUploadingProjectFiles, setIsUploadingProjectFiles] = useState(false);
   const [isProjectFilesLoading, setIsProjectFilesLoading] = useState(false);
   const [projectFileError, setProjectFileError] = useState<string | null>(null);
@@ -655,6 +667,10 @@ export default function App() {
   const canvasGraph = useMemo(() => getCanvasGraph(draftGraph, selectedAgentId), [draftGraph, selectedAgentId]);
   const selectedRunState = useMemo(() => getSelectedRunState(runState, selectedAgentId), [runState, selectedAgentId]);
   const selectedRunId = useMemo(() => getSelectedRunId(runState, activeRunId, selectedAgentId), [runState, activeRunId, selectedAgentId]);
+  const selectedRunFilesRequest = useMemo(
+    () => getSelectedRunFilesRequest(runState, activeRunId, selectedAgentId),
+    [runState, activeRunId, selectedAgentId],
+  );
   const filteredEvents = useMemo(() => filterEventsForAgent(events, selectedAgentId), [events, selectedAgentId]);
   const persistedGraphIds = useMemo(() => new Set(graphs.map((graph) => graph.graph_id)), [graphs]);
   const isEnvironment = isTestEnvironment(draftGraph);
@@ -677,10 +693,24 @@ export default function App() {
   const hasUnsavedChanges = (Boolean(draftGraph) && draftGraphSnapshot !== savedGraphSnapshot) || input !== savedInputPrompt;
   const projectFileGraphId = selectedGraphId || draftGraph?.graph_id || "";
   const readyProjectFiles = useMemo(() => projectFiles.filter((file) => file.status === "ready"), [projectFiles]);
-  const visibleRunFiles = useMemo(() => runFileListing?.files ?? [], [runFileListing]);
+  const visibleRunFiles = useMemo(() => {
+    const files = runFileListing?.files ?? [];
+    const agentId = selectedRunFilesRequest.agentId;
+    if (!agentId) {
+      return files;
+    }
+    return files.filter((file) => file.agent_id === agentId);
+  }, [runFileListing, selectedRunFilesRequest.agentId]);
   const selectedRunFile = useMemo(
     () => visibleRunFiles.find((file) => file.path === selectedRunFilePath) ?? null,
     [visibleRunFiles, selectedRunFilePath],
+  );
+  const recentRunFiles = useMemo(
+    () =>
+      [...visibleRunFiles]
+        .sort((left, right) => new Date(right.modified_at).getTime() - new Date(left.modified_at).getTime())
+        .slice(0, 3),
+    [visibleRunFiles],
   );
 
   useEffect(() => {
@@ -691,17 +721,24 @@ export default function App() {
     inputRef.current = input;
   }, [input]);
 
-  const refreshRunFiles = useCallback(async (runId: string) => {
+  const refreshRunFiles = useCallback(async (runId: string, agentId: string | null = null) => {
     setRunFilesError(null);
     setIsRunFilesLoading(true);
     try {
       const listing = await fetchRunFiles(runId);
+      const candidateFiles = agentId ? listing.files.filter((file) => file.agent_id === agentId) : listing.files;
+      const latestFilePath =
+        [...candidateFiles]
+          .sort((left, right) => new Date(right.modified_at).getTime() - new Date(left.modified_at).getTime())[0]?.path ?? null;
       setRunFileListing(listing);
       setSelectedRunFilePath((current) => {
-        if (current && listing.files.some((file) => file.path === current)) {
+        if (followLatestRunFile) {
+          return latestFilePath;
+        }
+        if (current && candidateFiles.some((file) => file.path === current)) {
           return current;
         }
-        return listing.files[0]?.path ?? null;
+        return latestFilePath;
       });
     } catch (loadError) {
       const message = loadError instanceof Error ? loadError.message : "Unable to load run files.";
@@ -711,22 +748,24 @@ export default function App() {
     } finally {
       setIsRunFilesLoading(false);
     }
-  }, []);
+  }, [followLatestRunFile]);
 
   useEffect(() => {
-    if (!selectedRunId) {
+    if (!selectedRunFilesRequest.runId) {
       setRunFileListing(null);
       setSelectedRunFilePath(null);
       setSelectedRunFileContent(null);
+      setFollowLatestRunFile(true);
       setRunFilesError(null);
       setRunFileContentError(null);
+      setIsRunFilesExplorerOpen(false);
       return;
     }
-    void refreshRunFiles(selectedRunId);
-  }, [refreshRunFiles, selectedRunId, selectedRunState?.event_history.length]);
+    void refreshRunFiles(selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId);
+  }, [refreshRunFiles, selectedRunFilesRequest.runId, selectedRunState?.event_history.length]);
 
   useEffect(() => {
-    if (!selectedRunId || !selectedRunFilePath) {
+    if (!selectedRunFilesRequest.runId || !selectedRunFilePath) {
       setSelectedRunFileContent(null);
       setRunFileContentError(null);
       return;
@@ -734,7 +773,7 @@ export default function App() {
     let cancelled = false;
     setRunFileContentError(null);
     setIsRunFileContentLoading(true);
-    void fetchRunFileContent(selectedRunId, selectedRunFilePath)
+    void fetchRunFileContent(selectedRunFilesRequest.runId, selectedRunFilePath)
       .then((content) => {
         if (!cancelled) {
           setSelectedRunFileContent(content);
@@ -756,7 +795,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedRunFilePath, selectedRunId]);
+  }, [selectedRunFilePath, selectedRunFilesRequest.runId]);
 
   const refreshCatalog = useCallback(async () => {
     const loadedCatalog = await fetchEditorCatalog();
@@ -1631,12 +1670,20 @@ export default function App() {
                     <button
                       type="button"
                       className="secondary-button"
+                      onClick={() => setIsRunFilesExplorerOpen(true)}
+                      disabled={!selectedRunFilesRequest.runId}
+                    >
+                      Open Explorer
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
                       onClick={() => {
-                        if (selectedRunId) {
-                          void refreshRunFiles(selectedRunId);
+                        if (selectedRunFilesRequest.runId) {
+                          void refreshRunFiles(selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId);
                         }
                       }}
-                      disabled={!selectedRunId || isRunFilesLoading}
+                      disabled={!selectedRunFilesRequest.runId || isRunFilesLoading}
                     >
                       {isRunFilesLoading ? "Refreshing..." : "Refresh Files"}
                     </button>
@@ -1653,37 +1700,16 @@ export default function App() {
                   </div>
                 ) : null}
                 {visibleRunFiles.length > 0 ? (
-                  <div className="execution-files-browser">
-                    <div className="execution-files-list-panel">
+                  <div className="execution-files-summary-grid">
+                    <div className="execution-files-summary-card">
                       <div className="execution-files-browser-header">
-                        <strong>Workspace Files</strong>
-                        <span>{visibleRunFiles.length} total</span>
+                        <strong>Quick Preview</strong>
+                        <span>{selectedRunFile ? selectedRunFile.name : "No file selected"}</span>
                       </div>
-                      <div className="execution-files-list" role="list" aria-label="Agent workspace files">
-                        {visibleRunFiles.map((file) => (
-                          <button
-                            key={file.path}
-                            type="button"
-                            className={`execution-file-row ${selectedRunFilePath === file.path ? "is-selected" : ""}`}
-                            onClick={() => setSelectedRunFilePath(file.path)}
-                          >
-                            <strong>{file.name}</strong>
-                            <span className="execution-file-row-path">{file.path}</span>
-                            <span>
-                              {formatDocumentSize(file.size_bytes)} · {formatTimestamp(file.modified_at)}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                    <div className="execution-file-preview">
                       {selectedRunFile ? (
                         <>
-                          <div className="execution-files-browser-header execution-files-browser-header--preview">
-                            <div>
-                              <strong>{selectedRunFile.name}</strong>
-                              <span className="execution-file-preview-path">{selectedRunFile.path}</span>
-                            </div>
+                          <div className="execution-file-summary-meta">
+                            <span className="execution-file-preview-path">{selectedRunFile.path}</span>
                             <span>
                               {selectedRunFile.mime_type} · {formatDocumentSize(selectedRunFile.size_bytes)}
                             </span>
@@ -1695,13 +1721,47 @@ export default function App() {
                           ) : null}
                         </>
                       ) : (
-                        <p className="execution-file-preview-empty">Select a file to preview it.</p>
+                        <p className="execution-file-preview-empty">Open the explorer to browse files from this run.</p>
                       )}
+                    </div>
+
+                    <div className="execution-files-summary-card">
+                      <div className="execution-files-browser-header">
+                        <strong>Recent Files</strong>
+                        <span>{visibleRunFiles.length} total</span>
+                      </div>
+                      <div className="execution-file-summary-list" role="list" aria-label="Recent agent workspace files">
+                        {recentRunFiles.map((file) => (
+                          <button
+                            key={file.path}
+                            type="button"
+                            className={`execution-file-row ${selectedRunFilePath === file.path ? "is-selected" : ""}`}
+                            onClick={() => {
+                              setFollowLatestRunFile(false);
+                              setSelectedRunFilePath(file.path);
+                              setIsRunFilesExplorerOpen(true);
+                            }}
+                          >
+                            <strong>{file.name}</strong>
+                            <span className="execution-file-row-path">{file.path}</span>
+                            <span>
+                              {formatDocumentSize(file.size_bytes)} · {formatTimestamp(file.modified_at)}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        className="secondary-button execution-files-open-button"
+                        onClick={() => setIsRunFilesExplorerOpen(true)}
+                      >
+                        Browse all files
+                      </button>
                     </div>
                   </div>
                 ) : (
                   <p className="execution-file-preview-empty">
-                    {selectedRunId ? "No files have been written in this run yet." : "Run the graph to inspect workspace files."}
+                    {selectedRunFilesRequest.runId ? "No files have been written in this run yet." : "Run the graph to inspect workspace files."}
                   </p>
                 )}
                 {runFilesError ? <p className="error-text">{runFilesError}</p> : null}
@@ -1776,6 +1836,29 @@ export default function App() {
           onUpdatePreferences={handleUpdateUserPreferences}
           onResetPreferences={handleResetUserPreferences}
           onClose={() => setUserPreferencesOpen(false)}
+        />
+      ) : null}
+      {isRunFilesExplorerOpen ? (
+        <RunFilesExplorerModal
+          listing={runFileListing}
+          files={visibleRunFiles}
+          selectedFilePath={selectedRunFilePath}
+          selectedFile={selectedRunFile}
+          selectedFileContent={selectedRunFileContent}
+          isRunFilesLoading={isRunFilesLoading}
+          isRunFileContentLoading={isRunFileContentLoading}
+          runFilesError={runFilesError}
+          runFileContentError={runFileContentError}
+          onClose={() => setIsRunFilesExplorerOpen(false)}
+          onRefresh={() => {
+            if (selectedRunFilesRequest.runId) {
+              void refreshRunFiles(selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId);
+            }
+          }}
+          onSelectFile={(path) => {
+            setFollowLatestRunFile(false);
+            setSelectedRunFilePath(path);
+          }}
         />
       ) : null}
       {mcpPanelOpen ? (

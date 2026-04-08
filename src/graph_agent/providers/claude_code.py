@@ -22,6 +22,7 @@ from graph_agent.providers.base import (
 )
 
 _HEALTHCHECK_MIN_TURNS = 2
+_MIN_REQUEST_TURNS = 2
 _ANTHROPIC_API_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 _LOG_PREVIEW_LIMIT = 240
 
@@ -70,6 +71,11 @@ def _friendly_cli_error_detail(detail: str) -> str:
     lowered = message_text.lower()
     if "hit your limit" in lowered:
         return f"Claude Code usage limit reached. {message_text}"
+    if parsed.get("subtype") == "error_max_turns":
+        return (
+            "Claude Code stopped after reaching the configured max turns. "
+            f"{message_text} Increase max_turns to allow the CLI to finish after tool use."
+        )
     if parsed.get("is_error") is True:
         return f"Claude Code request failed. {message_text}"
     return detail
@@ -123,6 +129,17 @@ def _command_preview(command: Sequence[str]) -> str:
 
 def _format_timeout_seconds(timeout_seconds: float) -> str:
     return str(int(timeout_seconds)) if float(timeout_seconds).is_integer() else f"{timeout_seconds:g}"
+
+
+def _resolved_max_turns(config: Mapping[str, Any]) -> int | None:
+    raw_value = _number_config(config, "max_turns")
+    if raw_value is None:
+        return _MIN_REQUEST_TURNS
+    configured = int(raw_value)
+    if configured <= 0:
+        return None
+    # Claude Code can stop on an intermediate tool_use before returning JSON.
+    return max(configured, _MIN_REQUEST_TURNS)
 
 
 class ClaudeCodeCLIModelProvider(ModelProvider):
@@ -343,8 +360,8 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
         if system_prompt:
             command.extend(["--system-prompt", system_prompt])
 
-        max_turns = int(_number_config(provider_config, "max_turns") or 1)
-        if max_turns > 0:
+        max_turns = _resolved_max_turns(provider_config)
+        if max_turns is not None:
             command.extend(["--max-turns", str(max_turns)])
 
         command.extend(
@@ -366,8 +383,8 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
 
     def _healthcheck_command(self, provider_config: Mapping[str, Any]) -> list[str]:
         healthcheck_config = dict(provider_config)
-        configured_max_turns = int(_number_config(provider_config, "max_turns") or 1)
-        healthcheck_config["max_turns"] = max(configured_max_turns, _HEALTHCHECK_MIN_TURNS)
+        configured_max_turns = _resolved_max_turns(provider_config)
+        healthcheck_config["max_turns"] = max(configured_max_turns or 0, _HEALTHCHECK_MIN_TURNS)
         return self._build_command(
             ModelRequest(
                 prompt_name="claude_code_healthcheck",
