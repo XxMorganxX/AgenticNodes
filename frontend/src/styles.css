@@ -2820,6 +2820,49 @@ pre {
   min-height: 212px;
 }
 
+.graph-node-card--parallel-splitter {
+  min-width: calc(420px * var(--graph-node-body-scale, 1));
+  min-height: 356px;
+  position: relative;
+}
+
+.graph-parallel-splitter-handles {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: flex-end;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.graph-parallel-splitter-handle-slot {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 28px;
+  pointer-events: none;
+}
+
+.graph-parallel-splitter-port {
+  position: static;
+  transform: none;
+  right: auto;
+  pointer-events: none;
+  padding-right: 18px;
+}
+
+.graph-parallel-splitter-handle {
+  position: absolute;
+  right: -15px;
+  top: 50% !important;
+  transform: translateY(-50%) scale(1);
+  pointer-events: all;
+}
+
 .graph-node-card--model-inputs .graph-node-card-inner {
   padding-left: calc(1rem * var(--graph-node-body-scale, 1));
 }
@@ -3247,12 +3290,38 @@ pre {
   gap: 0.75rem;
 }
 
+.graph-node-inline-select-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
 .graph-node-inline-toggle-label {
   color: #bcc4ef;
   font-size: 0.78rem;
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.graph-node-inline-select {
+  min-width: 0;
+  max-width: 15rem;
+  flex: 1 1 auto;
+  padding: 0.38rem 0.55rem;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background: rgba(12, 14, 24, 0.9);
+  color: #e6e9ff;
+  font-size: 0.78rem;
+  line-height: 1.2;
+}
+
+.graph-node-inline-select:focus {
+  outline: none;
+  border-color: rgba(144, 128, 255, 0.5);
+  box-shadow: 0 0 0 2px rgba(144, 128, 255, 0.12);
 }
 
 .graph-node-inline-toggle {
@@ -4138,6 +4207,35 @@ pre {
 .preferences-modal-actions {
   display: flex;
   justify-content: flex-start;
+}
+
+.preferences-shortcut-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.9rem;
+  align-items: center;
+}
+
+.preferences-shortcut-copy {
+  display: grid;
+  gap: 0.22rem;
+}
+
+.preferences-shortcut-copy strong {
+  color: #f0f0ff;
+}
+
+.preferences-shortcut-copy span {
+  color: #9fa4c7;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.preferences-shortcut-input {
+  width: 8rem;
+  min-width: 8rem;
+  text-align: center;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
 }
 
 .display-response-modal-preview pre {

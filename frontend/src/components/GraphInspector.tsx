@@ -36,6 +36,7 @@ import type {
   GraphDefinition,
   GraphEdge,
   GraphNode,
+  ProjectFile,
   RunState,
   SpreadsheetPreviewResult,
   ToolDefinition,
@@ -44,6 +45,7 @@ import type {
 type GraphInspectorProps = {
   graph: GraphDefinition | null;
   catalog: EditorCatalog | null;
+  availableProjectFiles?: ProjectFile[];
   runState: RunState | null;
   selectedNodeId: string | null;
   selectedEdgeId: string | null;
@@ -106,6 +108,7 @@ function uniqueStrings(values: string[]): string[] {
 
 const CONTEXT_BUILDER_PROVIDER_ID = "core.context_builder";
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
+const SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision";
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
 const WRITE_TEXT_FILE_PROVIDER_ID = "core.write_text_file";
@@ -145,6 +148,11 @@ function stringifyPreviewValue(value: unknown): string {
 
 function truncatePreview(value: string, limit = 180): string {
   return value.length > limit ? `${value.slice(0, limit - 1)}...` : value;
+}
+
+function isSpreadsheetProjectFile(file: ProjectFile): boolean {
+  const candidate = `${file.name} ${file.storage_path}`.toLowerCase();
+  return file.status === "ready" && (candidate.endsWith(".csv") || candidate.endsWith(".xlsx"));
 }
 
 function incomingEdgeContractLabel(graph: GraphDefinition, node: GraphNode): string {
@@ -324,6 +332,7 @@ function describeMcpExecutorBinding(binding: unknown): string {
 export function GraphInspector({
   graph,
   catalog,
+  availableProjectFiles = [],
   runState,
   selectedNodeId,
   selectedEdgeId,
@@ -361,8 +370,10 @@ export function GraphInspector({
 
   const selectedNode = selectedNodeId ? graph.nodes.find((node) => node.id === selectedNodeId) ?? null : null;
   const selectedEdge = selectedEdgeId ? graph.edges.find((edge) => edge.id === selectedEdgeId) ?? null : null;
+  const spreadsheetProjectFiles = availableProjectFiles.filter(isSpreadsheetProjectFile);
   const spreadsheetPreviewKey =
-    selectedNode?.provider_id === SPREADSHEET_ROW_PROVIDER_ID
+    selectedNode?.provider_id === SPREADSHEET_ROW_PROVIDER_ID ||
+    selectedNode?.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID
       ? JSON.stringify({
           id: selectedNode.id,
           file_format: selectedNode.config.file_format ?? "auto",
@@ -383,7 +394,10 @@ export function GraphInspector({
     selectedNode?.kind === "mcp_tool_executor" && Boolean(selectedNode.config.enable_follow_up_decision);
   const executorRetriesEnabled =
     selectedNode?.kind === "mcp_tool_executor" && Boolean(selectedNode.config.allow_retries ?? true);
-  const isPromptDrivenNode = selectedNode?.kind === "model" || executorFollowUpEnabled;
+  const isSpreadsheetMatrixDecisionNode =
+    selectedNode?.kind === "model" && selectedNode.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID;
+  const isPromptDrivenNode =
+    (selectedNode?.kind === "model" && !isSpreadsheetMatrixDecisionNode) || executorFollowUpEnabled;
   const selectedModelResponseMode =
     selectedNode?.kind === "model"
       ? inferModelResponseMode(graph, selectedNode)
@@ -392,6 +406,38 @@ export function GraphInspector({
         : null;
   const responseSchemaDetails =
     selectedNode && isPromptDrivenNode ? resolveResponseSchemaDetails(selectedNode.config as Record<string, unknown>) : null;
+  const selectedSpreadsheetProjectFile =
+    selectedNode?.provider_id === SPREADSHEET_ROW_PROVIDER_ID || selectedNode?.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID
+      ? spreadsheetProjectFiles.find((file) => file.file_id === String(selectedNode.config.project_file_id ?? "").trim()) ??
+        spreadsheetProjectFiles.find((file) => file.storage_path === String(selectedNode.config.file_path ?? "").trim()) ??
+        spreadsheetProjectFiles.find((file) => file.name === String(selectedNode.config.project_file_name ?? "").trim()) ??
+        null
+      : null;
+  const hasManualSpreadsheetPath =
+    !selectedSpreadsheetProjectFile && selectedNode ? String(selectedNode.config.file_path ?? "").trim().length > 0 : false;
+  const spreadsheetProjectFileSelectValue =
+    selectedSpreadsheetProjectFile?.file_id ?? (hasManualSpreadsheetPath ? "__manual__" : "");
+
+  const applySpreadsheetProjectFile = (fileId: string): void => {
+    if (!selectedNode) {
+      return;
+    }
+    const selectedFile = spreadsheetProjectFiles.find((file) => file.file_id === fileId) ?? null;
+    if (!selectedFile) {
+      return;
+    }
+    onGraphChange(
+      updateNode(graph, selectedNode.id, (node) => ({
+        ...node,
+        config: {
+          ...node.config,
+          project_file_id: selectedFile.file_id,
+          project_file_name: selectedFile.name,
+          file_path: selectedFile.storage_path,
+        },
+      })),
+    );
+  };
 
   if (selectedNode) {
     if (isWireJunctionNode(selectedNode)) {
@@ -813,9 +859,11 @@ export function GraphInspector({
       selectedNode.kind === "data" && selectedNode.provider_id === RUNTIME_NORMALIZER_PROVIDER_ID;
     const isControlFlowUnitNode = isControlFlowNode(selectedNode);
     const isSpreadsheetRowNode = isControlFlowUnitNode && selectedNode.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
+    const isSpreadsheetMatrixNode =
+      selectedNode.kind === "model" && selectedNode.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID;
     const isLogicConditionsNode = isControlFlowUnitNode && selectedNode.provider_id === LOGIC_CONDITIONS_PROVIDER_ID;
     const isParallelSplitterNode = isControlFlowUnitNode && selectedNode.provider_id === PARALLEL_SPLITTER_PROVIDER_ID;
-    const spreadsheetNode = isSpreadsheetRowNode ? selectedNode : null;
+    const spreadsheetNode = isSpreadsheetRowNode || isSpreadsheetMatrixNode ? selectedNode : null;
     const logicConditionConfig = isLogicConditionsNode ? normalizeLogicConditionConfig(selectedNode.config).normalized : null;
     const logicIncomingContractLabel = isLogicConditionsNode ? incomingEdgeContractLabel(graph, selectedNode) : "";
     const spreadsheetIteratorState =
@@ -830,6 +878,14 @@ export function GraphInspector({
       : [];
     const spreadsheetResolvedFilePath =
       spreadsheetNode ? String(resolveGraphEnvReferences(String(spreadsheetNode.config.file_path ?? ""), graph) ?? "") : "";
+    const spreadsheetPreviewPrimaryHeader = spreadsheetPreview?.headers[0] ?? "";
+    const spreadsheetPreviewSampleRowLabels = spreadsheetPreview
+      ? spreadsheetPreviewPrimaryHeader.length > 0
+        ? spreadsheetPreview.sample_rows
+            .map((row) => String(row.row_data[spreadsheetPreviewPrimaryHeader] ?? "").trim())
+            .filter((label) => label.length > 0)
+        : []
+      : [];
     async function handleSpreadsheetPreview(): Promise<void> {
       if (!spreadsheetNode) {
         return;
@@ -1388,6 +1444,144 @@ export function GraphInspector({
                   </label>
                 );
               })}
+              {isSpreadsheetMatrixNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Spreadsheet Matrix Decision</strong>
+                    <span>Uses the first row as column choices and the first column as row choices, then asks the configured model to pick the best row/column pair for the current request.</span>
+                    <span>The node emits the selected cell value as its message payload and stores the chosen coordinates in the run artifacts.</span>
+                  </div>
+                  <label>
+                    File Format
+                    <select
+                      value={String(selectedNode.config.file_format ?? "auto")}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              file_format: event.target.value,
+                              mode: "spreadsheet_matrix_decision",
+                            },
+                          })),
+                        )
+                      }
+                    >
+                      <option value="auto">Auto Detect</option>
+                      <option value="csv">CSV</option>
+                      <option value="xlsx">Excel (.xlsx)</option>
+                    </select>
+                  </label>
+                  <label>
+                    Project File
+                    <select
+                      value={spreadsheetProjectFileSelectValue}
+                      onChange={(event) => {
+                        const nextFileId = event.target.value;
+                        if (!nextFileId || nextFileId === "__manual__") {
+                          return;
+                        }
+                        applySpreadsheetProjectFile(nextFileId);
+                      }}
+                    >
+                      <option value="">Select a saved spreadsheet</option>
+                      {hasManualSpreadsheetPath ? <option value="__manual__">Manual path</option> : null}
+                      {spreadsheetProjectFiles.map((file) => (
+                        <option key={file.file_id} value={file.file_id}>
+                          {file.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    File Path
+                    <input
+                      value={String(selectedNode.config.file_path ?? "")}
+                      placeholder="Project file path or graph env reference for the matrix spreadsheet"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              project_file_id: "",
+                              project_file_name: "",
+                              file_path: event.target.value,
+                              mode: "spreadsheet_matrix_decision",
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Sheet Name
+                    <input
+                      value={String(selectedNode.config.sheet_name ?? "")}
+                      placeholder="Leave blank to use the first sheet"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              sheet_name: event.target.value,
+                              mode: "spreadsheet_matrix_decision",
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="context-builder-binding-actions">
+                    <button
+                      type="button"
+                      className="secondary-button context-builder-inline-button"
+                      onClick={() => void handleSpreadsheetPreview()}
+                      disabled={isSpreadsheetPreviewLoading || spreadsheetResolvedFilePath.trim().length === 0}
+                    >
+                      {isSpreadsheetPreviewLoading ? "Loading Preview..." : "Preview Matrix"}
+                    </button>
+                  </div>
+                  <div className="inspector-meta">
+                    <span>Resolved file path: {spreadsheetResolvedFilePath || "Enter a file path or graph env reference."}</span>
+                    <span>Axis parsing: row 1 becomes columns, column 1 becomes rows</span>
+                    <span>Output contract: message payload containing the selected cell value</span>
+                  </div>
+                  {spreadsheetPreviewError ? <div className="tool-details-modal-help">{spreadsheetPreviewError}</div> : null}
+                  <div className="contract-card">
+                    <strong>Matrix Preview</strong>
+                    <span>
+                      {spreadsheetPreview
+                        ? `${spreadsheetPreview.row_count} row(s) parsed from ${spreadsheetPreview.file_format.toUpperCase()}`
+                        : "Run a preview to inspect the matrix headers and sample rows."}
+                    </span>
+                    <span>
+                      Column labels: {spreadsheetPreview ? (spreadsheetPreview.headers.slice(1).join(", ") || "None") : "Unknown"}
+                    </span>
+                    <span>
+                      Sample row labels: {spreadsheetPreview ? (spreadsheetPreviewSampleRowLabels.join(", ") || "None") : "Unknown"}
+                    </span>
+                    <pre className="context-builder-preview">
+                      {spreadsheetPreview
+                        ? JSON.stringify(
+                            {
+                              corner_label: spreadsheetPreview.headers[0] ?? "",
+                              column_labels: spreadsheetPreview.headers.slice(1),
+                              sample_row_labels: spreadsheetPreviewSampleRowLabels,
+                              sheet_name: spreadsheetPreview.sheet_name,
+                              row_count: spreadsheetPreview.row_count,
+                              sample_rows: spreadsheetPreview.sample_rows,
+                            },
+                            null,
+                            2,
+                          )
+                        : "Preview output will appear here."}
+                    </pre>
+                  </div>
+                </>
+              ) : null}
               <label>
                 System Prompt
                 <textarea
@@ -1458,7 +1652,13 @@ export function GraphInspector({
               <label>
                 Response Mode
                 {selectedNode.kind === "model" ? (
-                  <>
+                  isSpreadsheetMatrixNode ? (
+                    <>
+                      <input value="message" readOnly />
+                      <small>This node always emits the selected spreadsheet cell as a message payload.</small>
+                    </>
+                  ) : (
+                    <>
                     <select
                       value={String(selectedNode.config.response_mode ?? "auto") || "auto"}
                       onChange={(event) =>
@@ -1478,7 +1678,8 @@ export function GraphInspector({
                       Choose a fixed mode or leave it on `auto` to follow graph wiring. Current effective mode:{" "}
                       <code>{selectedModelResponseMode ?? "message"}</code>.
                     </small>
-                  </>
+                    </>
+                  )
                 ) : (
                   <>
                     <select
@@ -1550,7 +1751,8 @@ export function GraphInspector({
                   </div>
                 </>
               ) : null}
-              <div className="checkbox-grid">
+              {!isSpreadsheetMatrixNode ? (
+                <div className="checkbox-grid">
                 <strong>{selectedNode.kind === "mcp_tool_executor" ? "Allowed MCP Tools" : "Direct Registry Tools"}</strong>
                 {followUpSelectableTools.map((tool) => {
                   const canonicalName = toolCanonicalName(tool);
@@ -1587,8 +1789,9 @@ export function GraphInspector({
                     </label>
                   );
                 })}
-              </div>
-              {selectedNode.kind === "model" ? (
+                </div>
+              ) : null}
+              {selectedNode.kind === "model" && !isSpreadsheetMatrixNode ? (
                 <div className="contract-card">
                   <strong>MCP Tools From Context Providers</strong>
                   <span>
@@ -1815,20 +2018,22 @@ export function GraphInspector({
                   </section>
                 </>
               ) : null}
-              <label>
-                Preferred Tool Name
-                <input
-                  value={String(selectedNode.config.preferred_tool_name ?? "")}
-                  onChange={(event) =>
-                    onGraphChange(
-                      updateNode(graph, selectedNode.id, (node) => ({
-                        ...node,
-                        config: { ...node.config, preferred_tool_name: event.target.value },
-                      })),
-                    )
-                  }
-                />
-              </label>
+              {!isSpreadsheetMatrixNode ? (
+                <label>
+                  Preferred Tool Name
+                  <input
+                    value={String(selectedNode.config.preferred_tool_name ?? "")}
+                    onChange={(event) =>
+                      onGraphChange(
+                        updateNode(graph, selectedNode.id, (node) => ({
+                          ...node,
+                          config: { ...node.config, preferred_tool_name: event.target.value },
+                        })),
+                      )
+                    }
+                  />
+                </label>
+              ) : null}
             </>
           ) : null}
           {selectedNode.kind === "tool" ? (
@@ -2081,15 +2286,42 @@ export function GraphInspector({
                     </select>
                   </label>
                   <label>
+                    Project File
+                    <select
+                      value={spreadsheetProjectFileSelectValue}
+                      onChange={(event) => {
+                        const nextFileId = event.target.value;
+                        if (!nextFileId || nextFileId === "__manual__") {
+                          return;
+                        }
+                        applySpreadsheetProjectFile(nextFileId);
+                      }}
+                    >
+                      <option value="">Select a saved spreadsheet</option>
+                      {hasManualSpreadsheetPath ? <option value="__manual__">Manual path</option> : null}
+                      {spreadsheetProjectFiles.map((file) => (
+                        <option key={file.file_id} value={file.file_id}>
+                          {file.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
                     File Path
                     <input
                       value={String(selectedNode.config.file_path ?? "")}
-                      placeholder="Path, env var, or leave empty if exactly one CSV/XLSX is attached to the run"
+                      placeholder="Project file path or graph env reference"
                       onChange={(event) =>
                         onGraphChange(
                           updateNode(graph, selectedNode.id, (node) => ({
                             ...node,
-                            config: { ...node.config, file_path: event.target.value, mode: "spreadsheet_rows" },
+                            config: {
+                              ...node.config,
+                              project_file_id: "",
+                              project_file_name: "",
+                              file_path: event.target.value,
+                              mode: "spreadsheet_rows",
+                            },
                           })),
                         )
                       }
@@ -2260,15 +2492,42 @@ export function GraphInspector({
                     </select>
                   </label>
                   <label>
+                    Project File
+                    <select
+                      value={spreadsheetProjectFileSelectValue}
+                      onChange={(event) => {
+                        const nextFileId = event.target.value;
+                        if (!nextFileId || nextFileId === "__manual__") {
+                          return;
+                        }
+                        applySpreadsheetProjectFile(nextFileId);
+                      }}
+                    >
+                      <option value="">Select a saved spreadsheet</option>
+                      {hasManualSpreadsheetPath ? <option value="__manual__">Manual path</option> : null}
+                      {spreadsheetProjectFiles.map((file) => (
+                        <option key={file.file_id} value={file.file_id}>
+                          {file.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
                     File Path
                     <input
                       value={String(selectedNode.config.file_path ?? "")}
-                      placeholder="Path, env var, or leave empty if exactly one CSV/XLSX is attached to the run"
+                      placeholder="Project file path or graph env reference"
                       onChange={(event) =>
                         onGraphChange(
                           updateNode(graph, selectedNode.id, (node) => ({
                             ...node,
-                            config: { ...node.config, file_path: event.target.value, mode: "spreadsheet_rows" },
+                            config: {
+                              ...node.config,
+                              project_file_id: "",
+                              project_file_name: "",
+                              file_path: event.target.value,
+                              mode: "spreadsheet_rows",
+                            },
                           })),
                         )
                       }

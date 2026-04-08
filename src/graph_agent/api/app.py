@@ -25,6 +25,18 @@ class RunDocumentPayload(BaseModel):
     error: Optional[str] = None
 
 
+class ProjectFilePayload(BaseModel):
+    file_id: str
+    graph_id: str
+    name: str
+    mime_type: str = "application/octet-stream"
+    size_bytes: int = 0
+    storage_path: str = ""
+    status: str = "ready"
+    created_at: str = ""
+    error: Optional[str] = None
+
+
 class RunRequest(BaseModel):
     input: Any
     agent_ids: Optional[list[str]] = None
@@ -142,6 +154,73 @@ def delete_graph(graph_id: str) -> dict[str, str]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"deleted": graph_id}
+
+
+@app.get("/api/graphs/{graph_id}/files")
+def list_project_files(graph_id: str) -> dict[str, Any]:
+    try:
+        return {"files": manager.list_project_files(graph_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/graphs/{graph_id}/files/upload")
+async def upload_project_files(graph_id: str, request: Request) -> dict[str, Any]:
+    try:
+        form = await request.form()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Document uploads require multipart support. Install the `python-multipart` package "
+                "in the same environment as the API server, then restart. "
+                f"({type(exc).__name__}: {exc})"
+            ),
+        ) from exc
+    files = form.getlist("files")
+    if not files:
+        raise HTTPException(status_code=400, detail="Select at least one file to upload.")
+    payloads: list[dict[str, Any]] = []
+    for upload in files:
+        filename = getattr(upload, "filename", None)
+        read = getattr(upload, "read", None)
+        close = getattr(upload, "close", None)
+        if not callable(read):
+            continue
+        try:
+            payloads.append(
+                {
+                    "name": filename or "file",
+                    "content_type": getattr(upload, "content_type", None),
+                    "data": await read(),
+                }
+            )
+        finally:
+            if callable(close):
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:  # noqa: BLE001
+                    pass
+    if not payloads:
+        raise HTTPException(status_code=400, detail="Select at least one file to upload.")
+    try:
+        project_files = manager.upload_project_files(graph_id, payloads)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"files": project_files}
+
+
+@app.delete("/api/graphs/{graph_id}/files/{file_id}")
+def delete_project_file(graph_id: str, file_id: str) -> dict[str, str]:
+    try:
+        manager.delete_project_file(graph_id, file_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown project file '{file_id}'.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"deleted": file_id}
 
 
 @app.get("/api/editor/catalog")

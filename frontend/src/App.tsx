@@ -9,10 +9,12 @@ import {
   bootMcpServer,
   createMcpServer,
   createGraph,
+  deleteProjectFile,
   deleteMcpServer,
   deleteGraph,
   eventStreamUrl,
   fetchEditorCatalog,
+  fetchProjectFiles,
   fetchRunFileContent,
   fetchRunFiles,
   fetchGraph,
@@ -24,11 +26,11 @@ import {
   startRun,
   stopMcpServer,
   testMcpServer,
-  uploadRunDocuments,
+  uploadProjectFiles,
   updateMcpServer,
   updateGraph,
 } from "./lib/api";
-import { createBlankGraph, layoutGraphDocument, layoutGraphLR, normalizeGraphDocument } from "./lib/editor";
+import { createBlankGraph, layoutGraphLR, normalizeGraphDocument } from "./lib/editor";
 import type { GraphLayoutNodeDimensions } from "./lib/editor";
 import { filterEventsForAgent, getCanvasGraph, getDefaultAgentId, getSelectedRunId, getSelectedRunState, isTestEnvironment, updateSelectedAgentGraph } from "./lib/graphDocuments";
 import { clearAllPersistedRunSnapshots, clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
@@ -41,6 +43,7 @@ import type {
   GraphDocument,
   McpServerDraft,
   McpServerStatus,
+  ProjectFile,
   RunDocument,
   RunFilesystemFileContent,
   RunFilesystemListing,
@@ -56,7 +59,6 @@ const DEFAULT_INPUT = "Find graph-agent references for a schema repair workflow.
 const DEFAULT_TEST_ENVIRONMENT_ID = "test-environment";
 const ENVIRONMENT_AGENT_SELECTION_STORAGE_KEY = "agentic-nodes-environment-agent-selection";
 const SELECTED_AGENT_ID_STORAGE_KEY = "agentic-nodes-selected-agent-id";
-const RECENT_RUN_DOCUMENT_STORAGE_KEY = "agentic-nodes-recent-run-document";
 
 function isTerminalRunStatus(status: string | null | undefined): boolean {
   return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
@@ -100,6 +102,45 @@ function formatTimestamp(value: string): string {
     return value;
   }
   return parsed.toLocaleString();
+}
+
+function normalizeShortcutToken(token: string): string {
+  const normalized = token.trim().toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized === "cmd" || normalized === "command" || normalized === "ctrl" || normalized === "control" || normalized === "mod") {
+    return "mod";
+  }
+  if (normalized === "option") {
+    return "alt";
+  }
+  return normalized;
+}
+
+function eventMatchesAccelerator(event: KeyboardEvent, accelerator: string): boolean {
+  const parts = accelerator
+    .split("+")
+    .map((part) => normalizeShortcutToken(part))
+    .filter(Boolean);
+  if (parts.length === 0) {
+    return false;
+  }
+  const keyToken = parts[parts.length - 1];
+  const modifierTokens = new Set(parts.slice(0, -1));
+  const requiresMod = modifierTokens.has("mod");
+  const requiresAlt = modifierTokens.has("alt");
+  const requiresShift = modifierTokens.has("shift");
+  if (Boolean(event.metaKey || event.ctrlKey) !== requiresMod) {
+    return false;
+  }
+  if (Boolean(event.altKey) !== requiresAlt) {
+    return false;
+  }
+  if (Boolean(event.shiftKey) !== requiresShift) {
+    return false;
+  }
+  return normalizeShortcutToken(event.key) === keyToken;
 }
 
 function markTerminalNodeStatuses(
@@ -241,53 +282,6 @@ function saveSelectedAgentId(graph: GraphDocument | null | undefined, selectedAg
     localStorage.setItem(SELECTED_AGENT_ID_STORAGE_KEY, JSON.stringify(storedSelections));
   } catch {
     // Ignore local persistence failures and keep the in-memory selection.
-  }
-}
-
-function normalizePersistedRunDocument(candidate: unknown): RunDocument | null {
-  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
-    return null;
-  }
-  const document = candidate as Partial<RunDocument>;
-  const documentId = typeof document.document_id === "string" ? document.document_id.trim() : "";
-  const name = typeof document.name === "string" ? document.name.trim() : "";
-  if (!documentId || !name) {
-    return null;
-  }
-  return {
-    document_id: documentId,
-    name,
-    mime_type: typeof document.mime_type === "string" ? document.mime_type : "application/octet-stream",
-    size_bytes: typeof document.size_bytes === "number" && Number.isFinite(document.size_bytes) ? Math.max(0, document.size_bytes) : 0,
-    storage_path: typeof document.storage_path === "string" ? document.storage_path : "",
-    text_content: typeof document.text_content === "string" ? document.text_content : "",
-    text_excerpt: typeof document.text_excerpt === "string" ? document.text_excerpt : "",
-    status: typeof document.status === "string" ? document.status : "ready",
-    error: typeof document.error === "string" ? document.error : null,
-  };
-}
-
-function loadRecentRunDocument(): RunDocument | null {
-  try {
-    const raw = localStorage.getItem(RECENT_RUN_DOCUMENT_STORAGE_KEY);
-    if (!raw) {
-      return null;
-    }
-    return normalizePersistedRunDocument(JSON.parse(raw));
-  } catch {
-    return null;
-  }
-}
-
-function saveRecentRunDocument(document: RunDocument | null | undefined): void {
-  try {
-    if (!document) {
-      localStorage.removeItem(RECENT_RUN_DOCUMENT_STORAGE_KEY);
-      return;
-    }
-    localStorage.setItem(RECENT_RUN_DOCUMENT_STORAGE_KEY, JSON.stringify(document));
-  } catch {
-    // Ignore local persistence failures and keep the in-memory document list.
   }
 }
 
@@ -628,10 +622,7 @@ export default function App() {
   const [visualizerResetVersion, setVisualizerResetVersion] = useState(0);
   const [input, setInput] = useState(DEFAULT_INPUT);
   const [savedInputPrompt, setSavedInputPrompt] = useState(DEFAULT_INPUT);
-  const [runDocuments, setRunDocuments] = useState<RunDocument[]>(() => {
-    const persistedDocument = loadRecentRunDocument();
-    return persistedDocument ? [persistedDocument] : [];
-  });
+  const [projectFiles, setProjectFiles] = useState<ProjectFile[]>([]);
   const [runFileListing, setRunFileListing] = useState<RunFilesystemListing | null>(null);
   const [selectedRunFilePath, setSelectedRunFilePath] = useState<string | null>(null);
   const [selectedRunFileContent, setSelectedRunFileContent] = useState<RunFilesystemFileContent | null>(null);
@@ -639,8 +630,9 @@ export default function App() {
   const [isRunFileContentLoading, setIsRunFileContentLoading] = useState(false);
   const [runFilesError, setRunFilesError] = useState<string | null>(null);
   const [runFileContentError, setRunFileContentError] = useState<string | null>(null);
-  const [isUploadingDocuments, setIsUploadingDocuments] = useState(false);
-  const [documentUploadError, setDocumentUploadError] = useState<string | null>(null);
+  const [isUploadingProjectFiles, setIsUploadingProjectFiles] = useState(false);
+  const [isProjectFilesLoading, setIsProjectFilesLoading] = useState(false);
+  const [projectFileError, setProjectFileError] = useState<string | null>(null);
   const [events, setEvents] = useState<RuntimeEvent[]>([]);
   const [runState, setRunState] = useState<RunState | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -683,11 +675,8 @@ export default function App() {
   const focusedEventGroups = focusedRunProjection.eventGroups;
   const draftGraphSnapshot = useMemo(() => serializeGraphSnapshot(draftGraph), [draftGraph]);
   const hasUnsavedChanges = (Boolean(draftGraph) && draftGraphSnapshot !== savedGraphSnapshot) || input !== savedInputPrompt;
-  const readyRunDocuments = useMemo(() => runDocuments.filter((document) => document.status === "ready"), [runDocuments]);
-  const visibleRunDocuments = useMemo(
-    () => ((selectedRunState?.documents?.length ?? 0) > 0 ? selectedRunState?.documents ?? [] : runDocuments),
-    [runDocuments, selectedRunState],
-  );
+  const projectFileGraphId = selectedGraphId || draftGraph?.graph_id || "";
+  const readyProjectFiles = useMemo(() => projectFiles.filter((file) => file.status === "ready"), [projectFiles]);
   const visibleRunFiles = useMemo(() => runFileListing?.files ?? [], [runFileListing]);
   const selectedRunFile = useMemo(
     () => visibleRunFiles.find((file) => file.path === selectedRunFilePath) ?? null,
@@ -701,11 +690,6 @@ export default function App() {
   useEffect(() => {
     inputRef.current = input;
   }, [input]);
-
-  useEffect(() => {
-    const mostRecentReadyDocument = [...runDocuments].reverse().find((document) => document.status === "ready") ?? null;
-    saveRecentRunDocument(mostRecentReadyDocument);
-  }, [runDocuments]);
 
   const refreshRunFiles = useCallback(async (runId: string) => {
     setRunFilesError(null);
@@ -781,7 +765,7 @@ export default function App() {
   }, []);
 
   const hydrateSelectedGraph = useCallback((graph: GraphDocument) => {
-    const nextGraph = layoutGraphDocument(normalizeGraphDocument(graph));
+    const nextGraph = normalizeGraphDocument(graph);
     resetHistory(nextGraph);
     setSavedGraphSnapshot(serializeGraphSnapshot(nextGraph));
     const nextInput = getSavedInputPrompt(nextGraph);
@@ -793,26 +777,95 @@ export default function App() {
     return nextGraph;
   }, [resetHistory]);
 
-  const handleDocumentUpload = useCallback(async (fileList: FileList | null) => {
-    if (!fileList || fileList.length === 0) {
+  const refreshProjectFiles = useCallback(async (graphId: string) => {
+    if (!graphId.trim()) {
+      setProjectFiles([]);
+      setProjectFileError(null);
       return;
     }
-    setDocumentUploadError(null);
-    setIsUploadingDocuments(true);
+    setProjectFileError(null);
+    setIsProjectFilesLoading(true);
     try {
-      const uploadedDocuments = await uploadRunDocuments(Array.from(fileList));
-      setRunDocuments((current) => [...current, ...uploadedDocuments]);
-    } catch (uploadError) {
-      const message = uploadError instanceof Error ? uploadError.message : "Unable to upload documents.";
-      setDocumentUploadError(message);
+      const files = await fetchProjectFiles(graphId);
+      setProjectFiles(files);
+    } catch (loadError) {
+      const message = loadError instanceof Error ? loadError.message : "Unable to load project files.";
+      setProjectFileError(message);
+      setProjectFiles([]);
     } finally {
-      setIsUploadingDocuments(false);
+      setIsProjectFilesLoading(false);
     }
   }, []);
 
-  const removeRunDocument = useCallback((documentId: string) => {
-    setRunDocuments((current) => current.filter((document) => document.document_id !== documentId));
+  const handleProjectFileUpload = useCallback(async (graphId: string, fileList: FileList | null) => {
+    if (!graphId.trim() || !fileList || fileList.length === 0) {
+      return;
+    }
+    setProjectFileError(null);
+    setIsUploadingProjectFiles(true);
+    try {
+      const uploadedFiles = await uploadProjectFiles(graphId, Array.from(fileList));
+      setProjectFiles((current) => [...current, ...uploadedFiles]);
+    } catch (uploadError) {
+      const message = uploadError instanceof Error ? uploadError.message : "Unable to upload project files.";
+      setProjectFileError(message);
+    } finally {
+      setIsUploadingProjectFiles(false);
+    }
   }, []);
+
+  const removeProjectFile = useCallback(async (graphId: string, fileId: string) => {
+    if (!graphId.trim()) {
+      return;
+    }
+    setProjectFileError(null);
+    try {
+      await deleteProjectFile(graphId, fileId);
+      setProjectFiles((current) => current.filter((file) => file.file_id !== fileId));
+    } catch (removeError) {
+      const message = removeError instanceof Error ? removeError.message : "Unable to remove project file.";
+      setProjectFileError(message);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!projectFileGraphId) {
+      setProjectFiles([]);
+      setProjectFileError(null);
+      setIsProjectFilesLoading(false);
+      return;
+    }
+    void refreshProjectFiles(projectFileGraphId);
+  }, [projectFileGraphId, refreshProjectFiles]);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      const saveGraphAccelerator = userPreferences.keyboardShortcuts.saveGraph.accelerator.trim();
+      if (saveGraphAccelerator && eventMatchesAccelerator(event, saveGraphAccelerator)) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        if (!draftGraph || isSaving) {
+          return;
+        }
+        void saveCurrentGraph();
+        return;
+      }
+      const runGraphAccelerator = userPreferences.keyboardShortcuts.runGraph.accelerator.trim();
+      if (runGraphAccelerator && eventMatchesAccelerator(event, runGraphAccelerator)) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        if (!draftGraph || isSaving || isRunning || isResettingRuntime) {
+          return;
+        }
+        void handleRun();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
+    return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
+  }, [draftGraph, handleRun, isResettingRuntime, isRunning, isSaving, saveCurrentGraph, userPreferences.keyboardShortcuts]);
 
   const clearRunPolling = useCallback(() => {
     if (runPollTimeoutRef.current === null) {
@@ -1258,10 +1311,6 @@ export default function App() {
     if (!draftGraph) {
       return;
     }
-    if (isUploadingDocuments) {
-      setError("Wait for document uploads to finish before starting the run.");
-      return;
-    }
     const agentIdsToRun = isTestEnvironment(draftGraph) ? getSelectedEnvironmentAgentIds(draftGraph, environmentAgentSelection) : undefined;
     if (isTestEnvironment(draftGraph) && (!agentIdsToRun || agentIdsToRun.length === 0)) {
       setError("Turn on at least one agent before running the environment.");
@@ -1277,7 +1326,6 @@ export default function App() {
     sourceRef.current?.close();
     sourceRef.current = null;
     setError(null);
-    setDocumentUploadError(null);
     cancelPersistedRunSnapshot(savedGraph.graph_id);
     clearPersistedRunSnapshot(savedGraph.graph_id);
     setActiveRunId(null);
@@ -1290,10 +1338,10 @@ export default function App() {
     }
 
     try {
-      const runId = await startRun(savedGraph.graph_id, input, { agent_ids: agentIdsToRun, documents: readyRunDocuments });
+      const runId = await startRun(savedGraph.graph_id, input, { agent_ids: agentIdsToRun });
       setActiveRunId(runId);
-      setRunState(createPendingRunState(savedGraph, runId, input, agentIdsToRun, readyRunDocuments));
-      connectToRunStream(runId, savedGraph.graph_id, input, readyRunDocuments);
+      setRunState(createPendingRunState(savedGraph, runId, input, agentIdsToRun));
+      connectToRunStream(runId, savedGraph.graph_id, input);
     } catch (runError) {
       const message = runError instanceof Error ? runError.message : "Unable to start run.";
       setError(message);
@@ -1383,7 +1431,7 @@ export default function App() {
                     type="button"
                     className="primary-button"
                     onClick={() => void handleRun()}
-                    disabled={!draftGraph || isRunning || isSaving || isResettingRuntime || isUploadingDocuments}
+                    disabled={!draftGraph || isRunning || isSaving || isResettingRuntime}
                   >
                     {isRunning ? "Running..." : isEnvironment ? "Run Environment" : "Run Graph"}
                   </button>
@@ -1515,64 +1563,59 @@ export default function App() {
                 <div className="mosaic-section-heading">
                   <span className="mosaic-section-kicker">Inputs</span>
                   <div className="execution-documents-header">
-                    <strong>Run Documents</strong>
+                    <strong>Project Files</strong>
                     <span>
-                      {readyRunDocuments.length} ready
-                      {runDocuments.length !== readyRunDocuments.length ? ` / ${runDocuments.length} uploaded` : ""}
+                      {readyProjectFiles.length} ready
+                      {projectFiles.length !== readyProjectFiles.length ? ` / ${projectFiles.length} uploaded` : ""}
                     </span>
                   </div>
                 </div>
                 <p>
-                  Upload reference files for this editor session. Ready documents are available during the run as <code>{"{documents}"}</code>.
+                  Upload reusable files into this project so spreadsheet-backed nodes can select them later.
                 </p>
                 <label className="execution-documents-picker">
-                  <span>{isUploadingDocuments ? "Uploading..." : "Add Documents"}</span>
+                  <span>{isUploadingProjectFiles ? "Uploading..." : "Add Project Files"}</span>
                   <input
                     type="file"
                     accept=".txt,.md,.markdown,.json,.csv,.xlsx,.pdf,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     multiple
-                    disabled={isRunning || isSaving || isResettingRuntime || isUploadingDocuments}
+                    disabled={!projectFileGraphId || isSaving || isResettingRuntime || isUploadingProjectFiles}
                     onChange={(event) => {
-                      void handleDocumentUpload(event.target.files);
+                      void handleProjectFileUpload(projectFileGraphId, event.target.files);
                       event.target.value = "";
                     }}
                   />
                 </label>
-                {visibleRunDocuments.length > 0 ? (
+                {projectFiles.length > 0 ? (
                   <div className="execution-documents-list">
-                    {visibleRunDocuments.map((document) => (
-                      <div key={document.document_id} className={`execution-document-card is-${document.status}`}>
+                    {projectFiles.map((file) => (
+                      <div key={file.file_id} className={`execution-document-card is-${file.status}`}>
                         <div className="execution-document-card-header">
                           <div>
-                            <strong>{document.name}</strong>
+                            <strong>{file.name}</strong>
                             <span>
-                              {formatDocumentSize(document.size_bytes)} · {document.mime_type || "document"}
+                              {formatDocumentSize(file.size_bytes)} · {file.mime_type || "file"}
                             </span>
                           </div>
                           <button
                             type="button"
                             className="secondary-button execution-document-remove"
-                            onClick={() => removeRunDocument(document.document_id)}
-                            disabled={isRunning || isSaving || isResettingRuntime}
+                            onClick={() => void removeProjectFile(projectFileGraphId, file.file_id)}
+                            disabled={!projectFileGraphId || isSaving || isResettingRuntime}
                           >
                             Remove
                           </button>
                         </div>
-                        <span className={`execution-document-status execution-document-status--${document.status}`}>{document.status}</span>
-                        {document.text_excerpt ? <pre className="execution-document-excerpt">{document.text_excerpt}</pre> : null}
-                        {document.error ? <span className="execution-document-error">{document.error}</span> : null}
+                        <span className={`execution-document-status execution-document-status--${file.status}`}>{file.status}</span>
+                        <pre className="execution-document-excerpt">{file.storage_path}</pre>
+                        {file.error ? <span className="execution-document-error">{file.error}</span> : null}
                       </div>
                     ))}
                   </div>
                 ) : (
-                  <p>No documents attached yet.</p>
+                  <p>{isProjectFilesLoading ? "Loading project files..." : "No project files uploaded yet."}</p>
                 )}
-                {selectedRunState?.documents && selectedRunState.documents.length > 0 ? (
-                  <p className="execution-documents-run-note">
-                    Current run includes {selectedRunState.documents.length} document{selectedRunState.documents.length === 1 ? "" : "s"}.
-                  </p>
-                ) : null}
-                {documentUploadError ? <p className="error-text">{documentUploadError}</p> : null}
+                {projectFileError ? <p className="error-text">{projectFileError}</p> : null}
               </div>
 
               <div className="mosaic-tile panel mosaic-files">
@@ -1693,6 +1736,7 @@ export default function App() {
           runSummary={focusedRunSummary}
           eventGroups={focusedEventGroups}
           catalog={catalog}
+          availableProjectFiles={projectFiles}
           selectedNodeId={selectedNodeId}
           selectedEdgeId={selectedEdgeId}
           onGraphChange={handleCanvasGraphChange}

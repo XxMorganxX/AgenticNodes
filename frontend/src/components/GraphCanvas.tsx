@@ -43,6 +43,7 @@ import {
   getApiToolContextTargetAnchorRatio,
   getNextAvailableParallelSplitterOutputHandleId,
   getNodeSourceHandleAnchorRatio,
+  getParallelSplitterOutputHandleIds,
   inferToolEdgeSourceHandle,
   isApiModelNode,
   isApiOutputHandleId,
@@ -71,7 +72,7 @@ import {
   type FocusedRunProjection,
   type FocusedRunSummary,
 } from "../lib/runVisualization";
-import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition, RunState, RuntimeEvent } from "../lib/types";
+import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition, ProjectFile, RunState, RuntimeEvent } from "../lib/types";
 
 type GraphCanvasProps = {
   graph: GraphDefinition | null;
@@ -89,6 +90,7 @@ type GraphCanvasProps = {
   runSummary?: FocusedRunSummary | null;
   eventGroups?: FocusedEventGroup[];
   catalog: EditorCatalog | null;
+  availableProjectFiles?: ProjectFile[];
   selectedNodeId: string | null;
   selectedEdgeId: string | null;
   onGraphChange: (graph: GraphDefinition) => void;
@@ -241,6 +243,9 @@ const NODE_STYLE = {
 } as const;
 const NODE_WIDTH = 320;
 const MODEL_NODE_WIDTH = 380;
+const PARALLEL_SPLITTER_NODE_WIDTH = 420;
+const PARALLEL_SPLITTER_NODE_HEIGHT = 356;
+const PARALLEL_SPLITTER_NODE_REGION_HEIGHT = 396;
 const NODE_HEIGHT = 178;
 const NODE_REGION_HEIGHT = 198;
 const MODEL_NODE_HEIGHT = 264;
@@ -875,6 +880,7 @@ export function GraphCanvas({
   runSummary,
   eventGroups = [],
   catalog,
+  availableProjectFiles = [],
   selectedNodeId,
   selectedEdgeId,
   onGraphChange,
@@ -1351,6 +1357,30 @@ export function GraphCanvas({
     [graph, onGraphChange],
   );
 
+  const handleSelectSpreadsheetFile = useCallback(
+    (nodeId: string, fileId: string) => {
+      if (!graph) {
+        return;
+      }
+      const selectedFile = availableProjectFiles.find((file) => file.file_id === fileId) ?? null;
+      if (!selectedFile) {
+        return;
+      }
+      onGraphChange(
+        updateNode(graph, nodeId, (node) => ({
+          ...node,
+          config: {
+            ...node.config,
+            project_file_id: selectedFile.file_id,
+            project_file_name: selectedFile.name,
+            file_path: selectedFile.storage_path,
+          },
+        })),
+      );
+    },
+    [availableProjectFiles, graph, onGraphChange],
+  );
+
   const handleFlowInit = useCallback((instance: ReactFlowInstance) => {
     const viewport = instance.getViewport();
     setFlowInstance(instance);
@@ -1369,6 +1399,9 @@ export function GraphCanvas({
     }
     if (node.kind === "model") {
       return { width: MODEL_NODE_WIDTH, height: MODEL_NODE_HEIGHT, regionHeight: MODEL_NODE_REGION_HEIGHT };
+    }
+    if (node.provider_id === "core.parallel_splitter") {
+      return { width: PARALLEL_SPLITTER_NODE_WIDTH, height: PARALLEL_SPLITTER_NODE_HEIGHT, regionHeight: PARALLEL_SPLITTER_NODE_REGION_HEIGHT };
     }
     return { width: NODE_WIDTH, height: NODE_HEIGHT, regionHeight: NODE_REGION_HEIGHT };
   }, []);
@@ -2555,6 +2588,18 @@ export function GraphCanvas({
       if (!nextEdge) {
         return false;
       }
+      const sourceNode = baseGraph.nodes.find((node) => node.id === sourceId);
+      if (sourceNode?.provider_id === "core.parallel_splitter") {
+        const graphAfterConflictRemoval = nextBaseGraph;
+        const correctHandle = getNextAvailableParallelSplitterOutputHandleId(
+          graphAfterConflictRemoval,
+          sourceNode,
+          nextEdge.source_handle_id,
+        );
+        if (correctHandle !== nextEdge.source_handle_id) {
+          nextEdge.source_handle_id = correctHandle;
+        }
+      }
       onGraphChange(
         normalizeParallelSplitterHandleAssignments(
           rebalanceOutgoingTargets(
@@ -3607,6 +3652,7 @@ export function GraphCanvas({
                 graph: null,
                 catalog,
                 runState,
+                availableProjectFiles,
                 kindColor: KIND_COLORS[node.kind] ?? "#8486a5",
                 status: "idle",
                 preview: false,
@@ -3619,6 +3665,7 @@ export function GraphCanvas({
                 onOpenDisplayResponse: handleOpenDisplayResponse,
                 onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
                 onOpenConditionResults: handleOpenConditionResults,
+                onSelectSpreadsheetFile: handleSelectSpreadsheetFile,
                 onHandlePointerDown: handleNodeHandlePointerDown,
                 onJunctionPointerDown: handleJunctionPointerDown,
               },
@@ -3703,6 +3750,7 @@ export function GraphCanvas({
         previousData.tooltipGraph === tooltipGraph &&
         previousData.catalog === catalog &&
         previousData.runState === runState &&
+        previousData.availableProjectFiles === availableProjectFiles &&
         previousData.kindColor === kindColor &&
         previousData.status === status &&
         previousData.runtimeOutput === runtimeNodeState?.latestOutput &&
@@ -3718,6 +3766,7 @@ export function GraphCanvas({
         previousData.onOpenDisplayResponse === handleOpenDisplayResponse &&
         previousData.onOpenContextBuilderPayload === handleOpenContextBuilderPayload &&
         previousData.onOpenConditionResults === handleOpenConditionResults &&
+        previousData.onSelectSpreadsheetFile === handleSelectSpreadsheetFile &&
         previousData.onHandlePointerDown === handleNodeHandlePointerDown &&
         previousData.onJunctionPointerDown === handleJunctionPointerDown
           ? previousData
@@ -3727,6 +3776,7 @@ export function GraphCanvas({
               tooltipGraph,
               catalog,
               runState,
+              availableProjectFiles,
               kindColor,
               status,
               runtimeOutput: runtimeNodeState?.latestOutput,
@@ -3743,6 +3793,7 @@ export function GraphCanvas({
               onOpenDisplayResponse: handleOpenDisplayResponse,
               onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
               onOpenConditionResults: handleOpenConditionResults,
+              onSelectSpreadsheetFile: handleSelectSpreadsheetFile,
               onHandlePointerDown: handleNodeHandlePointerDown,
               onJunctionPointerDown: handleJunctionPointerDown,
             };
@@ -3785,6 +3836,7 @@ export function GraphCanvas({
     }
     return nextNodes;
   }, [
+    availableProjectFiles,
     catalog,
     dragDiagnosticsEnabled,
     dragRenderTick,
@@ -3799,6 +3851,7 @@ export function GraphCanvas({
     handleOpenPromptBlockDetails,
     handleOpenProviderDetails,
     handleOpenConditionResults,
+    handleSelectSpreadsheetFile,
     handleToggleExecutorRetries,
     handleOpenToolDetails,
     handleToggleTooltip,
@@ -3830,7 +3883,7 @@ export function GraphCanvas({
           minY: Math.min(result.minY, node.position.y),
           maxX: Math.max(
             result.maxX,
-            node.position.x + (typeof node.width === "number" ? node.width : node.data.node.kind === "model" ? MODEL_NODE_WIDTH : NODE_WIDTH),
+            node.position.x + (typeof node.width === "number" ? node.width : node.data.node.kind === "model" ? MODEL_NODE_WIDTH : node.data.node.provider_id === "core.parallel_splitter" ? PARALLEL_SPLITTER_NODE_WIDTH : NODE_WIDTH),
           ),
           maxY: Math.max(result.maxY, node.position.y + (typeof node.height === "number" ? node.height : NODE_HEIGHT)),
         }),
@@ -3846,7 +3899,7 @@ export function GraphCanvas({
       }
       const largestNodeWidth = memberNodes.reduce(
         (maxWidth, node) =>
-          Math.max(maxWidth, typeof node.width === "number" ? node.width : node.data.node.kind === "model" ? MODEL_NODE_WIDTH : NODE_WIDTH),
+          Math.max(maxWidth, typeof node.width === "number" ? node.width : node.data.node.kind === "model" ? MODEL_NODE_WIDTH : node.data.node.provider_id === "core.parallel_splitter" ? PARALLEL_SPLITTER_NODE_WIDTH : NODE_WIDTH),
         0,
       );
       const largestNodeHeight = memberNodes.reduce(
@@ -4268,6 +4321,15 @@ export function GraphCanvas({
       let nextGraph = graph;
       changes.forEach((change) => {
         if (change.type === "remove") {
+          if (isConnectingRef.current) {
+            const removedEdge = nextGraph.edges.find((edge) => edge.id === change.id);
+            const removedSourceNode = removedEdge
+              ? nextGraph.nodes.find((node) => node.id === removedEdge.source_id)
+              : undefined;
+            if (removedSourceNode?.provider_id === "core.parallel_splitter") {
+              return;
+            }
+          }
           nextGraph = {
             ...nextGraph,
             edges: nextGraph.edges.filter((edge) => edge.id !== change.id),
@@ -4280,7 +4342,7 @@ export function GraphCanvas({
           requestPrimarySelectionChange(null, change.id);
         }
       });
-      onGraphChange(nextGraph);
+      onGraphChange(normalizeParallelSplitterHandleAssignments(nextGraph));
     },
     [clearCanvasSelection, graph, onGraphChange, requestPrimarySelectionChange, selectedEdgeIdSet],
   );
@@ -4294,6 +4356,17 @@ export function GraphCanvas({
       const targetNode = graph.nodes.find((node) => node.id === connection.target);
       if (!canConnectNodes(sourceNode, targetNode, catalog)) {
         return false;
+      }
+      if (sourceNode?.provider_id === "core.parallel_splitter") {
+        const splitterHandles = getParallelSplitterOutputHandleIds(graph, sourceNode);
+        const usedHandles = new Set(
+          graph.edges
+            .filter((edge) => edge.source_id === connection.source && edge.kind !== "binding")
+            .map((edge) => edge.source_handle_id ?? ""),
+        );
+        if (usedHandles.size >= splitterHandles.length) {
+          return false;
+        }
       }
       const effectiveSourceHandleId = getEffectiveSourceHandleId(sourceNode, connection.sourceHandle ?? null);
       const effectiveTargetHandleId = getEffectiveTargetHandleId(targetNode, connection.targetHandle ?? null);
@@ -4944,6 +5017,7 @@ export function GraphCanvas({
                 <GraphInspector
                   graph={graph}
                   catalog={catalog}
+                  availableProjectFiles={availableProjectFiles}
                   runState={runState}
                   selectedNodeId={selectedNodeId}
                   selectedEdgeId={selectedEdgeId}

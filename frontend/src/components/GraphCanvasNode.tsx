@@ -11,7 +11,6 @@ import {
   CONTROL_FLOW_IF_HANDLE_ID,
   CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
   createParallelSplitterOutputHandleId,
-  getNodeSourceHandleAnchorRatio,
   getParallelSplitterOutputHandleIds,
   inferModelResponseMode,
   getApiToolContextTargetAnchorRatio,
@@ -35,7 +34,7 @@ import type { NodeTooltipData } from "../lib/nodeTooltip";
 import { getContextBuilderBindings } from "../lib/contextBuilderBindings";
 import type { ContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
 import { formatRunStatusLabel } from "../lib/runVisualization";
-import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "../lib/types";
+import type { EditorCatalog, GraphDefinition, GraphNode, ProjectFile, RunState } from "../lib/types";
 
 export type GraphCanvasNodeData = {
   node: GraphNode;
@@ -43,6 +42,7 @@ export type GraphCanvasNodeData = {
   tooltipGraph?: GraphDefinition | null;
   catalog: EditorCatalog | null;
   runState: RunState | null;
+  availableProjectFiles?: ProjectFile[];
   runtimeOutput?: unknown;
   contextBuilderRuntime?: ContextBuilderRuntimeView | null;
   contextBuilderRuntimeKey?: string;
@@ -59,11 +59,13 @@ export type GraphCanvasNodeData = {
   onOpenDisplayResponse: (nodeId: string) => void;
   onOpenContextBuilderPayload: (nodeId: string) => void;
   onOpenConditionResults: (nodeId: string) => void;
+  onSelectSpreadsheetFile: (nodeId: string, fileId: string) => void;
   onHandlePointerDown: (nodeId: string, handleType: "source" | "target", handleId: string | null) => boolean;
   onJunctionPointerDown: (nodeId: string, clientPosition: { x: number; y: number }) => void;
 };
 
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
+const SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision";
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
 
@@ -183,6 +185,11 @@ function configuredResponseMode(node: GraphNode): "auto" | "tool_call" | "messag
   return value === "tool_call" || value === "message" || value === "auto" ? value : "auto";
 }
 
+function isSpreadsheetProjectFile(file: ProjectFile): boolean {
+  const candidate = `${file.name} ${file.storage_path}`.toLowerCase();
+  return file.status === "ready" && (candidate.endsWith(".csv") || candidate.endsWith(".xlsx"));
+}
+
 function GraphCanvasNodeComponent({
   data,
   selected,
@@ -193,6 +200,7 @@ function GraphCanvasNodeComponent({
     tooltipGraph = null,
     catalog,
     runState,
+    availableProjectFiles = [],
     runtimeOutput,
     contextBuilderRuntime = null,
     kindColor,
@@ -208,6 +216,7 @@ function GraphCanvasNodeComponent({
     onOpenDisplayResponse,
     onOpenContextBuilderPayload,
     onOpenConditionResults,
+    onSelectSpreadsheetFile,
     onJunctionPointerDown,
   } = data;
   const isWireJunction = isWireJunctionNode(node);
@@ -363,6 +372,8 @@ function GraphCanvasNodeComponent({
   const modelEffectiveResponseMode = isModelNode ? inferModelResponseMode(graph, node) : null;
   const executorConfiguredResponseMode = node.kind === "mcp_tool_executor" ? configuredResponseMode(node) : null;
   const isSpreadsheetRowNode = node.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
+  const isSpreadsheetMatrixDecisionNode = node.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID;
+  const isSpreadsheetBackedNode = isSpreadsheetRowNode || isSpreadsheetMatrixDecisionNode;
   const spreadsheetIteratorState = isSpreadsheetRowNode ? runState?.iterator_states?.[node.id] : undefined;
   const spreadsheetIteratorStatus =
     spreadsheetIteratorState && typeof spreadsheetIteratorState.status === "string" ? spreadsheetIteratorState.status : null;
@@ -378,6 +389,17 @@ function GraphCanvasNodeComponent({
         return `Row ${current} / ${total}`;
       })()
     : null;
+  const availableSpreadsheetFiles = availableProjectFiles.filter(isSpreadsheetProjectFile);
+  const selectedSpreadsheetFile =
+    availableSpreadsheetFiles.find((file) => file.file_id === String(node.config.project_file_id ?? "").trim()) ??
+    availableSpreadsheetFiles.find((file) => file.storage_path === String(node.config.file_path ?? "").trim()) ??
+    availableSpreadsheetFiles.find((file) => file.name === String(node.config.project_file_name ?? "").trim()) ??
+    null;
+  const hasManualSpreadsheetPath = !selectedSpreadsheetFile && String(node.config.file_path ?? "").trim().length > 0;
+  const spreadsheetSelectValue = selectedSpreadsheetFile?.file_id ?? (hasManualSpreadsheetPath ? "__manual__" : "");
+  const spreadsheetSelectLabel =
+    selectedSpreadsheetFile?.name ??
+    (hasManualSpreadsheetPath ? String(node.config.file_path ?? "").trim().split("/").pop() ?? "Manual path" : "No spreadsheet");
   const logicBranchSummary =
     isLogicConditionsNode &&
     runtimeOutput &&
@@ -457,6 +479,8 @@ function GraphCanvasNodeComponent({
     isContextProviderNode ? "graph-node-card--tool-context-provider" : ""
   } ${
     isControlFlowUnitNode ? "graph-node-card--control-flow" : ""
+  } ${
+    isParallelSplitterNode ? "graph-node-card--parallel-splitter" : ""
   } ${
     isLogicConditionsNode ? "graph-node-card--logic-conditions" : ""
   } ${
@@ -615,6 +639,33 @@ function GraphCanvasNodeComponent({
             }`}
           >
             {spreadsheetRowSummary}
+          </div>
+        ) : null}
+        {!preview && isSpreadsheetBackedNode && (availableSpreadsheetFiles.length > 0 || hasManualSpreadsheetPath) ? (
+          <div className="graph-node-inline-select-row">
+            <span className="graph-node-inline-toggle-label">Spreadsheet</span>
+            <select
+              className="graph-node-inline-select"
+              value={spreadsheetSelectValue}
+              aria-label={`Select spreadsheet for ${displayLabel}`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => event.stopPropagation()}
+              onChange={(event) => {
+                event.stopPropagation();
+                const nextFileId = event.target.value;
+                if (!nextFileId || nextFileId === "__manual__") {
+                  return;
+                }
+                onSelectSpreadsheetFile(node.id, nextFileId);
+              }}
+            >
+              {hasManualSpreadsheetPath ? <option value="__manual__">Manual: {spreadsheetSelectLabel}</option> : null}
+              {availableSpreadsheetFiles.map((file) => (
+                <option key={file.file_id} value={file.file_id}>
+                  {file.name}
+                </option>
+              ))}
+            </select>
           </div>
         ) : null}
         {logicConditionDisplayText ? (
@@ -855,28 +906,23 @@ function GraphCanvasNodeComponent({
         </>
       ) : null}
       {showSourceHandle && isControlFlowUnitNode && isParallelSplitterNode ? (
-        <>
+        <div className="graph-parallel-splitter-handles">
           {parallelSplitterOutputHandles.map((handleId, index) => {
-            const style = {
-              top: `${getNodeSourceHandleAnchorRatio(node, handleId, graph) * 100}%`,
-            } satisfies CSSProperties;
-            const isSpareHandle = index === parallelSplitterOutputHandles.length - 1;
             return (
-              <div key={handleId}>
-                <div className="graph-node-output-port graph-node-output-port--success" style={style} aria-hidden="true">
-                  <span className="graph-node-output-port-label">{isSpareHandle ? "New Branch" : `Branch ${index + 1}`}</span>
+              <div key={handleId} className="graph-parallel-splitter-handle-slot">
+                <div className="graph-node-output-port graph-node-output-port--success graph-parallel-splitter-port" aria-hidden="true">
+                  <span className="graph-node-output-port-label">{`Branch ${index + 1}`}</span>
                 </div>
                 <Handle
                   id={handleId}
                   type="source"
                   position={Position.Right}
-                  className="graph-node-handle graph-node-handle-source graph-node-handle-source--success"
-                  style={style}
+                  className="graph-node-handle graph-node-handle-source graph-node-handle-source--success graph-parallel-splitter-handle"
                 />
               </div>
             );
           })}
-        </>
+        </div>
       ) : null}
       {showSourceHandle && isControlFlowUnitNode && isLogicConditionsNode ? (
         <>

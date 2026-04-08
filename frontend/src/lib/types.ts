@@ -290,6 +290,18 @@ export type RunDocument = {
   error?: string | null;
 };
 
+export type ProjectFile = {
+  file_id: string;
+  graph_id: string;
+  name: string;
+  mime_type: string;
+  size_bytes: number;
+  storage_path: string;
+  status: string;
+  created_at: string;
+  error?: string | null;
+};
+
 export type RunFilesystemFile = {
   path: string;
   name: string;

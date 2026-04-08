@@ -4,6 +4,7 @@ import type {
   McpServerDraft,
   McpServerStatus,
   McpServerTestResult,
+  ProjectFile,
   ProviderDiagnosticsResult,
   ProviderPreflightResult,
   RunDocument,
@@ -106,6 +107,40 @@ export async function deleteGraph(graphId: string): Promise<void> {
   });
   if (!response.ok) {
     throw new Error("Failed to delete graph.");
+  }
+}
+
+export async function fetchProjectFiles(graphId: string): Promise<ProjectFile[]> {
+  const response = await fetch(`${API_BASE_URL}/api/graphs/${graphId}/files`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to load project files."));
+  }
+  const payload = (await response.json()) as { files?: ProjectFile[] };
+  return Array.isArray(payload.files) ? payload.files : [];
+}
+
+export async function uploadProjectFiles(graphId: string, files: File[]): Promise<ProjectFile[]> {
+  const formData = new FormData();
+  files.forEach((file) => formData.append("files", file));
+  const response = await fetch(`${API_BASE_URL}/api/graphs/${graphId}/files/upload`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to upload project files."));
+  }
+  const payload = (await response.json()) as { files?: ProjectFile[] };
+  return Array.isArray(payload.files) ? payload.files : [];
+}
+
+export async function deleteProjectFile(graphId: string, fileId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/graphs/${graphId}/files/${fileId}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to delete project file."));
   }
 }
 

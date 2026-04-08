@@ -84,6 +84,83 @@ def linkedin_graph_payload(
     }
 
 
+def linkedin_graph_with_payload_extractor() -> dict[str, object]:
+    return {
+        "graph_id": "linkedin-fetch-via-extractor-graph",
+        "name": "LinkedIn Fetch Via Extractor Graph",
+        "description": "",
+        "version": "1.0",
+        "start_node_id": "start",
+        "nodes": [
+            {
+                "id": "start",
+                "kind": "input",
+                "category": "start",
+                "label": "Start",
+                "provider_id": "start.manual_run",
+                "provider_label": "Run Button Start",
+                "config": {"input_binding": {"type": "input_payload"}},
+                "position": {"x": 0, "y": 0},
+            },
+            {
+                "id": "extract",
+                "kind": "data",
+                "category": "data",
+                "label": "Payload Field Extractor",
+                "provider_id": "core.runtime_normalizer",
+                "provider_label": "Payload Field Extractor",
+                "config": {
+                    "mode": "runtime_normalizer",
+                    "input_binding": {"type": "input_payload"},
+                    "field_name": "LinkedInURL",
+                    "fallback_field_names": [],
+                    "preferred_path": "",
+                    "case_sensitive": False,
+                    "max_matches": 25,
+                },
+                "position": {"x": 220, "y": 0},
+            },
+            {
+                "id": "linkedin",
+                "kind": "data",
+                "category": "data",
+                "label": "LinkedIn Profile Fetch",
+                "provider_id": "core.linkedin_profile_fetch",
+                "provider_label": "LinkedIn Profile Fetch",
+                "config": {
+                    "mode": "linkedin_profile_fetch",
+                    "input_binding": {"type": "input_payload"},
+                    "url_field": "url",
+                    "linkedin_data_dir": "/Users/morgannstuart/Desktop/Linkedin Data",
+                    "session_state_path": "",
+                    "headless": False,
+                    "navigation_timeout_ms": 45000,
+                    "page_settle_ms": 3000,
+                    "use_cache": True,
+                    "force_refresh": False,
+                    "workspace_cache_path_template": "cache/linkedin/{cache_key}.json",
+                },
+                "position": {"x": 440, "y": 0},
+            },
+            {
+                "id": "finish",
+                "kind": "output",
+                "category": "end",
+                "label": "Finish",
+                "provider_id": "core.output",
+                "provider_label": "Core Output Node",
+                "config": {"source_binding": {"type": "latest_payload", "source": "linkedin"}},
+                "position": {"x": 660, "y": 0},
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source_id": "start", "target_id": "extract", "label": "", "kind": "standard", "priority": 100},
+            {"id": "e2", "source_id": "extract", "target_id": "linkedin", "label": "", "kind": "standard", "priority": 100},
+            {"id": "e3", "source_id": "linkedin", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+        ],
+    }
+
+
 def sample_profile(name: str, *, status: str = "ok", page_type: str = "profile", title: str | None = None) -> dict[str, object]:
     resolved_title = title or f"{name} | LinkedIn"
     return {
@@ -196,6 +273,42 @@ class LinkedInProfileFetchTests(unittest.TestCase):
         self.assertTrue(second_workspace_copy.exists())
         self.assertEqual(json.loads(first_workspace_copy.read_text()), profile_payload)
         self.assertEqual(json.loads(second_workspace_copy.read_text()), profile_payload)
+
+    def test_runtime_accepts_upstream_payload_extractor_output(self) -> None:
+        graph = GraphDefinition.from_dict(linkedin_graph_with_payload_extractor())
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+        workspace_root = Path(tempfile.mkdtemp()) / ".graph-agent" / "runs"
+        profile_payload = sample_profile("Taylor Extracted")
+
+        with patch.dict("os.environ", {"GRAPH_AGENT_WORKSPACE_DIR": str(workspace_root)}, clear=False):
+            with patch(
+                "graph_agent.runtime.core.fetch_linkedin_profile_live",
+                return_value={
+                    "extracted": profile_payload,
+                    "final_page_url": "https://www.linkedin.com/in/taylor-extracted/",
+                    "storage_state_path": "/tmp/linkedin-session.json",
+                },
+            ) as fetch_mock:
+                state = runtime.run(
+                    graph,
+                    {
+                        "schema_version": "1.0",
+                        "payload": {
+                            "record": {
+                                "LinkedInURL": "https://www.linkedin.com/in/taylor-extracted/",
+                            }
+                        },
+                        "metadata": {"contract": "data_envelope"},
+                    },
+                    run_id="run-linkedin-via-extractor",
+                    agent_id="agent-alpha",
+                )
+
+        self.assertEqual(fetch_mock.call_count, 1)
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.node_outputs["extract"]["payload"], "https://www.linkedin.com/in/taylor-extracted/")
+        self.assertEqual(state.final_output["person"]["name"], "Taylor Extracted")
 
     def test_force_refresh_bypasses_shared_cache_and_overwrites_it(self) -> None:
         initial_graph = GraphDefinition.from_dict(linkedin_graph_payload("linkedin-refresh-initial"))

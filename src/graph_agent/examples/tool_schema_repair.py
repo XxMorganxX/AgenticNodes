@@ -151,6 +151,52 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="core.spreadsheet_matrix_decision",
+            display_name="Spreadsheet Matrix Decision",
+            category=NodeCategory.API,
+            node_kind="model",
+            description="Uses an LLM to choose the best matching first-column row and first-row column from a spreadsheet decision matrix, then emits the selected cell value.",
+            capabilities=["spreadsheet matrix lookup", "llm-guided row selection", "llm-guided column selection"],
+            model_provider_name="mock",
+            default_config={
+                "provider_name": "mock",
+                "model": "mock-default",
+                "mode": "spreadsheet_matrix_decision",
+                "system_prompt": (
+                    "Use the spreadsheet decision matrix to select the best matching row and column for the user's request."
+                ),
+                "user_message_template": "{input_payload}",
+                "response_mode": "message",
+                "file_format": "auto",
+                "file_path": "",
+                "sheet_name": "",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="file_format",
+                    label="File Format",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="auto", label="Auto Detect"),
+                        ProviderConfigOptionDefinition(value="csv", label="CSV"),
+                        ProviderConfigOptionDefinition(value="xlsx", label="Excel (.xlsx)"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(
+                    key="file_path",
+                    label="File Path",
+                    placeholder="/absolute/path/to/matrix.xlsx or {GRAPH_ENV_VAR}",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="sheet_name",
+                    label="Sheet Name",
+                    placeholder="Leave blank to use the first sheet",
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="provider.mock",
             display_name="Mock Provider",
             category=NodeCategory.PROVIDER,

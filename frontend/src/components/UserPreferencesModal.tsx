@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import type { ChangeEvent, MouseEvent } from "react";
+import type { ChangeEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent } from "react";
 
 import { DEFAULT_USER_PREFERENCES } from "../lib/userPreferences";
 import type { UserPreferences } from "../lib/userPreferences";
@@ -41,6 +41,81 @@ export function UserPreferencesModal({
     });
   }
 
+  function formatShortcutKey(event: KeyboardEvent | ReactKeyboardEvent<HTMLInputElement>): string {
+    const parts: string[] = [];
+    if (event.metaKey || event.ctrlKey) {
+      parts.push("Mod");
+    }
+    if (event.altKey) {
+      parts.push("Alt");
+    }
+    if (event.shiftKey) {
+      parts.push("Shift");
+    }
+    const rawKey = event.key.length === 1 ? event.key.toUpperCase() : event.key;
+    const normalizedKey =
+      rawKey === " " ? "Space" : rawKey === "Escape" || rawKey === "Tab" || rawKey.startsWith("Arrow") ? rawKey : rawKey;
+    if (["Meta", "Control", "Alt", "Shift"].includes(normalizedKey)) {
+      return parts.join("+");
+    }
+    parts.push(normalizedKey);
+    return parts.join("+");
+  }
+
+  function handleSaveGraphShortcutKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    const nextAccelerator = formatShortcutKey(event.nativeEvent);
+    onUpdatePreferences({
+      ...preferences,
+      keyboardShortcuts: {
+        ...preferences.keyboardShortcuts,
+        saveGraph: {
+          accelerator: nextAccelerator,
+        },
+      },
+    });
+  }
+
+  function handleSaveGraphShortcutChange(event: ChangeEvent<HTMLInputElement>) {
+    onUpdatePreferences({
+      ...preferences,
+      keyboardShortcuts: {
+        ...preferences.keyboardShortcuts,
+        saveGraph: {
+          accelerator: event.target.value,
+        },
+      },
+    });
+  }
+
+  function handleRunGraphShortcutKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    const nextAccelerator = formatShortcutKey(event.nativeEvent);
+    onUpdatePreferences({
+      ...preferences,
+      keyboardShortcuts: {
+        ...preferences.keyboardShortcuts,
+        runGraph: {
+          accelerator: nextAccelerator,
+        },
+      },
+    });
+  }
+
+  function handleRunGraphShortcutChange(event: ChangeEvent<HTMLInputElement>) {
+    onUpdatePreferences({
+      ...preferences,
+      keyboardShortcuts: {
+        ...preferences.keyboardShortcuts,
+        runGraph: {
+          accelerator: event.target.value,
+        },
+      },
+    });
+  }
+
   return (
     <div className="tool-details-modal-backdrop" onClick={handleOverlayClick} role="presentation">
       <section
@@ -79,6 +154,44 @@ export function UserPreferencesModal({
           <div className="tool-details-modal-help">
             Higher values make right-drag background panning follow your mouse more aggressively. The default is{" "}
             <code>{DEFAULT_USER_PREFERENCES.backgroundDragSensitivityPercent}%</code>.
+          </div>
+
+          <div className="preferences-shortcut-card">
+            <div className="preferences-shortcut-copy">
+              <strong>Save Graph</strong>
+              <span>
+                Press a shortcut to save the current graph and override the browser save action. Leave the field empty to disable it.
+              </span>
+            </div>
+            <input
+              type="text"
+              className="preferences-shortcut-input"
+              value={preferences.keyboardShortcuts.saveGraph.accelerator}
+              placeholder={DEFAULT_USER_PREFERENCES.keyboardShortcuts.saveGraph.accelerator}
+              onChange={handleSaveGraphShortcutChange}
+              onKeyDown={handleSaveGraphShortcutKeyDown}
+              spellCheck={false}
+              aria-label="Save graph shortcut"
+            />
+          </div>
+
+          <div className="preferences-shortcut-card">
+            <div className="preferences-shortcut-copy">
+              <strong>Run Agent</strong>
+              <span>
+                Press a shortcut to run the current graph or environment and override the browser refresh action. Leave the field empty to disable it.
+              </span>
+            </div>
+            <input
+              type="text"
+              className="preferences-shortcut-input"
+              value={preferences.keyboardShortcuts.runGraph.accelerator}
+              placeholder={DEFAULT_USER_PREFERENCES.keyboardShortcuts.runGraph.accelerator}
+              onChange={handleRunGraphShortcutChange}
+              onKeyDown={handleRunGraphShortcutKeyDown}
+              spellCheck={false}
+              aria-label="Run graph shortcut"
+            />
           </div>
 
           <div className="preferences-modal-actions">

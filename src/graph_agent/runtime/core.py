@@ -56,7 +56,9 @@ from graph_agent.runtime.run_documents import normalize_run_documents
 from graph_agent.runtime.spreadsheets import (
     SPREADSHEET_FIRST_DATA_ROW_INDEX,
     SPREADSHEET_HEADER_ROW_INDEX,
+    SpreadsheetMatrixParseResult,
     SpreadsheetParseError,
+    parse_spreadsheet_matrix,
     parse_spreadsheet,
     resolve_spreadsheet_path_from_run_documents,
 )
@@ -78,6 +80,7 @@ PROMPT_BLOCK_ROLES = {"system", "user", "assistant"}
 DISCORD_END_PROVIDER_ID = "end.discord_message"
 DEFAULT_DISCORD_BOT_TOKEN_ENV_VAR = "{DISCORD_BOT_TOKEN}"
 SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows"
+SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision"
 LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions"
 PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter"
 WRITE_TEXT_FILE_PROVIDER_ID = "core.write_text_file"
@@ -85,6 +88,7 @@ LINKEDIN_PROFILE_FETCH_PROVIDER_ID = "core.linkedin_profile_fetch"
 LINKEDIN_PROFILE_FETCH_MODE = "linkedin_profile_fetch"
 RUNTIME_NORMALIZER_PROVIDER_ID = "core.runtime_normalizer"
 RUNTIME_NORMALIZER_MODE = "runtime_normalizer"
+SPREADSHEET_MATRIX_DECISION_MODE = "spreadsheet_matrix_decision"
 CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body"
 CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if"
 CONTROL_FLOW_ELSE_HANDLE_ID = "control-flow-else"
@@ -207,6 +211,42 @@ def _render_spreadsheet_row_text(value: Mapping[str, Any]) -> str:
             rendered_cell = "" if cell_value is None else str(cell_value)
             lines.append(f"{label}: {rendered_cell}")
     return "\n".join(lines)
+
+
+def _render_spreadsheet_matrix_markdown(matrix: SpreadsheetMatrixParseResult) -> str:
+    header_label = matrix.corner_label or "row"
+    header_cells = [header_label, *matrix.column_labels]
+    divider = ["---"] * len(header_cells)
+    rows = [
+        "| " + " | ".join(str(cell) for cell in header_cells) + " |",
+        "| " + " | ".join(divider) + " |",
+    ]
+    for row in matrix.rows:
+        row_cells = [row.row_label, *[row.values.get(column_label) for column_label in matrix.column_labels]]
+        rendered_cells = ["" if cell is None else str(cell) for cell in row_cells]
+        rows.append("| " + " | ".join(rendered_cells) + " |")
+    return "\n".join(rows)
+
+
+def _spreadsheet_matrix_selection_response_schema(matrix: SpreadsheetMatrixParseResult) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "row_label": {
+                "type": "string",
+                "enum": list(matrix.row_labels),
+            },
+            "column_label": {
+                "type": "string",
+                "enum": list(matrix.column_labels),
+            },
+            "reasoning": {
+                "type": "string",
+            },
+        },
+        "required": ["row_label", "column_label"],
+    }
 
 
 def _render_context_builder_value(value: Any) -> Any:
@@ -336,6 +376,33 @@ def _deep_get(value: Any, path: str | None) -> Any:
         else:
             return None
     return current
+
+
+def _parse_json_object_or_array(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    candidate = value.strip()
+    if not candidate or candidate[0] not in {"{", "["}:
+        return value
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return value
+    return parsed
+
+
+def _is_message_envelope_like(value: Any) -> bool:
+    return isinstance(value, Mapping) and "schema_version" in value and "payload" in value
+
+
+def _normalize_runtime_normalizer_source(value: Any) -> Any:
+    normalized = _parse_json_object_or_array(value)
+    if not _is_message_envelope_like(normalized):
+        return normalized
+    payload_value = _parse_json_object_or_array(normalized.get("payload"))
+    if payload_value is normalized.get("payload"):
+        return normalized
+    return {**dict(normalized), "payload": payload_value}
 
 
 class SafeFormatDict(dict[str, Any]):
@@ -1860,6 +1927,14 @@ class DataNode(BaseNode):
             or "cache/linkedin/{cache_key}.json",
         }
 
+    def _linkedin_profile_fetch_source_value(self, context: NodeContext) -> Any:
+        source_value = context.resolve_binding(None)
+        if source_value is None:
+            source_value = context.resolve_binding(self.config.get("input_binding"))
+        if isinstance(source_value, Mapping) and "payload" in source_value:
+            source_value = source_value.get("payload")
+        return source_value
+
     def _build_linkedin_profile_envelope(
         self,
         profile_payload: Mapping[str, Any],
@@ -1905,9 +1980,7 @@ class DataNode(BaseNode):
 
     def _execute_linkedin_profile_fetch(self, context: NodeContext) -> NodeExecutionResult:
         resolved_config = self._linkedin_profile_fetch_config(context)
-        source_value = context.resolve_binding(self.config.get("input_binding"))
-        if isinstance(source_value, Mapping) and "payload" in source_value:
-            source_value = source_value.get("payload")
+        source_value = self._linkedin_profile_fetch_source_value(context)
         source_url = extract_linkedin_profile_url(source_value, url_field=resolved_config["url_field"])
         if not source_url:
             return NodeExecutionResult(
@@ -2063,11 +2136,23 @@ class DataNode(BaseNode):
             max_matches=_coerce_int(resolved.get("max_matches"), default=25, minimum=1),
         )
 
+    def _runtime_normalizer_source_roots(self, context: NodeContext) -> tuple[Any, ...]:
+        source_value = self._runtime_normalizer_source_value(context)
+        source_value = _normalize_runtime_normalizer_source(source_value)
+        roots: list[Any] = [source_value]
+        if _is_message_envelope_like(source_value):
+            roots.append(source_value.get("payload"))
+        return tuple(roots)
+
+    def _runtime_normalizer_source_value(self, context: NodeContext) -> Any:
+        source_value = context.resolve_binding(None)
+        if source_value is None:
+            source_value = context.resolve_binding(self.config.get("input_binding"))
+        return source_value
+
     def _execute_runtime_normalizer(self, context: NodeContext) -> NodeExecutionResult:
         resolved_config = self._runtime_normalizer_config(context)
-        source_value = context.resolve_binding(self.config.get("input_binding"))
-        if isinstance(source_value, Mapping) and "payload" in source_value:
-            source_value = source_value.get("payload")
+        source_roots = self._runtime_normalizer_source_roots(context)
         if not resolved_config.field_name:
             error = {
                 "type": "missing_field_name",
@@ -2080,8 +2165,10 @@ class DataNode(BaseNode):
         all_matches: list[dict[str, Any]] = []
 
         if resolved_config.preferred_path:
-            preferred_value = _deep_get(source_value, resolved_config.preferred_path)
-            if preferred_value is not None:
+            for source_value in source_roots:
+                preferred_value = _deep_get(source_value, resolved_config.preferred_path)
+                if preferred_value is None:
+                    continue
                 matched_value = preferred_value
                 matched_path = resolved_config.preferred_path
                 all_matches.append(
@@ -2091,18 +2178,22 @@ class DataNode(BaseNode):
                         "value": preferred_value,
                     }
                 )
+                break
 
         if matched_value is None:
             search_fields = (resolved_config.field_name, *resolved_config.fallback_field_names)
-            all_matches = extract_field_candidates(
-                source_value,
-                field_names=search_fields,
-                case_sensitive=resolved_config.case_sensitive,
-                max_matches=resolved_config.max_matches,
-            )
-            if all_matches:
+            for source_value in source_roots:
+                all_matches = extract_field_candidates(
+                    source_value,
+                    field_names=search_fields,
+                    case_sensitive=resolved_config.case_sensitive,
+                    max_matches=resolved_config.max_matches,
+                )
+                if not all_matches:
+                    continue
                 matched_value = all_matches[0].get("value")
                 matched_path = str(all_matches[0].get("path", "") or "")
+                break
 
         metadata = {
             "contract": "data_envelope",
@@ -2130,7 +2221,7 @@ class DataNode(BaseNode):
         if matched_path == "":
             error = {
                 "type": "field_not_found",
-                "message": f"Field '{resolved_config.field_name}' was not found in the incoming payload.",
+                "message": f"Field '{resolved_config.field_name}' was not found in the incoming envelope data.",
                 "field_name": resolved_config.field_name,
                 "fallback_field_names": list(resolved_config.fallback_field_names),
             }
@@ -2163,9 +2254,7 @@ class DataNode(BaseNode):
             }
         if self.provider_id == LINKEDIN_PROFILE_FETCH_PROVIDER_ID or mode == LINKEDIN_PROFILE_FETCH_MODE:
             resolved_config = self._linkedin_profile_fetch_config(context)
-            source_value = context.resolve_binding(self.config.get("input_binding"))
-            if isinstance(source_value, Mapping) and "payload" in source_value:
-                source_value = source_value.get("payload")
+            source_value = self._linkedin_profile_fetch_source_value(context)
             preview: dict[str, Any] = {
                 "url_field": resolved_config["url_field"],
                 "use_cache": resolved_config["use_cache"],
@@ -2207,32 +2296,7 @@ class DataNode(BaseNode):
                 preview["workspace_path_error"] = str(exc)
             return preview
         if self.provider_id == RUNTIME_NORMALIZER_PROVIDER_ID or mode == RUNTIME_NORMALIZER_MODE:
-            resolved_config = self._runtime_normalizer_config(context)
-            source_value = context.resolve_binding(self.config.get("input_binding"))
-            if isinstance(source_value, Mapping) and "payload" in source_value:
-                source_value = source_value.get("payload")
-            search_fields = (resolved_config.field_name, *resolved_config.fallback_field_names) if resolved_config.field_name else ()
-            matches = (
-                extract_field_candidates(
-                    source_value,
-                    field_names=search_fields,
-                    case_sensitive=resolved_config.case_sensitive,
-                    max_matches=resolved_config.max_matches,
-                )
-                if search_fields
-                else []
-            )
-            preferred_value = _deep_get(source_value, resolved_config.preferred_path) if resolved_config.preferred_path else None
-            return {
-                "field_name": resolved_config.field_name,
-                "fallback_field_names": list(resolved_config.fallback_field_names),
-                "preferred_path": resolved_config.preferred_path,
-                "case_sensitive": resolved_config.case_sensitive,
-                "max_matches": resolved_config.max_matches,
-                "preferred_path_value": preferred_value,
-                "matches": matches,
-                "selected_value": preferred_value if preferred_value is not None else (matches[0]["value"] if matches else None),
-            }
+            return self._runtime_normalizer_source_value(context)
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return context.prompt_block_payload_for_node(self.id)
         if mode == "context_builder":
@@ -3339,6 +3403,266 @@ class ModelNode(BaseNode):
             if key not in self._RUNTIME_CONFIG_KEYS:
                 provider_config[key] = value
         return context.resolve_graph_env_value(provider_config)
+
+
+class SpreadsheetMatrixDecisionNode(ModelNode):
+    _RUNTIME_CONFIG_KEYS = ModelNode._RUNTIME_CONFIG_KEYS | {
+        "file_format",
+        "file_path",
+        "project_file_id",
+        "project_file_name",
+        "sheet_name",
+        "run_document_id",
+        "run_document_name",
+    }
+
+    def _spreadsheet_config(self, context: NodeContext) -> dict[str, Any]:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        file_format = str(resolved.get("file_format", "auto") or "auto").strip().lower() or "auto"
+        file_path = str(resolved.get("file_path", "") or "").strip()
+        if not file_path:
+            file_path = resolve_spreadsheet_path_from_run_documents(
+                context.state.documents,
+                run_document_id=str(resolved.get("run_document_id", "") or ""),
+                run_document_name=str(resolved.get("run_document_name", "") or ""),
+            )
+        return {
+            "file_format": file_format,
+            "file_path": file_path,
+            "sheet_name": str(resolved.get("sheet_name", "") or "").strip() or None,
+        }
+
+    def _resolved_provider_name(self, bound_provider_node: ProviderNode | None) -> str:
+        return str(
+            (
+                bound_provider_node.config.get("provider_name")
+                if bound_provider_node is not None
+                else self.config.get("provider_name", self.provider_name)
+            )
+            or self.provider_name
+        )
+
+    def _build_request(
+        self,
+        context: NodeContext,
+        bound_provider_node: ProviderNode | None = None,
+    ) -> ModelRequest:
+        request, _ = self._build_matrix_request(context, bound_provider_node)
+        return request
+
+    def _build_matrix_request(
+        self,
+        context: NodeContext,
+        bound_provider_node: ProviderNode | None = None,
+    ) -> tuple[ModelRequest, SpreadsheetMatrixParseResult]:
+        if bound_provider_node is None:
+            bound_provider_node = context.bound_provider_node(self.id)
+        matrix = parse_spreadsheet_matrix(**self._spreadsheet_config(context))
+        metadata_bindings = dict(self.config.get("metadata_bindings", {}))
+        metadata: dict[str, Any] = {}
+        for key, binding in metadata_bindings.items():
+            if isinstance(binding, Mapping):
+                metadata[key] = context.resolve_binding(binding)
+            else:
+                metadata[key] = binding
+        metadata.update(
+            {
+                "mode": self.config.get("mode", SPREADSHEET_MATRIX_DECISION_MODE),
+                "spreadsheet_matrix_source_file": matrix.source_file,
+                "spreadsheet_matrix_sheet_name": matrix.sheet_name or "",
+                "spreadsheet_matrix_corner_label": matrix.corner_label,
+                "spreadsheet_matrix_row_labels": list(matrix.row_labels),
+                "spreadsheet_matrix_column_labels": list(matrix.column_labels),
+                "spreadsheet_matrix_markdown": _render_spreadsheet_matrix_markdown(matrix),
+            }
+        )
+        if context.prompt_block_payloads_for_node(self.id) and "prompt_blocks" not in metadata:
+            metadata["prompt_blocks"] = context.prompt_block_payloads_for_node(self.id)
+        system_prompt = context.render_template(str(self.config.get("system_prompt", "") or ""), metadata).strip()
+        matrix_instruction = "\n".join(
+            [
+                "You are selecting one cell from a spreadsheet decision matrix.",
+                "The first row contains the column-axis labels and the first column contains the row-axis labels.",
+                "Choose exactly one row_label and one column_label that best answer the user's request.",
+                "Return only structured JSON matching the schema. The row_label and column_label must exactly match the provided labels.",
+            ]
+        )
+        final_system_prompt = "\n\n".join(section for section in [system_prompt, matrix_instruction] if section.strip())
+        rendered_user_message = context.render_template(
+            str(self.config.get("user_message_template", "{input_payload}") or "{input_payload}"),
+            metadata,
+        ).strip()
+        matrix_context = "\n".join(
+            [
+                "Spreadsheet Matrix",
+                f"Source file: {matrix.source_file}",
+                f"Sheet: {matrix.sheet_name or 'first sheet'}",
+                f"Corner label: {matrix.corner_label or '(blank)'}",
+                "",
+                "Available row labels:",
+                *[f"- {label}" for label in matrix.row_labels],
+                "",
+                "Available column labels:",
+                *[f"- {label}" for label in matrix.column_labels],
+                "",
+                "Matrix:",
+                _render_spreadsheet_matrix_markdown(matrix),
+            ]
+        )
+        final_user_message = "\n\n".join(
+            section
+            for section in [
+                rendered_user_message and f"User question or context:\n{rendered_user_message}",
+                matrix_context,
+            ]
+            if section
+        )
+        return (
+            ModelRequest(
+                prompt_name=self.prompt_name,
+                messages=[
+                    ModelMessage(role="system", content=final_system_prompt),
+                    *context.prompt_block_messages_for_model(self.id),
+                    ModelMessage(role="user", content=final_user_message),
+                ],
+                response_schema=_spreadsheet_matrix_selection_response_schema(matrix),
+                provider_config=self._provider_config(context, bound_provider_node),
+                available_tools=[],
+                preferred_tool_name=None,
+                response_mode="message",
+                metadata=metadata,
+            ),
+            matrix,
+        )
+
+    def _selection_from_response(
+        self,
+        response: ModelResponse,
+        matrix: SpreadsheetMatrixParseResult,
+    ) -> dict[str, str]:
+        candidate = response.structured_output
+        if not isinstance(candidate, Mapping) and response.content.strip():
+            try:
+                parsed = json.loads(response.content)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, Mapping):
+                candidate = parsed
+        if not isinstance(candidate, Mapping):
+            raise ValueError("Spreadsheet matrix decision node requires a structured JSON object response.")
+        row_label = str(candidate.get("row_label", "") or "").strip()
+        column_label = str(candidate.get("column_label", "") or "").strip()
+        if row_label not in matrix.row_labels:
+            raise ValueError(
+                f"Spreadsheet matrix decision returned unknown row_label '{row_label}'."
+            )
+        if column_label not in matrix.column_labels:
+            raise ValueError(
+                f"Spreadsheet matrix decision returned unknown column_label '{column_label}'."
+            )
+        reasoning = str(candidate.get("reasoning", "") or "").strip()
+        return {
+            "row_label": row_label,
+            "column_label": column_label,
+            "reasoning": reasoning,
+        }
+
+    def execute(self, context: NodeContext) -> NodeExecutionResult:
+        bound_provider_node = context.bound_provider_node(self.id)
+        try:
+            request, matrix = self._build_matrix_request(context, bound_provider_node)
+        except SpreadsheetParseError as exc:
+            return NodeExecutionResult(
+                status="failed",
+                error={"type": "spreadsheet_parse_error", "message": str(exc)},
+                summary=str(exc),
+            )
+
+        provider_name = self._resolved_provider_name(bound_provider_node)
+        provider = context.services.model_providers[provider_name]
+        response = provider.generate(request)
+        try:
+            selection = self._selection_from_response(response, matrix)
+        except ValueError as exc:
+            error = {"message": str(exc), "type": "spreadsheet_matrix_selection_error"}
+            envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id=self.id,
+                from_category=self.category.value,
+                payload=None,
+                errors=[error],
+                metadata={
+                    "contract": "message_envelope",
+                    "node_kind": self.kind,
+                    "provider": provider.name,
+                    "prompt_name": self.prompt_name,
+                    "response_mode": "message",
+                    **response.metadata,
+                },
+            )
+            return NodeExecutionResult(
+                status="validation_error",
+                output=envelope.to_dict(),
+                error=error,
+                summary=f"Spreadsheet matrix node '{self.label}' returned an invalid selection.",
+                metadata=envelope.metadata,
+            )
+
+        selected_row = matrix.row_by_label(selection["row_label"])
+        selected_value = selected_row.values.get(selection["column_label"])
+        selection_payload = {
+            "row_label": selection["row_label"],
+            "column_label": selection["column_label"],
+            "row_number": selected_row.row_number,
+            "column_number": matrix.column_number_for_label(selection["column_label"]),
+            "value": selected_value,
+            "reasoning": selection["reasoning"],
+            "sheet_name": matrix.sheet_name,
+            "source_file": matrix.source_file,
+        }
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=selected_value,
+            artifacts={"spreadsheet_matrix_selection": selection_payload},
+            metadata={
+                "contract": "message_envelope",
+                "node_kind": self.kind,
+                "provider": provider.name,
+                "prompt_name": self.prompt_name,
+                "response_mode": "message",
+                "mode": self.config.get("mode", SPREADSHEET_MATRIX_DECISION_MODE),
+                "row_label": selection["row_label"],
+                "column_label": selection["column_label"],
+                "row_number": selected_row.row_number,
+                "column_number": matrix.column_number_for_label(selection["column_label"]),
+                "sheet_name": matrix.sheet_name,
+                "source_file": matrix.source_file,
+                **response.metadata,
+            },
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary=(
+                f"Spreadsheet matrix node '{self.label}' selected row '{selection['row_label']}' "
+                f"and column '{selection['column_label']}'."
+            ),
+            metadata=envelope.metadata,
+            route_outputs={API_MESSAGE_HANDLE_ID: envelope.to_dict()},
+        )
+
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        try:
+            request, matrix = self._build_matrix_request(context)
+        except SpreadsheetParseError as exc:
+            return {"error": str(exc)}
+        return {
+            "messages": [{"role": message.role, "content": message.content} for message in request.messages],
+            "response_mode": request.response_mode,
+            "matrix": matrix.preview(limit=3),
+        }
 
 
 class ToolNode(BaseNode):
@@ -4686,6 +5010,14 @@ def _node_from_dict(payload: Mapping[str, Any]) -> BaseNode:
             **common,
         )
     if kind == "model":
+        if provider_id == SPREADSHEET_MATRIX_DECISION_PROVIDER_ID:
+            return SpreadsheetMatrixDecisionNode(
+                provider_name=str(payload.get("model_provider_name") or payload.get("config", {}).get("provider_name", "")),
+                prompt_name=str(payload.get("prompt_name") or payload.get("config", {}).get("prompt_name", "")),
+                node_provider_id=provider_id,
+                node_provider_label=str(payload.get("provider_label", "Spreadsheet Matrix Decision")),
+                **common,
+            )
         return ModelNode(
             provider_name=str(payload.get("model_provider_name") or payload.get("config", {}).get("provider_name", "")),
             prompt_name=str(payload.get("prompt_name") or payload.get("config", {}).get("prompt_name", "")),

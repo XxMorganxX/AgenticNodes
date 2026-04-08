@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from graph_agent.api.graph_store import GraphStore
+from graph_agent.api.project_files import ProjectFileStore
 from graph_agent.api.run_store import RunStore, build_default_run_store
 from graph_agent.api.run_state_reducer import apply_event, build_run_state
 from graph_agent.examples.tool_schema_repair import build_example_services
@@ -30,6 +31,8 @@ from graph_agent.tools.mcp import McpServerDefinition
 LOGGER = logging.getLogger(__name__)
 DISCORD_START_PROVIDER_ID = "start.discord_message"
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
+SPREADSHEET_NODE_PROVIDER_IDS = {"core.spreadsheet_rows", "core.spreadsheet_matrix_decision"}
+SPREADSHEET_FILE_SUFFIXES = {".csv", ".xlsx"}
 STATE_FLUSH_EVENT_TYPES = {
     "run.completed",
     "run.failed",
@@ -183,6 +186,7 @@ class GraphRunManager:
         run_store: RunStore | None = None,
         run_log_store: RunStore | None = None,
         discord_service: DiscordTriggerService | None = None,
+        project_file_store: ProjectFileStore | None = None,
     ) -> None:
         self._services = services or build_example_services(include_user_mcp_servers=True)
         self._store = store or GraphStore(self._services)
@@ -192,6 +196,7 @@ class GraphRunManager:
         self._event_backlog: dict[str, list[dict[str, Any]]] = {}
         self._subscribers: dict[str, list[Queue[str | None]]] = {}
         self._run_store = run_store or run_log_store or build_default_run_store()
+        self._project_file_store = project_file_store or ProjectFileStore()
         self._discord_service = discord_service or DiscordTriggerService(self.handle_discord_message)
         self._runtime_instance_id = str(uuid4())
         self._heartbeat_interval_seconds = _read_interval_env("GRAPH_AGENT_RUN_HEARTBEAT_INTERVAL_SECONDS", 1.0)
@@ -217,12 +222,18 @@ class GraphRunManager:
         return self._decorate_graph(graph)
 
     def update_graph(self, graph_id: str, graph_payload: dict[str, Any]) -> dict[str, Any]:
+        previous_graph = self._store.get_graph(graph_id)
         graph = self._store.update_graph(graph_id, graph_payload)
+        previous_graph_id = str(previous_graph.get("graph_id") or graph_id)
+        next_graph_id = str(graph.get("graph_id") or graph_id)
+        if previous_graph_id != next_graph_id:
+            self._project_file_store.rename_graph(previous_graph_id, next_graph_id)
         self._sync_discord_service()
         return self._decorate_graph(graph)
 
     def delete_graph(self, graph_id: str) -> None:
         self._store.delete_graph(graph_id)
+        self._project_file_store.delete_graph(graph_id)
         self._sync_discord_service()
 
     def get_catalog(self) -> dict[str, Any]:
@@ -368,6 +379,15 @@ class GraphRunManager:
     def upload_run_documents(self, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return ingest_run_documents(documents)
 
+    def list_project_files(self, graph_id: str) -> list[dict[str, Any]]:
+        return self._project_file_store.list_files(graph_id)
+
+    def upload_project_files(self, graph_id: str, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return self._project_file_store.upload_files(graph_id, files)
+
+    def delete_project_file(self, graph_id: str, file_id: str) -> None:
+        self._project_file_store.delete_file(graph_id, file_id)
+
     def list_run_files(self, run_id: str) -> dict[str, Any]:
         from graph_agent.runtime.agent_filesystem import list_agent_workspace_files
 
@@ -496,6 +516,7 @@ class GraphRunManager:
                 event_listeners=[lambda event: self._record_event(run_id, event.to_dict())],
                 cancel_requested=lambda current_run_id=run_id: self._cancel_requested(current_run_id),
             )
+            self._hydrate_spreadsheet_project_files(graph)
             thread = Thread(
                 target=self._execute_run,
                 args=(runtime, graph, input_payload, run_id, normalized_documents, default_agent.agent_id),
@@ -729,6 +750,7 @@ class GraphRunManager:
             cancel_requested=lambda current_run_id=parent_run_id: self._cancel_requested(current_run_id),
         )
         graph = agent.to_graph(graph_id=document.graph_id, shared_env_vars=document.env_vars)
+        self._hydrate_spreadsheet_project_files(graph)
         runtime.run(
             graph,
             input_payload,
@@ -744,6 +766,57 @@ class GraphRunManager:
 
         self._run_store.write_state(child_run_id, snapshot)
         return snapshot
+
+    def _hydrate_spreadsheet_project_files(self, graph: GraphDefinition) -> None:
+        project_files = self._project_file_store.list_files(graph.graph_id)
+        if not project_files:
+            return
+        for node in graph.nodes.values():
+            if node.provider_id not in SPREADSHEET_NODE_PROVIDER_IDS:
+                continue
+            config = dict(node.config)
+            file_path = str(config.get("file_path") or "").strip()
+            if file_path:
+                continue
+            resolved_path = self._resolve_spreadsheet_project_file_path(graph.graph_id, config, project_files)
+            if not resolved_path:
+                continue
+            config["file_path"] = resolved_path
+            node.config = config
+
+    def _resolve_spreadsheet_project_file_path(
+        self,
+        graph_id: str,
+        config: dict[str, Any],
+        project_files: list[dict[str, Any]] | None = None,
+    ) -> str:
+        files = project_files if project_files is not None else self._project_file_store.list_files(graph_id)
+        ready_files = []
+        for file in files:
+            if str(file.get("status") or "") != "ready":
+                continue
+            storage_path = str(file.get("storage_path") or "").strip()
+            if not storage_path:
+                continue
+            if Path(storage_path).suffix.lower() not in SPREADSHEET_FILE_SUFFIXES:
+                continue
+            ready_files.append(file)
+        if not ready_files:
+            return ""
+        project_file_id = str(config.get("project_file_id") or "").strip()
+        if project_file_id:
+            for file in ready_files:
+                if str(file.get("file_id") or "").strip() == project_file_id:
+                    return str(file.get("storage_path") or "").strip()
+            return ""
+        project_file_name = str(config.get("project_file_name") or "").strip()
+        if project_file_name:
+            for file in ready_files:
+                name = str(file.get("name") or "")
+                if name == project_file_name or name.lower() == project_file_name.lower():
+                    return str(file.get("storage_path") or "").strip()
+            return ""
+        return ""
 
     def _record_event(self, run_id: str, event: dict[str, Any]) -> None:
         event = normalize_runtime_event_dict(event)

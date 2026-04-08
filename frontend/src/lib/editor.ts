@@ -206,11 +206,28 @@ export function createNodeFromProvider(
 
   if (provider.node_kind === "model") {
     const promptName = `${id}_prompt`;
+    const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
+    const configuredProviderName =
+      typeof defaultConfig.provider_name === "string" && defaultConfig.provider_name.trim().length > 0
+        ? defaultConfig.provider_name.trim()
+        : typeof provider.model_provider_name === "string" && provider.model_provider_name.trim().length > 0
+          ? provider.model_provider_name.trim()
+          : String(defaultModelConfig(promptName, catalog).provider_name ?? "mock");
+    const baseModelConfig = defaultModelConfig(promptName, catalog);
+    const nextConfig = {
+      ...baseModelConfig,
+      ...defaultConfig,
+      provider_name: configuredProviderName,
+      prompt_name:
+        typeof defaultConfig.prompt_name === "string" && defaultConfig.prompt_name.trim().length > 0
+          ? defaultConfig.prompt_name
+          : promptName,
+    };
     return {
       ...baseNode,
-      model_provider_name: String(defaultModelConfig(promptName, catalog).provider_name ?? "mock"),
-      prompt_name: promptName,
-      config: defaultModelConfig(promptName, catalog),
+      model_provider_name: configuredProviderName,
+      prompt_name: String(nextConfig.prompt_name ?? promptName),
+      config: nextConfig,
     };
   }
 
@@ -555,15 +572,16 @@ function getParallelSplitterOutgoingEdges(graph: GraphDefinition, nodeId: string
     .map(({ edge }) => edge);
 }
 
+const PARALLEL_SPLITTER_OUTPUT_COUNT = 3;
+
 export function getParallelSplitterOutputHandleIds(
-  graph: GraphDefinition | null | undefined,
+  _graph: GraphDefinition | null | undefined,
   node: GraphNode | null | undefined,
 ): string[] {
-  if (!graph || !isParallelSplitterNode(node)) {
+  if (!isParallelSplitterNode(node)) {
     return [createParallelSplitterOutputHandleId(0)];
   }
-  const outgoingEdges = getParallelSplitterOutgoingEdges(graph, node.id);
-  return Array.from({ length: outgoingEdges.length + 1 }, (_, index) => createParallelSplitterOutputHandleId(index));
+  return Array.from({ length: PARALLEL_SPLITTER_OUTPUT_COUNT }, (_, index) => createParallelSplitterOutputHandleId(index));
 }
 
 export function getNextAvailableParallelSplitterOutputHandleId(
@@ -576,64 +594,53 @@ export function getNextAvailableParallelSplitterOutputHandleId(
   }
 
   const usedHandleIds = new Set(
-    getParallelSplitterOutgoingEdges(graph, node.id).map((edge) => inferToolEdgeSourceHandle(edge, node, graph) ?? edge.source_handle_id ?? ""),
+    getParallelSplitterOutgoingEdges(graph, node.id).map((edge) => edge.source_handle_id ?? ""),
   );
   const normalizedPreferredHandleId = preferredHandleId ?? createParallelSplitterOutputHandleId(0);
   if (!usedHandleIds.has(normalizedPreferredHandleId)) {
     return normalizedPreferredHandleId;
   }
 
-  let nextIndex = 0;
-  while (usedHandleIds.has(createParallelSplitterOutputHandleId(nextIndex))) {
-    nextIndex += 1;
+  for (let i = 0; i < PARALLEL_SPLITTER_OUTPUT_COUNT; i++) {
+    const candidate = createParallelSplitterOutputHandleId(i);
+    if (!usedHandleIds.has(candidate)) {
+      return candidate;
+    }
   }
-  return createParallelSplitterOutputHandleId(nextIndex);
+  return createParallelSplitterOutputHandleId(0);
 }
 
 function getParallelSplitterEdgeHandleId(
   edge: GraphEdge,
-  graph: GraphDefinition | null | undefined,
-  sourceNode: GraphNode | null | undefined,
 ): string {
-  if (!graph || !isParallelSplitterNode(sourceNode)) {
-    return createParallelSplitterOutputHandleId(parseParallelSplitterOutputHandleIndex(edge.source_handle_id) ?? 0);
+  const index = parseParallelSplitterOutputHandleIndex(edge.source_handle_id);
+  if (index !== null && index < PARALLEL_SPLITTER_OUTPUT_COUNT) {
+    return createParallelSplitterOutputHandleId(index);
   }
-  const outgoingEdges = getParallelSplitterOutgoingEdges(graph, sourceNode.id);
-  const edgeIndex = outgoingEdges.findIndex((candidate) => candidate.id === edge.id);
-  return createParallelSplitterOutputHandleId(edgeIndex >= 0 ? edgeIndex : 0);
+  return createParallelSplitterOutputHandleId(0);
 }
 
 function normalizeParallelSplitterSourceHandles(graph: GraphDefinition, edges: GraphEdge[]): GraphEdge[] {
-  const parallelSplitterNodeIds = graph.nodes.filter((node) => isParallelSplitterNode(node)).map((node) => node.id);
-  if (parallelSplitterNodeIds.length === 0) {
+  const parallelSplitterNodeIds = new Set(
+    graph.nodes.filter((node) => isParallelSplitterNode(node)).map((node) => node.id),
+  );
+  if (parallelSplitterNodeIds.size === 0) {
     return edges;
   }
 
-  const graphWithEdges: GraphDefinition = {
-    ...graph,
-    edges,
-  };
-  const normalizedSourceHandlesByEdgeId = new Map<string, string>();
-  parallelSplitterNodeIds.forEach((nodeId) => {
-    getParallelSplitterOutgoingEdges(graphWithEdges, nodeId).forEach((edge, index) => {
-      normalizedSourceHandlesByEdgeId.set(edge.id, createParallelSplitterOutputHandleId(index));
-    });
-  });
-
-  if (normalizedSourceHandlesByEdgeId.size === 0) {
-    return edges;
-  }
-
-  return edges.map((edge) => {
-    const normalizedSourceHandleId = normalizedSourceHandlesByEdgeId.get(edge.id);
-    if (!normalizedSourceHandleId || edge.source_handle_id === normalizedSourceHandleId) {
+  let changed = false;
+  const result = edges.map((edge) => {
+    if (!parallelSplitterNodeIds.has(edge.source_id) || edge.kind === "binding") {
       return edge;
     }
-    return {
-      ...edge,
-      source_handle_id: normalizedSourceHandleId,
-    };
+    const index = parseParallelSplitterOutputHandleIndex(edge.source_handle_id);
+    if (index !== null && index < PARALLEL_SPLITTER_OUTPUT_COUNT) {
+      return edge;
+    }
+    changed = true;
+    return { ...edge, source_handle_id: createParallelSplitterOutputHandleId(0) };
   });
+  return changed ? result : edges;
 }
 
 export function normalizeParallelSplitterHandleAssignments(graph: GraphDefinition): GraphDefinition {
@@ -795,7 +802,7 @@ export function inferToolEdgeSourceHandle(
       return CONTROL_FLOW_LOOP_BODY_HANDLE_ID;
     }
     if (sourceNode.provider_id === "core.parallel_splitter") {
-      return getParallelSplitterEdgeHandleId(edge, graph, sourceNode);
+      return getParallelSplitterEdgeHandleId(edge);
     }
     if (edge.source_handle_id) {
       return edge.source_handle_id;
@@ -865,20 +872,26 @@ function getLogicConditionSourceHandleAnchorRatio(node: GraphNode, handleId: str
   return orderedHandleIds.length <= 1 ? 0.5 : 0.28 + (handleIndex / Math.max(1, orderedHandleIds.length - 1)) * 0.52;
 }
 
+const PARALLEL_SPLITTER_HANDLE_SLOT_HEIGHT = 28;
+const PARALLEL_SPLITTER_HANDLE_GAP = 12;
+const PARALLEL_SPLITTER_NODE_HEIGHT = 356;
+
 function getParallelSplitterSourceHandleAnchorRatio(
   node: GraphNode,
   handleId: string | null | undefined,
-  graph?: GraphDefinition | null,
 ): number | null {
   if (!isParallelSplitterNode(node)) {
     return null;
   }
   const handleIndex = parseParallelSplitterOutputHandleIndex(handleId) ?? 0;
-  const totalHandles = getParallelSplitterOutputHandleIds(graph, node).length;
-  if (totalHandles <= 1) {
+  if (PARALLEL_SPLITTER_OUTPUT_COUNT <= 1) {
     return 0.5;
   }
-  return 0.24 + (handleIndex / Math.max(1, totalHandles - 1)) * 0.52;
+  const stride = PARALLEL_SPLITTER_HANDLE_SLOT_HEIGHT + PARALLEL_SPLITTER_HANDLE_GAP;
+  const columnHeight = PARALLEL_SPLITTER_OUTPUT_COUNT * PARALLEL_SPLITTER_HANDLE_SLOT_HEIGHT + (PARALLEL_SPLITTER_OUTPUT_COUNT - 1) * PARALLEL_SPLITTER_HANDLE_GAP;
+  const columnTop = (PARALLEL_SPLITTER_NODE_HEIGHT - columnHeight) / 2;
+  const slotCenter = columnTop + handleIndex * stride + PARALLEL_SPLITTER_HANDLE_SLOT_HEIGHT / 2;
+  return slotCenter / PARALLEL_SPLITTER_NODE_HEIGHT;
 }
 
 export function getNodeSourceHandleAnchorRatio(
@@ -890,7 +903,7 @@ export function getNodeSourceHandleAnchorRatio(
   if (logicConditionAnchorRatio !== null) {
     return logicConditionAnchorRatio;
   }
-  const parallelSplitterAnchorRatio = getParallelSplitterSourceHandleAnchorRatio(node, sourceHandleId, graph);
+  const parallelSplitterAnchorRatio = getParallelSplitterSourceHandleAnchorRatio(node, sourceHandleId);
   if (parallelSplitterAnchorRatio !== null) {
     return parallelSplitterAnchorRatio;
   }
@@ -1045,6 +1058,7 @@ export function canConnectNodes(
 }
 
 const NODE_WIDTH = 320;
+const PARALLEL_SPLITTER_NODE_WIDTH = 420;
 const NODE_HEIGHT = 178;
 const MCP_TOOL_EXECUTOR_NODE_HEIGHT = 244;
 const AUTO_LAYOUT_VERTICAL_GAP = 120;
@@ -1053,8 +1067,8 @@ const AUTO_LAYOUT_COLUMN_TOLERANCE = 120;
 
 function getFallbackNodeDimensions(node: GraphNode): GraphLayoutNodeDimensions {
   return {
-    width: NODE_WIDTH,
-    height: node.kind === "mcp_tool_executor" ? MCP_TOOL_EXECUTOR_NODE_HEIGHT : NODE_HEIGHT,
+    width: node.provider_id === "core.parallel_splitter" ? PARALLEL_SPLITTER_NODE_WIDTH : NODE_WIDTH,
+    height: node.provider_id === "core.parallel_splitter" ? PARALLEL_SPLITTER_NODE_HEIGHT : node.kind === "mcp_tool_executor" ? MCP_TOOL_EXECUTOR_NODE_HEIGHT : NODE_HEIGHT,
   };
 }
 

@@ -389,6 +389,32 @@ export function buildNodeTooltip(
   }
 
   if (node.kind === "model") {
+    if (node.provider_id === "core.spreadsheet_matrix_decision") {
+      return {
+        title: nodeTitle,
+        eyebrow: `${node.category} / ${node.kind}`,
+        description: node.description,
+        sections: [
+          {
+            title: "Configuration",
+            rows: [
+              { label: "Provider", value: asString(node.config.provider_name) ?? node.model_provider_name ?? "Not set" },
+              { label: "Model", value: asString(node.config.model) ?? "Default" },
+              { label: "Prompt", value: asString(node.config.prompt_name) ?? node.prompt_name ?? "Not set" },
+              { label: "File", value: asString(node.config.file_path) ?? "Not set" },
+              { label: "Format", value: asString(node.config.file_format) ?? "auto" },
+              { label: "Sheet", value: asString(node.config.sheet_name) ?? "first sheet" },
+              { label: "Output", value: "Selected matrix cell value" },
+            ],
+          },
+          ...baseSections,
+        ],
+        parameters: [],
+        emptyState: !(asString(node.config.file_path) ?? "").trim()
+          ? "Set a CSV or XLSX file path so this node can select from the matrix."
+          : undefined,
+      };
+    }
     const allowedTools = asStringArray(node.config.allowed_tool_names);
     const preferredTool = asString(node.config.preferred_tool_name);
     const responseMode = inferModelResponseMode(graph, node);
