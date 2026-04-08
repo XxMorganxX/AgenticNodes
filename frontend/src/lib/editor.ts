@@ -275,6 +275,15 @@ export function createNodeFromProvider(
         },
       };
     }
+    if (provider.provider_id === "core.parallel_splitter") {
+      return {
+        ...baseNode,
+        config: {
+          mode: "parallel_splitter",
+          ...defaultConfig,
+        },
+      };
+    }
     return {
       ...baseNode,
       config: {
@@ -456,6 +465,8 @@ export const PROMPT_BLOCK_PROVIDER_ID = "core.prompt_block";
 export const CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body";
 export const CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if";
 export const CONTROL_FLOW_ELSE_HANDLE_ID = "control-flow-else";
+export const PARALLEL_SPLITTER_OUTPUT_HANDLE_ID = "parallel-splitter-output";
+const PARALLEL_SPLITTER_OUTPUT_HANDLE_PREFIX = `${PARALLEL_SPLITTER_OUTPUT_HANDLE_ID}-`;
 
 export function defaultToolFailureCondition(edgeId: string): GraphEdge["condition"] {
   return {
@@ -499,6 +510,140 @@ export function defaultMcpTerminalOutputCondition(edgeId: string): GraphEdge["co
 
 export function isApiOutputHandleId(handleId: string | null | undefined): boolean {
   return handleId === API_TOOL_CALL_HANDLE_ID || handleId === API_FINAL_MESSAGE_HANDLE_ID;
+}
+
+export function createParallelSplitterOutputHandleId(index: number): string {
+  return `${PARALLEL_SPLITTER_OUTPUT_HANDLE_PREFIX}${Math.max(0, Math.trunc(index))}`;
+}
+
+function parseParallelSplitterOutputHandleIndex(handleId: string | null | undefined): number | null {
+  if (!handleId) {
+    return null;
+  }
+  if (handleId === PARALLEL_SPLITTER_OUTPUT_HANDLE_ID) {
+    return 0;
+  }
+  if (!handleId.startsWith(PARALLEL_SPLITTER_OUTPUT_HANDLE_PREFIX)) {
+    return null;
+  }
+  const rawIndex = Number.parseInt(handleId.slice(PARALLEL_SPLITTER_OUTPUT_HANDLE_PREFIX.length), 10);
+  return Number.isFinite(rawIndex) && rawIndex >= 0 ? rawIndex : null;
+}
+
+function isParallelSplitterNode(node: GraphNode | null | undefined): node is GraphNode {
+  return Boolean(node && node.kind === "control_flow_unit" && node.provider_id === "core.parallel_splitter");
+}
+
+function getParallelSplitterOutgoingEdges(graph: GraphDefinition, nodeId: string): GraphEdge[] {
+  return graph.edges
+    .map((edge, index) => ({ edge, index }))
+    .filter(({ edge }) => edge.source_id === nodeId && edge.kind !== "binding")
+    .sort((left, right) => {
+      const leftIndex = parseParallelSplitterOutputHandleIndex(left.edge.source_handle_id);
+      const rightIndex = parseParallelSplitterOutputHandleIndex(right.edge.source_handle_id);
+      if (leftIndex !== null && rightIndex !== null && leftIndex !== rightIndex) {
+        return leftIndex - rightIndex;
+      }
+      if (leftIndex !== null && rightIndex === null) {
+        return -1;
+      }
+      if (leftIndex === null && rightIndex !== null) {
+        return 1;
+      }
+      return left.index - right.index;
+    })
+    .map(({ edge }) => edge);
+}
+
+export function getParallelSplitterOutputHandleIds(
+  graph: GraphDefinition | null | undefined,
+  node: GraphNode | null | undefined,
+): string[] {
+  if (!graph || !isParallelSplitterNode(node)) {
+    return [createParallelSplitterOutputHandleId(0)];
+  }
+  const outgoingEdges = getParallelSplitterOutgoingEdges(graph, node.id);
+  return Array.from({ length: outgoingEdges.length + 1 }, (_, index) => createParallelSplitterOutputHandleId(index));
+}
+
+export function getNextAvailableParallelSplitterOutputHandleId(
+  graph: GraphDefinition | null | undefined,
+  node: GraphNode | null | undefined,
+  preferredHandleId: string | null | undefined,
+): string {
+  if (!graph || !isParallelSplitterNode(node)) {
+    return preferredHandleId ?? createParallelSplitterOutputHandleId(0);
+  }
+
+  const usedHandleIds = new Set(
+    getParallelSplitterOutgoingEdges(graph, node.id).map((edge) => inferToolEdgeSourceHandle(edge, node, graph) ?? edge.source_handle_id ?? ""),
+  );
+  const normalizedPreferredHandleId = preferredHandleId ?? createParallelSplitterOutputHandleId(0);
+  if (!usedHandleIds.has(normalizedPreferredHandleId)) {
+    return normalizedPreferredHandleId;
+  }
+
+  let nextIndex = 0;
+  while (usedHandleIds.has(createParallelSplitterOutputHandleId(nextIndex))) {
+    nextIndex += 1;
+  }
+  return createParallelSplitterOutputHandleId(nextIndex);
+}
+
+function getParallelSplitterEdgeHandleId(
+  edge: GraphEdge,
+  graph: GraphDefinition | null | undefined,
+  sourceNode: GraphNode | null | undefined,
+): string {
+  if (!graph || !isParallelSplitterNode(sourceNode)) {
+    return createParallelSplitterOutputHandleId(parseParallelSplitterOutputHandleIndex(edge.source_handle_id) ?? 0);
+  }
+  const outgoingEdges = getParallelSplitterOutgoingEdges(graph, sourceNode.id);
+  const edgeIndex = outgoingEdges.findIndex((candidate) => candidate.id === edge.id);
+  return createParallelSplitterOutputHandleId(edgeIndex >= 0 ? edgeIndex : 0);
+}
+
+function normalizeParallelSplitterSourceHandles(graph: GraphDefinition, edges: GraphEdge[]): GraphEdge[] {
+  const parallelSplitterNodeIds = graph.nodes.filter((node) => isParallelSplitterNode(node)).map((node) => node.id);
+  if (parallelSplitterNodeIds.length === 0) {
+    return edges;
+  }
+
+  const graphWithEdges: GraphDefinition = {
+    ...graph,
+    edges,
+  };
+  const normalizedSourceHandlesByEdgeId = new Map<string, string>();
+  parallelSplitterNodeIds.forEach((nodeId) => {
+    getParallelSplitterOutgoingEdges(graphWithEdges, nodeId).forEach((edge, index) => {
+      normalizedSourceHandlesByEdgeId.set(edge.id, createParallelSplitterOutputHandleId(index));
+    });
+  });
+
+  if (normalizedSourceHandlesByEdgeId.size === 0) {
+    return edges;
+  }
+
+  return edges.map((edge) => {
+    const normalizedSourceHandleId = normalizedSourceHandlesByEdgeId.get(edge.id);
+    if (!normalizedSourceHandleId || edge.source_handle_id === normalizedSourceHandleId) {
+      return edge;
+    }
+    return {
+      ...edge,
+      source_handle_id: normalizedSourceHandleId,
+    };
+  });
+}
+
+export function normalizeParallelSplitterHandleAssignments(graph: GraphDefinition): GraphDefinition {
+  const normalizedEdges = normalizeParallelSplitterSourceHandles(graph, graph.edges);
+  return normalizedEdges === graph.edges
+    ? graph
+    : {
+        ...graph,
+        edges: normalizedEdges,
+      };
 }
 
 function hasExposedMcpToolContext(graph: GraphDefinition, node: GraphNode): boolean {
@@ -646,11 +791,14 @@ export function inferToolEdgeSourceHandle(
     return TOOL_CONTEXT_HANDLE_ID;
   }
   if (isControlFlowNode(sourceNode)) {
-    if (edge.source_handle_id) {
-      return edge.source_handle_id;
-    }
     if (sourceNode.provider_id === "core.spreadsheet_rows") {
       return CONTROL_FLOW_LOOP_BODY_HANDLE_ID;
+    }
+    if (sourceNode.provider_id === "core.parallel_splitter") {
+      return getParallelSplitterEdgeHandleId(edge, graph, sourceNode);
+    }
+    if (edge.source_handle_id) {
+      return edge.source_handle_id;
     }
     return edge.source_handle_id ?? null;
   }
@@ -683,6 +831,9 @@ export function getToolSourceHandleAnchorRatio(handleId: string | null | undefin
   if (handleId === CONTROL_FLOW_LOOP_BODY_HANDLE_ID) {
     return 0.5;
   }
+  if (handleId === PARALLEL_SPLITTER_OUTPUT_HANDLE_ID) {
+    return 0.5;
+  }
   if (handleId === CONTROL_FLOW_IF_HANDLE_ID) {
     return 0.4;
   }
@@ -694,6 +845,59 @@ export function getToolSourceHandleAnchorRatio(handleId: string | null | undefin
 
 export function getApiToolContextTargetAnchorRatio(handleId: string | null | undefined): number {
   return handleId === API_TOOL_CONTEXT_HANDLE_ID ? 0.82 : 0.26;
+}
+
+function getLogicConditionSourceHandleAnchorRatio(node: GraphNode, handleId: string | null | undefined): number | null {
+  if (node.kind !== "control_flow_unit" || node.provider_id !== "core.logic_conditions" || !handleId) {
+    return null;
+  }
+
+  const logicConditionConfig = normalizeLogicConditionConfig(node.config).normalized;
+  const orderedHandleIds = [
+    ...logicConditionConfig.branches.map((branch) => String(branch.output_handle_id)),
+    String(logicConditionConfig.else_output_handle_id),
+  ];
+  const handleIndex = orderedHandleIds.findIndex((candidate) => candidate === handleId);
+  if (handleIndex < 0) {
+    return null;
+  }
+
+  return orderedHandleIds.length <= 1 ? 0.5 : 0.28 + (handleIndex / Math.max(1, orderedHandleIds.length - 1)) * 0.52;
+}
+
+function getParallelSplitterSourceHandleAnchorRatio(
+  node: GraphNode,
+  handleId: string | null | undefined,
+  graph?: GraphDefinition | null,
+): number | null {
+  if (!isParallelSplitterNode(node)) {
+    return null;
+  }
+  const handleIndex = parseParallelSplitterOutputHandleIndex(handleId) ?? 0;
+  const totalHandles = getParallelSplitterOutputHandleIds(graph, node).length;
+  if (totalHandles <= 1) {
+    return 0.5;
+  }
+  return 0.24 + (handleIndex / Math.max(1, totalHandles - 1)) * 0.52;
+}
+
+export function getNodeSourceHandleAnchorRatio(
+  node: GraphNode,
+  sourceHandleId: string | null | undefined,
+  graph?: GraphDefinition | null,
+): number {
+  const logicConditionAnchorRatio = getLogicConditionSourceHandleAnchorRatio(node, sourceHandleId);
+  if (logicConditionAnchorRatio !== null) {
+    return logicConditionAnchorRatio;
+  }
+  const parallelSplitterAnchorRatio = getParallelSplitterSourceHandleAnchorRatio(node, sourceHandleId, graph);
+  if (parallelSplitterAnchorRatio !== null) {
+    return parallelSplitterAnchorRatio;
+  }
+  if (isApiModelNode(node) || isRoutableToolNode(node) || isMcpContextProviderNode(node)) {
+    return getToolSourceHandleAnchorRatio(sourceHandleId);
+  }
+  return 0.5;
 }
 
 export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
@@ -775,6 +979,7 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
                 : null,
     };
   });
+  normalizedGraph.edges = normalizeParallelSplitterSourceHandles(normalizedGraph, normalizedGraph.edges);
 
   return normalizedGraph;
 }
@@ -864,13 +1069,6 @@ function getLayoutNodeDimensions(node: GraphNode, options?: GraphLayoutOptions):
 
 function getNodeTargetAnchorRatio(node: GraphNode, targetHandleId: string | null | undefined): number {
   return node.kind === "model" ? getApiToolContextTargetAnchorRatio(targetHandleId) : 0.5;
-}
-
-function getNodeSourceAnchorRatio(node: GraphNode, sourceHandleId: string | null | undefined): number {
-  if (isApiModelNode(node) || isRoutableToolNode(node) || isMcpContextProviderNode(node)) {
-    return getToolSourceHandleAnchorRatio(sourceHandleId);
-  }
-  return 0.5;
 }
 
 function average(values: number[]): number {
@@ -1001,9 +1199,9 @@ export function layoutGraphLR(graph: GraphDefinition, options: GraphLayoutOption
       if (!sourceNode || !sourceCenter || sourceCenter.x >= center.x) {
         return;
       }
-      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, graph);
       const sourceDimensions = getLayoutNodeDimensions(sourceNode, options);
-      const sourceOffset = (getNodeSourceAnchorRatio(sourceNode, sourceHandleId) - 0.5) * sourceDimensions.height;
+      const sourceOffset = (getNodeSourceHandleAnchorRatio(sourceNode, sourceHandleId, graph) - 0.5) * sourceDimensions.height;
       const edgeTargetOffset =
         (getNodeTargetAnchorRatio(node, edge.target_handle_id ?? null) - 0.5) * nodeDimensions.height;
       anchorTargets.push(sourceCenter.y + sourceOffset - edgeTargetOffset);
@@ -1015,9 +1213,9 @@ export function layoutGraphLR(graph: GraphDefinition, options: GraphLayoutOption
       if (!targetNode || !targetCenter || targetCenter.x <= center.x) {
         return;
       }
-      const sourceHandleId = inferToolEdgeSourceHandle(edge, node);
+      const sourceHandleId = inferToolEdgeSourceHandle(edge, node, graph);
       const targetDimensions = getLayoutNodeDimensions(targetNode, options);
-      const sourceOffset = (getNodeSourceAnchorRatio(node, sourceHandleId) - 0.5) * nodeDimensions.height;
+      const sourceOffset = (getNodeSourceHandleAnchorRatio(node, sourceHandleId, graph) - 0.5) * nodeDimensions.height;
       const edgeTargetOffset =
         (getNodeTargetAnchorRatio(targetNode, edge.target_handle_id ?? null) - 0.5) * targetDimensions.height;
       anchorTargets.push(targetCenter.y + edgeTargetOffset - sourceOffset);

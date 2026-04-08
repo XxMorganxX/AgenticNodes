@@ -47,6 +47,16 @@ const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
 const CONTRACT_OPTIONS = ["message_envelope", "tool_result_envelope", "data_envelope"];
 const DEFAULT_OPERATOR_OPTIONS = ["exists", "equals", "not_equals", "contains", "gt", "gte", "lt", "lte"];
+const OPERATOR_LABELS: Record<string, string> = {
+  exists: "exists",
+  equals: "equals",
+  not_equals: "not equals",
+  contains: "contains",
+  gt: "greater than",
+  gte: "greater than or equal to",
+  lt: "less than",
+  lte: "less than or equal to",
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -61,6 +71,10 @@ function updateNode(graph: GraphDefinition, nodeId: string, updater: (node: Grap
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
+function humanizeOperatorLabel(operator: string): string {
+  return OPERATOR_LABELS[operator] ?? operator.replace(/[_-]+/g, " ");
 }
 
 function humanizePathLabel(path: string): string {
@@ -763,7 +777,7 @@ export function ConditionDetailsModal({
                     >
                       {(matchingSuggestion?.operatorSuggestions ?? DEFAULT_OPERATOR_OPTIONS).map((operator) => (
                         <option key={operator} value={operator}>
-                          {operator}
+                          {humanizeOperatorLabel(operator)}
                         </option>
                       ))}
                     </select>

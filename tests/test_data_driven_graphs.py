@@ -48,7 +48,7 @@ class DataDrivenGraphTests(unittest.TestCase):
         self.assertEqual(state.status, "completed")
         self.assertIsNotNone(state.final_output)
         self.assertIn("message", state.final_output)
-        self.assertEqual(state.transition_history[2].target_id, "repair_tool")
+        self.assertIn("repair_tool", [transition.target_id for transition in state.transition_history])
 
     def test_invalid_category_connection_is_rejected(self) -> None:
         payload = build_example_graph_payload()

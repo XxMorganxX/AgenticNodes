@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
+from graph_agent.schema_validation import validation_error_payload
+
 
 @dataclass
 class ToolContext:
@@ -227,54 +229,7 @@ class ToolRegistry:
             self.mark_tool_unavailable(tool_name, reason)
 
     def validate_input(self, schema: Mapping[str, Any], payload: Mapping[str, Any]) -> dict[str, Any] | None:
-        if schema.get("type") != "object":
-            return {"message": "Only object schemas are supported in v1."}
-
-        required = schema.get("required", [])
-        properties = schema.get("properties", {})
-
-        missing = [field for field in required if field not in payload]
-        if missing:
-            return {
-                "message": "Missing required fields.",
-                "missing_fields": missing,
-            }
-
-        type_map = {
-            "string": str,
-            "integer": int,
-            "number": (int, float),
-            "boolean": bool,
-            "object": dict,
-            "array": list,
-        }
-
-        type_errors: list[dict[str, str]] = []
-        for key, value in payload.items():
-            if key not in properties:
-                continue
-            expected_type = properties[key].get("type")
-            if expected_type is None:
-                continue
-            python_type = type_map.get(expected_type)
-            if python_type is None:
-                continue
-            if not isinstance(value, python_type):
-                type_errors.append(
-                    {
-                        "field": key,
-                        "expected": expected_type,
-                        "received": type(value).__name__,
-                    }
-                )
-
-        if type_errors:
-            return {
-                "message": "One or more fields have invalid types.",
-                "type_errors": type_errors,
-            }
-
-        return None
+        return validation_error_payload(payload, schema)
 
     def invoke(self, name: str, payload: Mapping[str, Any], context: ToolContext) -> ToolResult:
         tool = self.get(name)

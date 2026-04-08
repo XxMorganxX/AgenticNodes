@@ -1434,23 +1434,31 @@ export default function App() {
                   </select>
                 </label>
               </div>
+
+              <div className="mosaic-tile panel mosaic-env">
+                <h2>Environment</h2>
+                <GraphEnvEditor graph={draftGraph} onGraphChange={setDraftGraph} />
+              </div>
+
+              <div className="mosaic-tile panel mosaic-execution">
+                <label className="mosaic-execution-input">
+                  Input
+                  <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={7} />
+                </label>
+              </div>
             </div>
 
-            <div className="mosaic-tile panel mosaic-execution">
-              <label className="mosaic-execution-input">
-                Input
-                <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={10} />
-              </label>
-            </div>
-
-            <div className="hero-mosaic-row">
+            <div className={`hero-mosaic-row ${isEnvironment && draftGraph ? "" : "hero-mosaic-row--two-up"}`}>
               {isEnvironment && draftGraph ? (
                 <div className="mosaic-tile panel mosaic-agents-toggle">
-                  <div className="environment-run-toggle-header">
-                    <strong>Agents To Run</strong>
-                    <span>
-                      {selectedEnvironmentAgentIds.length} of {draftGraph.agents.length} enabled
-                    </span>
+                  <div className="mosaic-section-heading">
+                    <span className="mosaic-section-kicker">Execution</span>
+                    <div className="environment-run-toggle-header">
+                      <strong>Agents To Run</strong>
+                      <span>
+                        {selectedEnvironmentAgentIds.length} of {draftGraph.agents.length} enabled
+                      </span>
+                    </div>
                   </div>
                   <div className="environment-run-toggle-actions">
                     <button
@@ -1504,16 +1512,18 @@ export default function App() {
                 </div>
               ) : null}
               <div className="mosaic-tile panel mosaic-documents">
-                <div className="execution-documents-header">
-                  <strong>Run Documents</strong>
-                  <span>
-                    {readyRunDocuments.length} ready
-                    {runDocuments.length !== readyRunDocuments.length ? ` / ${runDocuments.length} uploaded` : ""}
-                  </span>
+                <div className="mosaic-section-heading">
+                  <span className="mosaic-section-kicker">Inputs</span>
+                  <div className="execution-documents-header">
+                    <strong>Run Documents</strong>
+                    <span>
+                      {readyRunDocuments.length} ready
+                      {runDocuments.length !== readyRunDocuments.length ? ` / ${runDocuments.length} uploaded` : ""}
+                    </span>
+                  </div>
                 </div>
                 <p>
-                  Upload reference files for this editor session. The most recent ready upload is cached locally and restored after
-                  refresh. Ready documents are available during the run as <code>{"{documents}"}</code>.
+                  Upload reference files for this editor session. Ready documents are available during the run as <code>{"{documents}"}</code>.
                 </p>
                 <label className="execution-documents-picker">
                   <span>{isUploadingDocuments ? "Uploading..." : "Add Documents"}</span>
@@ -1566,74 +1576,90 @@ export default function App() {
               </div>
 
               <div className="mosaic-tile panel mosaic-files">
-                <div className="execution-documents-header">
-                  <strong>Agent Files</strong>
-                  <span>{visibleRunFiles.length} file{visibleRunFiles.length === 1 ? "" : "s"}</span>
+                <div className="execution-files-header">
+                  <div className="mosaic-section-heading">
+                    <span className="mosaic-section-kicker">Workspace</span>
+                    <div className="execution-documents-header">
+                      <strong>Agent Files</strong>
+                      <span>{visibleRunFiles.length} file{visibleRunFiles.length === 1 ? "" : "s"}</span>
+                    </div>
+                  </div>
+                  <div className="execution-files-actions">
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => {
+                        if (selectedRunId) {
+                          void refreshRunFiles(selectedRunId);
+                        }
+                      }}
+                      disabled={!selectedRunId || isRunFilesLoading}
+                    >
+                      {isRunFilesLoading ? "Refreshing..." : "Refresh Files"}
+                    </button>
+                  </div>
                 </div>
-                <p>
-                  Browse files created inside the sandboxed workspace for the selected run
+                <p className="execution-files-intro">
+                  Inspect files created in the sandboxed workspace for the selected run
                   {selectedRunState?.agent_name ? ` (${selectedRunState.agent_name})` : ""}.
                 </p>
-                <div className="execution-files-actions">
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => {
-                      if (selectedRunId) {
-                        void refreshRunFiles(selectedRunId);
-                      }
-                    }}
-                    disabled={!selectedRunId || isRunFilesLoading}
-                  >
-                    {isRunFilesLoading ? "Refreshing..." : "Refresh Files"}
-                  </button>
-                </div>
                 {runFileListing?.workspace_root ? (
-                  <p className="execution-documents-run-note">
-                    Workspace root: <code>{runFileListing.workspace_root}</code>
-                  </p>
+                  <div className="execution-files-workspace">
+                    <span>Workspace root</span>
+                    <code>{runFileListing.workspace_root}</code>
+                  </div>
                 ) : null}
                 {visibleRunFiles.length > 0 ? (
                   <div className="execution-files-browser">
-                    <div className="execution-files-list" role="list" aria-label="Agent workspace files">
-                      {visibleRunFiles.map((file) => (
-                        <button
-                          key={file.path}
-                          type="button"
-                          className={`execution-file-row ${selectedRunFilePath === file.path ? "is-selected" : ""}`}
-                          onClick={() => setSelectedRunFilePath(file.path)}
-                        >
-                          <strong>{file.path}</strong>
-                          <span>
-                            {formatDocumentSize(file.size_bytes)} · {formatTimestamp(file.modified_at)}
-                          </span>
-                        </button>
-                      ))}
+                    <div className="execution-files-list-panel">
+                      <div className="execution-files-browser-header">
+                        <strong>Workspace Files</strong>
+                        <span>{visibleRunFiles.length} total</span>
+                      </div>
+                      <div className="execution-files-list" role="list" aria-label="Agent workspace files">
+                        {visibleRunFiles.map((file) => (
+                          <button
+                            key={file.path}
+                            type="button"
+                            className={`execution-file-row ${selectedRunFilePath === file.path ? "is-selected" : ""}`}
+                            onClick={() => setSelectedRunFilePath(file.path)}
+                          >
+                            <strong>{file.name}</strong>
+                            <span className="execution-file-row-path">{file.path}</span>
+                            <span>
+                              {formatDocumentSize(file.size_bytes)} · {formatTimestamp(file.modified_at)}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
                     </div>
                     <div className="execution-file-preview">
                       {selectedRunFile ? (
                         <>
-                          <div className="execution-document-card-header">
+                          <div className="execution-files-browser-header execution-files-browser-header--preview">
                             <div>
                               <strong>{selectedRunFile.name}</strong>
-                              <span>
-                                {selectedRunFile.mime_type} · {formatDocumentSize(selectedRunFile.size_bytes)}
-                              </span>
+                              <span className="execution-file-preview-path">{selectedRunFile.path}</span>
                             </div>
+                            <span>
+                              {selectedRunFile.mime_type} · {formatDocumentSize(selectedRunFile.size_bytes)}
+                            </span>
                           </div>
-                          {isRunFileContentLoading ? <p>Loading file preview...</p> : null}
-                          {selectedRunFileContent ? <pre className="execution-document-excerpt">{selectedRunFileContent.content}</pre> : null}
+                          {isRunFileContentLoading ? <p className="execution-file-preview-empty">Loading file preview...</p> : null}
+                          {selectedRunFileContent ? <pre className="execution-file-preview-content">{selectedRunFileContent.content}</pre> : null}
                           {selectedRunFileContent?.truncated ? (
-                            <p className="execution-documents-run-note">Preview truncated for large files.</p>
+                            <p className="execution-file-preview-note">Preview truncated for large files.</p>
                           ) : null}
                         </>
                       ) : (
-                        <p>Select a file to preview it.</p>
+                        <p className="execution-file-preview-empty">Select a file to preview it.</p>
                       )}
                     </div>
                   </div>
                 ) : (
-                  <p>{selectedRunId ? "No files have been written in this run yet." : "Run the graph to inspect workspace files."}</p>
+                  <p className="execution-file-preview-empty">
+                    {selectedRunId ? "No files have been written in this run yet." : "Run the graph to inspect workspace files."}
+                  </p>
                 )}
                 {runFilesError ? <p className="error-text">{runFilesError}</p> : null}
                 {runFileContentError ? <p className="error-text">{runFileContentError}</p> : null}
@@ -1641,12 +1667,6 @@ export default function App() {
             </div>
           </div>
 
-          <div className="hero-side-column">
-            <div className="mosaic-tile panel mosaic-env">
-              <h2>Environment</h2>
-              <GraphEnvEditor graph={draftGraph} onGraphChange={setDraftGraph} />
-            </div>
-          </div>
         </div>
 
       </div>

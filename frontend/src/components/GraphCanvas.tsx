@@ -41,7 +41,8 @@ import {
   defaultToolFailureCondition,
   duplicateGraphNode,
   getApiToolContextTargetAnchorRatio,
-  getToolSourceHandleAnchorRatio,
+  getNextAvailableParallelSplitterOutputHandleId,
+  getNodeSourceHandleAnchorRatio,
   inferToolEdgeSourceHandle,
   isApiModelNode,
   isApiOutputHandleId,
@@ -50,6 +51,7 @@ import {
   isRoutableToolNode,
   isWireJunctionNode,
   MCP_TERMINAL_OUTPUT_HANDLE_ID,
+  normalizeParallelSplitterHandleAssignments,
   TOOL_CONTEXT_HANDLE_ID,
   TOOL_FAILURE_HANDLE_ID,
   TOOL_SUCCESS_HANDLE_ID,
@@ -247,8 +249,8 @@ const JUNCTION_NODE_SIZE = 24;
 const DEFAULT_BACKGROUND_DRAG_SENSITIVITY = 0.28;
 const VIEWPORT_SYNC_EPSILON = 0.25;
 const MIN_GRAPH_ZOOM = 0.1;
-const LOOP_REGION_PADDING = 28;
-const LOOP_REGION_TOP_PADDING = 44;
+const LOOP_REGION_PADDING = 48;
+const LOOP_REGION_TOP_PADDING = 60;
 const LOOP_REGION_TRAILING_PADDING_RATIO = 0.16;
 const LOOP_REGION_MAX_TRAILING_PADDING = 72;
 const EDGE_STROKE_WIDTH = 3.6;
@@ -967,7 +969,7 @@ export function GraphCanvas({
     [graph, toolDetailsNodeId],
   );
   const providerDetailsNode = useMemo(
-    () => graph?.nodes.find((node) => node.id === providerDetailsNodeId && node.kind === "model") ?? null,
+    () => graph?.nodes.find((node) => node.id === providerDetailsNodeId && node.provider_id !== "core.logic_conditions") ?? null,
     [graph, providerDetailsNodeId],
   );
   const conditionDetailsNode = useMemo(
@@ -1397,11 +1399,8 @@ export function GraphCanvas({
             return null;
           }
 
-          const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
-          const sourceAnchorRatio =
-            isApiModelNode(sourceNode) || isRoutableToolNode(sourceNode) || isMcpContextProviderNode(sourceNode)
-              ? getToolSourceHandleAnchorRatio(sourceHandleId ?? TOOL_SUCCESS_HANDLE_ID)
-              : 0.5;
+          const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, baseGraph);
+          const sourceAnchorRatio = getNodeSourceHandleAnchorRatio(sourceNode, sourceHandleId, baseGraph);
           const targetDimensions = getNodeDimensions(targetNode);
           const targetAnchorRatio =
             targetNode.kind === "model" ? getApiToolContextTargetAnchorRatio(edge.target_handle_id ?? null) : 0.5;
@@ -1773,6 +1772,7 @@ export function GraphCanvas({
 
   const cancelDraftConnection = useCallback((message?: string) => {
     cancelPendingDraftPointerFrame();
+    draftConnectionRef.current = null;
     setDraftConnection(null);
     draftSnapTargetNodeIdRef.current = null;
     setDraftConnectionSnapTargetNodeId(null);
@@ -1800,13 +1800,7 @@ export function GraphCanvas({
         return null;
       }
       const dimensions = getNodeDimensions(sourceNode);
-      const verticalRatio = isApiModelNode(sourceNode)
-        ? sourceHandleId
-          ? getToolSourceHandleAnchorRatio(sourceHandleId)
-          : 0.5
-        : isRoutableToolNode(sourceNode) || isMcpContextProviderNode(sourceNode)
-          ? getToolSourceHandleAnchorRatio(sourceHandleId ?? TOOL_SUCCESS_HANDLE_ID)
-          : 0.5;
+      const verticalRatio = getNodeSourceHandleAnchorRatio(sourceNode, sourceHandleId, graph);
       return {
         x: sourceNode.position.x + dimensions.width,
         y: sourceNode.position.y + dimensions.height * verticalRatio,
@@ -1859,7 +1853,7 @@ export function GraphCanvas({
           if (!sourceNode || !targetNode) {
             return false;
           }
-          const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+          const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, graph);
           const sourceAnchor = getSourceAnchorPosition(edge.source_id, sourceHandleId);
           const targetAnchor = getTargetAnchorPosition(edge.target_id, edge.target_handle_id ?? null);
           if (!sourceAnchor || !targetAnchor) {
@@ -2044,7 +2038,7 @@ export function GraphCanvas({
 
   const getEdgeRouteSignature = useCallback(
     (edge: GraphEdge, sourceNode: GraphNode | undefined) => {
-      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, graph);
       const sourceAnchor = getSourceAnchorPosition(edge.source_id, sourceHandleId);
       const targetAnchor = getTargetAnchorPosition(edge.target_id, edge.target_handle_id ?? null);
       if (!sourceAnchor || !targetAnchor) {
@@ -2155,9 +2149,9 @@ export function GraphCanvas({
     [],
   );
 
-  const isDisplayContextBuilderBindingConnection = useCallback(
-    (sourceNode: GraphNode | undefined, targetNode: GraphNode | undefined) =>
-      sourceNode?.provider_id === "core.data_display" && targetNode?.provider_id === "core.context_builder",
+  const isContextBuilderBindingConnection = useCallback(
+    (_sourceNode: GraphNode | undefined, targetNode: GraphNode | undefined) =>
+      targetNode?.provider_id === "core.context_builder",
     [],
   );
 
@@ -2171,21 +2165,22 @@ export function GraphCanvas({
     ) => {
       const sourceNode = baseGraph.nodes.find((node) => node.id === sourceId);
       const targetNode = baseGraph.nodes.find((node) => node.id === targetId);
-      const effectiveSourceHandleId = getEffectiveSourceHandleId(sourceNode, sourceHandleId);
+      const requestedSourceHandleId = getEffectiveSourceHandleId(sourceNode, sourceHandleId);
+      const effectiveSourceHandleId =
+        sourceNode?.provider_id === "core.parallel_splitter"
+          ? getNextAvailableParallelSplitterOutputHandleId(baseGraph, sourceNode, requestedSourceHandleId)
+          : requestedSourceHandleId;
       const effectiveTargetHandleId = getEffectiveTargetHandleId(targetNode, targetHandleId);
       const isBindingConnection =
         isToolContextBindingConnection(sourceNode, targetNode, effectiveSourceHandleId, effectiveTargetHandleId) ||
         isPromptBlockBindingConnection(sourceNode, targetNode) ||
-        isDisplayContextBuilderBindingConnection(sourceNode, targetNode);
+        isContextBuilderBindingConnection(sourceNode, targetNode);
       const duplicateEdgeId =
         baseGraph.edges.find((edge) => {
           if (edge.source_id !== sourceId || edge.target_id !== targetId) {
             return false;
           }
-          const existingSourceHandleId =
-            isRoutableToolNode(sourceNode) || isMcpContextProviderNode(sourceNode)
-              ? inferToolEdgeSourceHandle(edge, sourceNode)
-              : (edge.source_handle_id ?? null);
+          const existingSourceHandleId = sourceNode ? inferToolEdgeSourceHandle(edge, sourceNode, baseGraph) : (edge.source_handle_id ?? null);
           return existingSourceHandleId === effectiveSourceHandleId && (edge.target_handle_id ?? null) === effectiveTargetHandleId;
         })?.id ?? null;
       if (isBindingConnection) {
@@ -2197,6 +2192,17 @@ export function GraphCanvas({
       if (allowParallelApiFanOut) {
         return { effectiveSourceHandleId, effectiveTargetHandleId, duplicateEdgeId, conflictingEdgeIds: [] as string[] };
       }
+      if (sourceNode?.provider_id === "core.parallel_splitter") {
+        const conflictingEdgeIds = baseGraph.edges
+          .filter((edge) => {
+            if (edge.id === duplicateEdgeId || edge.source_id !== sourceId) {
+              return false;
+            }
+            return inferToolEdgeSourceHandle(edge, sourceNode, baseGraph) === effectiveSourceHandleId;
+          })
+          .map((edge) => edge.id);
+        return { effectiveSourceHandleId, effectiveTargetHandleId, duplicateEdgeId, conflictingEdgeIds };
+      }
       const conflictingEdgeIds = Array.from(
         new Set(
           baseGraph.edges
@@ -2204,10 +2210,7 @@ export function GraphCanvas({
               if (edge.id === duplicateEdgeId) {
                 return false;
               }
-              const existingSourceHandleId =
-                isRoutableToolNode(sourceNode) || isMcpContextProviderNode(sourceNode)
-                  ? inferToolEdgeSourceHandle(edge, sourceNode)
-                  : (edge.source_handle_id ?? null);
+              const existingSourceHandleId = sourceNode ? inferToolEdgeSourceHandle(edge, sourceNode, baseGraph) : (edge.source_handle_id ?? null);
               return (
                 (edge.source_id === sourceId && existingSourceHandleId === effectiveSourceHandleId) || edge.target_id === targetId
               );
@@ -2220,7 +2223,8 @@ export function GraphCanvas({
     [
       getEffectiveSourceHandleId,
       getEffectiveTargetHandleId,
-      isDisplayContextBuilderBindingConnection,
+      getNextAvailableParallelSplitterOutputHandleId,
+      isContextBuilderBindingConnection,
       isPromptBlockBindingConnection,
       isToolContextBindingConnection,
     ],
@@ -2363,14 +2367,14 @@ export function GraphCanvas({
         return null;
       }
       const nextEdgeId = `edge-${sourceId}-${targetId}-${Date.now()}`;
-      if (sourceNode?.provider_id === "core.data_display" && targetNode?.provider_id === "core.context_builder") {
+      if (isContextBuilderBindingConnection(sourceNode, targetNode)) {
         return {
           id: nextEdgeId,
           source_id: sourceId,
           target_id: targetId,
           source_handle_id: effectiveSourceHandleId,
           target_handle_id: effectiveTargetHandleId,
-          label: "display input",
+          label: "context input",
           kind: "binding",
           priority: 0,
           waypoints,
@@ -2411,7 +2415,7 @@ export function GraphCanvas({
       if (isRoutableToolNode(sourceNode)) {
         if (sourceNode?.kind === "mcp_tool_executor" && effectiveSourceHandleId === MCP_TERMINAL_OUTPUT_HANDLE_ID) {
           const hasTerminalOutgoing = sourceEdges.some(
-            (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === MCP_TERMINAL_OUTPUT_HANDLE_ID,
+            (edge) => inferToolEdgeSourceHandle(edge, sourceNode, remainingGraph) === MCP_TERMINAL_OUTPUT_HANDLE_ID,
           );
           if (hasTerminalOutgoing) {
             setEditorMessage("MCP Tool Executor already has a terminal output route.");
@@ -2432,10 +2436,10 @@ export function GraphCanvas({
         }
         const effectiveHandleId = effectiveSourceHandleId === TOOL_FAILURE_HANDLE_ID ? TOOL_FAILURE_HANDLE_ID : TOOL_SUCCESS_HANDLE_ID;
         const hasSuccessOutgoing = sourceEdges.some(
-          (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === TOOL_SUCCESS_HANDLE_ID,
+          (edge) => inferToolEdgeSourceHandle(edge, sourceNode, remainingGraph) === TOOL_SUCCESS_HANDLE_ID,
         );
         const hasFailureOutgoing = sourceEdges.some(
-          (edge) => inferToolEdgeSourceHandle(edge, sourceNode) === TOOL_FAILURE_HANDLE_ID,
+          (edge) => inferToolEdgeSourceHandle(edge, sourceNode, remainingGraph) === TOOL_FAILURE_HANDLE_ID,
         );
         if (effectiveHandleId === TOOL_SUCCESS_HANDLE_ID && hasSuccessOutgoing) {
           setEditorMessage(
@@ -2516,17 +2520,17 @@ export function GraphCanvas({
         target_id: targetId,
           source_handle_id: effectiveSourceHandleId,
         target_handle_id: effectiveTargetHandleId,
-        label: hasStandardOutgoing ? "conditional route" : "next",
-        kind: hasStandardOutgoing ? "conditional" : "standard",
-        priority: hasStandardOutgoing ? 10 : 100,
+        label: sourceNode?.provider_id === "core.parallel_splitter" ? "parallel branch" : hasStandardOutgoing ? "conditional route" : "next",
+        kind: sourceNode?.provider_id === "core.parallel_splitter" ? "standard" : hasStandardOutgoing ? "conditional" : "standard",
+        priority: sourceNode?.provider_id === "core.parallel_splitter" ? 100 : hasStandardOutgoing ? 10 : 100,
         waypoints,
-        condition: hasStandardOutgoing ? defaultConditionalCondition(nextEdgeId) : null,
+        condition: sourceNode?.provider_id === "core.parallel_splitter" ? null : hasStandardOutgoing ? defaultConditionalCondition(nextEdgeId) : null,
       };
     },
     [
       catalog,
       getConnectionConflictState,
-      isDisplayContextBuilderBindingConnection,
+      isContextBuilderBindingConnection,
       isPromptBlockBindingConnection,
       isToolContextBindingConnection,
       removeEdgesAndPruneJunctions,
@@ -2551,10 +2555,17 @@ export function GraphCanvas({
       if (!nextEdge) {
         return false;
       }
-      onGraphChange(rebalanceOutgoingTargets({
-        ...nextBaseGraph,
-        edges: [...nextBaseGraph.edges, nextEdge],
-      }, sourceId));
+      onGraphChange(
+        normalizeParallelSplitterHandleAssignments(
+          rebalanceOutgoingTargets(
+            {
+              ...nextBaseGraph,
+              edges: [...nextBaseGraph.edges, nextEdge],
+            },
+            sourceId,
+          ),
+        ),
+      );
       setEditorMessage(null);
       return true;
     },
@@ -2610,7 +2621,7 @@ export function GraphCanvas({
       if (!sourceNode || !targetNode) {
         return;
       }
-      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, graph);
       const sourceAnchor = getSourceAnchorPosition(edge.source_id, sourceHandleId);
       const targetAnchor = getTargetAnchorPosition(edge.target_id, edge.target_handle_id ?? null);
       if (!sourceAnchor || !targetAnchor) {
@@ -2787,10 +2798,10 @@ export function GraphCanvas({
         if (!sourceNode || !targetNode) {
           return edge;
         }
-        const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+        const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, baseGraph);
         const sourceDimensions = getNodeDimensions(sourceNode);
         const targetDimensions = getNodeDimensions(targetNode);
-        const verticalRatio = getToolSourceHandleAnchorRatio(sourceHandleId);
+        const verticalRatio = getNodeSourceHandleAnchorRatio(sourceNode, sourceHandleId, baseGraph);
         const sourceAnchor = {
           x: sourceNode.position.x + sourceDimensions.width,
           y: sourceNode.position.y + sourceDimensions.height * verticalRatio,
@@ -3911,13 +3922,7 @@ export function GraphCanvas({
         return null;
       }
       const dimensions = getNodeDimensions(sourceNode);
-      const verticalRatio = isApiModelNode(sourceNode)
-        ? sourceHandleId
-          ? getToolSourceHandleAnchorRatio(sourceHandleId)
-          : 0.5
-        : isRoutableToolNode(sourceNode) || isMcpContextProviderNode(sourceNode)
-          ? getToolSourceHandleAnchorRatio(sourceHandleId ?? TOOL_SUCCESS_HANDLE_ID)
-          : 0.5;
+      const verticalRatio = getNodeSourceHandleAnchorRatio(sourceNode, sourceHandleId, graph);
       return {
         x: sourceNode.position.x + dimensions.width,
         y: sourceNode.position.y + dimensions.height * verticalRatio,
@@ -3937,7 +3942,7 @@ export function GraphCanvas({
       };
     };
     const getEdgeRouteSignatureForLookup = (edge: GraphEdge, sourceNode: GraphNode | undefined) => {
-      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, graph);
       const sourceAnchor = getSourceAnchorForLookup(edge.source_id, sourceHandleId);
       const targetAnchor = getTargetAnchorForLookup(edge.target_id, edge.target_handle_id ?? null);
       if (!sourceAnchor || !targetAnchor) {
@@ -3994,7 +3999,7 @@ export function GraphCanvas({
       const targetNode = nodeLookup.get(edge.target_id);
       const touchesWireJunction = isWireJunctionNode(sourceNode) || isWireJunctionNode(targetNode);
       const labelText = touchesWireJunction ? "" : String(edge.condition?.label ?? edge.label ?? "");
-      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode);
+      const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, graph);
       const sourceAnchor = getSourceAnchorForLookup(edge.source_id, sourceHandleId);
       const targetAnchor = getTargetAnchorForLookup(edge.target_id, edge.target_handle_id ?? null);
       const routeSignature = getEdgeRouteSignatureForLookup(edge, sourceNode);
@@ -4070,7 +4075,7 @@ export function GraphCanvas({
         type: "graphEdge",
         source: edge.source_id,
         target: edge.target_id,
-        sourceHandle: edge.source_handle_id ?? sourceHandleId ?? undefined,
+        sourceHandle: sourceHandleId ?? edge.source_handle_id ?? undefined,
         targetHandle: edge.target_handle_id ?? undefined,
         selected: selectedEdgeIdSet.has(edge.id),
         markerEnd: {
@@ -4326,18 +4331,20 @@ export function GraphCanvas({
       if (!connection.source || !connection.target) {
         return;
       }
+      const activeDraftConnection = draftConnectionRef.current;
       didCreateConnectionRef.current = true;
       commitEdge(
         connection.source,
         connection.target,
-        draftConnection?.waypoints ?? [],
+        activeDraftConnection?.waypoints ?? [],
         graph,
-        connection.sourceHandle ?? draftConnection?.sourceHandleId ?? null,
+        activeDraftConnection?.sourceHandleId ?? connection.sourceHandle ?? null,
         connection.targetHandle ?? null,
       );
+      draftConnectionRef.current = null;
       setDraftConnection(null);
     },
-    [commitEdge, draftConnection, graph],
+    [commitEdge, graph],
   );
 
   const onConnectStart = useCallback(
@@ -4350,14 +4357,17 @@ export function GraphCanvas({
       if (!sourceAnchor) {
         return;
       }
-      didCreateConnectionRef.current = false;
-      setIsConnecting(true);
-      setDraftConnection({
+      const nextDraftConnection = {
         sourceNodeId: params.nodeId,
         sourceHandleId,
         waypoints: [],
         pointerPosition: sourceAnchor,
-      });
+      };
+      didCreateConnectionRef.current = false;
+      setIsConnecting(true);
+      draftConnectionRef.current = nextDraftConnection;
+      draftPreviewPointerPositionRef.current = sourceAnchor;
+      setDraftConnection(nextDraftConnection);
     },
     [getSourceAnchorPosition],
   );

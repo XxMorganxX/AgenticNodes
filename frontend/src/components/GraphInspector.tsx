@@ -107,7 +107,10 @@ function uniqueStrings(values: string[]): string[] {
 const CONTEXT_BUILDER_PROVIDER_ID = "core.context_builder";
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
+const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
 const WRITE_TEXT_FILE_PROVIDER_ID = "core.write_text_file";
+const LINKEDIN_PROFILE_FETCH_PROVIDER_ID = "core.linkedin_profile_fetch";
+const RUNTIME_NORMALIZER_PROVIDER_ID = "core.runtime_normalizer";
 const CONTEXT_BUILDER_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONTEXT_BUILDER_TOKEN_PATTERN = /\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 const CONTEXT_BUILDER_BASE_VARIABLES = ["current_node_id", "documents", "graph_id", "input_payload", "run_id"];
@@ -804,9 +807,14 @@ export function GraphInspector({
     const isContextBuilderNode = selectedNode.kind === "data" && selectedNode.provider_id === CONTEXT_BUILDER_PROVIDER_ID;
     const isPromptBlockDataNode = selectedNode.kind === "data" && selectedNode.provider_id === PROMPT_BLOCK_PROVIDER_ID;
     const isWriteTextFileNode = selectedNode.kind === "data" && selectedNode.provider_id === WRITE_TEXT_FILE_PROVIDER_ID;
+    const isLinkedInProfileFetchNode =
+      selectedNode.kind === "data" && selectedNode.provider_id === LINKEDIN_PROFILE_FETCH_PROVIDER_ID;
+    const isRuntimeNormalizerNode =
+      selectedNode.kind === "data" && selectedNode.provider_id === RUNTIME_NORMALIZER_PROVIDER_ID;
     const isControlFlowUnitNode = isControlFlowNode(selectedNode);
     const isSpreadsheetRowNode = isControlFlowUnitNode && selectedNode.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
     const isLogicConditionsNode = isControlFlowUnitNode && selectedNode.provider_id === LOGIC_CONDITIONS_PROVIDER_ID;
+    const isParallelSplitterNode = isControlFlowUnitNode && selectedNode.provider_id === PARALLEL_SPLITTER_PROVIDER_ID;
     const spreadsheetNode = isSpreadsheetRowNode ? selectedNode : null;
     const logicConditionConfig = isLogicConditionsNode ? normalizeLogicConditionConfig(selectedNode.config).normalized : null;
     const logicIncomingContractLabel = isLogicConditionsNode ? incomingEdgeContractLabel(graph, selectedNode) : "";
@@ -1013,6 +1021,17 @@ export function GraphInspector({
             <span>Kind: {selectedNode.kind}</span>
             <span>Provider: {selectedNode.provider_label}</span>
           </div>
+          {onOpenProviderDetails &&
+          selectedNode.provider_id !== "core.data_display" &&
+          selectedNode.provider_id !== "core.logic_conditions" ? (
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => onOpenProviderDetails(selectedNode.id)}
+            >
+              Learn More About Provider
+            </button>
+          ) : null}
           {contract ? (
             <div className="contract-card">
               <strong>Contract</strong>
@@ -1246,15 +1265,6 @@ export function GraphInspector({
                   })}
                 </select>
               </label>
-              {onOpenProviderDetails ? (
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => onOpenProviderDetails(selectedNode.id)}
-                >
-                  Learn More About Provider
-                </button>
-              ) : null}
               {providerStatus ? (
                 <div className="contract-card">
                   <strong>Provider Health</strong>
@@ -1981,7 +1991,7 @@ export function GraphInspector({
                 />
                 <span>
                   Enable Follow-Up Decision
-                  <small>Let the executor inspect each MCP result with a model and decide whether to stop or call another exposed MCP tool.</small>
+                  <small>Let the executor inspect each MCP result with a model, repair invalid MCP tool-call schemas, and decide whether to stop or call another exposed MCP tool.</small>
                 </span>
               </label>
               {executorFollowUpEnabled ? (
@@ -2003,7 +2013,7 @@ export function GraphInspector({
                   />
                   <span>
                     Stop On Failed Tool Result
-                    <small>When enabled, the executor will not ask the follow-up model for another MCP tool after a failed tool execution.</small>
+                    <small>When enabled, the executor stops after actual MCP execution failures. Schema validation errors can still be repaired when retries are on.</small>
                   </span>
                 </label>
               ) : null}
@@ -2026,17 +2036,19 @@ export function GraphInspector({
                   />
                   <span>
                     Enable Retries
-                    <small>When off, this node makes no follow-up model/API calls. It only executes the incoming MCP tool call and forwards the execution result.</small>
+                    <small>Retries require follow-up decisions. When on, the executor can repair malformed MCP tool-call schemas and continue model-guided follow-up checks; when off, it only executes the incoming tool call once.</small>
                   </span>
                 </label>
               ) : null}
               <div className="inspector-meta">
-                <span>Dispatch mode: single MCP tool call from upstream API output</span>
+                <span>Dispatch mode: one MCP tool call at a time from upstream API output</span>
                 <span>Input binding: {executorBindingSummary}</span>
                 <span>
                   Follow-up decision: {executorFollowUpEnabled ? "enabled via internal model loop" : "disabled"}
                 </span>
-                <span>Retries: {executorFollowUpEnabled ? (executorRetriesEnabled ? "enabled" : "disabled") : "n/a"}</span>
+                <span>
+                  Retries: {executorFollowUpEnabled ? (executorRetriesEnabled ? "enabled for schema repair and follow-up" : "disabled") : "n/a"}
+                </span>
                 <span>Routes: on finish / on failure / terminal output</span>
               </div>
             </>
@@ -2205,6 +2217,19 @@ export function GraphInspector({
                     ) : null}
                   </div>
                 </>
+              ) : isParallelSplitterNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Parallel Splitter</strong>
+                    <span>Copies the incoming envelope to every connected downstream standard branch.</span>
+                    <span>Use this node when you want one explicit fan-out point instead of giving ordinary nodes multiple outputs.</span>
+                  </div>
+                  <div className="contract-card">
+                    <strong>Branching</strong>
+                    <span>Every connected standard outgoing edge runs in parallel from the same input envelope.</span>
+                    <span>Connect one edge per branch you want to launch.</span>
+                  </div>
+                </>
               ) : null}
             </>
           ) : selectedNode.kind === "data" ? (
@@ -2368,10 +2393,384 @@ export function GraphInspector({
                       }
                     />
                   </label>
+                  <label>
+                    When File Exists
+                    <select
+                      value={String(selectedNode.config.exists_behavior ?? "")}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => {
+                            const nextConfig: Record<string, unknown> = { ...node.config, mode: "write_text_file" };
+                            if (event.target.value) {
+                              nextConfig.exists_behavior = event.target.value;
+                            } else {
+                              delete nextConfig.exists_behavior;
+                            }
+                            return {
+                              ...node,
+                              config: nextConfig,
+                            };
+                          }),
+                        )
+                      }
+                    >
+                      <option value="">Auto (overwrite normally, append in loops)</option>
+                      <option value="overwrite">Overwrite</option>
+                      <option value="append">Append</option>
+                      <option value="error">Error</option>
+                    </select>
+                  </label>
+                  <label className="checkbox-option">
+                    <input
+                      type="checkbox"
+                      checked={selectedNode.config.append_newline !== false}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "write_text_file",
+                              append_newline: event.target.checked,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                    <span>
+                      Insert Newline Before Appended Content
+                      <small>When appending to a non-empty file, adds a newline separator unless the file already ends with one.</small>
+                    </span>
+                  </label>
                   <div className="inspector-meta">
                     <span>Sandbox: per-run, per-agent workspace under `.graph-agent/`</span>
                     <span>Default file: {String(selectedNode.config.relative_path ?? "response.txt") || "response.txt"}</span>
                     <span>Input source: latest incoming payload unless a binding overrides it</span>
+                    <span>Auto mode: overwrites outside loops and appends inside iterator executions</span>
+                  </div>
+                </>
+              ) : isLinkedInProfileFetchNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>LinkedIn Profile Fetch</strong>
+                    <span>Fetches a LinkedIn profile URL, parses it into structured JSON, and mirrors the parsed result into the agent workspace.</span>
+                    <span>Shared cache entries live outside the per-run workspace so repeat profile URLs only scrape once unless you force a refresh.</span>
+                  </div>
+                  <label>
+                    URL Field
+                    <input
+                      value={String(selectedNode.config.url_field ?? "url")}
+                      placeholder="url"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "linkedin_profile_fetch",
+                              url_field: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    LinkedIn Data Directory
+                    <input
+                      value={String(selectedNode.config.linkedin_data_dir ?? "")}
+                      placeholder="/Users/.../Desktop/Linkedin Data"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "linkedin_profile_fetch",
+                              linkedin_data_dir: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Session State Path
+                    <input
+                      value={String(selectedNode.config.session_state_path ?? "")}
+                      placeholder="Optional override for the LinkedIn storage-state JSON"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "linkedin_profile_fetch",
+                              session_state_path: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="checkbox-grid">
+                    <label className="checkbox-option">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(selectedNode.config.use_cache ?? true)}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                mode: "linkedin_profile_fetch",
+                                use_cache: event.target.checked,
+                              },
+                            })),
+                          )
+                        }
+                      />
+                      <span>
+                        Use Shared Cache
+                        <small>Read and write the reusable `.graph-agent/cache/linkedin/` entry for this normalized URL.</small>
+                      </span>
+                    </label>
+                    <label className="checkbox-option">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(selectedNode.config.force_refresh ?? false)}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                mode: "linkedin_profile_fetch",
+                                force_refresh: event.target.checked,
+                              },
+                            })),
+                          )
+                        }
+                      />
+                      <span>
+                        Force Refresh
+                        <small>Bypass any existing shared cache entry and scrape the profile again.</small>
+                      </span>
+                    </label>
+                    <label className="checkbox-option">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(selectedNode.config.headless ?? false)}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                mode: "linkedin_profile_fetch",
+                                headless: event.target.checked,
+                              },
+                            })),
+                          )
+                        }
+                      />
+                      <span>
+                        Headless Browser
+                        <small>Turn this off if the run may need a visible browser window for LinkedIn login.</small>
+                      </span>
+                    </label>
+                  </div>
+                  <label>
+                    Navigation Timeout (ms)
+                    <input
+                      type="number"
+                      value={String(selectedNode.config.navigation_timeout_ms ?? 45000)}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => {
+                            const nextConfig: Record<string, unknown> = { ...node.config, mode: "linkedin_profile_fetch" };
+                            if (event.target.value) {
+                              nextConfig.navigation_timeout_ms = Number(event.target.value);
+                            } else {
+                              delete nextConfig.navigation_timeout_ms;
+                            }
+                            return {
+                              ...node,
+                              config: nextConfig,
+                            };
+                          }),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Page Settle Delay (ms)
+                    <input
+                      type="number"
+                      value={String(selectedNode.config.page_settle_ms ?? 3000)}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => {
+                            const nextConfig: Record<string, unknown> = { ...node.config, mode: "linkedin_profile_fetch" };
+                            if (event.target.value) {
+                              nextConfig.page_settle_ms = Number(event.target.value);
+                            } else {
+                              delete nextConfig.page_settle_ms;
+                            }
+                            return {
+                              ...node,
+                              config: nextConfig,
+                            };
+                          }),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Workspace Cache Path Template
+                    <input
+                      value={String(selectedNode.config.workspace_cache_path_template ?? "cache/linkedin/{cache_key}.json")}
+                      placeholder="cache/linkedin/{cache_key}.json"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "linkedin_profile_fetch",
+                              workspace_cache_path_template: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="inspector-meta">
+                    <span>
+                      Input source: raw string payload or the <code>{String(selectedNode.config.url_field ?? "url")}</code> field from an object payload
+                    </span>
+                    <span>
+                      Workspace mirror: {String(selectedNode.config.workspace_cache_path_template ?? "cache/linkedin/{cache_key}.json")}
+                    </span>
+                    <span>Shared cache: sibling of the configured `.graph-agent/runs` root under `.graph-agent/cache/linkedin/`</span>
+                    <span>Only successful profile parses are written to the shared cache</span>
+                  </div>
+                </>
+              ) : isRuntimeNormalizerNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Payload Field Extractor</strong>
+                    <span>Searches the incoming payload for one named field and forwards only the matched value.</span>
+                    <span>Use it when the payload structure is unknown but the user knows the variable name they need.</span>
+                  </div>
+                  <label>
+                    Field Name
+                    <input
+                      value={String(selectedNode.config.field_name ?? "url")}
+                      placeholder="url"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "runtime_normalizer",
+                              field_name: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Fallback Field Names
+                    <textarea
+                      rows={4}
+                      value={
+                        Array.isArray(selectedNode.config.fallback_field_names)
+                          ? selectedNode.config.fallback_field_names.map((value) => String(value)).join("\n")
+                          : String(selectedNode.config.fallback_field_names ?? "")
+                      }
+                      placeholder={"profile_url\nlinkedin_url"}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "runtime_normalizer",
+                              fallback_field_names: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Preferred Path
+                    <input
+                      value={String(selectedNode.config.preferred_path ?? "")}
+                      placeholder="data.user.url"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "runtime_normalizer",
+                              preferred_path: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label className="checkbox-option">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selectedNode.config.case_sensitive ?? false)}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "runtime_normalizer",
+                              case_sensitive: event.target.checked,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                    <span>
+                      Case Sensitive
+                      <small>Match field names with exact case instead of lowercase-insensitive matching.</small>
+                    </span>
+                  </label>
+                  <label>
+                    Max Matches
+                    <input
+                      type="number"
+                      value={String(selectedNode.config.max_matches ?? 25)}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "runtime_normalizer",
+                              max_matches: event.target.value ? Number(event.target.value) : 25,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="inspector-meta">
+                    <span>Output payload: the matched field value only</span>
+                    <span>Metadata includes the matched path and match count; artifacts include all discovered matches</span>
+                    <span>Preferred path is tried first, then the node falls back to recursive key search</span>
                   </div>
                 </>
               ) : selectedNode.provider_id === "core.data_display" ? (

@@ -313,7 +313,8 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 "mode": "mcp_executor_follow_up",
                 "system_prompt": (
                     "Review the original request and tool history in the input payload. "
-                    "If the last MCP tool call failed, do not request another tool call. "
+                    "If the last MCP tool call failed schema validation, repair it using the validation details in the input payload. "
+                    "If the last MCP tool execution failed for another reason, do not request another tool call. "
                     "If more live MCP data is still required, call exactly one exposed MCP tool. "
                     "Otherwise return the final answer."
                 ),
@@ -413,6 +414,110 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                     help_text="Saved inside the agent workspace for this run. Nested folders like outputs/response.txt are allowed.",
                     placeholder="response.txt",
                 ),
+                ProviderConfigFieldDefinition(
+                    key="exists_behavior",
+                    label="When File Exists",
+                    input_type="select",
+                    help_text="Leave unset to overwrite outside loops and append inside spreadsheet/iterator loops.",
+                    options=[
+                        ProviderConfigOptionDefinition(value="overwrite", label="Overwrite"),
+                        ProviderConfigOptionDefinition(value="append", label="Append"),
+                        ProviderConfigOptionDefinition(value="error", label="Error"),
+                    ],
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="core.linkedin_profile_fetch",
+            display_name="LinkedIn Profile Fetch",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Fetches a LinkedIn profile page, parses the profile into structured JSON, and reuses a shared cache across runs.",
+            capabilities=["linkedin profile fetch", "shared cache reuse", "agent workspace mirror"],
+            default_config={
+                "mode": "linkedin_profile_fetch",
+                "input_binding": {"type": "input_payload"},
+                "url_field": "url",
+                "linkedin_data_dir": "/Users/morgannstuart/Desktop/Linkedin Data",
+                "session_state_path": "",
+                "headless": False,
+                "navigation_timeout_ms": 45000,
+                "page_settle_ms": 3000,
+                "use_cache": True,
+                "force_refresh": False,
+                "workspace_cache_path_template": "cache/linkedin/{cache_key}.json",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(key="url_field", label="URL Field"),
+                ProviderConfigFieldDefinition(key="linkedin_data_dir", label="LinkedIn Data Directory"),
+                ProviderConfigFieldDefinition(key="session_state_path", label="Session State Path"),
+                ProviderConfigFieldDefinition(key="headless", label="Headless", input_type="checkbox"),
+                ProviderConfigFieldDefinition(
+                    key="navigation_timeout_ms",
+                    label="Navigation Timeout (ms)",
+                    input_type="number",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="page_settle_ms",
+                    label="Page Settle Delay (ms)",
+                    input_type="number",
+                ),
+                ProviderConfigFieldDefinition(key="use_cache", label="Use Cache", input_type="checkbox"),
+                ProviderConfigFieldDefinition(key="force_refresh", label="Force Refresh", input_type="checkbox"),
+                ProviderConfigFieldDefinition(
+                    key="workspace_cache_path_template",
+                    label="Workspace Cache Path Template",
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="core.runtime_normalizer",
+            display_name="Payload Field Extractor",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Finds a named field inside an incoming payload with unknown structure and forwards just that matched value.",
+            capabilities=["recursive field lookup", "unknown payload extraction", "value isolation"],
+            default_config={
+                "mode": "runtime_normalizer",
+                "input_binding": {"type": "input_payload"},
+                "field_name": "url",
+                "fallback_field_names": [],
+                "preferred_path": "",
+                "case_sensitive": False,
+                "max_matches": 25,
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="field_name",
+                    label="Field Name",
+                    help_text="The key to look for anywhere in the incoming payload.",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="fallback_field_names",
+                    label="Fallback Field Names",
+                    input_type="textarea",
+                    help_text="Optional alternate field names to try if the primary field is not found.",
+                    placeholder="profile_url\nlinkedin_url",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="preferred_path",
+                    label="Preferred Path",
+                    help_text="Optional exact dot path to try first before recursive key search, like data.user.url.",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="case_sensitive",
+                    label="Case Sensitive",
+                    input_type="checkbox",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="max_matches",
+                    label="Max Matches",
+                    input_type="number",
+                ),
             ],
         )
     )
@@ -500,6 +605,19 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                     }
                 ],
                 "else_output_handle_id": "control-flow-else",
+            },
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="core.parallel_splitter",
+            display_name="Parallel Splitter",
+            category=NodeCategory.CONTROL_FLOW_UNIT,
+            node_kind="control_flow_unit",
+            description="Duplicates the incoming envelope across every connected downstream branch so they can run in parallel from one explicit fan-out step.",
+            capabilities=["parallel branch fan-out", "shared envelope forwarding", "explicit splitter node"],
+            default_config={
+                "mode": "parallel_splitter",
             },
         )
     )
@@ -715,6 +833,20 @@ def build_example_graph_payload() -> dict[str, object]:
                 "kind": "standard",
                 "priority": 100,
                 "condition": None,
+            },
+            {
+                "id": "edge-propose-repair",
+                "source_id": "propose_tool",
+                "target_id": "repair_tool",
+                "label": "repair invalid proposal",
+                "kind": "conditional",
+                "priority": 10,
+                "condition": {
+                    "id": "proposal_validation_failed",
+                    "label": "Proposal validation failed",
+                    "type": "result_status_equals",
+                    "value": "validation_error",
+                },
             },
             {
                 "id": "edge-run-repair",

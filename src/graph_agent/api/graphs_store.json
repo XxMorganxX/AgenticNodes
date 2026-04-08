@@ -462,6 +462,20 @@
         { "id": "edge-start-propose", "source_id": "start", "target_id": "propose_tool", "label": "begin", "kind": "standard", "priority": 100, "condition": null },
         { "id": "edge-propose-run", "source_id": "propose_tool", "target_id": "run_tool", "label": "try tool", "kind": "standard", "priority": 100, "condition": null },
         {
+          "id": "edge-propose-repair",
+          "source_id": "propose_tool",
+          "target_id": "repair_tool",
+          "label": "repair invalid proposal",
+          "kind": "conditional",
+          "priority": 10,
+          "condition": {
+            "id": "proposal_validation_failed",
+            "label": "Proposal validation failed",
+            "type": "result_status_equals",
+            "value": "validation_error"
+          }
+        },
+        {
           "id": "edge-run-repair",
           "source_id": "run_tool",
           "target_id": "repair_tool",

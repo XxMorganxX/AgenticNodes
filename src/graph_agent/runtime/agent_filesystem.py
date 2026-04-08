@@ -12,6 +12,7 @@ from typing import Any
 DEFAULT_AGENT_FILESYSTEM_ROOT = Path(__file__).resolve().parents[3] / ".graph-agent" / "runs"
 DEFAULT_FILE_READ_CHAR_LIMIT = 100_000
 SAFE_WORKSPACE_SEGMENT_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+WORKSPACE_TEXT_WRITE_BEHAVIORS = {"overwrite", "append", "error"}
 
 
 class AgentFilesystemError(ValueError):
@@ -84,11 +85,24 @@ def resolve_agent_workspace_path(
     return workspace, normalized_relative_path, target_path
 
 
+def normalize_workspace_text_write_behavior(value: Any) -> str | None:
+    raw_value = str(value or "").strip().lower()
+    if not raw_value:
+        return None
+    if raw_value not in WORKSPACE_TEXT_WRITE_BEHAVIORS:
+        allowed_values = ", ".join(sorted(WORKSPACE_TEXT_WRITE_BEHAVIORS))
+        raise AgentFilesystemError(f"Unsupported text file exists behavior '{raw_value}'. Expected one of: {allowed_values}.")
+    return raw_value
+
+
 def write_agent_workspace_text_file(
     run_id: str,
     agent_id: str | None,
     relative_path: str,
     content: str,
+    *,
+    exists_behavior: str = "overwrite",
+    append_newline: bool = False,
 ) -> dict[str, Any]:
     workspace, normalized_relative_path, target_path = resolve_agent_workspace_path(
         run_id,
@@ -96,8 +110,28 @@ def write_agent_workspace_text_file(
         relative_path,
         create_parent=True,
     )
-    target_path.write_text(content, encoding="utf-8")
-    return describe_agent_workspace_file(workspace, target_path, relative_path=normalized_relative_path.as_posix())
+    resolved_behavior = normalize_workspace_text_write_behavior(exists_behavior) or "overwrite"
+    if target_path.exists() and not target_path.is_file():
+        raise AgentFilesystemError(f"Workspace path '{normalized_relative_path.as_posix()}' already exists and is not a file.")
+
+    if not target_path.exists():
+        target_path.write_text(content, encoding="utf-8")
+        write_mode = "created"
+    elif resolved_behavior == "error":
+        raise AgentFilesystemError(f"Workspace file '{normalized_relative_path.as_posix()}' already exists.")
+    elif resolved_behavior == "append":
+        append_content = _prepare_workspace_text_append(target_path, content, append_newline=append_newline)
+        with target_path.open("a", encoding="utf-8") as handle:
+            handle.write(append_content)
+        write_mode = "appended"
+    else:
+        target_path.write_text(content, encoding="utf-8")
+        write_mode = "overwritten"
+
+    return {
+        **describe_agent_workspace_file(workspace, target_path, relative_path=normalized_relative_path.as_posix()),
+        "write_mode": write_mode,
+    }
 
 
 def list_agent_workspace_files(run_id: str, agent_id: str | None) -> dict[str, Any]:
@@ -164,3 +198,25 @@ def describe_agent_workspace_file(
 def _sanitize_workspace_segment(value: str, *, fallback: str) -> str:
     normalized = SAFE_WORKSPACE_SEGMENT_PATTERN.sub("-", str(value or "").strip()).strip("-.")
     return normalized or fallback
+
+
+def _prepare_workspace_text_append(target_path: Path, content: str, *, append_newline: bool) -> str:
+    if not append_newline or not content:
+        return content
+    try:
+        if target_path.stat().st_size == 0:
+            return content
+    except FileNotFoundError:
+        return content
+    if content.startswith("\n") or _workspace_file_ends_with_newline(target_path):
+        return content
+    return f"\n{content}"
+
+
+def _workspace_file_ends_with_newline(target_path: Path) -> bool:
+    with target_path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            return False
+        handle.seek(-1, os.SEEK_END)
+        return handle.read(1) == b"\n"

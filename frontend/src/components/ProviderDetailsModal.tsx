@@ -52,11 +52,15 @@ function updateModelNode(
 }
 
 function resolveProviderDefinition(node: GraphNode, catalog: EditorCatalog | null) {
+  const directProvider = (catalog?.node_providers ?? []).find((provider) => provider.provider_id === node.provider_id) ?? null;
+  if (node.kind !== "model") {
+    return directProvider;
+  }
   const providerName = String(node.config.provider_name ?? node.model_provider_name ?? "").trim();
   if (!providerName) {
-    return null;
+    return directProvider;
   }
-  return findProviderDefinition(catalog, providerName);
+  return findProviderDefinition(catalog, providerName) ?? directProvider;
 }
 
 function toolCanonicalName(tool: ToolDefinition): string {
@@ -230,11 +234,14 @@ export function ProviderDetailsModal({
 }: ProviderDetailsModalProps) {
   const nodeLabel = getNodeInstanceLabel(graph, node);
   const provider = resolveProviderDefinition(node, catalog);
+  const isModelNode = node.kind === "model";
   const availableProviders = modelProviderDefinitions(catalog);
   const envVarEntries = Object.entries(getGraphEnvVars(graph));
-  const providerName = String(node.config.provider_name ?? node.model_provider_name ?? "not-set");
+  const providerName = isModelNode
+    ? String(node.config.provider_name ?? node.model_provider_name ?? "not-set")
+    : String(provider?.provider_id ?? node.provider_id ?? "not-set");
   const providerConfigFields = provider?.config_fields ?? [];
-  const supportsLiveVerification = providerName !== "mock";
+  const supportsLiveVerification = isModelNode && providerName !== "mock";
   const catalogTools = catalog?.tools ?? [];
   const mcpCatalogTools = catalogTools.filter((tool) => tool.source_type === "mcp");
   const standardCatalogTools = catalogTools.filter((tool) => tool.source_type !== "mcp");
@@ -476,12 +483,15 @@ export function ProviderDetailsModal({
   }, [onClose]);
 
   const preflightConfig = useMemo<Record<string, unknown>>(() => {
+    if (!isModelNode) {
+      return Object.fromEntries(providerConfigFields.map((field) => [field.key, node.config[field.key]]));
+    }
     const entries: Array<[string, unknown]> = [["provider_name", providerName]];
     providerConfigFields.forEach((field) => {
       entries.push([field.key, node.config[field.key]]);
     });
     return Object.fromEntries(entries);
-  }, [node.config, providerConfigFields, providerName]);
+  }, [isModelNode, node.config, providerConfigFields, providerName]);
   const verificationStorageKey = useMemo(
     () => buildProviderVerificationStorageKey(providerName, preflightConfig),
     [preflightConfig, providerName],
@@ -498,7 +508,7 @@ export function ProviderDetailsModal({
 
   useEffect(() => {
     let cancelled = false;
-    if (!providerName || providerName === "not-set") {
+    if (!isModelNode || !providerName || providerName === "not-set") {
       setPreflightResult(null);
       setDiagnostics(null);
       setPreflightError(null);
@@ -535,7 +545,7 @@ export function ProviderDetailsModal({
     return () => {
       cancelled = true;
     };
-  }, [preflightConfig, providerName]);
+  }, [isModelNode, preflightConfig, providerName]);
 
   const displayedPreflightResult = useMemo(() => {
     if (
@@ -563,7 +573,7 @@ export function ProviderDetailsModal({
     return diagnostics;
   }, [diagnostics, persistedVerification]);
 
-  function updateProviderConfig(key: string, value: string | number) {
+  function updateProviderConfig(key: string, value: string | number | boolean) {
     onGraphChange(
       updateModelNode(graph, node.id, (currentNode) => ({
         ...currentNode,
@@ -685,20 +695,21 @@ export function ProviderDetailsModal({
       >
         <div className="tool-details-modal-header provider-details-modal-header">
           <div className="provider-details-modal-title-block">
-            <div className="tool-details-modal-eyebrow">API Provider Details</div>
+            <div className="tool-details-modal-eyebrow">{isModelNode ? "API Provider Details" : "Node Provider Details"}</div>
             <h3 id="provider-details-modal-title">
               {nodeLabel}
               {provider ? ` · ${provider.display_name}` : ""}
             </h3>
             <p>
-              Required provider selection stays on the API node. Use this modal to review provider capabilities and tune
-              optional provider parameters and prompt instructions for the selected API step.
+              {isModelNode
+                ? "Required provider selection stays on the API node. Use this modal to review provider capabilities and tune optional provider parameters and prompt instructions for the selected API step."
+                : "Use this modal to review the node provider capabilities and edit provider-specific configuration for this step."}
             </p>
             <div className="provider-details-modal-meta">
               <span className="provider-details-modal-meta-pill">provider {provider?.display_name ?? providerName}</span>
               <span className="provider-details-modal-meta-pill">node {node.kind}</span>
-              <span className="provider-details-modal-meta-pill">response {selectedModelResponseMode ?? "message"}</span>
-              <span className="provider-details-modal-meta-pill">{responseSchemaDetails.statusLabel}</span>
+              {isModelNode ? <span className="provider-details-modal-meta-pill">response {selectedModelResponseMode ?? "message"}</span> : null}
+              {isModelNode ? <span className="provider-details-modal-meta-pill">{responseSchemaDetails.statusLabel}</span> : null}
             </div>
           </div>
           <button type="button" className="secondary-button" onClick={onClose}>
@@ -711,8 +722,7 @@ export function ProviderDetailsModal({
             {[
               ["node", "Node"],
               ["overview", "Overview"],
-              ["prompt", "Prompt"],
-              ["routing", "Routing"],
+              ...(isModelNode ? [["prompt", "Prompt"], ["routing", "Routing"]] as Array<[string, string]> : []),
               ["config", "Config"],
               ["preview", "Preview"],
             ].map(([tabId, label]) => (
@@ -738,43 +748,52 @@ export function ProviderDetailsModal({
                   catalog={catalog}
                   onGraphChange={onGraphChange}
                 />
-                <label>
-                  Prompt Name
-                  <input
-                    value={String(node.config.prompt_name ?? node.prompt_name ?? "")}
-                    onChange={(event) =>
-                      onGraphChange(
-                        updateModelNode(graph, node.id, (currentNode) => ({
-                          ...currentNode,
-                          prompt_name: event.target.value,
-                          config: {
-                            ...currentNode.config,
-                            prompt_name: event.target.value,
-                            mode: event.target.value,
-                          },
-                        })),
-                      )
-                    }
-                  />
-                </label>
-                <label>
-                  Model Provider Name
-                  <input
-                    value={String(node.config.provider_name ?? node.model_provider_name ?? "")}
-                    onChange={(event) =>
-                      onGraphChange(
-                        updateModelNode(graph, node.id, (currentNode) => ({
-                          ...currentNode,
-                          model_provider_name: event.target.value,
-                          config: {
-                            ...currentNode.config,
-                            provider_name: event.target.value,
-                          },
-                        })),
-                      )
-                    }
-                  />
-                </label>
+                {isModelNode ? (
+                  <>
+                    <label>
+                      Prompt Name
+                      <input
+                        value={String(node.config.prompt_name ?? node.prompt_name ?? "")}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateModelNode(graph, node.id, (currentNode) => ({
+                              ...currentNode,
+                              prompt_name: event.target.value,
+                              config: {
+                                ...currentNode.config,
+                                prompt_name: event.target.value,
+                                mode: event.target.value,
+                              },
+                            })),
+                          )
+                        }
+                      />
+                    </label>
+                    <label>
+                      Model Provider Name
+                      <input
+                        value={String(node.config.provider_name ?? node.model_provider_name ?? "")}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateModelNode(graph, node.id, (currentNode) => ({
+                              ...currentNode,
+                              model_provider_name: event.target.value,
+                              config: {
+                                ...currentNode.config,
+                                provider_name: event.target.value,
+                              },
+                            })),
+                          )
+                        }
+                      />
+                    </label>
+                  </>
+                ) : (
+                  <label>
+                    Provider ID
+                    <input value={String(provider?.provider_id ?? node.provider_id ?? "")} readOnly />
+                  </label>
+                )}
               </div>
             ) : null}
 
@@ -799,10 +818,10 @@ export function ProviderDetailsModal({
                 <aside className="provider-details-overview-side">
                   <section className="provider-details-status-card">
                     <div className="provider-details-status-card-header">
-                      <strong>Health Check</strong>
-                      <span>{supportsLiveVerification ? "Live capable" : "Mock / local only"}</span>
+                      <strong>{isModelNode ? "Health Check" : "Provider Status"}</strong>
+                      <span>{isModelNode ? (supportsLiveVerification ? "Live capable" : "Mock / local only") : "Node-configured"}</span>
                     </div>
-                    {displayedPreflightResult ? (
+                    {isModelNode && displayedPreflightResult ? (
                       <div className="tool-details-modal-help">
                         <strong>Provider Health</strong>
                         <div>{displayedPreflightResult.message}</div>
@@ -811,24 +830,30 @@ export function ProviderDetailsModal({
                         ))}
                       </div>
                     ) : null}
-                    {preflightError ? <div className="tool-details-modal-help">{preflightError}</div> : null}
-                    {!supportsLiveVerification ? (
+                    {isModelNode && preflightError ? <div className="tool-details-modal-help">{preflightError}</div> : null}
+                    {isModelNode && !supportsLiveVerification ? (
                       <div className="tool-details-modal-help">Live verification is not required for the mock provider.</div>
                     ) : null}
-                    <button
-                      type="button"
-                      className="secondary-button provider-details-verify-button"
-                      onClick={handleLiveVerification}
-                      disabled={isPreflighting || !supportsLiveVerification}
-                    >
-                      {isPreflighting
-                        ? "Checking Provider..."
-                        : supportsLiveVerification
-                          ? "Run Live Verification"
-                          : "Live Verification Not Required"}
-                    </button>
+                    {isModelNode ? (
+                      <button
+                        type="button"
+                        className="secondary-button provider-details-verify-button"
+                        onClick={handleLiveVerification}
+                        disabled={isPreflighting || !supportsLiveVerification}
+                      >
+                        {isPreflighting
+                          ? "Checking Provider..."
+                          : supportsLiveVerification
+                            ? "Run Live Verification"
+                            : "Live Verification Not Required"}
+                      </button>
+                    ) : (
+                      <div className="tool-details-modal-help">
+                        This node provider is configured directly in the graph and does not need live API verification.
+                      </div>
+                    )}
                   </section>
-                  {displayedDiagnostics ? (
+                  {isModelNode && displayedDiagnostics ? (
                     <section className="provider-details-status-card provider-details-status-card--diagnostics">
                       <div className="provider-details-status-card-header">
                         <strong>Diagnostics</strong>
@@ -888,7 +913,7 @@ export function ProviderDetailsModal({
               </div>
             ) : null}
 
-            {activeTab === "prompt" ? (
+            {activeTab === "prompt" && isModelNode ? (
               <div className="modal-folder-section provider-details-prompt-layout">
                 <div className="provider-details-prompt-main">
                 <label>
@@ -990,7 +1015,7 @@ export function ProviderDetailsModal({
               </div>
             ) : null}
 
-            {activeTab === "routing" ? (
+            {activeTab === "routing" && isModelNode ? (
               <div className="modal-folder-section provider-details-routing-layout">
                 <div className="provider-details-routing-main">
                 <label>
@@ -1214,22 +1239,29 @@ export function ProviderDetailsModal({
             {activeTab === "config" ? (
               <div className="modal-folder-section provider-details-config-layout">
                 <div className="provider-details-grid">
-                  <label>
-                    Provider
-                    <select
-                      value={providerName}
-                      onChange={(event) => handleProviderChange(event.target.value)}
-                    >
-                      {availableProviders.map((candidate) => {
-                        const candidateName = providerModelName(candidate);
-                        return (
-                          <option key={candidate.provider_id} value={candidateName}>
-                            {candidate.display_name}
-                          </option>
-                        );
-                      })}
-                    </select>
-                  </label>
+                  {isModelNode ? (
+                    <label>
+                      Provider
+                      <select
+                        value={providerName}
+                        onChange={(event) => handleProviderChange(event.target.value)}
+                      >
+                        {availableProviders.map((candidate) => {
+                          const candidateName = providerModelName(candidate);
+                          return (
+                            <option key={candidate.provider_id} value={candidateName}>
+                              {candidate.display_name}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </label>
+                  ) : (
+                    <label>
+                      Provider
+                      <input value={provider?.display_name ?? providerName} readOnly />
+                    </label>
+                  )}
                   {providerConfigFields.map((field) => (
                     <label key={field.key}>
                       {field.label}
@@ -1237,6 +1269,8 @@ export function ProviderDetailsModal({
                         const currentValue = String(node.config[field.key] ?? "");
                         const isSelectField = field.input_type === "select" && (field.options?.length ?? 0) > 0;
                         const isModelSelectField = isSelectField && field.key === "model";
+                        const isCheckboxField = field.input_type === "checkbox";
+                        const isTextareaField = field.input_type === "textarea";
                         const selectOptions =
                           isSelectField && currentValue && !field.options?.some((option) => option.value === currentValue)
                             ? [...(field.options ?? []), { value: currentValue, label: `Custom: ${currentValue}` }]
@@ -1271,6 +1305,19 @@ export function ProviderDetailsModal({
                                   </option>
                                 ))}
                               </select>
+                            ) : isCheckboxField ? (
+                              <input
+                                type="checkbox"
+                                checked={Boolean(node.config[field.key] ?? false)}
+                                onChange={(event) => updateProviderConfig(field.key, event.target.checked)}
+                              />
+                            ) : isTextareaField ? (
+                              <textarea
+                                rows={4}
+                                value={currentValue}
+                                placeholder={field.placeholder || undefined}
+                                onChange={handleTextInputChange(field.key)}
+                              />
                             ) : (
                               <input
                                 type={field.input_type === "number" ? "number" : "text"}
@@ -1291,8 +1338,9 @@ export function ProviderDetailsModal({
                 </div>
 
                 <div className="tool-details-modal-help">
-                  Required provider choice is controlled from the API node itself. These fields are optional overrides for
-                  the selected provider.
+                  {isModelNode
+                    ? "Required provider choice is controlled from the API node itself. These fields are optional overrides for the selected provider."
+                    : "These fields define how this node provider behaves for the selected graph node."}
                 </div>
 
                 <div className="tool-details-modal-help">

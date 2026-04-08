@@ -923,6 +923,128 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertEqual(else_output["metadata"]["branch_evaluations"][0]["matched"], False)
         self.assertEqual(else_output["metadata"]["branch_evaluations"][1]["matched"], False)
 
+    def test_logic_conditions_coerce_numeric_string_thresholds(self) -> None:
+        services = build_example_services()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "logic-string-thresholds-graph",
+            "name": "Logic String Thresholds Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "branch",
+                    "kind": "control_flow_unit",
+                    "category": "control_flow_unit",
+                    "label": "Branch",
+                    "provider_id": "core.logic_conditions",
+                    "provider_label": "Logic Conditions",
+                    "config": {
+                        "mode": "logic_conditions",
+                        "branches": [
+                            {
+                                "id": "within-limit",
+                                "label": "Within Limit",
+                                "output_handle_id": "within-limit-handle",
+                                "root_group": {
+                                    "id": "within-limit-root",
+                                    "type": "group",
+                                    "combinator": "all",
+                                    "children": [
+                                        {
+                                            "id": "row-index-rule",
+                                            "type": "rule",
+                                            "path": "row_index",
+                                            "operator": "lte",
+                                            "value": "3",
+                                            "source_contracts": [],
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                        "else_output_handle_id": "control-flow-else",
+                    },
+                    "position": {"x": 120, "y": 0},
+                },
+                {
+                    "id": "within_limit_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Within Limit Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {},
+                    "position": {"x": 260, "y": -60},
+                },
+                {
+                    "id": "else_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Else Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {},
+                    "position": {"x": 260, "y": 60},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "branch", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "e2",
+                    "source_id": "branch",
+                    "source_handle_id": "within-limit-handle",
+                    "target_id": "within_limit_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                },
+                {
+                    "id": "e3",
+                    "source_id": "branch",
+                    "source_handle_id": "control-flow-else",
+                    "target_id": "else_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                },
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(services)
+
+        matched_state = runtime.run(graph, {"row_index": 2}, run_id="logic-string-thresholds-if")
+        self.assertEqual(matched_state.status, "completed")
+        self.assertTrue(any(transition.target_id == "within_limit_finish" for transition in matched_state.transition_history))
+        self.assertFalse(any(transition.target_id == "else_finish" for transition in matched_state.transition_history))
+        matched_output = matched_state.node_outputs["branch"]
+        self.assertEqual(matched_output["metadata"]["matched_branch_label"], "Within Limit")
+        self.assertEqual(matched_output["metadata"]["condition_evaluations"][0]["matched"], True)
+        self.assertEqual(matched_output["metadata"]["condition_evaluations"][0]["actual_value"], 2)
+        self.assertEqual(matched_output["metadata"]["condition_evaluations"][0]["expected_value"], "3")
+
+        else_state = runtime.run(graph, {"row_index": 4}, run_id="logic-string-thresholds-else")
+        self.assertEqual(else_state.status, "completed")
+        self.assertTrue(any(transition.target_id == "else_finish" for transition in else_state.transition_history))
+        else_output = else_state.node_outputs["branch"]
+        self.assertEqual(else_output["metadata"]["matched_branch_label"], "Else")
+        self.assertEqual(else_output["metadata"]["condition_evaluations"][0]["matched"], False)
+
     def test_run_state_reducer_tracks_iterator_updates(self) -> None:
         state = build_run_state("run-iterator", "graph-1", None, execution_node_ids=["sheet"])
         next_state = apply_single_run_event(

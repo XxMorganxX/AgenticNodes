@@ -12,6 +12,7 @@ dependencies = [
     "discord.py",
     "fastapi",
     "httpx",
+    "jsonschema",
     "openpyxl",
     "pypdf",
     "python-multipart",
@@ -23,3 +24,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+graph_agent = ["runtime/*.js"]

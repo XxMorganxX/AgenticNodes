@@ -24,9 +24,27 @@ from graph_agent.runtime.event_contract import (
     normalize_runtime_event_dict,
 )
 from graph_agent.runtime.agent_filesystem import (
+    normalize_workspace_text_write_behavior,
     resolve_agent_workspace,
     resolve_agent_workspace_path,
     write_agent_workspace_text_file,
+)
+from graph_agent.runtime.linkedin_profile_fetch import (
+    LinkedInFetchError,
+    build_linkedin_profile_cache_info,
+    error_from_linkedin_profile_payload,
+    extract_linkedin_profile_url,
+    fetch_linkedin_profile_live,
+    is_cacheable_linkedin_profile,
+    read_cached_linkedin_profile,
+    write_cached_linkedin_profile,
+    write_linkedin_profile_workspace_copy,
+    workspace_cache_relative_path,
+)
+from graph_agent.runtime.runtime_normalizer import (
+    RuntimeFieldExtractorConfig,
+    extract_field_candidates,
+    parse_field_name_list,
 )
 from graph_agent.runtime.node_providers import (
     NodeCategory,
@@ -61,7 +79,12 @@ DISCORD_END_PROVIDER_ID = "end.discord_message"
 DEFAULT_DISCORD_BOT_TOKEN_ENV_VAR = "{DISCORD_BOT_TOKEN}"
 SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows"
 LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions"
+PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter"
 WRITE_TEXT_FILE_PROVIDER_ID = "core.write_text_file"
+LINKEDIN_PROFILE_FETCH_PROVIDER_ID = "core.linkedin_profile_fetch"
+LINKEDIN_PROFILE_FETCH_MODE = "linkedin_profile_fetch"
+RUNTIME_NORMALIZER_PROVIDER_ID = "core.runtime_normalizer"
+RUNTIME_NORMALIZER_MODE = "runtime_normalizer"
 CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body"
 CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if"
 CONTROL_FLOW_ELSE_HANDLE_ID = "control-flow-else"
@@ -76,6 +99,54 @@ def _json_safe(value: Any) -> str:
 def _normalize_prompt_block_role(value: Any) -> str:
     role = str(value or "user").strip().lower()
     return role if role in PROMPT_BLOCK_ROLES else "user"
+
+
+def _coerce_logic_order_operand(value: Any) -> Any:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return value
+        if re.fullmatch(r"[+-]?\d+", candidate):
+            try:
+                return int(candidate)
+            except ValueError:
+                return value
+        if re.fullmatch(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", candidate):
+            try:
+                return float(candidate)
+            except ValueError:
+                return value
+    return value
+
+
+def _coerce_bool(value: Any, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _coerce_int(value: Any, *, default: int, minimum: int | None = None) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        resolved = int(str(value).strip()) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        return max(resolved, minimum)
+    return resolved
 
 
 def _is_prompt_block_payload(value: Any) -> bool:
@@ -637,6 +708,7 @@ class RunState:
     parent_run_id: str | None = None
     current_node_id: str | None = None
     current_edge_id: str | None = None
+    current_iteration_context: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"
     started_at: str = field(default_factory=utc_now_iso)
     ended_at: str | None = None
@@ -785,6 +857,13 @@ class NodeContext:
             create_parent=create_parent,
         )
         return str(target_path), normalized_relative_path.as_posix()
+
+    def current_iteration_context(self) -> dict[str, Any]:
+        return dict(self.state.current_iteration_context)
+
+    def is_loop_execution(self) -> bool:
+        iteration_context = self.current_iteration_context()
+        return bool(iteration_context.get("iteration_id")) or isinstance(iteration_context.get("iterator_row_index"), int)
 
     def resolve_graph_env_value(self, value: Any) -> Any:
         return resolve_graph_env_value(value, self.graph.env_vars)
@@ -1715,12 +1794,20 @@ class DataNode(BaseNode):
         if isinstance(source_value, Mapping) and "payload" in source_value:
             source_value = source_value.get("payload")
         rendered_content = _render_workspace_file_content(source_value)
+        is_loop_execution = context.is_loop_execution()
+        resolved_exists_behavior = normalize_workspace_text_write_behavior(self.config.get("exists_behavior"))
+        if resolved_exists_behavior is None:
+            resolved_exists_behavior = "append" if is_loop_execution else "overwrite"
+        append_newline = bool(self.config.get("append_newline", True))
         file_record = write_agent_workspace_text_file(
             context.state.run_id,
             context.state.agent_id,
             relative_path,
             rendered_content,
+            exists_behavior=resolved_exists_behavior,
+            append_newline=append_newline,
         )
+        write_mode = str(file_record.get("write_mode", "created") or "created")
         preview_limit = 500
         content_preview = rendered_content if len(rendered_content) <= preview_limit else f"{rendered_content[:preview_limit].rstrip()}..."
         envelope = MessageEnvelope(
@@ -1730,6 +1817,7 @@ class DataNode(BaseNode):
             payload={
                 "file": file_record,
                 "content_preview": content_preview,
+                "write_mode": write_mode,
             },
             artifacts={"workspace_file": file_record},
             metadata={
@@ -1738,12 +1826,321 @@ class DataNode(BaseNode):
                 "data_mode": "write_text_file",
                 "provider_id": self.provider_id,
                 "workspace_dir": context.workspace_dir(create=True),
+                "write_mode": write_mode,
+                "exists_behavior": resolved_exists_behavior,
+                "append_newline": append_newline,
+                "loop_execution": is_loop_execution,
             },
         )
+        action_label = {
+            "created": "Wrote",
+            "overwritten": "Overwrote",
+            "appended": "Appended",
+        }.get(write_mode, "Wrote")
         return NodeExecutionResult(
             status="success",
             output=envelope.to_dict(),
-            summary=f"Wrote {file_record['path']} to the agent workspace.",
+            summary=f"{action_label} {file_record['path']} in the agent workspace.",
+        )
+
+    def _linkedin_profile_fetch_config(self, context: NodeContext) -> dict[str, Any]:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        return {
+            "url_field": str(resolved.get("url_field", "url") or "url").strip() or "url",
+            "linkedin_data_dir": str(resolved.get("linkedin_data_dir", "") or "").strip(),
+            "session_state_path": str(resolved.get("session_state_path", "") or "").strip(),
+            "headless": _coerce_bool(resolved.get("headless"), default=False),
+            "navigation_timeout_ms": _coerce_int(resolved.get("navigation_timeout_ms"), default=45000, minimum=1000),
+            "page_settle_ms": _coerce_int(resolved.get("page_settle_ms"), default=3000, minimum=0),
+            "use_cache": _coerce_bool(resolved.get("use_cache"), default=True),
+            "force_refresh": _coerce_bool(resolved.get("force_refresh"), default=False),
+            "workspace_cache_path_template": str(
+                resolved.get("workspace_cache_path_template", "cache/linkedin/{cache_key}.json") or "cache/linkedin/{cache_key}.json"
+            ).strip()
+            or "cache/linkedin/{cache_key}.json",
+        }
+
+    def _build_linkedin_profile_envelope(
+        self,
+        profile_payload: Mapping[str, Any],
+        *,
+        cache_status: str,
+        cache_key: str,
+        source_url: str,
+        normalized_url: str,
+        workspace_relative_path: str,
+        workspace_file: Mapping[str, Any],
+        shared_cache_file: Mapping[str, Any] | None = None,
+        final_page_url: str = "",
+        storage_state_path: str = "",
+    ) -> MessageEnvelope:
+        artifacts: dict[str, Any] = {
+            "workspace_file": dict(workspace_file),
+        }
+        if shared_cache_file is not None:
+            artifacts["shared_cache_file"] = dict(shared_cache_file)
+        if final_page_url:
+            artifacts["final_page_url"] = final_page_url
+        if storage_state_path:
+            artifacts["storage_state_path"] = storage_state_path
+        return MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=dict(profile_payload),
+            artifacts=artifacts,
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "data_mode": LINKEDIN_PROFILE_FETCH_MODE,
+                "provider_id": self.provider_id,
+                "cache_status": cache_status,
+                "cache_key": cache_key,
+                "source_url": source_url,
+                "normalized_url": normalized_url,
+                "workspace_cache_path": workspace_relative_path,
+                **({"shared_cache_path": str(shared_cache_file.get("path", ""))} if shared_cache_file is not None else {}),
+            },
+        )
+
+    def _execute_linkedin_profile_fetch(self, context: NodeContext) -> NodeExecutionResult:
+        resolved_config = self._linkedin_profile_fetch_config(context)
+        source_value = context.resolve_binding(self.config.get("input_binding"))
+        if isinstance(source_value, Mapping) and "payload" in source_value:
+            source_value = source_value.get("payload")
+        source_url = extract_linkedin_profile_url(source_value, url_field=resolved_config["url_field"])
+        if not source_url:
+            return NodeExecutionResult(
+                status="failed",
+                error={
+                    "type": "invalid_linkedin_profile_input",
+                    "message": f"No LinkedIn URL was found in the incoming payload. Expected a string URL or a '{resolved_config['url_field']}' field.",
+                    "url_field": resolved_config["url_field"],
+                },
+                summary="LinkedIn profile fetch did not receive a URL.",
+            )
+
+        try:
+            cache_info = build_linkedin_profile_cache_info(source_url)
+        except LinkedInFetchError as exc:
+            return NodeExecutionResult(status="failed", error=exc.to_error_dict(), summary=str(exc))
+
+        workspace_template = resolved_config["workspace_cache_path_template"]
+        use_cache = resolved_config["use_cache"]
+        force_refresh = resolved_config["force_refresh"]
+
+        if use_cache and not force_refresh:
+            cached_payload, shared_cache_file = read_cached_linkedin_profile(cache_info)
+            if cached_payload is not None:
+                try:
+                    workspace_relative_path, workspace_file = write_linkedin_profile_workspace_copy(
+                        context.state.run_id,
+                        context.state.agent_id,
+                        workspace_template,
+                        cache_key=cache_info.cache_key,
+                        payload=cached_payload,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    return NodeExecutionResult(
+                        status="failed",
+                        error={
+                            "type": "linkedin_workspace_cache_write_failed",
+                            "message": str(exc),
+                            "cache_key": cache_info.cache_key,
+                        },
+                        summary="LinkedIn cache hit could not be mirrored into the agent workspace.",
+                    )
+                envelope = self._build_linkedin_profile_envelope(
+                    cached_payload,
+                    cache_status="hit",
+                    cache_key=cache_info.cache_key,
+                    source_url=source_url,
+                    normalized_url=cache_info.normalized_url,
+                    workspace_relative_path=workspace_relative_path,
+                    workspace_file=workspace_file,
+                    shared_cache_file=shared_cache_file,
+                )
+                return NodeExecutionResult(
+                    status="success",
+                    output=envelope.to_dict(),
+                    summary=f"Loaded LinkedIn profile '{cache_info.normalized_url}' from shared cache.",
+                    metadata=envelope.metadata,
+                )
+
+        cache_status = "refresh" if force_refresh else "miss"
+        try:
+            live_result = fetch_linkedin_profile_live(
+                url=cache_info.normalized_url,
+                linkedin_data_dir=resolved_config["linkedin_data_dir"],
+                session_state_path=resolved_config["session_state_path"],
+                headless=resolved_config["headless"],
+                navigation_timeout_ms=resolved_config["navigation_timeout_ms"],
+                page_settle_ms=resolved_config["page_settle_ms"],
+            )
+        except LinkedInFetchError as exc:
+            return NodeExecutionResult(status="failed", error=exc.to_error_dict(), summary=str(exc))
+
+        profile_payload = dict(live_result["extracted"])
+        try:
+            workspace_relative_path, workspace_file = write_linkedin_profile_workspace_copy(
+                context.state.run_id,
+                context.state.agent_id,
+                workspace_template,
+                cache_key=cache_info.cache_key,
+                payload=profile_payload,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return NodeExecutionResult(
+                status="failed",
+                error={
+                    "type": "linkedin_workspace_cache_write_failed",
+                    "message": str(exc),
+                    "cache_key": cache_info.cache_key,
+                },
+                summary="LinkedIn fetch completed but the workspace mirror could not be written.",
+            )
+
+        shared_cache_file: dict[str, Any] | None = None
+        if use_cache and is_cacheable_linkedin_profile(profile_payload):
+            try:
+                shared_cache_file = write_cached_linkedin_profile(cache_info, profile_payload)
+            except Exception as exc:  # noqa: BLE001
+                return NodeExecutionResult(
+                    status="failed",
+                    error={
+                        "type": "linkedin_shared_cache_write_failed",
+                        "message": str(exc),
+                        "cache_key": cache_info.cache_key,
+                    },
+                    summary="LinkedIn fetch completed but the shared cache entry could not be written.",
+                )
+
+        envelope = self._build_linkedin_profile_envelope(
+            profile_payload,
+            cache_status=cache_status,
+            cache_key=cache_info.cache_key,
+            source_url=source_url,
+            normalized_url=cache_info.normalized_url,
+            workspace_relative_path=workspace_relative_path,
+            workspace_file=workspace_file,
+            shared_cache_file=shared_cache_file,
+            final_page_url=str(live_result.get("final_page_url", "") or ""),
+            storage_state_path=str(live_result.get("storage_state_path", "") or ""),
+        )
+
+        if not is_cacheable_linkedin_profile(profile_payload):
+            error = error_from_linkedin_profile_payload(
+                profile_payload,
+                source_url=source_url,
+                normalized_url=cache_info.normalized_url,
+            )
+            return NodeExecutionResult(
+                status="failed",
+                output=envelope.to_dict(),
+                error=error,
+                summary=error["message"],
+                metadata=envelope.metadata,
+            )
+
+        summary_prefix = "Refreshed" if cache_status == "refresh" else "Fetched"
+        summary_suffix = " and updated shared cache." if shared_cache_file is not None else "."
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary=f"{summary_prefix} LinkedIn profile '{cache_info.normalized_url}'{summary_suffix}",
+            metadata=envelope.metadata,
+        )
+
+    def _runtime_normalizer_config(self, context: NodeContext) -> RuntimeFieldExtractorConfig:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        field_name = str(resolved.get("field_name", "") or "").strip()
+        fallback_field_names = parse_field_name_list(resolved.get("fallback_field_names"))
+        return RuntimeFieldExtractorConfig(
+            field_name=field_name,
+            fallback_field_names=fallback_field_names,
+            preferred_path=str(resolved.get("preferred_path", "") or "").strip(),
+            case_sensitive=_coerce_bool(resolved.get("case_sensitive"), default=False),
+            max_matches=_coerce_int(resolved.get("max_matches"), default=25, minimum=1),
+        )
+
+    def _execute_runtime_normalizer(self, context: NodeContext) -> NodeExecutionResult:
+        resolved_config = self._runtime_normalizer_config(context)
+        source_value = context.resolve_binding(self.config.get("input_binding"))
+        if isinstance(source_value, Mapping) and "payload" in source_value:
+            source_value = source_value.get("payload")
+        if not resolved_config.field_name:
+            error = {
+                "type": "missing_field_name",
+                "message": "Runtime field extractor requires a field_name configuration value.",
+            }
+            return NodeExecutionResult(status="failed", error=error, summary=error["message"])
+
+        matched_value = None
+        matched_path = ""
+        all_matches: list[dict[str, Any]] = []
+
+        if resolved_config.preferred_path:
+            preferred_value = _deep_get(source_value, resolved_config.preferred_path)
+            if preferred_value is not None:
+                matched_value = preferred_value
+                matched_path = resolved_config.preferred_path
+                all_matches.append(
+                    {
+                        "field": resolved_config.field_name,
+                        "path": resolved_config.preferred_path,
+                        "value": preferred_value,
+                    }
+                )
+
+        if matched_value is None:
+            search_fields = (resolved_config.field_name, *resolved_config.fallback_field_names)
+            all_matches = extract_field_candidates(
+                source_value,
+                field_names=search_fields,
+                case_sensitive=resolved_config.case_sensitive,
+                max_matches=resolved_config.max_matches,
+            )
+            if all_matches:
+                matched_value = all_matches[0].get("value")
+                matched_path = str(all_matches[0].get("path", "") or "")
+
+        metadata = {
+            "contract": "data_envelope",
+            "node_kind": self.kind,
+            "data_mode": RUNTIME_NORMALIZER_MODE,
+            "provider_id": self.provider_id,
+            "field_name": resolved_config.field_name,
+            "fallback_field_names": list(resolved_config.fallback_field_names),
+            "matched_path": matched_path or None,
+            "match_count": len(all_matches),
+            "case_sensitive": resolved_config.case_sensitive,
+        }
+        artifacts = {"field_matches": all_matches}
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=matched_value,
+            artifacts=artifacts,
+            metadata=metadata,
+        )
+        error = None
+        summary = f"Extracted '{resolved_config.field_name}' from '{matched_path}'." if matched_path else f"Field '{resolved_config.field_name}' was not found."
+        status = "success"
+        if matched_path == "":
+            error = {
+                "type": "field_not_found",
+                "message": f"Field '{resolved_config.field_name}' was not found in the incoming payload.",
+                "field_name": resolved_config.field_name,
+                "fallback_field_names": list(resolved_config.fallback_field_names),
+            }
+            status = "failed"
+        return NodeExecutionResult(
+            status=status,
+            output=envelope.to_dict(),
+            error=error,
+            summary=summary,
+            metadata=metadata,
         )
 
     def runtime_input_preview(self, context: NodeContext) -> Any:
@@ -1754,10 +2151,87 @@ class DataNode(BaseNode):
             source_value = context.resolve_binding(self.config.get("input_binding"))
             if isinstance(source_value, Mapping) and "payload" in source_value:
                 source_value = source_value.get("payload")
+            is_loop_execution = context.is_loop_execution()
+            resolved_exists_behavior = normalize_workspace_text_write_behavior(self.config.get("exists_behavior"))
             return {
                 "relative_path": str(self.config.get("relative_path", "response.txt") or "response.txt").strip() or "response.txt",
                 "workspace_dir": context.workspace_dir(create=True),
                 "content_preview": _render_workspace_file_content(source_value),
+                "exists_behavior": resolved_exists_behavior or ("append" if is_loop_execution else "overwrite"),
+                "append_newline": bool(self.config.get("append_newline", True)),
+                "loop_execution": is_loop_execution,
+            }
+        if self.provider_id == LINKEDIN_PROFILE_FETCH_PROVIDER_ID or mode == LINKEDIN_PROFILE_FETCH_MODE:
+            resolved_config = self._linkedin_profile_fetch_config(context)
+            source_value = context.resolve_binding(self.config.get("input_binding"))
+            if isinstance(source_value, Mapping) and "payload" in source_value:
+                source_value = source_value.get("payload")
+            preview: dict[str, Any] = {
+                "url_field": resolved_config["url_field"],
+                "use_cache": resolved_config["use_cache"],
+                "force_refresh": resolved_config["force_refresh"],
+                "headless": resolved_config["headless"],
+                "navigation_timeout_ms": resolved_config["navigation_timeout_ms"],
+                "page_settle_ms": resolved_config["page_settle_ms"],
+                "linkedin_data_dir": resolved_config["linkedin_data_dir"],
+                "session_state_path": resolved_config["session_state_path"],
+            }
+            source_url = extract_linkedin_profile_url(source_value, url_field=resolved_config["url_field"])
+            if not source_url:
+                preview["error"] = f"Expected a raw string URL or a '{resolved_config['url_field']}' field."
+                return preview
+            preview["source_url"] = source_url
+            try:
+                cache_info = build_linkedin_profile_cache_info(source_url)
+            except LinkedInFetchError as exc:
+                preview["error"] = str(exc)
+                return preview
+            preview["normalized_url"] = cache_info.normalized_url
+            preview["cache_key"] = cache_info.cache_key
+            preview["shared_cache_path"] = str(cache_info.shared_cache_path)
+            cached_payload, shared_cache_file = read_cached_linkedin_profile(cache_info) if resolved_config["use_cache"] else (None, None)
+            preview["cache_hit"] = cached_payload is not None and not resolved_config["force_refresh"]
+            if shared_cache_file is not None:
+                preview["shared_cache_file"] = shared_cache_file
+            if isinstance(cached_payload, Mapping):
+                preview["cached_profile_name"] = _deep_get(cached_payload, "person.name")
+            workspace_relative_path = workspace_cache_relative_path(
+                resolved_config["workspace_cache_path_template"],
+                cache_key=cache_info.cache_key,
+            )
+            preview["workspace_cache_path"] = workspace_relative_path
+            try:
+                workspace_absolute_path, _ = context.resolve_workspace_path(workspace_relative_path)
+                preview["workspace_cache_absolute_path"] = workspace_absolute_path
+            except Exception as exc:  # noqa: BLE001
+                preview["workspace_path_error"] = str(exc)
+            return preview
+        if self.provider_id == RUNTIME_NORMALIZER_PROVIDER_ID or mode == RUNTIME_NORMALIZER_MODE:
+            resolved_config = self._runtime_normalizer_config(context)
+            source_value = context.resolve_binding(self.config.get("input_binding"))
+            if isinstance(source_value, Mapping) and "payload" in source_value:
+                source_value = source_value.get("payload")
+            search_fields = (resolved_config.field_name, *resolved_config.fallback_field_names) if resolved_config.field_name else ()
+            matches = (
+                extract_field_candidates(
+                    source_value,
+                    field_names=search_fields,
+                    case_sensitive=resolved_config.case_sensitive,
+                    max_matches=resolved_config.max_matches,
+                )
+                if search_fields
+                else []
+            )
+            preferred_value = _deep_get(source_value, resolved_config.preferred_path) if resolved_config.preferred_path else None
+            return {
+                "field_name": resolved_config.field_name,
+                "fallback_field_names": list(resolved_config.fallback_field_names),
+                "preferred_path": resolved_config.preferred_path,
+                "case_sensitive": resolved_config.case_sensitive,
+                "max_matches": resolved_config.max_matches,
+                "preferred_path_value": preferred_value,
+                "matches": matches,
+                "selected_value": preferred_value if preferred_value is not None else (matches[0]["value"] if matches else None),
             }
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return context.prompt_block_payload_for_node(self.id)
@@ -1795,6 +2269,10 @@ class DataNode(BaseNode):
             return self._execute_spreadsheet_rows(context)
         if self.provider_id == WRITE_TEXT_FILE_PROVIDER_ID or mode == "write_text_file":
             return self._execute_write_text_file(context)
+        if self.provider_id == LINKEDIN_PROFILE_FETCH_PROVIDER_ID or mode == LINKEDIN_PROFILE_FETCH_MODE:
+            return self._execute_linkedin_profile_fetch(context)
+        if self.provider_id == RUNTIME_NORMALIZER_PROVIDER_ID or mode == RUNTIME_NORMALIZER_MODE:
+            return self._execute_runtime_normalizer(context)
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return self._execute_prompt_block(context)
         source_value = context.resolve_binding(self.config.get("input_binding"))
@@ -2167,13 +2645,33 @@ class ControlFlowNode(BaseNode):
             else:
                 matched = False
         elif operator == "gt":
-            matched = actual_value is not None and expected_value is not None and actual_value > expected_value
+            comparable_actual = _coerce_logic_order_operand(actual_value)
+            comparable_expected = _coerce_logic_order_operand(expected_value)
+            try:
+                matched = comparable_actual is not None and comparable_expected is not None and comparable_actual > comparable_expected
+            except TypeError:
+                matched = False
         elif operator == "gte":
-            matched = actual_value is not None and expected_value is not None and actual_value >= expected_value
+            comparable_actual = _coerce_logic_order_operand(actual_value)
+            comparable_expected = _coerce_logic_order_operand(expected_value)
+            try:
+                matched = comparable_actual is not None and comparable_expected is not None and comparable_actual >= comparable_expected
+            except TypeError:
+                matched = False
         elif operator == "lt":
-            matched = actual_value is not None and expected_value is not None and actual_value < expected_value
+            comparable_actual = _coerce_logic_order_operand(actual_value)
+            comparable_expected = _coerce_logic_order_operand(expected_value)
+            try:
+                matched = comparable_actual is not None and comparable_expected is not None and comparable_actual < comparable_expected
+            except TypeError:
+                matched = False
         elif operator == "lte":
-            matched = actual_value is not None and expected_value is not None and actual_value <= expected_value
+            comparable_actual = _coerce_logic_order_operand(actual_value)
+            comparable_expected = _coerce_logic_order_operand(expected_value)
+            try:
+                matched = comparable_actual is not None and comparable_expected is not None and comparable_actual <= comparable_expected
+            except TypeError:
+                matched = False
         return (
             matched,
             {
@@ -2232,6 +2730,36 @@ class ControlFlowNode(BaseNode):
 
     def _evaluate_logic_clause(self, payload: Any, clause: Mapping[str, Any], incoming_contract: str) -> tuple[bool, dict[str, Any]]:
         return self._evaluate_logic_rule(payload, clause, incoming_contract)
+
+    def _execute_parallel_splitter(self, context: NodeContext) -> NodeExecutionResult:
+        source_envelope = self._source_envelope(context)
+        incoming_contract = str(source_envelope.metadata.get("contract", "") or "").strip() or "data_envelope"
+        forwarded_envelope = MessageEnvelope(
+            schema_version=source_envelope.schema_version,
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=source_envelope.payload,
+            artifacts=dict(source_envelope.artifacts),
+            errors=list(source_envelope.errors),
+            tool_calls=list(source_envelope.tool_calls),
+            metadata={
+                **dict(source_envelope.metadata),
+                "contract": incoming_contract,
+                "node_kind": self.kind,
+                "control_flow_mode": "parallel_splitter",
+                "fan_out_parallel": True,
+            },
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=forwarded_envelope.to_dict(),
+            summary="Parallel splitter forwarded the incoming envelope to all downstream branches.",
+            metadata={
+                "control_flow_mode": "parallel_splitter",
+                "fan_out_parallel": True,
+                "incoming_contract": incoming_contract,
+            },
+        )
 
     def _execute_logic_conditions(self, context: NodeContext) -> NodeExecutionResult:
         source_envelope = self._source_envelope(context)
@@ -2314,6 +2842,8 @@ class ControlFlowNode(BaseNode):
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         if self.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
             return self._execute_spreadsheet_rows(context)
+        if self.provider_id == PARALLEL_SPLITTER_PROVIDER_ID:
+            return self._execute_parallel_splitter(context)
         if self.provider_id == LOGIC_CONDITIONS_PROVIDER_ID:
             return self._execute_logic_conditions(context)
         envelope = self._source_envelope(context)
@@ -2612,6 +3142,28 @@ class ModelNode(BaseNode):
             for tool in available_tool_payloads
             if isinstance(tool, Mapping) and str(tool.get("name", "")).strip()
         }
+        tool_payload_lookup = {
+            str(tool.get("name", "")).strip(): tool
+            for tool in available_tool_payloads
+            if isinstance(tool, Mapping) and str(tool.get("name", "")).strip()
+        }
+        decision_validation_tools = [
+            tool
+            for tool in request.available_tools
+            if str(tool_payload_lookup.get(tool.name, {}).get("source_type", "")).strip() != "mcp"
+        ]
+        decision_validation_schema = (
+            request.response_schema
+            if len(decision_validation_tools) == len(request.available_tools)
+            else api_decision_response_schema(
+                final_message_schema=self.config.get("response_schema")
+                if isinstance(self.config.get("response_schema"), Mapping)
+                else None,
+                available_tools=decision_validation_tools or None,
+                allow_tool_calls=bool(available_tool_payloads),
+                response_mode=response_mode_hint,
+            )
+        )
         response = provider.generate(request)
         try:
             normalized_decision_output = _canonicalize_api_decision_tool_names(
@@ -2624,11 +3176,16 @@ class ModelNode(BaseNode):
             )
             decision_output = validate_api_decision_output(
                 normalized_decision_output,
+                decision_schema=decision_validation_schema if isinstance(decision_validation_schema, Mapping) else None,
+                available_tools=decision_validation_tools or None,
                 callable_tool_names=callable_tool_names,
                 response_mode=response_mode_hint,
             )
         except ValueError as exc:
             error = {"message": str(exc), "type": "structured_api_output_error"}
+            details = getattr(exc, "details", None)
+            if isinstance(details, Mapping):
+                error["details"] = dict(details)
             envelope = MessageEnvelope(
                 schema_version="1.0",
                 from_node_id=self.id,
@@ -3246,8 +3803,16 @@ class McpToolExecutorNode(BaseNode):
                 metadata=envelope.metadata,
             )
 
-    def _invalid_follow_up_result(self, message: str, *, route_outputs: Mapping[str, Any] | None = None) -> NodeExecutionResult:
+    def _invalid_follow_up_result(
+        self,
+        message: str,
+        *,
+        route_outputs: Mapping[str, Any] | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> NodeExecutionResult:
         error = {"type": "mcp_executor_follow_up_error", "node_id": self.id, "message": message}
+        if isinstance(details, Mapping):
+            error["details"] = dict(details)
         envelope = MessageEnvelope(
             schema_version="1.0",
             from_node_id=self.id,
@@ -3263,6 +3828,78 @@ class McpToolExecutorNode(BaseNode):
             summary=f"MCP executor '{self.label}' could not prepare follow-up context.",
             metadata=envelope.metadata,
             route_outputs=dict(route_outputs or {}),
+        )
+
+    def _validation_details(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, Mapping):
+            return dict(value)
+        return {}
+
+    def _should_halt_after_tool_result(self, normalized_payload: Mapping[str, Any]) -> bool:
+        if not bool(self.config.get("validate_last_tool_success", True)):
+            return False
+        return str(normalized_payload.get("tool_status", "")).strip() not in {"success", "validation_error"}
+
+    def _repair_context_payload(
+        self,
+        normalized_payload: Mapping[str, Any],
+        *,
+        repair_type: str,
+        message: str,
+        validation_details: Mapping[str, Any] | None = None,
+        attempted_decision: Mapping[str, Any] | None = None,
+        attempted_tool_call: Mapping[str, Any] | None = None,
+        available_tool_names: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        updated_payload = dict(normalized_payload)
+        follow_up_context = (
+            dict(updated_payload.get("follow_up_context", {}))
+            if isinstance(updated_payload.get("follow_up_context"), Mapping)
+            else {}
+        )
+        repair_context: dict[str, Any] = {
+            "repair_type": repair_type,
+            "message": message,
+            "allowed_tool_names": [str(name).strip() for name in (available_tool_names or []) if str(name).strip()],
+        }
+        if isinstance(validation_details, Mapping):
+            repair_context.update(self._validation_details(validation_details))
+        if isinstance(attempted_decision, Mapping):
+            repair_context["attempted_decision"] = dict(attempted_decision)
+        if isinstance(attempted_tool_call, Mapping):
+            repair_context["attempted_tool_call"] = dict(attempted_tool_call)
+        follow_up_context["repair_attempt_count"] = int(follow_up_context.get("repair_attempt_count", 0) or 0) + 1
+        updated_payload["follow_up_context"] = follow_up_context
+        updated_payload["repair_context"] = repair_context
+        return updated_payload
+
+    def _clear_repair_context(self, normalized_payload: Mapping[str, Any]) -> dict[str, Any]:
+        updated_payload = dict(normalized_payload)
+        updated_payload.pop("repair_context", None)
+        return updated_payload
+
+    def _repair_payload_for_validation_error(
+        self,
+        normalized_payload: Mapping[str, Any],
+        *,
+        available_tool_names: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        if str(normalized_payload.get("tool_status", "")).strip() != "validation_error":
+            return normalized_payload
+        tool_error = self._validation_details(normalized_payload.get("tool_error"))
+        attempted_tool_call = (
+            dict(normalized_payload.get("tool_call", {}))
+            if isinstance(normalized_payload.get("tool_call"), Mapping)
+            else None
+        )
+        message = str(tool_error.get("message", "") or "The last MCP tool call failed schema validation.")
+        return self._repair_context_payload(
+            normalized_payload,
+            repair_type="tool_call_validation_error",
+            message=message,
+            validation_details=tool_error,
+            attempted_tool_call=attempted_tool_call,
+            available_tool_names=available_tool_names,
         )
 
     def _build_follow_up_payload(
@@ -3428,6 +4065,27 @@ class McpToolExecutorNode(BaseNode):
                 "Do not repeat any already satisfied MCP tool call signatures from tool_history. "
                 + "Forbidden successful call signatures for this step: "
                 + ", ".join(sorted(forbidden_signatures))
+            )
+        if isinstance(normalized_payload.get("repair_context"), Mapping):
+            mcp_prompt_sections.append(
+                "\n".join(
+                    [
+                        "MCP Tool Repair",
+                        "input_payload.repair_context contains validation feedback for an invalid MCP tool decision or tool payload.",
+                        "Use that feedback to repair the schema and return exactly one corrected exposed MCP tool call when more live MCP data is required.",
+                        "Do not repeat malformed arguments unchanged.",
+                    ]
+                )
+            )
+        elif str(normalized_payload.get("tool_status", "")).strip() == "validation_error":
+            mcp_prompt_sections.append(
+                "\n".join(
+                    [
+                        "MCP Tool Repair",
+                        "The last MCP tool call failed schema validation.",
+                        "Inspect tool_error and tool_history carefully, then return exactly one corrected exposed MCP tool call if a repair is needed.",
+                    ]
+                )
             )
         if not include_available_tools:
             mcp_prompt_sections.append(
@@ -3621,22 +4279,33 @@ class McpToolExecutorNode(BaseNode):
                 route_outputs=dispatch_result.route_outputs,
             )
         normalized_payload, source_tool_call_envelope, terminal_output_envelope = self._build_follow_up_payload(context, source_envelope)
-        if bool(self.config.get("validate_last_tool_success", True)) and normalized_payload["tool_status"] != "success":
+        if self._should_halt_after_tool_result(normalized_payload):
             return self._follow_up_failure_result(normalized_payload, source_envelope, route_outputs=dispatch_result.route_outputs)
 
         provider_name = str(self.config.get("provider_name", "") or "claude_code")
         provider = context.services.model_providers[provider_name]
         route_outputs = dict(dispatch_result.route_outputs)
         iteration_budget = self._follow_up_iteration_limit()
+        allowed_tool_names = sorted(str(name).strip() for name in self.config.get("allowed_tool_names", []) if str(name).strip())
+        normalized_payload = self._repair_payload_for_validation_error(
+            normalized_payload,
+            available_tool_names=allowed_tool_names,
+        )
 
         while True:
-            pending_tool_calls = self._normalize_tool_calls(normalized_payload.get("pending_tool_calls", []))
+            pending_tool_calls = (
+                []
+                if str(normalized_payload.get("tool_status", "")).strip() == "validation_error"
+                else self._normalize_tool_calls(normalized_payload.get("pending_tool_calls", []))
+            )
             if pending_tool_calls:
                 if iteration_budget <= 0:
                     return self._invalid_follow_up_result(
                         "MCP executor follow-up exceeded the configured iteration limit.",
                         route_outputs=route_outputs,
+                        details=self._validation_details(normalized_payload.get("repair_context")),
                     )
+                iteration_budget -= 1
                 next_tool_call = pending_tool_calls[0]
                 queued_tool_metadata = {
                     "node_kind": self.kind,
@@ -3684,15 +4353,25 @@ class McpToolExecutorNode(BaseNode):
                     context,
                     source_envelope,
                 )
-                if bool(self.config.get("validate_last_tool_success", True)) and normalized_payload["tool_status"] != "success":
+                if self._should_halt_after_tool_result(normalized_payload):
                     return self._follow_up_failure_result(
                         normalized_payload,
                         source_envelope,
                         route_outputs=route_outputs,
                     )
-                iteration_budget -= 1
+                normalized_payload = self._repair_payload_for_validation_error(
+                    normalized_payload,
+                    available_tool_names=allowed_tool_names,
+                )
                 continue
             successful_tool_call_signatures = self._successful_tool_call_signatures(normalized_payload)
+            if iteration_budget <= 0:
+                return self._invalid_follow_up_result(
+                    "MCP executor follow-up exceeded the configured iteration limit.",
+                    route_outputs=route_outputs,
+                    details=self._validation_details(normalized_payload.get("repair_context")),
+                )
+            iteration_budget -= 1
             request = self._build_follow_up_request(
                 context,
                 normalized_payload,
@@ -3708,6 +4387,7 @@ class McpToolExecutorNode(BaseNode):
                 if isinstance(tool, Mapping) and str(tool.get("name", "")).strip()
             }
             response = provider.generate(request)
+            normalized_decision_output: Mapping[str, Any] | None = None
             try:
                 normalized_decision_output = _canonicalize_api_decision_tool_names(
                     normalize_api_decision_output(
@@ -3719,11 +4399,30 @@ class McpToolExecutorNode(BaseNode):
                 )
                 decision_output = validate_api_decision_output(
                     normalized_decision_output,
+                    decision_schema=request.response_schema if isinstance(request.response_schema, Mapping) else None,
+                    available_tools=request.available_tools,
                     callable_tool_names=callable_tool_names,
                     response_mode=response_mode,
                 )
             except ValueError as exc:
-                return self._invalid_follow_up_result(str(exc), route_outputs=route_outputs)
+                normalized_payload = self._repair_context_payload(
+                    normalized_payload,
+                    repair_type="follow_up_decision_validation_error",
+                    message=str(exc),
+                    validation_details=self._validation_details(getattr(exc, "details", None)),
+                    attempted_decision=normalized_decision_output,
+                    attempted_tool_call=(
+                        normalized_decision_output["tool_calls"][0]
+                        if isinstance(normalized_decision_output, Mapping)
+                        and isinstance(normalized_decision_output.get("tool_calls"), list)
+                        and normalized_decision_output.get("tool_calls")
+                        and isinstance(normalized_decision_output["tool_calls"][0], Mapping)
+                        else None
+                    ),
+                    available_tool_names=sorted(callable_tool_names),
+                )
+                continue
+            normalized_payload = self._clear_repair_context(normalized_payload)
             normalized_tool_calls = [
                 tool_call
                 for tool_call in list(decision_output["tool_calls"])
@@ -3742,11 +4441,6 @@ class McpToolExecutorNode(BaseNode):
                 **response.metadata,
             }
             if normalized_tool_calls:
-                if iteration_budget <= 0:
-                    return self._invalid_follow_up_result(
-                        "MCP executor follow-up exceeded the configured iteration limit.",
-                        route_outputs=route_outputs,
-                    )
                 next_tool_call = normalized_tool_calls[0]
                 tool_call_envelope = self._follow_up_tool_call_envelope(
                     tool_call=next_tool_call,
@@ -3774,13 +4468,16 @@ class McpToolExecutorNode(BaseNode):
                     context,
                     source_envelope,
                 )
-                if bool(self.config.get("validate_last_tool_success", True)) and normalized_payload["tool_status"] != "success":
+                if self._should_halt_after_tool_result(normalized_payload):
                     return self._follow_up_failure_result(
                         normalized_payload,
                         source_envelope,
                         route_outputs=route_outputs,
                     )
-                iteration_budget -= 1
+                normalized_payload = self._repair_payload_for_validation_error(
+                    normalized_payload,
+                    available_tool_names=sorted(callable_tool_names),
+                )
                 continue
 
             return self._follow_up_result(
@@ -4134,6 +4831,8 @@ class GraphDefinition:
                     continue
                 standard_edge_counts[edge.source_id] = standard_edge_counts.get(edge.source_id, 0) + 1
                 if standard_edge_counts[edge.source_id] > 1:
+                    if source_node.provider_id == PARALLEL_SPLITTER_PROVIDER_ID:
+                        continue
                     standard_outgoing_edges = [
                         candidate for candidate in self.get_outgoing_edges(edge.source_id) if candidate.kind == "standard"
                     ]
@@ -4527,6 +5226,41 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Prompt block '{node.id}' uses unsupported role '{raw_role}'."
                     )
+            if node.kind == "data" and node.provider_id == LINKEDIN_PROFILE_FETCH_PROVIDER_ID:
+                url_field = str(node.config.get("url_field", "url") or "").strip()
+                if not url_field:
+                    raise GraphValidationError(f"LinkedIn profile fetch node '{node.id}' must declare a url_field.")
+                linkedin_data_dir = str(node.config.get("linkedin_data_dir", "") or "").strip()
+                if not linkedin_data_dir:
+                    raise GraphValidationError(
+                        f"LinkedIn profile fetch node '{node.id}' must declare linkedin_data_dir."
+                    )
+                workspace_template = str(
+                    node.config.get("workspace_cache_path_template", "cache/linkedin/{cache_key}.json")
+                    or "cache/linkedin/{cache_key}.json"
+                ).strip()
+                if not workspace_template:
+                    raise GraphValidationError(
+                        f"LinkedIn profile fetch node '{node.id}' must declare workspace_cache_path_template."
+                    )
+                try:
+                    preview_path = workspace_cache_relative_path(workspace_template, cache_key="preview")
+                    resolve_agent_workspace_path("preview-run", "preview-agent", preview_path)
+                except Exception as exc:  # noqa: BLE001
+                    raise GraphValidationError(
+                        f"LinkedIn profile fetch node '{node.id}' uses an invalid workspace cache path template."
+                    ) from exc
+            if node.kind == "data" and node.provider_id == RUNTIME_NORMALIZER_PROVIDER_ID:
+                field_name = str(node.config.get("field_name", "") or "").strip()
+                if not field_name:
+                    raise GraphValidationError(f"Runtime field extractor node '{node.id}' must declare field_name.")
+                try:
+                    if int(node.config.get("max_matches", 25)) < 1:
+                        raise ValueError("max_matches")
+                except (TypeError, ValueError) as exc:
+                    raise GraphValidationError(
+                        f"Runtime field extractor node '{node.id}' must declare a positive max_matches value."
+                    ) from exc
             if node.kind == "control_flow_unit":
                 if node.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
                     allowed_handles = {CONTROL_FLOW_LOOP_BODY_HANDLE_ID, None}

@@ -1,0 +1,183 @@
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from graph_agent.api.graph_store import GraphStore
+from graph_agent.examples.tool_schema_repair import build_example_services
+from graph_agent.runtime.core import GraphDefinition
+from graph_agent.runtime.engine import GraphRuntime
+
+
+def runtime_field_extractor_graph_payload(
+    graph_id: str = "runtime-field-extractor-graph",
+    *,
+    node_config: dict[str, object] | None = None,
+) -> dict[str, object]:
+    resolved_node_config: dict[str, object] = {
+        "mode": "runtime_normalizer",
+        "input_binding": {"type": "input_payload"},
+        "field_name": "url",
+        "fallback_field_names": [],
+        "preferred_path": "",
+        "case_sensitive": False,
+        "max_matches": 25,
+    }
+    if node_config:
+        resolved_node_config.update(node_config)
+    return {
+        "graph_id": graph_id,
+        "name": "Runtime Field Extractor Graph",
+        "description": "",
+        "version": "1.0",
+        "start_node_id": "start",
+        "nodes": [
+            {
+                "id": "start",
+                "kind": "input",
+                "category": "start",
+                "label": "Start",
+                "provider_id": "start.manual_run",
+                "provider_label": "Run Button Start",
+                "config": {"input_binding": {"type": "input_payload"}},
+                "position": {"x": 0, "y": 0},
+            },
+            {
+                "id": "extract",
+                "kind": "data",
+                "category": "data",
+                "label": "Payload Field Extractor",
+                "provider_id": "core.runtime_normalizer",
+                "provider_label": "Payload Field Extractor",
+                "config": resolved_node_config,
+                "position": {"x": 220, "y": 0},
+            },
+            {
+                "id": "finish",
+                "kind": "output",
+                "category": "end",
+                "label": "Finish",
+                "provider_id": "core.output",
+                "provider_label": "Core Output Node",
+                "config": {"source_binding": {"type": "latest_payload", "source": "extract"}},
+                "position": {"x": 440, "y": 0},
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source_id": "start", "target_id": "extract", "label": "", "kind": "standard", "priority": 100},
+            {"id": "e2", "source_id": "extract", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+        ],
+    }
+
+
+class RuntimeFieldExtractorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.services = build_example_services()
+
+    def _runtime(self) -> GraphRuntime:
+        return GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+    def test_field_extractor_provider_appears_in_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = GraphStore(self.services, path=Path(directory) / "graphs.json")
+            catalog = store.catalog()
+
+        provider = next(candidate for candidate in catalog["node_providers"] if candidate["provider_id"] == "core.runtime_normalizer")
+        self.assertEqual(provider["default_config"]["mode"], "runtime_normalizer")
+        self.assertEqual(provider["default_config"]["field_name"], "url")
+        self.assertEqual(provider["default_config"]["max_matches"], 25)
+
+    def test_extracts_field_recursively_when_structure_is_unknown(self) -> None:
+        graph = GraphDefinition.from_dict(runtime_field_extractor_graph_payload(node_config={"field_name": "headline"}))
+        graph.validate_against_services(self.services)
+
+        runtime = self._runtime()
+        state = runtime.run(
+            graph,
+            {
+                "person": {
+                    "profile": {
+                        "headline": "Engineer",
+                    }
+                }
+            },
+            run_id="run-field-extractor-recursive",
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output, "Engineer")
+        self.assertEqual(state.node_outputs["extract"]["metadata"]["matched_path"], "person.profile.headline")
+
+    def test_preferred_path_wins_when_present(self) -> None:
+        graph = GraphDefinition.from_dict(
+            runtime_field_extractor_graph_payload(
+                "runtime-field-preferred",
+                node_config={"field_name": "url", "preferred_path": "result.primary.url"},
+            )
+        )
+        graph.validate_against_services(self.services)
+
+        runtime = self._runtime()
+        state = runtime.run(
+            graph,
+            {
+                "result": {
+                    "primary": {"url": "https://preferred.example"},
+                    "secondary": {"url": "https://secondary.example"},
+                }
+            },
+            run_id="run-field-extractor-preferred",
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output, "https://preferred.example")
+        self.assertEqual(state.node_outputs["extract"]["metadata"]["matched_path"], "result.primary.url")
+
+    def test_fallback_field_names_are_used(self) -> None:
+        graph = GraphDefinition.from_dict(
+            runtime_field_extractor_graph_payload(
+                "runtime-field-fallback",
+                node_config={"field_name": "url", "fallback_field_names": "profile_url\nlinkedin_url"},
+            )
+        )
+        graph.validate_against_services(self.services)
+
+        runtime = self._runtime()
+        state = runtime.run(
+            graph,
+            {"person": {"linkedin_url": "https://www.linkedin.com/in/example/"}},
+            run_id="run-field-extractor-fallback",
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output, "https://www.linkedin.com/in/example/")
+        self.assertEqual(state.node_outputs["extract"]["metadata"]["matched_path"], "person.linkedin_url")
+
+    def test_missing_field_fails_cleanly(self) -> None:
+        graph = GraphDefinition.from_dict(runtime_field_extractor_graph_payload("runtime-field-missing", node_config={"field_name": "headline"}))
+        graph.validate_against_services(self.services)
+
+        runtime = self._runtime()
+        state = runtime.run(
+            graph,
+            {"person": {"name": "Taylor"}},
+            run_id="run-field-extractor-missing",
+        )
+
+        self.assertEqual(state.status, "failed")
+        self.assertEqual(state.terminal_error["type"], "field_not_found")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -25,8 +25,18 @@ from graph_agent.examples.tool_schema_repair import (
     build_example_graph_payload,
     build_example_services,
 )
-from graph_agent.providers.base import ModelMessage, ModelRequest, ModelToolCall, ModelToolDefinition, api_decision_response_schema
-from graph_agent.providers.base import ModelProvider, ModelResponse, ProviderPreflightResult
+from graph_agent.providers.base import (
+    ModelMessage,
+    ModelProvider,
+    ModelRequest,
+    ModelResponse,
+    ModelToolCall,
+    ModelToolDefinition,
+    ProviderPreflightResult,
+    StructuredOutputValidationError,
+    api_decision_response_schema,
+    validate_api_decision_output,
+)
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.mock import MockModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
@@ -599,6 +609,231 @@ class RecheckLoopProvider(ModelProvider):
         return ProviderPreflightResult(status="available", ok=True, message="ok")
 
 
+class InvalidWeatherToolCallProvider(ModelProvider):
+    name = "invalid_weather_tool_call"
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        return ModelResponse(
+            content="",
+            structured_output=_decision(
+                tool_calls=[
+                    {
+                        "tool_name": "weather_current",
+                        "arguments": {"city": "Austin"},
+                        "provider_tool_id": "invalid-tool-1",
+                        "metadata": {"variant": "invalid_tool_call"},
+                    }
+                ]
+            ),
+            tool_calls=[
+                ModelToolCall(
+                    tool_name="weather_current",
+                    arguments={"city": "Austin"},
+                    provider_tool_id="invalid-tool-1",
+                    metadata={"variant": "invalid_tool_call"},
+                )
+            ],
+            metadata={"variant": "invalid_tool_call"},
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
+class ToolValidationRepairProvider(ModelProvider):
+    name = "tool_validation_repair"
+
+    def __init__(self) -> None:
+        self.last_request: ModelRequest | None = None
+        self.seen_payloads: list[dict[str, Any]] = []
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        self.last_request = request
+        payload = json.loads(request.messages[-1].content) if request.messages else {}
+        assert isinstance(payload, dict)
+        self.seen_payloads.append(payload)
+        if payload.get("tool_status") == "validation_error":
+            return ModelResponse(
+                content="",
+                structured_output=_decision(
+                    tool_calls=[
+                        {
+                            "tool_name": "weather_current",
+                            "arguments": {"location": "Austin"},
+                            "provider_tool_id": "repair-tool-1",
+                            "metadata": {"variant": "repair"},
+                        }
+                    ]
+                ),
+                tool_calls=[
+                    ModelToolCall(
+                        tool_name="weather_current",
+                        arguments={"location": "Austin"},
+                        provider_tool_id="repair-tool-1",
+                        metadata={"variant": "repair"},
+                    )
+                ],
+                metadata={"variant": "repair"},
+            )
+        return ModelResponse(
+            content="",
+            structured_output=_decision(final_message="Repair complete."),
+            metadata={"variant": "message"},
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
+class FollowUpDecisionRepairProvider(ModelProvider):
+    name = "followup_decision_repair"
+
+    def __init__(self) -> None:
+        self.last_request: ModelRequest | None = None
+        self.seen_payloads: list[dict[str, Any]] = []
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        self.last_request = request
+        payload = json.loads(request.messages[-1].content) if request.messages else {}
+        assert isinstance(payload, dict)
+        self.seen_payloads.append(payload)
+        repair_context = payload.get("repair_context", {})
+        if isinstance(repair_context, dict) and repair_context.get("repair_type") == "follow_up_decision_validation_error":
+            return ModelResponse(
+                content="",
+                structured_output=_decision(
+                    tool_calls=[
+                        {
+                            "tool_name": "weather_current",
+                            "arguments": {"location": "Seattle"},
+                            "provider_tool_id": "followup-repair-1",
+                            "metadata": {"variant": "repair"},
+                        }
+                    ]
+                ),
+                tool_calls=[
+                    ModelToolCall(
+                        tool_name="weather_current",
+                        arguments={"location": "Seattle"},
+                        provider_tool_id="followup-repair-1",
+                        metadata={"variant": "repair"},
+                    )
+                ],
+                metadata={"variant": "repair"},
+            )
+        current_location = payload.get("tool_arguments", {}).get("location")
+        if current_location == "Austin":
+            return ModelResponse(
+                content="",
+                structured_output=_decision(
+                    tool_calls=[
+                        {
+                            "tool_name": "weather_current",
+                            "arguments": {"city": "Seattle"},
+                            "provider_tool_id": "followup-invalid-1",
+                            "metadata": {"variant": "invalid_followup"},
+                        }
+                    ]
+                ),
+                tool_calls=[
+                    ModelToolCall(
+                        tool_name="weather_current",
+                        arguments={"city": "Seattle"},
+                        provider_tool_id="followup-invalid-1",
+                        metadata={"variant": "invalid_followup"},
+                    )
+                ],
+                metadata={"variant": "invalid_followup"},
+            )
+        return ModelResponse(
+            content="",
+            structured_output=_decision(final_message="Repair complete."),
+            metadata={"variant": "message"},
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
+class AlwaysInvalidRepairProvider(ModelProvider):
+    name = "always_invalid_repair"
+
+    def __init__(self) -> None:
+        self.last_request: ModelRequest | None = None
+        self.seen_payloads: list[dict[str, Any]] = []
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        self.last_request = request
+        payload = json.loads(request.messages[-1].content) if request.messages else {}
+        assert isinstance(payload, dict)
+        self.seen_payloads.append(payload)
+        return ModelResponse(
+            content="",
+            structured_output=_decision(
+                tool_calls=[
+                    {
+                        "tool_name": "weather_current",
+                        "arguments": {"city": "Austin"},
+                        "provider_tool_id": "always-invalid-1",
+                        "metadata": {"variant": "invalid_repair"},
+                    }
+                ]
+            ),
+            tool_calls=[
+                ModelToolCall(
+                    tool_name="weather_current",
+                    arguments={"city": "Austin"},
+                    provider_tool_id="always-invalid-1",
+                    metadata={"variant": "invalid_repair"},
+                )
+            ],
+            metadata={"variant": "invalid_repair"},
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
+class DuplicateSuccessfulCallProvider(ModelProvider):
+    name = "duplicate_successful_call"
+
+    def __init__(self) -> None:
+        self.last_request: ModelRequest | None = None
+        self.seen_payloads: list[dict[str, Any]] = []
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        self.last_request = request
+        payload = json.loads(request.messages[-1].content) if request.messages else {}
+        assert isinstance(payload, dict)
+        self.seen_payloads.append(payload)
+        location = payload.get("tool_arguments", {}).get("location", "Austin")
+        return ModelResponse(
+            content="",
+            structured_output=_decision(
+                tool_calls=[
+                    {
+                        "tool_name": "weather_current",
+                        "arguments": {"location": location},
+                        "provider_tool_id": "duplicate-tool-1",
+                        "metadata": {"variant": "duplicate"},
+                    }
+                ]
+            ),
+            tool_calls=[
+                ModelToolCall(
+                    tool_name="weather_current",
+                    arguments={"location": location},
+                    provider_tool_id="duplicate-tool-1",
+                    metadata={"variant": "duplicate"},
+                )
+            ],
+            metadata={"variant": "duplicate"},
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
+
+
 class ModelProviderTests(unittest.TestCase):
     def _build_auto_branch_graph(self, provider_name: str, provider: ModelProvider | None = None) -> tuple[Any, GraphRuntime, dict[str, Any]]:
         services = build_example_services()
@@ -874,7 +1109,7 @@ class ModelProviderTests(unittest.TestCase):
         self.assertEqual(provider.last_cwd, str(ROOT))
         self.assertEqual(provider.last_timeout_seconds, 15.0)
 
-    def test_claude_code_provider_uses_object_schema_for_multiple_tools(self) -> None:
+    def test_claude_code_provider_uses_discriminated_tool_schema_for_multiple_tools(self) -> None:
         provider = ClaudeCodeCLIModelProvider()
         tools = [
             ModelToolDefinition(
@@ -908,12 +1143,35 @@ class ModelProviderTests(unittest.TestCase):
         assert schema is not None
         self.assertEqual(schema["type"], "object")
         self.assertEqual(schema["properties"]["need_tool"]["type"], "boolean")
-        self.assertEqual(
-            schema["properties"]["tool_calls"]["items"]["properties"]["tool_name"]["enum"],
-            ["weather_current", "time_current_minute"],
-        )
-        self.assertEqual(schema["properties"]["tool_calls"]["items"]["properties"]["arguments"]["type"], "object")
+        self.assertIn("oneOf", schema["properties"]["tool_calls"]["items"])
+        item_schemas = schema["properties"]["tool_calls"]["items"]["oneOf"]
+        self.assertEqual(len(item_schemas), 2)
+        self.assertEqual(item_schemas[0]["properties"]["tool_name"]["const"], "weather_current")
+        self.assertEqual(item_schemas[0]["properties"]["arguments"]["required"], ["location"])
+        self.assertEqual(item_schemas[1]["properties"]["tool_name"]["const"], "time_current_minute")
+        self.assertEqual(item_schemas[1]["properties"]["arguments"]["type"], "object")
         self.assertEqual(schema["required"], ["message", "need_tool", "tool_calls"])
+
+    def test_validate_api_decision_output_rejects_tool_arguments_that_do_not_match_schema(self) -> None:
+        with self.assertRaises(StructuredOutputValidationError) as context:
+            validate_api_decision_output(
+                _decision(
+                    tool_calls=[
+                        {
+                            "tool_name": "search_catalog",
+                            "arguments": {"query": "graph agents", "limit": "three"},
+                        }
+                    ]
+                ),
+                available_tools=[SEARCH_CATALOG_TOOL],
+                callable_tool_names={"search_catalog"},
+                response_mode="tool_call",
+            )
+
+        error = context.exception
+        self.assertIn("does not match the tool schema", str(error))
+        self.assertEqual(error.details["validation_errors"][0]["path"], "$.arguments.limit")
+        self.assertEqual(error.details["validation_errors"][0]["validator"], "type")
 
     def test_claude_code_provider_converts_union_types_for_strict_json_schema(self) -> None:
         provider = StubClaudeCodeProvider()
@@ -2676,6 +2934,52 @@ class ModelProviderTests(unittest.TestCase):
             finally:
                 manager.stop_background_services()
 
+    def test_tool_registry_validate_input_uses_full_json_schema(self) -> None:
+        registry = ToolRegistry()
+        error = registry.validate_input(
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "options": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {"type": "string", "enum": ["fast", "safe"]},
+                            "limit": {"type": "integer"},
+                        },
+                        "required": ["mode", "limit"],
+                        "additionalProperties": False,
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["query", "options", "tags"],
+                "additionalProperties": False,
+            },
+            {
+                "query": 42,
+                "options": {"mode": "turbo", "extra": True},
+                "tags": [1, "ok"],
+            },
+        )
+
+        assert error is not None
+        self.assertEqual(error["message"], "Payload does not match the tool input schema.")
+        self.assertEqual(error["missing_fields"], ["limit"])
+        self.assertEqual(
+            error["type_errors"],
+            [
+                {"field": "query", "expected": "string", "received": "integer"},
+                {"field": "tags.0", "expected": "string", "received": "integer"},
+            ],
+        )
+        validation_paths = {entry["path"] for entry in error["validation_errors"]}
+        self.assertIn("$.options.mode", validation_paths)
+        self.assertIn("$.options", validation_paths)
+        self.assertIn("$.tags[0]", validation_paths)
+
     def test_mcp_executor_validation_rejects_auto_mode_sources_without_tool_call_condition(self) -> None:
         services, _runtime, graph_payload = self._build_auto_branch_graph("mock")
         for edge in graph_payload["edges"]:
@@ -4231,6 +4535,214 @@ class ModelProviderTests(unittest.TestCase):
         assert isinstance(executor_output, dict)
         self.assertEqual(executor_output["artifacts"]["terminal_output_envelope"]["metadata"]["contract"], "terminal_output_envelope")
         self.assertEqual(executor_output["artifacts"]["follow_up_payload"]["terminal_output"]["tool_name"], "mock_terminal_tool")
+
+    def test_mcp_executor_repairs_invalid_initial_tool_call_schema(self) -> None:
+        services = build_example_services()
+        followup_provider = ToolValidationRepairProvider()
+        services.model_providers["invalid_weather_tool_call"] = InvalidWeatherToolCallProvider()
+        services.model_providers["tool_validation_repair"] = followup_provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = self._build_mcp_followup_executor_graph(
+            initial_provider_name="invalid_weather_tool_call",
+            followup_provider_name="tool_validation_repair",
+            tool_name="weather_current",
+        )
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "repair weather tool"}, run_id="run-mcp-repair-invalid-tool")
+
+                    self.assertEqual(state.status, "completed")
+                    assert isinstance(state.final_output, dict)
+                    self.assertFalse(state.final_output["should_call_tool"])
+                    self.assertEqual(
+                        [entry["tool_status"] for entry in state.final_output["tool_payloads"]],
+                        ["validation_error", "success"],
+                    )
+                    self.assertEqual(
+                        state.final_output["tool_payloads"][1]["tool_arguments"],
+                        {"location": "Austin"},
+                    )
+                    self.assertEqual(len(followup_provider.seen_payloads), 2)
+                    self.assertEqual(followup_provider.seen_payloads[0]["tool_status"], "validation_error")
+                    self.assertEqual(
+                        followup_provider.seen_payloads[0]["repair_context"]["repair_type"],
+                        "tool_call_validation_error",
+                    )
+                    self.assertEqual(
+                        followup_provider.seen_payloads[0]["repair_context"]["attempted_tool_call"]["arguments"],
+                        {"city": "Austin"},
+                    )
+            finally:
+                manager.stop_background_services()
+
+    def test_mcp_executor_repairs_invalid_follow_up_tool_decision(self) -> None:
+        services = build_example_services()
+        followup_provider = FollowUpDecisionRepairProvider()
+        services.model_providers["auto_tool_call"] = AutoToolCallProvider()
+        services.model_providers["followup_decision_repair"] = followup_provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = self._build_mcp_followup_executor_graph(
+            initial_provider_name="auto_tool_call",
+            followup_provider_name="followup_decision_repair",
+            tool_name="weather_current",
+        )
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "repair follow-up decision"}, run_id="run-mcp-repair-followup-decision")
+
+                    self.assertEqual(state.status, "completed")
+                    assert isinstance(state.final_output, dict)
+                    self.assertEqual(
+                        [entry["tool_arguments"] for entry in state.final_output["tool_payloads"]],
+                        [{"location": "Austin"}, {"location": "Seattle"}],
+                    )
+                    self.assertEqual(len(followup_provider.seen_payloads), 3)
+                    self.assertEqual(
+                        followup_provider.seen_payloads[1]["repair_context"]["repair_type"],
+                        "follow_up_decision_validation_error",
+                    )
+                    self.assertEqual(
+                        followup_provider.seen_payloads[1]["repair_context"]["attempted_tool_call"]["arguments"],
+                        {"city": "Seattle"},
+                    )
+            finally:
+                manager.stop_background_services()
+
+    def test_mcp_executor_retries_off_returns_validation_error_without_repair(self) -> None:
+        services = build_example_services()
+        followup_provider = ToolValidationRepairProvider()
+        services.model_providers["invalid_weather_tool_call"] = InvalidWeatherToolCallProvider()
+        services.model_providers["tool_validation_repair"] = followup_provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = self._build_mcp_followup_executor_graph(
+            initial_provider_name="invalid_weather_tool_call",
+            followup_provider_name="tool_validation_repair",
+            tool_name="weather_current",
+        )
+        executor_node = next(node for node in graph_payload["nodes"] if node["id"] == "executor")
+        executor_node["config"]["allow_retries"] = False
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "no repair"}, run_id="run-mcp-retries-off")
+
+                    self.assertEqual(state.status, "failed")
+                    self.assertEqual(followup_provider.seen_payloads, [])
+                    executor_output = state.node_outputs["executor"]
+                    assert isinstance(executor_output, dict)
+                    self.assertEqual(executor_output["metadata"]["tool_status"], "validation_error")
+                    self.assertEqual(executor_output["errors"][0]["message"], "Missing required fields.")
+                    self.assertEqual(
+                        executor_output["errors"][0]["missing_fields"],
+                        ["location"],
+                    )
+                    assert isinstance(state.terminal_error, dict)
+                    self.assertEqual(state.terminal_error["message"], "Missing required fields.")
+            finally:
+                manager.stop_background_services()
+
+    def test_mcp_executor_invalid_repairs_exhaust_max_turns(self) -> None:
+        services = build_example_services()
+        followup_provider = AlwaysInvalidRepairProvider()
+        services.model_providers["invalid_weather_tool_call"] = InvalidWeatherToolCallProvider()
+        services.model_providers["always_invalid_repair"] = followup_provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = self._build_mcp_followup_executor_graph(
+            initial_provider_name="invalid_weather_tool_call",
+            followup_provider_name="always_invalid_repair",
+            tool_name="weather_current",
+        )
+        executor_node = next(node for node in graph_payload["nodes"] if node["id"] == "executor")
+        executor_node["config"]["max_turns"] = 2
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "exhaust retries"}, run_id="run-mcp-repair-exhaustion")
+
+                    self.assertEqual(state.status, "failed")
+                    self.assertEqual(len(followup_provider.seen_payloads), 2)
+                    assert isinstance(state.terminal_error, dict)
+                    self.assertIn("iteration limit", state.terminal_error["message"])
+                    self.assertIn("repair_type", state.terminal_error["details"])
+            finally:
+                manager.stop_background_services()
+
+    def test_mcp_executor_filters_duplicate_successful_tool_calls(self) -> None:
+        services = build_example_services()
+        followup_provider = DuplicateSuccessfulCallProvider()
+        services.model_providers["auto_tool_call"] = AutoToolCallProvider()
+        services.model_providers["duplicate_successful_call"] = followup_provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = self._build_mcp_followup_executor_graph(
+            initial_provider_name="auto_tool_call",
+            followup_provider_name="duplicate_successful_call",
+            tool_name="weather_current",
+        )
+        graph = GraphDefinition.from_dict(graph_payload)
+        manager = GraphRunManager(services=services)
+        with WeatherStubServer() as weather_base:
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WEATHER_API_BASE": weather_base}, clear=False):
+                    manager.boot_mcp_server("weather_mcp")
+                    manager.set_mcp_tool_enabled("weather_current", True)
+                    graph.validate_against_services(services)
+
+                    state = runtime.run(graph, {"request": "avoid duplicate"}, run_id="run-mcp-duplicate-filter")
+
+                    self.assertEqual(state.status, "completed")
+                    assert isinstance(state.final_output, dict)
+                    self.assertFalse(state.final_output["should_call_tool"])
+                    self.assertEqual(len(state.final_output["tool_payloads"]), 1)
+                    self.assertEqual(state.final_output["tool_payloads"][0]["tool_arguments"], {"location": "Austin"})
+                    self.assertEqual(len(followup_provider.seen_payloads), 1)
+            finally:
+                manager.stop_background_services()
 
     def test_mcp_executor_follow_up_stops_after_failed_tool_result(self) -> None:
         services = build_example_services()

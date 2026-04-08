@@ -383,6 +383,7 @@ class GraphRuntime:
             if self.cancel_requested():
                 return self.cancel_run(state, summary="Run cancelled before starting the next node.")
             frame = pending_nodes.popleft()
+            state.current_iteration_context = self._frame_iteration_context(frame)
             current_node_id = str(frame["node_id"])
             state.current_node_id = current_node_id
             incoming_edge_id = frame.get("incoming_edge_id")
@@ -613,7 +614,7 @@ class GraphRuntime:
                 node_id,
                 remaining_outgoing,
                 result,
-                allow_parallel=self._should_fan_out_to_multiple_end_nodes(graph, remaining_outgoing),
+                allow_parallel=self._should_fan_out_in_parallel(graph, node_id, remaining_outgoing),
             )
             route_result = self._route_result(result, MCP_TERMINAL_OUTPUT_HANDLE_ID)
             if route_result is not None:
@@ -624,7 +625,7 @@ class GraphRuntime:
                         node_id,
                         handle_edges,
                         route_result,
-                        allow_parallel=self._should_fan_out_to_multiple_end_nodes(graph, handle_edges),
+                        allow_parallel=self._should_fan_out_in_parallel(graph, node_id, handle_edges),
                     )
                 )
             return selected_edges
@@ -670,7 +671,7 @@ class GraphRuntime:
                         node_id,
                         handle_edges,
                         route_result,
-                        allow_parallel=self._should_fan_out_to_multiple_end_nodes(graph, handle_edges),
+                        allow_parallel=self._should_fan_out_in_parallel(graph, node_id, handle_edges),
                     )
                 )
             if selected_edges:
@@ -681,7 +682,7 @@ class GraphRuntime:
             node_id,
             outgoing,
             result,
-            allow_parallel=self._should_fan_out_to_multiple_end_nodes(graph, outgoing),
+            allow_parallel=self._should_fan_out_in_parallel(graph, node_id, outgoing),
         )
 
     def select_edge(
@@ -732,6 +733,12 @@ class GraphRuntime:
             if target is None or target.kind != "output":
                 return False
         return True
+
+    def _should_fan_out_in_parallel(self, graph: GraphDefinition, node_id: str, outgoing: list[Edge]) -> bool:
+        source_node = graph.nodes.get(node_id)
+        if source_node is not None and getattr(source_node, "provider_id", None) == "core.parallel_splitter":
+            return len([edge for edge in outgoing if edge.kind == "standard"]) > 1
+        return self._should_fan_out_to_multiple_end_nodes(graph, outgoing)
 
     def _select_matching_edges(
         self,

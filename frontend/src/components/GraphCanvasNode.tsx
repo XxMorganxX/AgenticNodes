@@ -10,6 +10,9 @@ import {
   CONTROL_FLOW_ELSE_HANDLE_ID,
   CONTROL_FLOW_IF_HANDLE_ID,
   CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
+  createParallelSplitterOutputHandleId,
+  getNodeSourceHandleAnchorRatio,
+  getParallelSplitterOutputHandleIds,
   inferModelResponseMode,
   getApiToolContextTargetAnchorRatio,
   getToolSourceHandleAnchorRatio,
@@ -62,6 +65,7 @@ export type GraphCanvasNodeData = {
 
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
+const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
 
 const KIND_LABELS: Record<string, string> = {
   input: "IN",
@@ -214,6 +218,8 @@ function GraphCanvasNodeComponent({
   const isDisplayNode = node.provider_id === "core.data_display";
   const isContextBuilderNode = node.provider_id === "core.context_builder";
   const isLogicConditionsNode = node.provider_id === LOGIC_CONDITIONS_PROVIDER_ID;
+  const isParallelSplitterNode = node.provider_id === PARALLEL_SPLITTER_PROVIDER_ID;
+  const isRuntimeNormalizerNode = node.provider_id === "core.runtime_normalizer";
   const displayLabel = getNodeInstanceLabel(graph, node);
   const displayEnvelope =
     isDisplayNode &&
@@ -301,6 +307,9 @@ function GraphCanvasNodeComponent({
   const controlFlowLoopHandleStyle = {
     top: `${getToolSourceHandleAnchorRatio(CONTROL_FLOW_LOOP_BODY_HANDLE_ID) * 100}%`,
   } satisfies CSSProperties;
+  const parallelSplitterOutputHandles = isParallelSplitterNode
+    ? getParallelSplitterOutputHandleIds(graph, node)
+    : [createParallelSplitterOutputHandleId(0)];
   const logicConditionConfig = isLogicConditionsNode ? normalizeLogicConditionConfig(node.config).normalized : null;
   const logicConditionOutputHandles = isLogicConditionsNode
     ? [
@@ -680,7 +689,7 @@ function GraphCanvasNodeComponent({
             <span className="graph-node-inline-display-hint">Click to expand</span>
           </div>
         ) : null}
-        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode) ? (
+        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isRuntimeNormalizerNode) ? (
           <div className="graph-node-card-actions" aria-hidden="false">
             <button
               type="button"
@@ -702,6 +711,8 @@ function GraphCanvasNodeComponent({
               {node.category === "tool"
                 ? "Learn More"
                 : isLogicConditionsNode
+                  ? "Learn More"
+                : isRuntimeNormalizerNode
                   ? "Learn More"
                 : isPromptBlockNode(node)
                   ? "More Info"
@@ -841,6 +852,30 @@ function GraphCanvasNodeComponent({
             className="graph-node-handle graph-node-handle-source graph-node-handle-source--success"
             style={controlFlowLoopHandleStyle}
           />
+        </>
+      ) : null}
+      {showSourceHandle && isControlFlowUnitNode && isParallelSplitterNode ? (
+        <>
+          {parallelSplitterOutputHandles.map((handleId, index) => {
+            const style = {
+              top: `${getNodeSourceHandleAnchorRatio(node, handleId, graph) * 100}%`,
+            } satisfies CSSProperties;
+            const isSpareHandle = index === parallelSplitterOutputHandles.length - 1;
+            return (
+              <div key={handleId}>
+                <div className="graph-node-output-port graph-node-output-port--success" style={style} aria-hidden="true">
+                  <span className="graph-node-output-port-label">{isSpareHandle ? "New Branch" : `Branch ${index + 1}`}</span>
+                </div>
+                <Handle
+                  id={handleId}
+                  type="source"
+                  position={Position.Right}
+                  className="graph-node-handle graph-node-handle-source graph-node-handle-source--success"
+                  style={style}
+                />
+              </div>
+            );
+          })}
         </>
       ) : null}
       {showSourceHandle && isControlFlowUnitNode && isLogicConditionsNode ? (

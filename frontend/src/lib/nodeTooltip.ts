@@ -348,7 +348,7 @@ export function buildNodeTooltip(
         {
           title: "MCP Execution",
           rows: [
-            { label: "Dispatch", value: "Single tool call from upstream API output" },
+            { label: "Dispatch", value: "One MCP tool call at a time from upstream API output" },
             {
               label: "Input Binding",
               value:
@@ -362,11 +362,17 @@ export function buildNodeTooltip(
               label: "Retries",
               value: followUpEnabled
                 ? retriesEnabled
-                  ? "Enabled"
-                  : "Disabled; no follow-up model call"
+                  ? "Enabled; repairs malformed MCP tool calls and can continue follow-up decisions"
+                  : "Disabled; no schema repair or follow-up model call"
                 : "Not applicable",
             },
-            { label: "Validation", value: node.config.validate_last_tool_success === false ? "Allows failed tool results" : "Stops on failed tool results" },
+            {
+              label: "Validation",
+              value:
+                node.config.validate_last_tool_success === false
+                  ? "Allows failed tool results after execution"
+                  : "Stops on failed MCP executions; malformed tool calls can still be repaired",
+            },
             ...(followUpEnabled
               ? [
                   { label: "Model Provider", value: asString(node.config.provider_name) ?? "claude_code" },
@@ -418,6 +424,8 @@ export function buildNodeTooltip(
     const isPromptBlockNode = node.provider_id === "core.prompt_block";
     const isSpreadsheetNode = node.provider_id === "core.spreadsheet_rows";
     const isLogicConditionsNode = node.provider_id === "core.logic_conditions";
+    const isParallelSplitterNode = node.provider_id === "core.parallel_splitter";
+    const isRuntimeFieldExtractorNode = node.provider_id === "core.runtime_normalizer";
     const contextBuilderBindings = Array.isArray(node.config.input_bindings)
       ? node.config.input_bindings.filter((binding): binding is Record<string, unknown> => isRecord(binding))
       : [];
@@ -446,6 +454,10 @@ export function buildNodeTooltip(
                   ? "prompt block"
                 : isContextBuilderNode
                   ? "context builder"
+                  : isParallelSplitterNode
+                    ? "parallel splitter"
+                  : isRuntimeFieldExtractorNode
+                    ? "payload field extractor"
                   : isLogicConditionsNode
                     ? "logic conditions"
                   : isSpreadsheetNode
@@ -460,6 +472,10 @@ export function buildNodeTooltip(
                   ? truncate(asString(node.config.content) ?? "")
                 : isContextBuilderNode
                   ? truncate(asString(node.config.template) ?? "Generated from connected placeholders")
+                  : isParallelSplitterNode
+                    ? "Fan out to every connected branch"
+                  : isRuntimeFieldExtractorNode
+                    ? truncate(asString(node.config.field_name) ?? "Select a field to isolate from the payload")
                   : isLogicConditionsNode
                     ? truncate(
                         logicConditionConfig?.branches[0]
@@ -493,6 +509,21 @@ export function buildNodeTooltip(
                   { label: "First Data Row", value: String(node.config.start_row_index ?? 2) },
                 ]
               : []),
+            ...(isRuntimeFieldExtractorNode
+              ? [
+                  { label: "Field Name", value: asString(node.config.field_name) ?? "Not set" },
+                  { label: "Preferred Path", value: asString(node.config.preferred_path) ?? "Recursive search only" },
+                  {
+                    label: "Fallback Fields",
+                    value: formatList(asStringArray(node.config.fallback_field_names)),
+                  },
+                ]
+              : []),
+            ...(isParallelSplitterNode
+              ? [
+                  { label: "Branch Mode", value: "Parallel standard fan-out" },
+                ]
+              : []),
             ...(isLogicConditionsNode
               ? [
                   { label: "Branches", value: String(logicConditionConfig?.branches.length ?? 0) },
@@ -520,6 +551,10 @@ export function buildNodeTooltip(
           ? "Add prompt content, then bind this node into a Context Builder or model."
           : isContextBuilderNode && connectedSourceCount === 0
           ? "Connect one or more upstream text nodes to start composing a shared prompt block."
+          : isRuntimeFieldExtractorNode && !(asString(node.config.field_name) ?? "").trim()
+          ? "Set the field name you want this node to isolate from the incoming payload."
+          : isParallelSplitterNode
+          ? "Connect two or more downstream branches to split this signal in parallel."
           : isLogicConditionsNode && (logicConditionConfig?.branches.length ?? 0) === 0
           ? "Add a branch to route the incoming envelope into explicit control-flow paths."
           : isSpreadsheetNode && !(asString(node.config.file_path) ?? "").trim()
