@@ -187,7 +187,8 @@ export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView,
                         onClick={() => setExpandedSourceNodeId(isExpanded ? null : slot.sourceNodeId)}
                       >
                         <div className="context-builder-input-row-main">
-                          <span className="context-builder-input-label">{slot.sourceLabel}</span>
+                          <span className="context-builder-input-label">{slot.header}</span>
+                          <span className="context-builder-input-source">{slot.sourceLabel}</span>
                           <span className="context-builder-input-placeholder">{`{${slot.placeholder}}`}</span>
                         </div>
                         <div className="context-builder-input-status">

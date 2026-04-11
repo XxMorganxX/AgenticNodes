@@ -27,6 +27,7 @@ function summarizeNodeError(error: unknown): string {
 export type ContextBuilderSourceSlot = {
   sourceNodeId: string;
   sourceLabel: string;
+  header: string;
   placeholder: string;
   status: "pending" | "fulfilled" | "error";
   errorSummary?: string;
@@ -63,6 +64,7 @@ export function buildContextBuilderRuntimeView(
       return {
         sourceNodeId: binding.sourceNodeId,
         sourceLabel: binding.sourceLabel,
+        header: binding.header,
         placeholder: binding.placeholder,
         status: "error" as const,
         errorSummary: summarizeNodeError(err),
@@ -74,6 +76,7 @@ export function buildContextBuilderRuntimeView(
     return {
       sourceNodeId: binding.sourceNodeId,
       sourceLabel: binding.sourceLabel,
+      header: binding.header,
       placeholder: binding.placeholder,
       status: hasOutput ? ("fulfilled" as const) : ("pending" as const),
     };

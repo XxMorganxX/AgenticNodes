@@ -517,6 +517,46 @@ class AgentFilesystemTests(unittest.TestCase):
                 app_module.manager = original_manager
                 manager.stop_background_services()
 
+    def test_parent_environment_run_files_endpoint_keeps_agent_metadata_when_one_agent_selected(self) -> None:
+        app_module = importlib.import_module("graph_agent.api.app")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            bundled_path = temp_path / "bundled_graphs.json"
+            bundled_path.write_text(json.dumps({"graphs": []}), encoding="utf-8")
+            services = build_example_services()
+            services.model_providers["file_writer_test"] = FileWriterProvider()
+            manager = GraphRunManager(
+                services=services,
+                store=GraphStore(services, path=temp_path / "graphs.json", bundled_path=bundled_path),
+                run_log_store=RunLogStore(temp_path / ".logs" / "runs"),
+            )
+            manager.create_graph(writer_environment_payload("writer-environment-single-agent-api"))
+            original_manager = app_module.manager
+            app_module.manager = manager
+            try:
+                with patch.dict("os.environ", {"GRAPH_AGENT_WORKSPACE_DIR": str(temp_path / ".graph-agent" / "runs")}, clear=False):
+                    run_id = manager.start_run("writer-environment-single-agent-api", "Save only one agent output.", agent_ids=["agent-alpha"])
+                    state = wait_for_run_completion(manager, run_id)
+                    self.assertEqual(state["status"], "completed")
+                    with TestClient(app_module.app) as client:
+                        listing_response = client.get(f"/api/runs/{run_id}/files")
+                        self.assertEqual(listing_response.status_code, 200, msg=listing_response.text)
+                        listing_payload = listing_response.json()
+                        self.assertEqual([entry["path"] for entry in listing_payload["files"]], ["outputs/alpha.txt"])
+                        self.assertEqual([entry["agent_id"] for entry in listing_payload["files"]], ["agent-alpha"])
+
+                        content_response = client.get(
+                            f"/api/runs/{run_id}/files/content",
+                            params={"path": "outputs/alpha.txt"},
+                        )
+                        self.assertEqual(content_response.status_code, 200, msg=content_response.text)
+                        content_payload = content_response.json()
+                        self.assertEqual(content_payload["agent_id"], "agent-alpha")
+                        self.assertEqual(content_payload["content"], "Workspace output from the model.")
+            finally:
+                app_module.manager = original_manager
+                manager.stop_background_services()
+
 
 if __name__ == "__main__":
     unittest.main()

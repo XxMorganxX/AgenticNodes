@@ -490,6 +490,21 @@ def _slugify_context_builder_placeholder(value: Any, *, fallback: str = "source"
     return normalized
 
 
+def _normalize_context_builder_header(value: Any, *, fallback: str = "Context") -> str:
+    header = str(value or "").strip()
+    if header:
+        return header
+    fallback_header = str(fallback or "").strip()
+    return fallback_header or "Context"
+
+
+def _build_context_builder_section(header: str, body: Any) -> dict[str, Any]:
+    return {
+        "header": _normalize_context_builder_header(header),
+        "body": body,
+    }
+
+
 def resolve_graph_env_value(value: Any, env_vars: Mapping[str, str]) -> Any:
     if isinstance(value, str):
         return _resolve_graph_env_string(value, env_vars)
@@ -1600,12 +1615,17 @@ class DataNode(BaseNode):
                     raw_binding.get("placeholder"),
                     fallback=(source_node.label if source_node is not None else f"source_{index + 1}"),
                 )
+                header = _normalize_context_builder_header(
+                    raw_binding.get("header"),
+                    fallback=(source_node.label if source_node is not None else f"Source {index + 1}"),
+                )
                 binding = raw_binding.get("binding")
                 if not isinstance(binding, Mapping):
                     binding = {"type": "latest_payload", "source": source_node_id}
                 bindings.append(
                     {
                         "source_node_id": source_node_id,
+                        "header": header,
                         "placeholder": placeholder,
                         "binding": dict(binding),
                     }
@@ -1630,6 +1650,7 @@ class DataNode(BaseNode):
                 bindings.append(
                     {
                         "source_node_id": sid,
+                        "header": _normalize_context_builder_header(source_node.label, fallback=sid),
                         "placeholder": placeholder,
                         "binding": {"type": "latest_payload", "source": sid},
                     }
@@ -1646,6 +1667,10 @@ class DataNode(BaseNode):
                 bindings.append(
                     {
                         "source_node_id": source_node_id,
+                        "header": _normalize_context_builder_header(
+                            source_node.label if source_node is not None else source_node_id,
+                            fallback=f"Source {index + 1}",
+                        ),
                         "placeholder": placeholder,
                         "binding": {"type": "latest_payload", "source": source_node_id},
                     }
@@ -1682,11 +1707,12 @@ class DataNode(BaseNode):
         bindings = self._context_builder_bindings(context)
         all_fulfilled = self._context_builder_all_sources_fulfilled(context)
         resolved_variables: dict[str, Any] = {}
-        ordered_values: list[str] = []
+        ordered_sections: list[dict[str, Any]] = []
         ordered_prompt_blocks: list[dict[str, Any]] = []
         saw_non_prompt_value = False
         for binding in bindings:
             source_node_id = str(binding.get("source_node_id", "")).strip()
+            header = _normalize_context_builder_header(binding.get("header"), fallback=source_node_id or "Context")
             placeholder = str(binding.get("placeholder", "")).strip()
             if not source_node_id:
                 if placeholder:
@@ -1749,19 +1775,23 @@ class DataNode(BaseNode):
             elif value is not None and value != "":
                 saw_non_prompt_value = True
             if value is not None and value != "":
-                ordered_values.append(rendered_value if isinstance(rendered_value, str) else _json_safe(rendered_value))
+                ordered_sections.append(
+                    _build_context_builder_section(
+                        header,
+                        rendered_value,
+                    )
+                )
 
         template = str(self.config.get("template", "") or "")
         if template.strip():
             payload = context.render_template(template, resolved_variables)
         else:
-            joiner = str(self.config.get("joiner", "\n\n") or "\n\n")
             should_compile_chatgpt_messages = bool(ordered_prompt_blocks) and not saw_non_prompt_value
             if should_compile_chatgpt_messages:
                 rendered_messages = _render_chatgpt_style_messages(ordered_prompt_blocks)
-                payload = rendered_messages if rendered_messages else joiner.join(ordered_values)
+                payload = rendered_messages if rendered_messages else ordered_sections
             else:
-                payload = joiner.join(ordered_values)
+                payload = ordered_sections
 
         envelope = MessageEnvelope(
             schema_version="1.0",
@@ -1773,15 +1803,17 @@ class DataNode(BaseNode):
                 "node_kind": self.kind,
                 "data_mode": "context_builder",
                 "binding_count": len(bindings),
+                "headers": [str(binding.get("header", "")) for binding in bindings],
                 "placeholders": [str(binding.get("placeholder", "")) for binding in bindings],
                 "prompt_blocks": ordered_prompt_blocks,
+                "structured_sections": ordered_sections,
                 "context_builder_complete": all_fulfilled,
             },
         )
         return NodeExecutionResult(
             status="success",
             output=envelope.to_dict(),
-            summary="Context builder rendered a prompt block." if bindings else "Context builder rendered an empty prompt block.",
+            summary="Context builder rendered a context payload." if bindings else "Context builder rendered an empty context payload.",
             metadata={"hold_outgoing_edges": not all_fulfilled},
         )
 
@@ -2488,6 +2520,7 @@ class DataNode(BaseNode):
                 preview_bindings.append(
                     {
                         "source_node_id": str(binding.get("source_node_id", "")),
+                        "header": str(binding.get("header", "")),
                         "placeholder": str(binding.get("placeholder", "")),
                         "value": _render_prompt_block_text(value) if _is_prompt_block_payload(value) else value,
                     }

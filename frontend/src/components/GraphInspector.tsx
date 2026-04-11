@@ -24,6 +24,7 @@ import {
 } from "../lib/responseSchema";
 import {
   getContextBuilderBindings,
+  normalizeContextBuilderHeader,
   slugifyContextBuilderPlaceholder,
   type ContextBuilderBindingRow,
 } from "../lib/contextBuilderBindings";
@@ -124,8 +125,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function buildContextBuilderTemplate(bindings: ContextBuilderBindingRow[]): string {
   return bindings
-    .map((binding) => `# ${binding.sourceLabel}\n{${binding.placeholder}}`)
+    .map((binding) => `# ${binding.header}\n{${binding.placeholder}}`)
     .join("\n\n");
+}
+
+function buildContextBuilderStructuredPreview(
+  bindings: ContextBuilderBindingRow[],
+  previewValues: Record<string, string>,
+): string {
+  return JSON.stringify(
+    bindings.map((binding) => ({
+      header: binding.header,
+      body: previewValues[binding.placeholder] ?? "",
+    })),
+    null,
+    2,
+  );
+}
+
+function contextBuilderPreviewBlocks(
+  bindings: ContextBuilderBindingRow[],
+  previewValues: Record<string, string>,
+): Array<{ sourceNodeId: string; header: string; body: string }> {
+  return bindings.map((binding) => ({
+    sourceNodeId: binding.sourceNodeId,
+    header: binding.header,
+    body: previewValues[binding.placeholder] ?? "",
+  }));
 }
 
 function extractTemplateTokens(template: string): string[] {
@@ -970,15 +996,18 @@ export function GraphInspector({
           ]),
         )
       : {};
+    const contextBuilderUsesCustomTemplate = isContextBuilderNode ? rawContextBuilderTemplate.trim().length > 0 : false;
     const contextBuilderRenderedPreview = isContextBuilderNode
-      ? renderContextBuilderPreview(contextBuilderTemplate, {
-          ...Object.fromEntries(Object.entries(graph.env_vars ?? {}).map(([key, value]) => [key, String(value)])),
-          current_node_id: selectedNode.id,
-          graph_id: graph.graph_id,
-          input_payload: "",
-          run_id: runState?.run_id ?? "",
-          ...contextBuilderPreviewVariables,
-        })
+      ? contextBuilderUsesCustomTemplate
+        ? renderContextBuilderPreview(contextBuilderTemplate, {
+            ...Object.fromEntries(Object.entries(graph.env_vars ?? {}).map(([key, value]) => [key, String(value)])),
+            current_node_id: selectedNode.id,
+            graph_id: graph.graph_id,
+            input_payload: "",
+            run_id: runState?.run_id ?? "",
+            ...contextBuilderPreviewVariables,
+          })
+        : buildContextBuilderStructuredPreview(contextBuilderBindings, contextBuilderPreviewVariables)
       : "";
     const contextBuilderHasPreviewData = isContextBuilderNode
       ? contextBuilderBindings.some((binding) => getContextBuilderSourcePreviewFromGraph(graph, runState, binding.sourceNodeId) !== null)
@@ -993,6 +1022,7 @@ export function GraphInspector({
             ...node.config,
             input_bindings: bindings.map((binding) => ({
               source_node_id: binding.sourceNodeId,
+              header: binding.rawHeader,
               placeholder: binding.placeholder,
               binding: binding.binding,
             })),
@@ -3160,7 +3190,7 @@ export function GraphInspector({
                 <>
                   <div className="contract-card">
                     <strong>Context Builder</strong>
-                    <span>Connect any number of upstream text nodes, rename their placeholders, and compose one prompt block.</span>
+                    <span>Connect any number of upstream nodes, name each section header, and compose one structured context payload.</span>
                     <span>
                       Connected inputs: {contextBuilderBindings.length > 0 ? String(contextBuilderBindings.length) : "None yet"}
                     </span>
@@ -3211,6 +3241,25 @@ export function GraphInspector({
                               </div>
                             </div>
                             <label>
+                              Header
+                              <input
+                                value={binding.rawHeader}
+                                placeholder={binding.sourceLabel}
+                                onChange={(event) => {
+                                  const nextBindings = contextBuilderBindings.map((candidate) =>
+                                    candidate.sourceNodeId === binding.sourceNodeId
+                                      ? {
+                                          ...candidate,
+                                          rawHeader: event.target.value,
+                                          header: normalizeContextBuilderHeader(event.target.value, candidate.sourceLabel),
+                                        }
+                                      : candidate,
+                                  );
+                                  updateContextBuilderBindings(nextBindings);
+                                }}
+                              />
+                            </label>
+                            <label>
                               Placeholder
                               <input
                                 value={binding.placeholder}
@@ -3232,6 +3281,7 @@ export function GraphInspector({
                               />
                             </label>
                             <div className="inspector-meta">
+                              <span>Output header: {binding.header}</span>
                               <span>Token: {`{${binding.placeholder}}`}</span>
                               <span>{binding.autoGenerated ? "Auto-generated from the source label" : "Custom placeholder"}</span>
                               <span>
@@ -3310,13 +3360,28 @@ export function GraphInspector({
                         {contextBuilderPreviewFormatted ? "Raw" : "Formatted"}
                       </button>
                     </div>
-                    <pre className="context-builder-preview">
-                      {contextBuilderRenderedPreview
-                        ? contextBuilderPreviewFormatted
-                          ? contextBuilderRenderedPreview.replace(/\\n/g, "\n").replace(/\\t/g, "\t")
-                          : contextBuilderRenderedPreview
-                        : "Template output will appear here."}
-                    </pre>
+                    {contextBuilderRenderedPreview ? (
+                      contextBuilderPreviewFormatted && !contextBuilderUsesCustomTemplate ? (
+                        <div className="context-builder-preview-block-list">
+                          {contextBuilderPreviewBlocks(contextBuilderBindings, contextBuilderPreviewVariables).map((block) => (
+                            <section key={block.sourceNodeId} className="context-builder-preview-block">
+                              <div className="context-builder-preview-block-header">{block.header}</div>
+                              <pre className="context-builder-preview-block-body">
+                                {block.body || "This block is waiting for runtime data."}
+                              </pre>
+                            </section>
+                          ))}
+                        </div>
+                      ) : (
+                        <pre className="context-builder-preview">
+                          {contextBuilderPreviewFormatted
+                            ? contextBuilderRenderedPreview.replace(/\\n/g, "\n").replace(/\\t/g, "\t")
+                            : contextBuilderRenderedPreview}
+                        </pre>
+                      )
+                    ) : (
+                      <pre className="context-builder-preview">Template output will appear here.</pre>
+                    )}
                     <span>
                       {contextBuilderHasPreviewData
                         ? "Preview uses the latest run outputs from connected nodes."

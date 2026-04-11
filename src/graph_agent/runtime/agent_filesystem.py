@@ -137,13 +137,17 @@ def write_agent_workspace_text_file(
 def list_agent_workspace_files(run_id: str, agent_id: str | None) -> dict[str, Any]:
     workspace = resolve_agent_workspace(run_id, agent_id, create=True)
     files = [
-        describe_agent_workspace_file(workspace, candidate)
+        {
+            **describe_agent_workspace_file(workspace, candidate),
+            "agent_id": workspace.agent_id,
+            "run_id": workspace.run_id,
+        }
         for candidate in sorted(workspace.workspace_dir.rglob("*"))
         if candidate.is_file()
     ]
     return {
-        "run_id": run_id,
-        "agent_id": agent_id or "default",
+        "run_id": workspace.run_id,
+        "agent_id": workspace.agent_id,
         "workspace_root": str(workspace.workspace_dir),
         "files": files,
     }
@@ -167,6 +171,8 @@ def read_agent_workspace_file(
         truncated = True
     return {
         **describe_agent_workspace_file(workspace, target_path, relative_path=normalized_relative_path.as_posix()),
+        "agent_id": workspace.agent_id,
+        "run_id": workspace.run_id,
         "content": text_content,
         "truncated": truncated,
         "encoding": "utf-8",

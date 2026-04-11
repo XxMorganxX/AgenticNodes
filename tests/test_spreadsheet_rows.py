@@ -370,7 +370,7 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertIsInstance(state.final_output, str)
         self.assertIn("Portland", state.final_output)
 
-    def test_context_builder_renders_spreadsheet_rows_as_llm_friendly_text(self) -> None:
+    def test_context_builder_renders_spreadsheet_rows_as_llm_friendly_text_sections(self) -> None:
         with TemporaryDirectory() as temp_dir:
             csv_path = Path(temp_dir) / "jobs.csv"
             with csv_path.open("w", encoding="utf-8", newline="") as handle:
@@ -458,13 +458,15 @@ class SpreadsheetRowTests(unittest.TestCase):
             state = runtime.run(graph, {"request": "Process spreadsheet rows"}, run_id="spreadsheet-row-context-builder")
 
         self.assertEqual(state.status, "completed")
-        self.assertIsInstance(state.final_output, str)
-        assert isinstance(state.final_output, str)
-        self.assertIn("Spreadsheet record 1", state.final_output)
-        self.assertIn("Company: Scale AI", state.final_output)
-        self.assertIn("CEO: Alexandr Wang", state.final_output)
-        self.assertIn("Summer_2026_Internships?: YES", state.final_output)
-        self.assertNotIn('"row_data"', state.final_output)
+        self.assertIsInstance(state.final_output, list)
+        assert isinstance(state.final_output, list)
+        self.assertEqual(len(state.final_output), 1)
+        self.assertEqual(state.final_output[0]["header"], "Spreadsheet Rows")
+        self.assertIn("Spreadsheet record 1", state.final_output[0]["body"])
+        self.assertIn("Company: Scale AI", state.final_output[0]["body"])
+        self.assertIn("CEO: Alexandr Wang", state.final_output[0]["body"])
+        self.assertIn("Summer_2026_Internships?: YES", state.final_output[0]["body"])
+        self.assertNotIn('"row_data"', state.final_output[0]["body"])
 
     def test_failed_spreadsheet_rows_do_not_traverse_standard_edges(self) -> None:
         services = build_example_services()
