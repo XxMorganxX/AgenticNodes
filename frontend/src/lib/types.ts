@@ -130,6 +130,7 @@ export type McpServerConfig = {
   command?: string[];
   cwd?: string | null;
   env?: Record<string, string>;
+  headers?: Record<string, string>;
   base_url?: string | null;
   timeout_seconds?: number | null;
 };
@@ -142,6 +143,7 @@ export type McpServerDraft = {
   command: string[];
   cwd?: string | null;
   env: Record<string, string>;
+  headers: Record<string, string>;
   base_url?: string | null;
   timeout_seconds: number;
   auto_boot: boolean;
@@ -276,6 +278,49 @@ export type SpreadsheetPreviewResult = {
   headers: string[];
   row_count: number;
   sample_rows: SpreadsheetPreviewRow[];
+};
+
+export type SupabaseSchemaColumn = {
+  name: string;
+  data_type: string;
+  nullable: boolean;
+  description: string;
+};
+
+export type SupabaseSchemaSource = {
+  name: string;
+  source_kind: string;
+  columns: SupabaseSchemaColumn[];
+  description: string;
+};
+
+export type SupabaseSchemaPreviewResult = {
+  schema: string;
+  source_count: number;
+  sources: SupabaseSchemaSource[];
+};
+
+export type SupabaseRuntimeStatusResult = {
+  supabase_url_env_var: string;
+  supabase_key_env_var: string;
+  supabase_url_env_present: boolean;
+  supabase_key_env_present: boolean;
+  missing_env_vars: string[];
+  ready: boolean;
+};
+
+export type SupabaseAuthVerificationResult = {
+  schema: string;
+  static_auth_valid: boolean;
+  source_count: number;
+  sources: SupabaseSchemaSource[];
+  mcp_auth_checked: boolean;
+  mcp_auth_valid: boolean;
+  warnings: string[];
+  mcp_server?: {
+    server_name: string;
+    server_version: string;
+  };
 };
 
 export type RunDocument = {

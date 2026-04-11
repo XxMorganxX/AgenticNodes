@@ -10,6 +10,7 @@ from threading import Thread
 import unittest
 from typing import Any
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -237,6 +238,73 @@ class PartialDiscoveryHttpServer:
         self._thread.join(timeout=2)
 
 
+class _EnvExpansionDiscoveryStubHandler(BaseHTTPRequestHandler):
+    last_authorization: str = ""
+    last_query: dict[str, list[str]] = {}
+
+    def do_POST(self) -> None:  # noqa: N802
+        type(self).last_authorization = str(self.headers.get("Authorization", ""))
+        type(self).last_query = parse_qs(urlparse(self.path).query)
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        method = payload.get("method")
+        message_id = payload.get("id")
+
+        if method == "initialize":
+            result = {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "env-expansion-stub", "version": "0.1.0"},
+            }
+        elif method == "tools/list":
+            result = {
+                "tools": [
+                    {
+                        "name": "echo_tool",
+                        "description": "Echo a message back.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"message": {"type": "string"}},
+                            "required": ["message"],
+                        },
+                    }
+                ]
+            }
+        else:
+            result = {}
+
+        if message_id is None:
+            self.send_response(202)
+            self.end_headers()
+            return
+
+        body = json.dumps({"jsonrpc": "2.0", "id": message_id, "result": result}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+        return
+
+
+class EnvExpansionDiscoveryHttpServer:
+    def __enter__(self) -> str:
+        _EnvExpansionDiscoveryStubHandler.last_authorization = ""
+        _EnvExpansionDiscoveryStubHandler.last_query = {}
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _EnvExpansionDiscoveryStubHandler)
+        self._thread = Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        host, port = self._server.server_address
+        return f"http://{host}:{port}/mcp"
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
+
+
 class McpDiscoveryTests(unittest.TestCase):
     def test_manager_discovers_mixed_capability_types_and_keeps_tool_execution(self) -> None:
         registry = ToolRegistry()
@@ -335,7 +403,39 @@ class McpDiscoveryTests(unittest.TestCase):
             self.assertIn(DISCOVERY_RESOURCE_ID, capability_names)
             self.assertIn(DISCOVERY_PROMPT_ID, capability_names)
             self.assertIn("official.fetch", template_ids)
+            self.assertIn("official.supabase_read", template_ids)
+            self.assertIn("official.supabase_admin", template_ids)
             self.assertIn("custom.directory", template_ids)
+
+    def test_http_servers_expand_process_env_in_base_url_and_headers(self) -> None:
+        registry = ToolRegistry()
+        manager = McpServerManager(registry)
+        with EnvExpansionDiscoveryHttpServer() as base_url:
+            definition = McpServerDefinition(
+                server_id=DISCOVERY_SERVER_ID,
+                display_name="Supabase-style HTTP Stub",
+                description="Stub server for env expansion coverage.",
+                transport="http",
+                base_url=f"{base_url}?project_ref=${{SUPABASE_PROJECT_REF}}&read_only=true&features=database,docs",
+                headers={"Authorization": "Bearer ${SUPABASE_ACCESS_TOKEN}"},
+            )
+            manager.register_server(definition)
+            with patch.dict(
+                os.environ,
+                {
+                    "SUPABASE_PROJECT_REF": "project-123",
+                    "SUPABASE_ACCESS_TOKEN": "token-xyz",
+                },
+                clear=False,
+            ):
+                server_state = manager.boot_server(DISCOVERY_SERVER_ID)
+
+        self.assertTrue(server_state["running"])
+        self.assertEqual(server_state["tool_names"], [DISCOVERY_TOOL_ID])
+        self.assertEqual(_EnvExpansionDiscoveryStubHandler.last_authorization, "Bearer token-xyz")
+        self.assertEqual(_EnvExpansionDiscoveryStubHandler.last_query.get("project_ref"), ["project-123"])
+        self.assertEqual(_EnvExpansionDiscoveryStubHandler.last_query.get("read_only"), ["true"])
+        self.assertEqual(_EnvExpansionDiscoveryStubHandler.last_query.get("features"), ["database,docs"])
 
     def test_test_mcp_server_returns_rich_discovery_snapshot(self) -> None:
         services = build_example_services(include_user_mcp_servers=False)

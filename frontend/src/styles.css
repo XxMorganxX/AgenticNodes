@@ -4343,6 +4343,10 @@ pre {
   width: min(680px, calc(100vw - 3rem));
 }
 
+.supabase-auth-modal {
+  width: min(780px, calc(100vw - 3rem));
+}
+
 .mcp-server-modal {
   width: min(1120px, calc(100vw - 3rem));
 }
@@ -4381,6 +4385,7 @@ pre {
 .preferences-modal-actions {
   display: flex;
   justify-content: flex-start;
+  gap: 0.6rem;
 }
 
 .preferences-shortcut-card {
@@ -4782,6 +4787,144 @@ pre {
   border-radius: 16px;
   border: 1px solid rgba(72, 78, 126, 0.42);
   background: rgba(18, 22, 37, 0.68);
+}
+
+.provider-details-schema-browser {
+  display: grid;
+  gap: 0.9rem;
+  padding: 1rem;
+  border: 1px solid rgba(72, 98, 126, 0.42);
+  border-radius: 8px;
+  background: rgba(18, 22, 37, 0.74);
+}
+
+.provider-details-schema-lock-banner {
+  margin-bottom: 0.25rem;
+}
+
+.provider-details-schema-browser-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: start;
+}
+
+.provider-details-schema-browser-header strong {
+  color: #f5f7ff;
+}
+
+.provider-details-schema-browser-header span,
+.provider-details-schema-browser-meta,
+.provider-details-schema-description,
+.provider-details-schema-column-description {
+  color: #9ca3c6;
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.provider-details-schema-browser-actions,
+.provider-details-schema-column-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.provider-details-schema-browser-toolbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: end;
+}
+
+.provider-details-schema-browser-toolbar label {
+  flex: 1 1 280px;
+}
+
+.provider-details-schema-browser-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.4fr);
+  gap: 0.85rem;
+  align-items: start;
+}
+
+.provider-details-schema-source-list,
+.provider-details-schema-column-panel,
+.provider-details-schema-column-list {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.provider-details-schema-source-card {
+  display: grid;
+  gap: 0.2rem;
+  width: 100%;
+  padding: 0.8rem 0.9rem;
+  border: 1px solid rgba(79, 88, 132, 0.45);
+  border-radius: 8px;
+  background: rgba(13, 17, 30, 0.82);
+  color: #d8def7;
+  text-align: left;
+}
+
+.provider-details-schema-source-card:disabled {
+  opacity: 0.62;
+  cursor: not-allowed;
+}
+
+.provider-details-schema-source-card.is-active {
+  border-color: rgba(96, 165, 250, 0.72);
+  background: rgba(18, 30, 51, 0.92);
+}
+
+.provider-details-schema-source-card strong,
+.provider-details-schema-column-header strong,
+.provider-details-schema-column-main strong {
+  color: #f5f7ff;
+}
+
+.provider-details-schema-source-card span,
+.provider-details-schema-column-header span,
+.provider-details-schema-column-main small {
+  color: #9ca3c6;
+  font-size: 0.8rem;
+}
+
+.provider-details-schema-column-panel {
+  padding: 0.9rem;
+  border: 1px solid rgba(79, 88, 132, 0.45);
+  border-radius: 8px;
+  background: rgba(13, 17, 30, 0.82);
+}
+
+.provider-details-schema-column-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  align-items: start;
+}
+
+.provider-details-schema-column-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.45rem 0.75rem;
+  align-items: start;
+  padding: 0.65rem 0.7rem;
+  border: 1px solid rgba(60, 66, 104, 0.5);
+  border-radius: 8px;
+  background: rgba(17, 22, 38, 0.72);
+}
+
+.provider-details-schema-column-row input {
+  margin-top: 0.2rem;
+}
+
+.provider-details-schema-column-main {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.provider-details-schema-column-description {
+  grid-column: 2;
 }
 
 .provider-details-preview-layout {
@@ -5400,6 +5543,14 @@ pre {
   .provider-details-preview-layout,
   .provider-details-grid {
     grid-template-columns: 1fr;
+  }
+
+  .provider-details-schema-browser-layout,
+  .provider-details-schema-browser-toolbar,
+  .provider-details-schema-column-header {
+    grid-template-columns: 1fr;
+    flex-direction: column;
+    align-items: stretch;
   }
 }
 
@@ -6238,6 +6389,94 @@ pre {
   line-height: 1.4;
 }
 
+.env-supabase-launcher {
+  display: grid;
+  gap: 0.55rem;
+  margin-bottom: 0.85rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid rgba(91, 97, 144, 0.7);
+  border-radius: 12px;
+  background:
+    linear-gradient(180deg, rgba(30, 32, 51, 0.96) 0%, rgba(20, 22, 37, 0.94) 100%);
+}
+
+.env-supabase-launcher-copy {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.env-supabase-launcher-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.env-supabase-launcher-heading strong {
+  font-size: 0.92rem;
+  color: #f4f2ff;
+}
+
+.env-supabase-launcher-copy p {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: #b7bcdf;
+}
+
+.env-supabase-launcher-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.55rem;
+}
+
+.env-supabase-launcher-button {
+  justify-content: center;
+}
+
+.env-supabase-verify-button {
+  min-width: 6.5rem;
+  justify-content: center;
+}
+
+.env-supabase-launcher-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.env-integration-status {
+  padding: 0.32rem 0.58rem;
+  border: 1px solid rgba(99, 106, 150, 0.6);
+  border-radius: 999px;
+  color: #a8aed3;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.env-integration-status.is-ready {
+  border-color: rgba(84, 182, 127, 0.55);
+  color: #b8ecc7;
+  background: rgba(33, 82, 55, 0.24);
+}
+
+.env-supabase-launcher-verification {
+  font-size: 0.76rem;
+  line-height: 1.45;
+  color: #b7e5c8;
+}
+
+.env-supabase-launcher-verification code {
+  color: #f5dcff;
+}
+
+.env-supabase-launcher-error {
+  font-size: 0.76rem;
+  line-height: 1.45;
+  color: #f0b1ba;
+}
+
 .env-tiles {
   display: flex;
   flex-wrap: wrap;
@@ -6329,6 +6568,105 @@ pre {
 
 .graph-env-empty {
   color: #8e92b3;
+}
+
+.supabase-auth-modal-body {
+  display: grid;
+  gap: 1rem;
+}
+
+.supabase-auth-modal-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.9rem;
+}
+
+.supabase-auth-modal-label-with-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.supabase-auth-modal-hint {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.supabase-auth-modal-hint-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  padding: 0;
+  border: 1px solid rgba(99, 106, 150, 0.7);
+  border-radius: 999px;
+  background: rgba(25, 27, 44, 0.9);
+  color: #c9d0f7;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+}
+
+.supabase-auth-modal-hint-button:hover,
+.supabase-auth-modal-hint-button:focus-visible {
+  border-color: rgba(139, 146, 201, 0.9);
+  color: #f5f7ff;
+}
+
+.supabase-auth-modal-tooltip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 0.45rem);
+  transform: translateX(-50%) translateY(4px);
+  min-width: 13rem;
+  max-width: 16rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid rgba(110, 118, 176, 0.7);
+  border-radius: 8px;
+  background: rgba(14, 16, 29, 0.98);
+  color: #dfe5ff;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease;
+  z-index: 20;
+}
+
+.supabase-auth-modal-tooltip::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  transform: translateX(-50%);
+  border-width: 6px 5px 0 5px;
+  border-style: solid;
+  border-color: rgba(14, 16, 29, 0.98) transparent transparent transparent;
+}
+
+.supabase-auth-modal-hint:hover .supabase-auth-modal-tooltip,
+.supabase-auth-modal-hint:focus-within .supabase-auth-modal-tooltip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.supabase-auth-modal-status {
+  padding: 0.8rem 0.9rem;
+  border: 1px solid rgba(74, 129, 104, 0.45);
+  border-radius: 12px;
+  background: rgba(28, 58, 44, 0.22);
+}
+
+.supabase-auth-modal-status--error {
+  border-color: rgba(164, 79, 89, 0.44);
+  background: rgba(84, 35, 41, 0.24);
+  color: #f0b1ba;
 }
 
 .timeline {
@@ -6565,6 +6903,10 @@ pre {
 
   .mosaic-env .env-tiles {
     gap: 0.5rem;
+  }
+
+  .supabase-auth-modal-grid {
+    grid-template-columns: 1fr;
   }
 
   .mosaic-env .env-tile {

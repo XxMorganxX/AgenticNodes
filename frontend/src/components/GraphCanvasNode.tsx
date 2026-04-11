@@ -229,6 +229,7 @@ function GraphCanvasNodeComponent({
   const isLogicConditionsNode = node.provider_id === LOGIC_CONDITIONS_PROVIDER_ID;
   const isParallelSplitterNode = node.provider_id === PARALLEL_SPLITTER_PROVIDER_ID;
   const isRuntimeNormalizerNode = node.provider_id === "core.runtime_normalizer";
+  const isSupabaseDataNode = node.provider_id === "core.supabase_data";
   const displayLabel = getNodeInstanceLabel(graph, node);
   const displayEnvelope =
     isDisplayNode &&
@@ -742,7 +743,7 @@ function GraphCanvasNodeComponent({
             <span className="graph-node-inline-display-hint">Click to expand</span>
           </div>
         ) : null}
-        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isRuntimeNormalizerNode) ? (
+        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isRuntimeNormalizerNode || isSupabaseDataNode) ? (
           <div className="graph-node-card-actions" aria-hidden="false">
             <button
               type="button"
@@ -766,6 +767,8 @@ function GraphCanvasNodeComponent({
                 : isLogicConditionsNode
                   ? "Learn More"
                 : isRuntimeNormalizerNode
+                  ? "Learn More"
+                : isSupabaseDataNode
                   ? "Learn More"
                 : isPromptBlockNode(node)
                   ? "More Info"

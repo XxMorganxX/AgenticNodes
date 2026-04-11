@@ -69,5 +69,57 @@
       "registry": "bundled",
       "publisher": "modelcontextprotocol"
     }
+  },
+  {
+    "template_id": "official.supabase_read",
+    "display_name": "Supabase Read-Only MCP",
+    "description": "Connect the hosted Supabase MCP server in project-scoped read-only mode for developer-driven schema inspection, docs lookup, and safe ad hoc reads.",
+    "draft": {
+      "server_id": "supabase_read",
+      "display_name": "Supabase Read-Only MCP",
+      "description": "Project-scoped hosted Supabase MCP server with read-only access.",
+      "transport": "http",
+      "command": [],
+      "cwd": null,
+      "env": {},
+      "headers": {
+        "Authorization": "Bearer ${SUPABASE_ACCESS_TOKEN}"
+      },
+      "base_url": "https://mcp.supabase.com/mcp?project_ref=${SUPABASE_PROJECT_REF}&read_only=true&features=database,docs",
+      "timeout_seconds": 20,
+      "auto_boot": false,
+      "persistent": true
+    },
+    "capability_hints": ["tool", "resource", "prompt"],
+    "provenance": {
+      "registry": "bundled",
+      "publisher": "supabase"
+    }
+  },
+  {
+    "template_id": "official.supabase_admin",
+    "display_name": "Supabase Admin MCP",
+    "description": "Connect the hosted Supabase MCP server with broader developer capabilities for migrations, debugging, and operational workflows when explicitly enabled.",
+    "draft": {
+      "server_id": "supabase_admin",
+      "display_name": "Supabase Admin MCP",
+      "description": "Project-scoped hosted Supabase MCP server for broader developer workflows.",
+      "transport": "http",
+      "command": [],
+      "cwd": null,
+      "env": {},
+      "headers": {
+        "Authorization": "Bearer ${SUPABASE_ACCESS_TOKEN}"
+      },
+      "base_url": "https://mcp.supabase.com/mcp?project_ref=${SUPABASE_PROJECT_REF}&features=database,docs,debugging,development,functions,branching",
+      "timeout_seconds": 20,
+      "auto_boot": false,
+      "persistent": true
+    },
+    "capability_hints": ["tool", "resource", "prompt"],
+    "provenance": {
+      "registry": "bundled",
+      "publisher": "supabase"
+    }
   }
 ]

@@ -521,6 +521,72 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="core.supabase_data",
+            display_name="Supabase Data Source",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Loads deterministic data from a fixed Supabase table, view, or RPC and forwards it as a reusable data envelope.",
+            capabilities=["supabase table reads", "supabase rpc calls", "deterministic context loading"],
+            default_config={
+                "mode": "supabase_data",
+                "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_URL",
+                "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_SECRET_KEY",
+                "schema": "public",
+                "source_kind": "table",
+                "source_name": "",
+                "select": "*",
+                "filters_text": "",
+                "order_by": "",
+                "order_desc": False,
+                "limit": 25,
+                "single_row": False,
+                "output_mode": "records",
+                "rpc_params_json": "{}",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(key="schema", label="Schema"),
+                ProviderConfigFieldDefinition(
+                    key="source_kind",
+                    label="Source Kind",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="table", label="Table or View"),
+                        ProviderConfigOptionDefinition(value="rpc", label="RPC"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(key="source_name", label="Source Name"),
+                ProviderConfigFieldDefinition(key="select", label="Select"),
+                ProviderConfigFieldDefinition(
+                    key="filters_text",
+                    label="Filters",
+                    input_type="textarea",
+                    help_text="One PostgREST query parameter per line, for example status=eq.active.",
+                    placeholder="status=eq.active\nteam_id=eq.123",
+                ),
+                ProviderConfigFieldDefinition(key="order_by", label="Order By"),
+                ProviderConfigFieldDefinition(key="order_desc", label="Descending Order", input_type="checkbox"),
+                ProviderConfigFieldDefinition(key="limit", label="Limit", input_type="number"),
+                ProviderConfigFieldDefinition(key="single_row", label="Single Row", input_type="checkbox"),
+                ProviderConfigFieldDefinition(
+                    key="output_mode",
+                    label="Output Mode",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="records", label="Records"),
+                        ProviderConfigOptionDefinition(value="markdown", label="Markdown"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(
+                    key="rpc_params_json",
+                    label="RPC Params JSON",
+                    input_type="textarea",
+                    placeholder="{\n  \"project_id\": \"123\"\n}",
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.runtime_normalizer",
             display_name="Payload Field Extractor",
             category=NodeCategory.DATA,

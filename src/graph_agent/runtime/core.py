@@ -49,6 +49,11 @@ from graph_agent.runtime.runtime_normalizer import (
     extract_field_candidates,
     parse_field_name_list,
 )
+from graph_agent.runtime.supabase_data import (
+    SupabaseDataError,
+    SupabaseDataRequest,
+    fetch_supabase_data,
+)
 from graph_agent.runtime.node_providers import (
     NodeCategory,
     NodeProviderRegistry,
@@ -91,6 +96,8 @@ LINKEDIN_PROFILE_FETCH_PROVIDER_ID = "core.linkedin_profile_fetch"
 LINKEDIN_PROFILE_FETCH_MODE = "linkedin_profile_fetch"
 RUNTIME_NORMALIZER_PROVIDER_ID = "core.runtime_normalizer"
 RUNTIME_NORMALIZER_MODE = "runtime_normalizer"
+SUPABASE_DATA_PROVIDER_ID = "core.supabase_data"
+SUPABASE_DATA_MODE = "supabase_data"
 SPREADSHEET_MATRIX_DECISION_MODE = "spreadsheet_matrix_decision"
 CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body"
 CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if"
@@ -501,7 +508,13 @@ def resolve_graph_process_env(value: str, env_vars: Mapping[str, str]) -> str:
     env_var_name = resolve_graph_env_var_name(value, env_vars)
     if not env_var_name:
         return ""
-    return os.environ.get(env_var_name, "")
+    process_value = os.environ.get(env_var_name, "")
+    if str(process_value).strip():
+        return process_value
+    graph_value = str(env_vars.get(env_var_name, "") or "").strip()
+    if graph_value and graph_value != env_var_name:
+        return graph_value
+    return ""
 
 
 class ResolvedConfigMapping(MappingABC[str, Any]):
@@ -2306,6 +2319,78 @@ class DataNode(BaseNode):
             metadata=metadata,
         )
 
+    def _supabase_data_request(self, context: NodeContext) -> SupabaseDataRequest:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        rpc_params_text = str(resolved.get("rpc_params_json", "{}") or "{}").strip() or "{}"
+        try:
+            rpc_params = json.loads(rpc_params_text)
+        except json.JSONDecodeError as exc:
+            raise SupabaseDataError(
+                "Supabase rpc_params_json must be valid JSON.",
+                error_type="invalid_supabase_rpc_params",
+            ) from exc
+        return SupabaseDataRequest(
+            supabase_url=resolve_graph_process_env(
+                str(resolved.get("supabase_url_env_var", "GRAPH_AGENT_SUPABASE_URL") or "GRAPH_AGENT_SUPABASE_URL"),
+                context.graph.env_vars,
+            ),
+            supabase_key=resolve_graph_process_env(
+                str(resolved.get("supabase_key_env_var", "GRAPH_AGENT_SUPABASE_SECRET_KEY") or "GRAPH_AGENT_SUPABASE_SECRET_KEY"),
+                context.graph.env_vars,
+            ),
+            schema=str(resolved.get("schema", "public") or "public").strip() or "public",
+            source_kind=str(resolved.get("source_kind", "table") or "table").strip().lower() or "table",
+            source_name=str(resolved.get("source_name", "") or "").strip(),
+            select=str(resolved.get("select", "*") or "*").strip() or "*",
+            filters_text=str(resolved.get("filters_text", "") or "").strip(),
+            order_by=str(resolved.get("order_by", "") or "").strip(),
+            order_desc=_coerce_bool(resolved.get("order_desc"), default=False),
+            limit=_coerce_int(resolved.get("limit"), default=25, minimum=1),
+            single_row=_coerce_bool(resolved.get("single_row"), default=False),
+            output_mode=str(resolved.get("output_mode", "records") or "records").strip().lower() or "records",
+            rpc_params=rpc_params if isinstance(rpc_params, dict) else {},
+        )
+
+    def _execute_supabase_data(self, context: NodeContext) -> NodeExecutionResult:
+        try:
+            request = self._supabase_data_request(context)
+            result = fetch_supabase_data(request)
+        except SupabaseDataError as exc:
+            return NodeExecutionResult(
+                status="failed",
+                error=exc.to_error_payload(),
+                summary=str(exc),
+            )
+
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=result.payload,
+            artifacts={
+                "supabase_raw_payload": result.raw_payload,
+                "supabase_request_url": result.request_url,
+            },
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "data_mode": SUPABASE_DATA_MODE,
+                "provider_id": self.provider_id,
+                "source_kind": result.source_kind,
+                "source_name": result.source_name,
+                "schema": result.schema,
+                "row_count": result.row_count,
+                "output_mode": result.output_mode,
+            },
+        )
+        summary_count = "unknown rows" if result.row_count is None else f"{result.row_count} row(s)"
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary=f"Loaded {summary_count} from Supabase {result.source_kind} '{result.source_name}'.",
+            metadata=envelope.metadata,
+        )
+
     def runtime_input_preview(self, context: NodeContext) -> Any:
         mode = "passthrough" if bool(self.config.get("lock_passthrough", False)) else self.config.get("mode", "passthrough")
         if self.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
@@ -2371,6 +2456,26 @@ class DataNode(BaseNode):
             return preview
         if self.provider_id == RUNTIME_NORMALIZER_PROVIDER_ID or mode == RUNTIME_NORMALIZER_MODE:
             return self._runtime_normalizer_source_value(context)
+        if self.provider_id == SUPABASE_DATA_PROVIDER_ID or mode == SUPABASE_DATA_MODE:
+            try:
+                request = self._supabase_data_request(context)
+            except SupabaseDataError as exc:
+                return {"error": str(exc)}
+            return {
+                "source_kind": request.source_kind,
+                "source_name": request.source_name,
+                "schema": request.schema,
+                "select": request.select,
+                "filters_text": request.filters_text,
+                "order_by": request.order_by,
+                "order_desc": request.order_desc,
+                "limit": request.limit,
+                "single_row": request.single_row,
+                "output_mode": request.output_mode,
+                "supabase_url_present": bool(request.supabase_url),
+                "supabase_key_present": bool(request.supabase_key),
+                "rpc_params": request.rpc_params,
+            }
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return context.prompt_block_payload_for_node(self.id)
         if mode == "context_builder":
@@ -2411,6 +2516,8 @@ class DataNode(BaseNode):
             return self._execute_linkedin_profile_fetch(context)
         if self.provider_id == RUNTIME_NORMALIZER_PROVIDER_ID or mode == RUNTIME_NORMALIZER_MODE:
             return self._execute_runtime_normalizer(context)
+        if self.provider_id == SUPABASE_DATA_PROVIDER_ID or mode == SUPABASE_DATA_MODE:
+            return self._execute_supabase_data(context)
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return self._execute_prompt_block(context)
         source_value = context.resolve_binding(self.config.get("input_binding"))
@@ -5705,6 +5812,25 @@ class GraphDefinition:
                 except (TypeError, ValueError) as exc:
                     raise GraphValidationError(
                         f"Runtime field extractor node '{node.id}' must declare a positive max_matches value."
+                    ) from exc
+            if node.kind == "data" and node.provider_id == SUPABASE_DATA_PROVIDER_ID:
+                source_name = str(node.config.get("source_name", "") or "").strip()
+                source_kind = str(node.config.get("source_kind", "table") or "table").strip().lower() or "table"
+                if source_kind not in {"table", "rpc"}:
+                    raise GraphValidationError(
+                        f"Supabase data source node '{node.id}' uses unsupported source_kind '{source_kind}'."
+                    )
+                output_mode = str(node.config.get("output_mode", "records") or "records").strip().lower() or "records"
+                if output_mode not in {"records", "markdown"}:
+                    raise GraphValidationError(
+                        f"Supabase data source node '{node.id}' uses unsupported output_mode '{output_mode}'."
+                    )
+                try:
+                    if int(node.config.get("limit", 25)) < 1:
+                        raise ValueError("limit")
+                except (TypeError, ValueError) as exc:
+                    raise GraphValidationError(
+                        f"Supabase data source node '{node.id}' must declare a positive limit value."
                     ) from exc
             if node.kind == "control_flow_unit":
                 if node.provider_id == SPREADSHEET_ROW_PROVIDER_ID:

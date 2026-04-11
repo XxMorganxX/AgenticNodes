@@ -19,12 +19,13 @@ from graph_agent.api.run_store import RunStore, build_default_run_store
 from graph_agent.api.run_state_reducer import apply_event, build_run_state
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.providers.discord import DiscordMessageEvent, DiscordTriggerService, normalize_discord_message_payload
-from graph_agent.runtime.core import GraphDefinition, resolve_graph_process_env, utc_now_iso
+from graph_agent.runtime.core import GraphDefinition, resolve_graph_env_var_name, resolve_graph_process_env, utc_now_iso
 from graph_agent.runtime.documents import AgentDefinition, TestEnvironmentDefinition, load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
 from graph_agent.runtime.run_documents import ingest_run_documents, normalize_run_documents
 from graph_agent.runtime.spreadsheets import SpreadsheetParseError, parse_spreadsheet
+from graph_agent.runtime.supabase_data import SupabaseDataError, fetch_supabase_schema_catalog, verify_supabase_mcp_auth
 from graph_agent.tools.mcp import McpServerDefinition
 
 
@@ -114,6 +115,7 @@ def _normalize_mcp_server_template(payload: dict[str, Any], *, source: str) -> d
                 "command": draft_payload.get("command", []),
                 "cwd": draft_payload.get("cwd"),
                 "env": draft_payload.get("env", {}),
+                "headers": draft_payload.get("headers", {}),
                 "base_url": draft_payload.get("base_url"),
                 "timeout_seconds": draft_payload.get("timeout_seconds", 15),
                 "auto_boot": draft_payload.get("auto_boot", False),
@@ -136,6 +138,7 @@ def _normalize_mcp_server_template(payload: dict[str, Any], *, source: str) -> d
             "command": list(definition.command),
             "cwd": definition.cwd,
             "env": dict(definition.env),
+            "headers": dict(definition.headers),
             "base_url": definition.base_url,
             "timeout_seconds": definition.timeout_seconds,
             "auto_boot": definition.auto_boot,
@@ -375,6 +378,115 @@ class GraphRunManager:
         except SpreadsheetParseError as exc:
             raise ValueError(str(exc)) from exc
         return parsed.preview()
+
+    def preview_supabase_schema(self, config: dict[str, Any]) -> dict[str, Any]:
+        graph_env_vars = config.get("graph_env_vars", {})
+        resolved_env_vars = graph_env_vars if isinstance(graph_env_vars, dict) else {}
+        supabase_url = resolve_graph_process_env(
+            str(config.get("supabase_url_env_var", "GRAPH_AGENT_SUPABASE_URL") or "GRAPH_AGENT_SUPABASE_URL"),
+            resolved_env_vars,
+        )
+        supabase_key = resolve_graph_process_env(
+            str(config.get("supabase_key_env_var", "GRAPH_AGENT_SUPABASE_SECRET_KEY") or "GRAPH_AGENT_SUPABASE_SECRET_KEY"),
+            resolved_env_vars,
+        )
+        schema = str(config.get("schema", "public") or "public").strip() or "public"
+        try:
+            sources = fetch_supabase_schema_catalog(
+                supabase_url=supabase_url,
+                supabase_key=supabase_key,
+                schema=schema,
+            )
+        except SupabaseDataError as exc:
+            raise ValueError(str(exc)) from exc
+        return {
+            "schema": schema,
+            "source_count": len(sources),
+            "sources": [source.to_dict() for source in sources],
+        }
+
+    def inspect_supabase_runtime(self, config: dict[str, Any]) -> dict[str, Any]:
+        graph_env_vars = config.get("graph_env_vars", {})
+        resolved_env_vars = graph_env_vars if isinstance(graph_env_vars, dict) else {}
+        supabase_url_env_var = resolve_graph_env_var_name(
+            str(config.get("supabase_url_env_var", "GRAPH_AGENT_SUPABASE_URL") or "GRAPH_AGENT_SUPABASE_URL"),
+            resolved_env_vars,
+        )
+        supabase_key_env_var = resolve_graph_env_var_name(
+            str(config.get("supabase_key_env_var", "GRAPH_AGENT_SUPABASE_SECRET_KEY") or "GRAPH_AGENT_SUPABASE_SECRET_KEY"),
+            resolved_env_vars,
+        )
+        supabase_url_present = bool(
+            resolve_graph_process_env(
+                str(config.get("supabase_url_env_var", "GRAPH_AGENT_SUPABASE_URL") or "GRAPH_AGENT_SUPABASE_URL"),
+                resolved_env_vars,
+            ).strip()
+        )
+        supabase_key_present = bool(
+            resolve_graph_process_env(
+                str(config.get("supabase_key_env_var", "GRAPH_AGENT_SUPABASE_SECRET_KEY") or "GRAPH_AGENT_SUPABASE_SECRET_KEY"),
+                resolved_env_vars,
+            ).strip()
+        )
+        missing_env_vars = [
+            env_var
+            for env_var, present in [
+                (supabase_url_env_var, supabase_url_present),
+                (supabase_key_env_var, supabase_key_present),
+            ]
+            if env_var and not present
+        ]
+        return {
+            "supabase_url_env_var": supabase_url_env_var,
+            "supabase_key_env_var": supabase_key_env_var,
+            "supabase_url_env_present": supabase_url_present,
+            "supabase_key_env_present": supabase_key_present,
+            "missing_env_vars": missing_env_vars,
+            "ready": supabase_url_present and supabase_key_present,
+        }
+
+    def verify_supabase_auth(self, config: dict[str, Any]) -> dict[str, Any]:
+        supabase_url = str(config.get("supabase_url", "") or "").strip()
+        supabase_key = str(config.get("supabase_key", "") or "").strip()
+        schema = str(config.get("schema", "public") or "public").strip() or "public"
+        project_ref = str(config.get("project_ref", "") or "").strip()
+        access_token = str(config.get("access_token", "") or "").strip()
+        mcp_base_url = str(config.get("mcp_base_url", "") or "").strip() or None
+
+        try:
+            sources = fetch_supabase_schema_catalog(
+                supabase_url=supabase_url,
+                supabase_key=supabase_key,
+                schema=schema,
+            )
+        except SupabaseDataError as exc:
+            raise ValueError(str(exc)) from exc
+
+        response: dict[str, Any] = {
+            "schema": schema,
+            "static_auth_valid": True,
+            "source_count": len(sources),
+            "sources": [source.to_dict() for source in sources],
+            "mcp_auth_checked": False,
+            "mcp_auth_valid": False,
+            "warnings": [],
+        }
+        if project_ref or access_token:
+            if not project_ref or not access_token:
+                response["warnings"].append("Provide both Supabase project ref and access token to verify MCP access.")
+            else:
+                try:
+                    mcp_result = verify_supabase_mcp_auth(
+                        project_ref=project_ref,
+                        access_token=access_token,
+                        base_url=mcp_base_url,
+                    )
+                except SupabaseDataError as exc:
+                    raise ValueError(str(exc)) from exc
+                response["mcp_auth_checked"] = True
+                response["mcp_auth_valid"] = True
+                response["mcp_server"] = mcp_result
+        return response
 
     def upload_run_documents(self, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return ingest_run_documents(documents)

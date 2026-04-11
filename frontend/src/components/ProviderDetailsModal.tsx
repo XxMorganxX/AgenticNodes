@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, MouseEvent } from "react";
 
-import { fetchProviderDiagnostics, preflightProvider } from "../lib/api";
+import { fetchProviderDiagnostics, inspectSupabaseRuntimeStatus, preflightProvider, previewSupabaseSchema } from "../lib/api";
 import { findProviderDefinition, inferModelResponseMode, modelProviderDefinitions, providerDefaultConfig, providerModelName } from "../lib/editor";
 import { getGraphEnvVars, resolveGraphEnvReferences } from "../lib/graphEnv";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
@@ -12,6 +12,7 @@ import {
   RESPONSE_SCHEMA_PRESETS,
   RESPONSE_SCHEMA_TEXT_CONFIG_KEY,
 } from "../lib/responseSchema";
+import { loadSessionSupabaseSchema, saveSessionSupabaseSchema } from "../lib/sessionSupabaseSchema";
 import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
 import { NodeDetailsForm } from "./NodeDetailsForm";
 import type {
@@ -20,6 +21,9 @@ import type {
   GraphNode,
   ProviderDiagnosticsResult,
   ProviderPreflightResult,
+  SupabaseRuntimeStatusResult,
+  SupabaseSchemaPreviewResult,
+  SupabaseSchemaSource,
   ToolDefinition,
 } from "../lib/types";
 
@@ -91,6 +95,27 @@ function toolMatchesReference(tool: ToolDefinition, reference: string): boolean 
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
+function parseSupabaseSelect(selectValue: string, availableColumns: string[]): string[] {
+  const trimmed = selectValue.trim();
+  if (!trimmed || trimmed === "*") {
+    return [...availableColumns];
+  }
+  return uniqueStrings(
+    trimmed
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0),
+  );
+}
+
+function normalizedGraphEnvValue(graph: GraphDefinition, key: string): string {
+  const value = String(getGraphEnvVars(graph)[key] ?? "").trim();
+  if (!value || value === key) {
+    return "";
+  }
+  return value;
 }
 
 function extractTemplateTokens(template: string): string[] {
@@ -241,6 +266,10 @@ export function ProviderDetailsModal({
     ? String(node.config.provider_name ?? node.model_provider_name ?? "not-set")
     : String(provider?.provider_id ?? node.provider_id ?? "not-set");
   const providerConfigFields = provider?.config_fields ?? [];
+  const isSupabaseDataNode = node.provider_id === "core.supabase_data";
+  const displayedProviderConfigFields = isSupabaseDataNode
+    ? providerConfigFields.filter((field) => !["supabase_url_env_var", "supabase_key_env_var"].includes(field.key))
+    : providerConfigFields;
   const supportsLiveVerification = isModelNode && providerName !== "mock";
   const catalogTools = catalog?.tools ?? [];
   const mcpCatalogTools = catalogTools.filter((tool) => tool.source_type === "mcp");
@@ -470,6 +499,13 @@ export function ProviderDetailsModal({
   const [diagnostics, setDiagnostics] = useState<ProviderDiagnosticsResult | null>(null);
   const [preflightError, setPreflightError] = useState<string | null>(null);
   const [isPreflighting, setIsPreflighting] = useState(false);
+  const [supabaseRuntimeStatus, setSupabaseRuntimeStatus] = useState<SupabaseRuntimeStatusResult | null>(null);
+  const [isLoadingSupabaseRuntimeStatus, setIsLoadingSupabaseRuntimeStatus] = useState(false);
+  const [supabaseSchemaPreview, setSupabaseSchemaPreview] = useState<SupabaseSchemaPreviewResult | null>(null);
+  const [supabaseSchemaError, setSupabaseSchemaError] = useState<string | null>(null);
+  const [isLoadingSupabaseSchema, setIsLoadingSupabaseSchema] = useState(false);
+  const [supabaseSourceSearch, setSupabaseSourceSearch] = useState("");
+  const [selectedSupabaseSourceName, setSelectedSupabaseSourceName] = useState<string>("");
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -684,6 +720,204 @@ export function ProviderDetailsModal({
       ],
     ),
   );
+  const supabaseSourceKind = String(node.config.source_kind ?? "table") || "table";
+  const supabaseOutputMode = String(node.config.output_mode ?? "records") || "records";
+  const supabaseFilterLines = String(node.config.filters_text ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const supabaseUrlEnvVarName = String(node.config.supabase_url_env_var ?? "GRAPH_AGENT_SUPABASE_URL") || "GRAPH_AGENT_SUPABASE_URL";
+  const supabaseKeyEnvVarName =
+    String(node.config.supabase_key_env_var ?? "GRAPH_AGENT_SUPABASE_SECRET_KEY") || "GRAPH_AGENT_SUPABASE_SECRET_KEY";
+  const localSupabaseUrlValue = normalizedGraphEnvValue(graph, supabaseUrlEnvVarName);
+  const localSupabaseKeyValue = normalizedGraphEnvValue(graph, supabaseKeyEnvVarName);
+  const hasLocalSupabaseRuntimeValues = Boolean(localSupabaseUrlValue && localSupabaseKeyValue);
+  const hasSupabaseSchemaMemory = Boolean((supabaseSchemaPreview?.sources.length ?? 0) > 0);
+  const isSupabaseRuntimeReady = hasLocalSupabaseRuntimeValues || supabaseRuntimeStatus?.ready === true;
+  const isSupabaseRuntimePending = isSupabaseDataNode && supabaseRuntimeStatus === null && isLoadingSupabaseRuntimeStatus;
+  const isSupabaseBrowserLocked = isSupabaseDataNode && !isSupabaseRuntimeReady && !hasSupabaseSchemaMemory;
+
+  useEffect(() => {
+    if (
+      !isSupabaseDataNode ||
+      activeTab !== "config" ||
+      supabaseSchemaPreview !== null ||
+      isLoadingSupabaseSchema ||
+      !isSupabaseRuntimeReady
+    ) {
+      return;
+    }
+    void handleLoadSupabaseSchema();
+  }, [activeTab, isLoadingSupabaseSchema, isSupabaseDataNode, isSupabaseRuntimeReady, supabaseSchemaPreview]);
+
+  const filteredSupabaseSources = useMemo(() => {
+    const sources = supabaseSchemaPreview?.sources ?? [];
+    const query = supabaseSourceSearch.trim().toLowerCase();
+    if (!query) {
+      return sources;
+    }
+    return sources.filter((source) => {
+      const haystack = [
+        source.name,
+        source.description,
+        ...source.columns.map((column) => `${column.name} ${column.data_type} ${column.description}`),
+      ]
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(query);
+    });
+  }, [supabaseSchemaPreview, supabaseSourceSearch]);
+  const selectedSupabaseSource = useMemo<SupabaseSchemaSource | null>(() => {
+    const availableSources = supabaseSchemaPreview?.sources ?? [];
+    if (availableSources.length === 0) {
+      return null;
+    }
+    if (selectedSupabaseSourceName) {
+      return availableSources.find((source) => source.name === selectedSupabaseSourceName) ?? null;
+    }
+    const configuredSourceName = String(node.config.source_name ?? "").trim();
+    if (configuredSourceName) {
+      return availableSources.find((source) => source.name === configuredSourceName) ?? null;
+    }
+    return availableSources[0] ?? null;
+  }, [node.config.source_name, selectedSupabaseSourceName, supabaseSchemaPreview]);
+  const selectedSupabaseColumnNames = useMemo(() => {
+    const availableColumns = selectedSupabaseSource?.columns.map((column) => column.name) ?? [];
+    return parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns);
+  }, [node.config.select, selectedSupabaseSource]);
+
+  useEffect(() => {
+    if (!isSupabaseDataNode) {
+      setSupabaseRuntimeStatus(null);
+      setIsLoadingSupabaseRuntimeStatus(false);
+      setSupabaseSchemaPreview(null);
+      setSupabaseSchemaError(null);
+      setIsLoadingSupabaseSchema(false);
+      setSupabaseSourceSearch("");
+      setSelectedSupabaseSourceName("");
+      return;
+    }
+    const cachedSchema = loadSessionSupabaseSchema(graph);
+    if (cachedSchema) {
+      setSupabaseSchemaPreview(cachedSchema);
+    }
+    setSelectedSupabaseSourceName(String(node.config.source_name ?? "").trim());
+  }, [graph, isSupabaseDataNode, node.config.source_name]);
+
+  useEffect(() => {
+    if (!isSupabaseDataNode) {
+      return;
+    }
+    setSupabaseRuntimeStatus(null);
+    setSupabaseSchemaError(null);
+    const cachedSchema = loadSessionSupabaseSchema(graph);
+    setSupabaseSchemaPreview(cachedSchema);
+  }, [graph, isSupabaseDataNode, graph.env_vars, supabaseKeyEnvVarName, supabaseUrlEnvVarName]);
+
+  useEffect(() => {
+    if (!isSupabaseDataNode || activeTab !== "config" || supabaseRuntimeStatus !== null || isLoadingSupabaseRuntimeStatus) {
+      return;
+    }
+    void handleLoadSupabaseRuntimeStatus();
+  }, [activeTab, isLoadingSupabaseRuntimeStatus, isSupabaseDataNode, supabaseRuntimeStatus, supabaseKeyEnvVarName, supabaseUrlEnvVarName]);
+
+  async function handleLoadSupabaseSchema() {
+    if (!isSupabaseDataNode || !isSupabaseRuntimeReady) {
+      return;
+    }
+    setIsLoadingSupabaseSchema(true);
+    setSupabaseSchemaError(null);
+    try {
+      const result = await previewSupabaseSchema({
+        supabase_url_env_var: String(resolvedPreviewConfig.supabase_url_env_var ?? "GRAPH_AGENT_SUPABASE_URL"),
+        supabase_key_env_var: String(resolvedPreviewConfig.supabase_key_env_var ?? "GRAPH_AGENT_SUPABASE_SECRET_KEY"),
+        schema: String(resolvedPreviewConfig.schema ?? "public") || "public",
+        graph_env_vars: getGraphEnvVars(graph),
+      });
+      saveSessionSupabaseSchema(graph, result);
+      setSupabaseSchemaPreview(result);
+      const configuredSourceName = String(node.config.source_name ?? "").trim();
+      const firstSource = result.sources[0]?.name ?? "";
+      setSelectedSupabaseSourceName(configuredSourceName || firstSource);
+    } catch (error) {
+      setSupabaseSchemaPreview(null);
+      setSupabaseSchemaError(error instanceof Error ? error.message : "Failed to load Supabase schema.");
+    } finally {
+      setIsLoadingSupabaseSchema(false);
+    }
+  }
+
+  async function handleLoadSupabaseRuntimeStatus() {
+    if (!isSupabaseDataNode) {
+      return;
+    }
+    if (hasLocalSupabaseRuntimeValues) {
+      setSupabaseRuntimeStatus({
+        supabase_url_env_var: supabaseUrlEnvVarName,
+        supabase_key_env_var: supabaseKeyEnvVarName,
+        supabase_url_env_present: true,
+        supabase_key_env_present: true,
+        missing_env_vars: [],
+        ready: true,
+      });
+      return;
+    }
+    setIsLoadingSupabaseRuntimeStatus(true);
+    try {
+      const result = await inspectSupabaseRuntimeStatus({
+        supabase_url_env_var: supabaseUrlEnvVarName,
+        supabase_key_env_var: supabaseKeyEnvVarName,
+        graph_env_vars: getGraphEnvVars(graph),
+      });
+      setSupabaseRuntimeStatus(result);
+    } catch (error) {
+      setSupabaseRuntimeStatus({
+        supabase_url_env_var: supabaseUrlEnvVarName,
+        supabase_key_env_var: supabaseKeyEnvVarName,
+        supabase_url_env_present: false,
+        supabase_key_env_present: false,
+        missing_env_vars: [supabaseUrlEnvVarName, supabaseKeyEnvVarName].filter(Boolean),
+        ready: false,
+      });
+      setSupabaseSchemaError(error instanceof Error ? error.message : "Failed to inspect Supabase runtime environment.");
+    } finally {
+      setIsLoadingSupabaseRuntimeStatus(false);
+    }
+  }
+
+  function applySupabaseSourceSelection(source: SupabaseSchemaSource, nextColumns?: string[]) {
+    const availableColumns = source.columns.map((column) => column.name);
+    const resolvedColumns = nextColumns ?? parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns);
+    onGraphChange(
+      updateModelNode(graph, node.id, (currentNode) => ({
+        ...currentNode,
+        config: {
+          ...currentNode.config,
+          source_kind: source.source_kind,
+          source_name: source.name,
+          select:
+            resolvedColumns.length === 0 || resolvedColumns.length === availableColumns.length
+              ? "*"
+              : resolvedColumns.join(","),
+        },
+      })),
+    );
+    setSelectedSupabaseSourceName(source.name);
+  }
+
+  function toggleSupabaseColumn(columnName: string) {
+    if (!selectedSupabaseSource) {
+      return;
+    }
+    const availableColumns = selectedSupabaseSource.columns.map((column) => column.name);
+    const nextSet = new Set(parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns));
+    if (nextSet.has(columnName)) {
+      nextSet.delete(columnName);
+    } else {
+      nextSet.add(columnName);
+    }
+    applySupabaseSourceSelection(selectedSupabaseSource, availableColumns.filter((column) => nextSet.has(column)));
+  }
 
   return (
     <div className="tool-details-modal-backdrop" onClick={handleOverlayClick} role="presentation">
@@ -815,6 +1049,27 @@ export function ProviderDetailsModal({
                     </div>
                   ) : null}
                 </section>
+                {isSupabaseDataNode ? (
+                  <section className="provider-details-summary">
+                    <div className="provider-details-summary-header">
+                      <strong>Supabase Query Shape</strong>
+                      <span>{supabaseSourceKind === "rpc" ? "RPC call" : "Table or view read"}</span>
+                    </div>
+                    <p>
+                      This provider is for deterministic data loading from a fixed Supabase source. It uses the graph&apos;s saved
+                      Supabase credentials from the Environment section, issues one read against the configured source, and emits
+                      a normal data envelope that downstream Context Builder or model nodes can reuse.
+                    </p>
+                    <div className="provider-details-capabilities">
+                      <span className="provider-capability-chip">source {String(node.config.source_name ?? "not set") || "not set"}</span>
+                      <span className="provider-capability-chip">output {supabaseOutputMode}</span>
+                      <span className="provider-capability-chip">limit {String(node.config.limit ?? 25)}</span>
+                      <span className="provider-capability-chip">
+                        {Boolean(node.config.single_row) ? "single row" : "multi row"}
+                      </span>
+                    </div>
+                  </section>
+                ) : null}
                 <aside className="provider-details-overview-side">
                   <section className="provider-details-status-card">
                     <div className="provider-details-status-card-header">
@@ -847,12 +1102,40 @@ export function ProviderDetailsModal({
                             ? "Run Live Verification"
                             : "Live Verification Not Required"}
                       </button>
-                    ) : (
-                      <div className="tool-details-modal-help">
-                        This node provider is configured directly in the graph and does not need live API verification.
-                      </div>
-                    )}
+                  ) : (
+                    <div className="tool-details-modal-help">
+                      This node provider is configured directly in the graph and does not need live API verification.
+                    </div>
+                  )}
                   </section>
+                  {isSupabaseDataNode ? (
+                    <section className="provider-details-status-card">
+                      <div className="provider-details-status-card-header">
+                        <strong>Runtime Inputs</strong>
+                        <span>{isSupabaseRuntimeReady ? "Unlocked" : "Locked"}</span>
+                      </div>
+                      <div className="tool-details-modal-help">
+                        <div>
+                          {isSupabaseRuntimeReady
+                            ? "This node is using the verified Supabase credentials saved from the hero Environment section."
+                            : "Set the Supabase runtime values from the hero Environment section's Supabase button before using the schema browser."}
+                        </div>
+                        <div>
+                          URL env var: <code>{supabaseUrlEnvVarName}</code>
+                          {supabaseRuntimeStatus ? ` (${supabaseRuntimeStatus.supabase_url_env_present ? "present" : "missing"})` : ""}
+                        </div>
+                        <div>
+                          Key env var: <code>{supabaseKeyEnvVarName}</code>
+                          {supabaseRuntimeStatus ? ` (${supabaseRuntimeStatus.supabase_key_env_present ? "present" : "missing"})` : ""}
+                        </div>
+                        <div>Schema: <code>{String(node.config.schema ?? "public")}</code></div>
+                        <div>Select: <code>{String(node.config.select ?? "*") || "*"}</code></div>
+                        {supabaseRuntimeStatus?.missing_env_vars.length ? (
+                          <div>Missing: {supabaseRuntimeStatus.missing_env_vars.join(", ")}</div>
+                        ) : null}
+                      </div>
+                    </section>
+                  ) : null}
                   {isModelNode && displayedDiagnostics ? (
                     <section className="provider-details-status-card provider-details-status-card--diagnostics">
                       <div className="provider-details-status-card-header">
@@ -1238,6 +1521,140 @@ export function ProviderDetailsModal({
 
             {activeTab === "config" ? (
               <div className="modal-folder-section provider-details-config-layout">
+                {isSupabaseDataNode ? (
+                  <section className="provider-details-schema-browser">
+                    {isSupabaseBrowserLocked ? (
+                      <div className="tool-details-modal-help provider-details-schema-lock-banner">
+                        <strong>Supabase access is locked until the graph has verified Supabase auth.</strong>
+                        <div>
+                          Open the Environment section's Supabase button, save and verify the connection, then come back here to browse tables and columns.
+                          {isSupabaseRuntimePending ? " Checking the runtime status now." : ""}
+                        </div>
+                        <div>
+                          Required: <code>{supabaseUrlEnvVarName}</code> and <code>{supabaseKeyEnvVarName}</code>
+                        </div>
+                      </div>
+                    ) : null}
+                    <div className="provider-details-schema-browser-header">
+                      <div>
+                        <strong>Supabase Schema Browser</strong>
+                        <span>
+                          {isSupabaseBrowserLocked
+                            ? "Verify Supabase auth to browse tables and columns."
+                            : "Browse live tables and columns, then apply the source and selected columns to this node."}
+                        </span>
+                      </div>
+                      <div className="provider-details-schema-browser-actions">
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => void handleLoadSupabaseSchema()}
+                          disabled={isLoadingSupabaseSchema || !isSupabaseRuntimeReady}
+                        >
+                          {isLoadingSupabaseSchema ? "Loading..." : "Refresh Schema"}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="provider-details-schema-browser-toolbar">
+                      <label>
+                        Search tables or columns
+                        <input
+                          value={supabaseSourceSearch}
+                          onChange={(event) => setSupabaseSourceSearch(event.target.value)}
+                          placeholder="projects, profiles, created_at..."
+                          disabled={isSupabaseBrowserLocked}
+                        />
+                      </label>
+                      <div className="provider-details-schema-browser-meta">
+                        <span>{supabaseSchemaPreview ? `${filteredSupabaseSources.length}/${supabaseSchemaPreview.source_count} sources` : "No schema loaded yet"}</span>
+                        <span>Schema: {String(resolvedPreviewConfig.schema ?? "public") || "public"}</span>
+                      </div>
+                    </div>
+                    {supabaseSchemaError ? <p className="error-text">{supabaseSchemaError}</p> : null}
+                    <div className="provider-details-schema-browser-layout">
+                      <div className="provider-details-schema-source-list">
+                        {filteredSupabaseSources.length > 0 ? (
+                          filteredSupabaseSources.map((source) => {
+                            const isActive = selectedSupabaseSource?.name === source.name;
+                            const isConfigured = String(node.config.source_name ?? "").trim() === source.name;
+                            return (
+                              <button
+                                key={source.name}
+                                type="button"
+                                className={`provider-details-schema-source-card${isActive ? " is-active" : ""}`}
+                                onClick={() => setSelectedSupabaseSourceName(source.name)}
+                                disabled={isSupabaseBrowserLocked}
+                              >
+                                <strong>{source.name}</strong>
+                                <span>{source.columns.length} columns</span>
+                                <span>{isConfigured ? "Selected in node" : source.source_kind}</span>
+                              </button>
+                            );
+                          })
+                        ) : (
+                          <div className="tool-details-modal-help">Load the schema to inspect available sources.</div>
+                        )}
+                      </div>
+                      <div className="provider-details-schema-column-panel">
+                        {selectedSupabaseSource ? (
+                          <>
+                            <div className="provider-details-schema-column-header">
+                              <div>
+                                <strong>{selectedSupabaseSource.name}</strong>
+                                <span>{selectedSupabaseSource.columns.length} columns</span>
+                              </div>
+                              <div className="provider-details-schema-column-actions">
+                                <button
+                                  type="button"
+                                  className="secondary-button"
+                                  onClick={() => applySupabaseSourceSelection(selectedSupabaseSource, selectedSupabaseSource.columns.map((column) => column.name))}
+                                  disabled={isSupabaseBrowserLocked}
+                                >
+                                  Use All Columns
+                                </button>
+                                <button
+                                  type="button"
+                                  className="secondary-button"
+                                  onClick={() => applySupabaseSourceSelection(selectedSupabaseSource, selectedSupabaseColumnNames)}
+                                  disabled={isSupabaseBrowserLocked}
+                                >
+                                  Apply Selection
+                                </button>
+                              </div>
+                            </div>
+                            {selectedSupabaseSource.description ? (
+                              <p className="provider-details-schema-description">{selectedSupabaseSource.description}</p>
+                            ) : null}
+                            <div className="provider-details-schema-column-list">
+                              {selectedSupabaseSource.columns.map((column) => {
+                                const checked = selectedSupabaseColumnNames.includes(column.name);
+                                return (
+                                  <label key={column.name} className="provider-details-schema-column-row">
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={() => toggleSupabaseColumn(column.name)}
+                                      disabled={isSupabaseBrowserLocked}
+                                    />
+                                    <span className="provider-details-schema-column-main">
+                                      <strong>{column.name}</strong>
+                                      <small>{column.data_type}{column.nullable ? " · nullable" : ""}</small>
+                                    </span>
+                                    {column.description ? (
+                                      <span className="provider-details-schema-column-description">{column.description}</span>
+                                    ) : null}
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          </>
+                        ) : (
+                          <div className="tool-details-modal-help">Choose a source to inspect its columns.</div>
+                        )}
+                      </div>
+                    </div>
+                  </section>
+                ) : null}
                 <div className="provider-details-grid">
                   {isModelNode ? (
                     <label>
@@ -1262,7 +1679,7 @@ export function ProviderDetailsModal({
                       <input value={provider?.display_name ?? providerName} readOnly />
                     </label>
                   )}
-                  {providerConfigFields.map((field) => (
+                  {displayedProviderConfigFields.map((field) => (
                     <label key={field.key}>
                       {field.label}
                       {(() => {
@@ -1343,6 +1760,16 @@ export function ProviderDetailsModal({
                     : "These fields define how this node provider behaves for the selected graph node."}
                 </div>
 
+                {isSupabaseDataNode ? (
+                  <div className="tool-details-modal-help">
+                    <strong>Supabase data node notes</strong>
+                    <div>Choose your table or view from the schema browser above, then pick the columns you want returned.</div>
+                    <div>Use <code>filters_text</code> as one PostgREST query parameter per line, like <code>status=eq.active</code>.</div>
+                    <div>Choose <code>records</code> when downstream nodes need structured JSON, or <code>markdown</code> when you want prompt-ready text.</div>
+                    <div>Use <code>single_row</code> when the result should collapse to one record instead of an array.</div>
+                  </div>
+                ) : null}
+
                 <div className="tool-details-modal-help">
                   Graph env refs can be used in any text field here:
                   <div className="graph-env-reference-list">
@@ -1365,6 +1792,27 @@ export function ProviderDetailsModal({
                   </div>
                   <pre>{JSON.stringify(resolvedPreviewConfig, null, 2)}</pre>
                 </section>
+                {isSupabaseDataNode ? (
+                  <section className="tool-details-modal-preview provider-details-preview-card">
+                    <div className="tool-details-modal-preview-header">
+                      <strong>Supabase Request Preview</strong>
+                      <span>This is the intended query shape before runtime credentials are applied.</span>
+                    </div>
+                    <pre>{JSON.stringify({
+                      source_kind: supabaseSourceKind,
+                      source_name: String(node.config.source_name ?? ""),
+                      schema: String(node.config.schema ?? "public"),
+                      select: String(node.config.select ?? "*") || "*",
+                      filters: supabaseFilterLines,
+                      order_by: String(node.config.order_by ?? ""),
+                      order_desc: Boolean(node.config.order_desc),
+                      limit: Number(node.config.limit ?? 25),
+                      single_row: Boolean(node.config.single_row),
+                      output_mode: supabaseOutputMode,
+                      rpc_params_json: String(node.config.rpc_params_json ?? "{}") || "{}",
+                    }, null, 2)}</pre>
+                  </section>
+                ) : null}
                 {node.kind === "model" ? (
                   <section className="tool-details-modal-preview provider-details-preview-card provider-details-preview-card--prompt">
                     <div className="tool-details-modal-preview-header">

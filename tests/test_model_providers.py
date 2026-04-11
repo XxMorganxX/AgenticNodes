@@ -5433,6 +5433,27 @@ class ModelProviderTests(unittest.TestCase):
             self.assertEqual(_HttpMcpStubHandler.requests[0]["method"], "initialize")
             self.assertTrue(any(request["method"] == "tools/list" for request in _HttpMcpStubHandler.requests))
 
+    def test_start_auto_boot_does_not_raise_when_server_boot_fails(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            state_path = Path(tmp_dir) / "mcp_servers_state.json"
+            manager = McpServerManager(ToolRegistry(), state_path=state_path)
+            definition = McpServerDefinition(
+                server_id="remote_http",
+                display_name="Remote HTTP",
+                description="HTTP MCP server",
+                transport="http",
+                base_url="http://127.0.0.1:9/mcp",
+                auto_boot=True,
+                persistent=True,
+            )
+            manager.register_server(definition)
+
+            manager.start_auto_boot()
+
+            server = manager.get_server("remote_http")
+            self.assertFalse(server["running"])
+            self.assertIn("Connection refused", server["error"])
+
     def test_unique_legacy_mcp_aliases_resolve_to_canonical_tools(self) -> None:
         services = build_example_services()
 

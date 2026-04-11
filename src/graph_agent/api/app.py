@@ -8,7 +8,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from graph_agent.api.manager import GraphRunManager
 
@@ -58,6 +58,27 @@ class SpreadsheetPreviewRequest(BaseModel):
     empty_row_policy: str = "skip"
 
 
+class SupabaseSchemaPreviewRequest(BaseModel):
+    supabase_url_env_var: str = "GRAPH_AGENT_SUPABASE_URL"
+    supabase_key_env_var: str = "GRAPH_AGENT_SUPABASE_SECRET_KEY"
+    schema_name: str = Field(default="public", alias="schema")
+    graph_env_vars: Optional[dict[str, str]] = None
+
+
+class SupabaseRuntimeStatusRequest(BaseModel):
+    supabase_url_env_var: str = "GRAPH_AGENT_SUPABASE_URL"
+    supabase_key_env_var: str = "GRAPH_AGENT_SUPABASE_SECRET_KEY"
+    graph_env_vars: Optional[dict[str, str]] = None
+
+
+class SupabaseAuthVerifyRequest(BaseModel):
+    supabase_url: str
+    supabase_key: str
+    schema_name: str = Field(default="public", alias="schema")
+    project_ref: str = ""
+    access_token: str = ""
+
+
 class GraphPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -86,6 +107,7 @@ class McpServerPayload(BaseModel):
     command: list[str] = []
     cwd: Optional[str] = None
     env: Optional[dict[str, str]] = None
+    headers: Optional[dict[str, str]] = None
     base_url: Optional[str] = None
     timeout_seconds: int = 15
     auto_boot: bool = False
@@ -256,6 +278,30 @@ def provider_diagnostics(request: ProviderPreflightRequest) -> dict[str, Any]:
 def preview_spreadsheet_rows(request: SpreadsheetPreviewRequest) -> dict[str, Any]:
     try:
         return manager.preview_spreadsheet_rows(request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/editor/data/supabase/schema")
+def preview_supabase_schema(request: SupabaseSchemaPreviewRequest) -> dict[str, Any]:
+    try:
+        return manager.preview_supabase_schema(request.model_dump(by_alias=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/editor/data/supabase/status")
+def inspect_supabase_runtime(request: SupabaseRuntimeStatusRequest) -> dict[str, Any]:
+    try:
+        return manager.inspect_supabase_runtime(request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/editor/data/supabase/auth/verify")
+def verify_supabase_auth(request: SupabaseAuthVerifyRequest) -> dict[str, Any]:
+    try:
+        return manager.verify_supabase_auth(request.model_dump(by_alias=True))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

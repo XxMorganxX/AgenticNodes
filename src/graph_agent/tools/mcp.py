@@ -6,8 +6,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
+import re
 import subprocess
 from threading import Lock, Thread
 from typing import Any
@@ -26,6 +28,8 @@ MCP_CAPABILITY_TOOL = "tool"
 MCP_CAPABILITY_RESOURCE = "resource"
 MCP_CAPABILITY_RESOURCE_TEMPLATE = "resource_template"
 MCP_CAPABILITY_PROMPT = "prompt"
+PROCESS_ENV_REFERENCE_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+LOGGER = logging.getLogger(__name__)
 
 
 def _utc_now_iso() -> str:
@@ -43,6 +47,20 @@ def _normalize_string_map(value: Mapping[str, Any] | None) -> dict[str, str]:
     for key, item in value.items():
         normalized[str(key)] = str(item)
     return normalized
+
+
+def _expand_process_env_string(value: str) -> str:
+    return PROCESS_ENV_REFERENCE_PATTERN.sub(
+        lambda match: os.environ.get(match.group(1), ""),
+        str(value),
+    )
+
+
+def _expand_process_env_map(overrides: Mapping[str, str]) -> dict[str, str]:
+    return {
+        str(key): _expand_process_env_string(str(value))
+        for key, value in overrides.items()
+    }
 
 
 def _mapping_dict(value: Any) -> dict[str, Any]:
@@ -83,6 +101,7 @@ class McpServerDefinition:
     command: list[str] = field(default_factory=list)
     cwd: str | None = None
     env: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
     base_url: str | None = None
     timeout_seconds: int = 15
     auto_boot: bool = False
@@ -97,6 +116,7 @@ class McpServerDefinition:
         source = self.source.strip().lower()
         command = [str(part).strip() for part in self.command if str(part).strip()]
         env = _normalize_string_map(self.env)
+        headers = _normalize_string_map(self.headers)
         base_url = str(self.base_url).strip() if self.base_url is not None else None
         cwd = str(self.cwd).strip() if self.cwd is not None and str(self.cwd).strip() else None
 
@@ -106,6 +126,7 @@ class McpServerDefinition:
         object.__setattr__(self, "transport", transport)
         object.__setattr__(self, "command", command)
         object.__setattr__(self, "env", env)
+        object.__setattr__(self, "headers", headers)
         object.__setattr__(self, "base_url", base_url)
         object.__setattr__(self, "cwd", cwd)
         object.__setattr__(self, "source", source)
@@ -141,6 +162,7 @@ class McpServerDefinition:
             "command": list(self.command),
             "cwd": self.cwd,
             "env": dict(self.env),
+            "headers": dict(self.headers),
             "base_url": self.base_url,
             "timeout_seconds": self.timeout_seconds,
         }
@@ -176,6 +198,7 @@ class McpServerDefinition:
             "command": list(self.command),
             "cwd": self.cwd,
             "env": dict(self.env),
+            "headers": dict(self.headers),
             "base_url": self.base_url,
             "timeout_seconds": self.timeout_seconds,
             "auto_boot": self.auto_boot,
@@ -188,6 +211,7 @@ class McpServerDefinition:
             raise ValueError("MCP server payload must be an object.")
         command = payload.get("command", [])
         env = payload.get("env", {})
+        headers = payload.get("headers", {})
         return cls(
             server_id=str(payload.get("server_id", "")).strip(),
             display_name=str(payload.get("display_name", "")).strip(),
@@ -196,6 +220,7 @@ class McpServerDefinition:
             command=list(command) if isinstance(command, Sequence) and not isinstance(command, (str, bytes)) else [],
             cwd=(None if payload.get("cwd") in {"", None} else str(payload.get("cwd"))),
             env=_normalize_string_map(env if _is_mapping(env) else {}),
+            headers=_normalize_string_map(headers if _is_mapping(headers) else {}),
             base_url=(None if payload.get("base_url") in {"", None} else str(payload.get("base_url"))),
             timeout_seconds=int(payload.get("timeout_seconds", 15) or 15),
             auto_boot=bool(payload.get("auto_boot", False)),
@@ -788,15 +813,16 @@ class _McpStdioSession(_BaseMcpSession):
             return
         if not self.definition.command:
             raise RuntimeError(f"MCP server '{self.definition.server_id}' is missing a launch command.")
-        if self.definition.cwd:
-            Path(self.definition.cwd).mkdir(parents=True, exist_ok=True)
+        resolved_cwd = _expand_process_env_string(self.definition.cwd) if self.definition.cwd else None
+        if resolved_cwd:
+            Path(resolved_cwd).mkdir(parents=True, exist_ok=True)
         self._process = subprocess.Popen(
             list(self.definition.command),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            cwd=self.definition.cwd,
-            env=_merge_env(self.definition.env),
+            cwd=resolved_cwd,
+            env=_merge_env(_expand_process_env_map(self.definition.env)),
         )
         self._stderr_thread = Thread(target=self._consume_stderr, daemon=True)
         self._stderr_thread.start()
@@ -958,15 +984,18 @@ class _McpHttpSession(_BaseMcpSession):
     def _send(self, payload: Mapping[str, Any], *, expect_response: bool) -> dict[str, Any]:
         if not self.definition.base_url:
             raise RuntimeError(f"MCP HTTP server '{self.definition.server_id}' is missing a base_url.")
+        resolved_base_url = _expand_process_env_string(self.definition.base_url)
+        resolved_headers = _expand_process_env_map(self.definition.headers)
         body = json.dumps(dict(payload), separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(
-            self.definition.base_url,
+            resolved_base_url,
             data=body,
             method="POST",
             headers={
                 "Content-Type": "application/json",
-                "Accept": "application/json",
+                "Accept": "application/json, text/event-stream",
                 "User-Agent": "graph-agent-mcp/0.1",
+                **resolved_headers,
             },
         )
         try:
@@ -1137,7 +1166,14 @@ class McpServerManager:
     def start_auto_boot(self) -> None:
         for definition in self._definitions.values():
             if definition.auto_boot or (definition.persistent and self._desired_running.get(definition.server_id, False)):
-                self.boot_server(definition.server_id)
+                try:
+                    self.boot_server(definition.server_id)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning(
+                        "MCP auto-boot failed for server '%s': %s",
+                        definition.server_id,
+                        exc,
+                    )
 
     def boot_server(self, server_id: str) -> dict[str, Any]:
         with self._lock:

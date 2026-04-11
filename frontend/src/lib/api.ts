@@ -12,6 +12,9 @@ import type {
   RunFilesystemListing,
   RunState,
   SpreadsheetPreviewResult,
+  SupabaseAuthVerificationResult,
+  SupabaseRuntimeStatusResult,
+  SupabaseSchemaPreviewResult,
   StartRunOptions,
   ToolDefinition,
 } from "./types";
@@ -215,6 +218,63 @@ export async function previewSpreadsheetRows(config: {
     throw new Error(await response.text());
   }
   return (await response.json()) as SpreadsheetPreviewResult;
+}
+
+export async function previewSupabaseSchema(config: {
+  supabase_url_env_var: string;
+  supabase_key_env_var: string;
+  schema: string;
+  graph_env_vars?: Record<string, string>;
+}): Promise<SupabaseSchemaPreviewResult> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/data/supabase/schema`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to load Supabase schema."));
+  }
+  return (await response.json()) as SupabaseSchemaPreviewResult;
+}
+
+export async function inspectSupabaseRuntimeStatus(config: {
+  supabase_url_env_var: string;
+  supabase_key_env_var: string;
+  graph_env_vars?: Record<string, string>;
+}): Promise<SupabaseRuntimeStatusResult> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/data/supabase/status`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to inspect Supabase runtime environment."));
+  }
+  return (await response.json()) as SupabaseRuntimeStatusResult;
+}
+
+export async function verifySupabaseAuth(config: {
+  supabase_url: string;
+  supabase_key: string;
+  schema?: string;
+  project_ref?: string;
+  access_token?: string;
+}): Promise<SupabaseAuthVerificationResult> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/data/supabase/auth/verify`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to verify Supabase authentication."));
+  }
+  return (await response.json()) as SupabaseAuthVerificationResult;
 }
 
 export async function uploadRunDocuments(files: File[]): Promise<RunDocument[]> {

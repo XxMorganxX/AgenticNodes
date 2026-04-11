@@ -38,6 +38,7 @@ type McpServerFormState = {
   command_text: string;
   cwd: string;
   env_text: string;
+  headers_text: string;
   base_url: string;
   timeout_seconds: string;
   auto_boot: boolean;
@@ -58,6 +59,7 @@ function createBlankForm(transport: "stdio" | "http" = "stdio"): McpServerFormSt
     command_text: "",
     cwd: "",
     env_text: "",
+    headers_text: "",
     base_url: "",
     timeout_seconds: "15",
     auto_boot: false,
@@ -76,6 +78,9 @@ function formFromServer(server: McpServerStatus): McpServerFormState {
     env_text: Object.entries(server.config?.env ?? {})
       .map(([key, value]) => `${key}=${value}`)
       .join("\n"),
+    headers_text: Object.entries(server.config?.headers ?? {})
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n"),
     base_url: server.config?.base_url ?? "",
     timeout_seconds: String(server.config?.timeout_seconds ?? 15),
     auto_boot: server.auto_boot,
@@ -92,6 +97,9 @@ function formFromDraft(draft: McpServerDraft): McpServerFormState {
     command_text: draft.command.join("\n"),
     cwd: draft.cwd ?? "",
     env_text: Object.entries(draft.env ?? {})
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n"),
+    headers_text: Object.entries(draft.headers ?? {})
       .map(([key, value]) => `${key}=${value}`)
       .join("\n"),
     base_url: draft.base_url ?? "",
@@ -138,6 +146,7 @@ function toDraft(form: McpServerFormState): McpServerDraft {
     command: parseCommand(form.command_text),
     cwd: form.cwd.trim() || null,
     env: parseEnv(form.env_text),
+    headers: parseEnv(form.headers_text),
     base_url: form.base_url.trim() || null,
     timeout_seconds: Number.parseInt(form.timeout_seconds.trim() || "15", 10) || 15,
     auto_boot: form.auto_boot,
@@ -242,6 +251,8 @@ function buildFormInsights(form: McpServerFormState): FormInsight {
   const command = parseCommand(form.command_text);
   const envEntries = parseEnv(form.env_text);
   const envKeys = Object.keys(envEntries);
+  const headerEntries = parseEnv(form.headers_text);
+  const headerKeys = Object.keys(headerEntries);
 
   if (!form.server_id.trim()) {
     errors.push("Server ID is required.");
@@ -284,6 +295,9 @@ function buildFormInsights(form: McpServerFormState): FormInsight {
   }
   if (envKeys.length > 0 && envKeys.some((key) => key.includes(" "))) {
     warnings.push("Environment variable keys should not contain spaces.");
+  }
+  if (headerKeys.length > 0 && headerKeys.some((key) => key.includes(" "))) {
+    warnings.push("Header names should not contain spaces.");
   }
   if (form.transport === "stdio" && command.length > 0 && command[0]?.startsWith("python")) {
     warnings.push("Python-based servers require the same runtime to be available where the API process runs.");
@@ -721,14 +735,27 @@ export function McpServerPanel({
                     </label>
                   </>
                 ) : (
-                  <label className="mcp-server-form-grid--full">
-                    Base URL
-                    <input
-                      value={formState.base_url}
-                      onChange={(event) => setFormState((current) => ({ ...current, base_url: event.target.value }))}
-                      placeholder="https://example.com/mcp"
-                    />
-                  </label>
+                  <>
+                    <label className="mcp-server-form-grid--full">
+                      Base URL
+                      <input
+                        value={formState.base_url}
+                        onChange={(event) => setFormState((current) => ({ ...current, base_url: event.target.value }))}
+                        placeholder="https://example.com/mcp"
+                      />
+                      <small>Host env refs like `${"{SUPABASE_PROJECT_REF}"}` are resolved when you test or boot the server.</small>
+                    </label>
+                    <label className="mcp-server-form-grid--full">
+                      HTTP Headers
+                      <textarea
+                        value={formState.headers_text}
+                        onChange={(event) => setFormState((current) => ({ ...current, headers_text: event.target.value }))}
+                        rows={3}
+                        placeholder={"Authorization=Bearer ${SUPABASE_ACCESS_TOKEN}"}
+                      />
+                      <small>Use one `Header-Name=value` pair per line. Host env refs are resolved at runtime.</small>
+                    </label>
+                  </>
                 )}
                 <label className="checkbox-option">
                   <input
@@ -797,6 +824,12 @@ export function McpServerPanel({
                       <p className="mcp-editor-preview-label">Endpoint</p>
                       <div className="mcp-preview-chip-list">
                         {formState.base_url.trim() ? <code>{formState.base_url.trim()}</code> : <span className="inspector-hint">No base URL yet.</span>}
+                      </div>
+                      <p className="mcp-editor-preview-label">Headers</p>
+                      <div className="mcp-preview-chip-list">
+                        {Object.keys(parseEnv(formState.headers_text)).length > 0
+                          ? Object.entries(parseEnv(formState.headers_text)).map(([key, value]) => <code key={key}>{`${key}=${value}`}</code>)
+                          : <span className="inspector-hint">No HTTP headers yet.</span>}
                       </div>
                     </>
                   )}

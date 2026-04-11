@@ -4,6 +4,10 @@ export const DEFAULT_GRAPH_ENV_VARS: Record<string, string> = {
   OPENAI_API_KEY: "OPENAI_API_KEY",
   ANTHROPIC_API_KEY: "ANTHROPIC_API_KEY",
   DISCORD_BOT_TOKEN: "DISCORD_BOT_TOKEN",
+  GRAPH_AGENT_SUPABASE_URL: "",
+  GRAPH_AGENT_SUPABASE_SECRET_KEY: "",
+  SUPABASE_PROJECT_REF: "",
+  SUPABASE_ACCESS_TOKEN: "",
 };
 
 export const STANDARD_GRAPH_ENV_FIELDS = [
@@ -21,6 +25,26 @@ export const STANDARD_GRAPH_ENV_FIELDS = [
     key: "DISCORD_BOT_TOKEN",
     label: "Discord Bot Token Reference",
     placeholder: "DISCORD_BOT_TOKEN",
+  },
+  {
+    key: "GRAPH_AGENT_SUPABASE_URL",
+    label: "Supabase URL Reference",
+    placeholder: "GRAPH_AGENT_SUPABASE_URL",
+  },
+  {
+    key: "GRAPH_AGENT_SUPABASE_SECRET_KEY",
+    label: "Supabase Secret Key Reference",
+    placeholder: "GRAPH_AGENT_SUPABASE_SECRET_KEY",
+  },
+  {
+    key: "SUPABASE_PROJECT_REF",
+    label: "Supabase Project Ref Reference",
+    placeholder: "SUPABASE_PROJECT_REF",
+  },
+  {
+    key: "SUPABASE_ACCESS_TOKEN",
+    label: "Supabase Access Token Reference",
+    placeholder: "SUPABASE_ACCESS_TOKEN",
   },
 ] as const;
 
