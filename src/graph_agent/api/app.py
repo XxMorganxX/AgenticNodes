@@ -79,6 +79,12 @@ class SupabaseAuthVerifyRequest(BaseModel):
     access_token: str = ""
 
 
+class MicrosoftDeviceCodeStartRequest(BaseModel):
+    client_id: str
+    tenant_id: str
+    scopes: Optional[list[str]] = None
+
+
 class GraphPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -303,6 +309,32 @@ def verify_supabase_auth(request: SupabaseAuthVerifyRequest) -> dict[str, Any]:
     try:
         return manager.verify_supabase_auth(request.model_dump(by_alias=True))
     except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/editor/integrations/microsoft/status")
+def get_microsoft_auth_status() -> dict[str, Any]:
+    try:
+        return manager.get_microsoft_auth_status()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/editor/integrations/microsoft/device/start")
+def start_microsoft_device_code(request: MicrosoftDeviceCodeStartRequest) -> dict[str, Any]:
+    try:
+        return manager.start_microsoft_device_code(request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/editor/integrations/microsoft")
+def disconnect_microsoft_auth() -> dict[str, Any]:
+    try:
+        return manager.disconnect_microsoft_auth()
+    except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

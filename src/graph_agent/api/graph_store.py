@@ -10,6 +10,37 @@ from graph_agent.runtime.documents import load_graph_document
 from graph_agent.runtime.node_providers import DEFAULT_CATEGORY_CONTRACTS, list_connection_rules
 
 
+NON_PERSISTED_GRAPH_ENV_KEYS = {"MICROSOFT_GRAPH_ACCESS_TOKEN"}
+
+
+def _sanitize_env_var_mapping(payload: Any) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(key).strip(): str(value if isinstance(value, str) else value or "")
+        for key, value in payload.items()
+        if str(key).strip() and str(key).strip() not in NON_PERSISTED_GRAPH_ENV_KEYS
+    }
+
+
+def _sanitize_graph_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized = deepcopy(payload)
+    if "env_vars" in sanitized:
+        sanitized["env_vars"] = _sanitize_env_var_mapping(sanitized.get("env_vars"))
+    agents = sanitized.get("agents")
+    if isinstance(agents, list):
+        sanitized["agents"] = [
+            {
+                **agent,
+                "env_vars": _sanitize_env_var_mapping(agent.get("env_vars")),
+            }
+            if isinstance(agent, dict)
+            else agent
+            for agent in agents
+        ]
+    return sanitized
+
+
 class GraphStore:
     def __init__(
         self,
@@ -23,6 +54,7 @@ class GraphStore:
         self._merged_graphs_cache: dict[str, dict[str, Any]] | None = None
         self._catalog_cache: dict[str, Any] | None = None
         self._ensure_user_store()
+        self._sanitize_user_store()
 
     def list_graphs(self) -> list[dict[str, Any]]:
         return [deepcopy(graph) for graph in self._merged_graphs().values()]
@@ -34,8 +66,9 @@ class GraphStore:
         return deepcopy(graph)
 
     def create_graph(self, graph_payload: dict[str, Any]) -> dict[str, Any]:
-        self._validate_graph_payload(graph_payload)
-        normalized_graph = load_graph_document(graph_payload).to_dict()
+        sanitized_payload = _sanitize_graph_payload(graph_payload)
+        self._validate_graph_payload(sanitized_payload)
+        normalized_graph = load_graph_document(sanitized_payload).to_dict()
         payload = self._load_user_all()
         existing_ids = set(self._merged_graphs())
         if normalized_graph["graph_id"] in existing_ids:
@@ -45,8 +78,9 @@ class GraphStore:
         return deepcopy(normalized_graph)
 
     def update_graph(self, graph_id: str, graph_payload: dict[str, Any]) -> dict[str, Any]:
-        self._validate_graph_payload(graph_payload)
-        normalized_graph = load_graph_document(graph_payload).to_dict()
+        sanitized_payload = _sanitize_graph_payload(graph_payload)
+        self._validate_graph_payload(sanitized_payload)
+        normalized_graph = load_graph_document(sanitized_payload).to_dict()
         if graph_id not in self._merged_graphs():
             raise KeyError(graph_id)
 
@@ -109,15 +143,38 @@ class GraphStore:
         self._save_user_all({"graphs": []})
 
     def _load_bundled_all(self) -> dict[str, Any]:
-        return json.loads(self.bundled_path.read_text())
+        payload = json.loads(self.bundled_path.read_text())
+        return {
+            "graphs": [
+                _sanitize_graph_payload(graph)
+                for graph in payload.get("graphs", [])
+                if isinstance(graph, dict)
+            ]
+        }
 
     def _load_user_all(self) -> dict[str, Any]:
-        return json.loads(self.path.read_text())
+        payload = json.loads(self.path.read_text())
+        return {
+            "graphs": [
+                _sanitize_graph_payload(graph)
+                for graph in payload.get("graphs", [])
+                if isinstance(graph, dict)
+            ]
+        }
 
     def _save_user_all(self, payload: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(payload, indent=2))
+        self.path.write_text(json.dumps({"graphs": [_sanitize_graph_payload(graph) for graph in payload.get("graphs", [])]}, indent=2))
         self._invalidate_caches()
+
+    def _sanitize_user_store(self) -> None:
+        try:
+            payload = json.loads(self.path.read_text())
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return
+        sanitized = {"graphs": [_sanitize_graph_payload(graph) for graph in payload.get("graphs", []) if isinstance(graph, dict)]}
+        if sanitized != payload:
+            self._save_user_all(sanitized)
 
     def _bundled_graph_ids(self) -> set[str]:
         return {graph["graph_id"] for graph in self._load_bundled_all()["graphs"]}

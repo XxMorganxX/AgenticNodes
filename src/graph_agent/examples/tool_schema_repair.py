@@ -7,9 +7,11 @@ import sys
 from graph_agent import config
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.discord import DiscordMessageSender
+from graph_agent.providers.outlook import OutlookDraftClient
 from graph_agent.providers.mock import MockModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
 from graph_agent.runtime.core import GraphDefinition, RuntimeServices
+from graph_agent.runtime.microsoft_auth import MicrosoftAuthService
 from graph_agent.runtime.node_providers import (
     NodeCategory,
     NodeProviderDefinition,
@@ -777,6 +779,32 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             ],
         )
     )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="end.outlook_draft",
+            display_name="Outlook Draft End",
+            category=NodeCategory.END,
+            node_kind="output",
+            description="Creates a draft email in Outlook using Microsoft Graph and never sends it automatically.",
+            capabilities=["outlook draft creation", "email drafting", "side-effect output"],
+            default_config={
+                "to": "",
+                "subject": "",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="to",
+                    label="To",
+                    placeholder="person@example.com, teammate@example.com",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="subject",
+                    label="Subject",
+                    placeholder="Draft subject",
+                ),
+            ],
+        )
+    )
     return RuntimeServices(
         model_providers={
             "claude": ClaudeMessagesModelProvider(),
@@ -788,6 +816,8 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
         tool_registry=registry,
         mcp_server_manager=mcp_server_manager,
         discord_message_sender=DiscordMessageSender(),
+        outlook_draft_client=OutlookDraftClient(),
+        microsoft_auth_service=MicrosoftAuthService(),
         config={
             "max_steps": config.DEFAULT_RUN_MAX_STEPS,
             "max_visits_per_node": config.DEFAULT_MAX_VISITS_PER_NODE,

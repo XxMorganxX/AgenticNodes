@@ -238,6 +238,7 @@ export type EditorCatalog = {
   connection_rules: ConnectionRule[];
   contracts: Record<string, CategoryContract>;
   provider_statuses?: Record<string, ProviderPreflightResult>;
+  microsoft_auth?: MicrosoftAuthStatus | null;
   mcp_servers?: McpServerStatus[];
   mcp_capabilities?: McpCapabilityDefinition[];
   mcp_server_templates?: McpServerTemplate[];
@@ -321,6 +322,24 @@ export type SupabaseAuthVerificationResult = {
     server_name: string;
     server_version: string;
   };
+};
+
+export type MicrosoftAuthStatus = {
+  status: string;
+  connected: boolean;
+  pending: boolean;
+  client_id: string;
+  tenant_id: string;
+  account_username: string;
+  request_id: string;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete: string;
+  message: string;
+  expires_at: string;
+  connected_at: string;
+  last_error: string;
+  scopes: string[];
 };
 
 export type RunDocument = {

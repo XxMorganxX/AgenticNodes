@@ -1,3 +1,5 @@
+import { sanitizeGraphEnvVars } from "./graphEnv";
+
 const STORAGE_KEY = "agentic-nodes-graph-env-vars";
 const DRAFT_GRAPH_ENV_KEY = "__draft__";
 
@@ -16,11 +18,7 @@ function loadPersistedEnvMap(): Record<string, Record<string, string>> {
         if (!graphKey.trim() || !envVars || typeof envVars !== "object" || Array.isArray(envVars)) {
           return [];
         }
-        const normalizedEnvVars = Object.fromEntries(
-          Object.entries(envVars).flatMap(([envKey, envValue]) =>
-            envKey.trim() ? [[envKey.trim(), typeof envValue === "string" ? envValue : String(envValue ?? "")]] : [],
-          ),
-        );
+        const normalizedEnvVars = sanitizeGraphEnvVars(envVars as Record<string, string>);
         return [[graphKey, normalizedEnvVars]];
       }),
     );
@@ -53,7 +51,7 @@ export function savePersistedGraphEnvVars(graphKey: string | null | undefined, e
     return;
   }
   const current = loadPersistedEnvMap();
-  current[graphKey] = { ...envVars };
+  current[graphKey] = sanitizeGraphEnvVars(envVars);
   savePersistedEnvMap(current);
 }
 

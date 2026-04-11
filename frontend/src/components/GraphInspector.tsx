@@ -135,8 +135,7 @@ function buildContextBuilderStructuredPreview(
 ): string {
   return JSON.stringify(
     bindings.map((binding) => ({
-      header: binding.header,
-      body: previewValues[binding.placeholder] ?? "",
+      [binding.header]: previewValues[binding.placeholder] ?? "",
     })),
     null,
     2,
@@ -353,6 +352,57 @@ function describeMcpExecutorBinding(binding: unknown): string {
   }
   const sourceId = String(bindingRecord.source ?? "").trim();
   return sourceId ? `${bindingType} from ${sourceId}` : bindingType;
+}
+
+function encodeOutputSourceBinding(binding: unknown): string {
+  if (!isRecord(binding)) {
+    return "auto";
+  }
+  const bindingType = String(binding.type ?? "").trim();
+  if (bindingType === "input_payload") {
+    return "input_payload";
+  }
+  if ((bindingType === "latest_payload" || bindingType === "latest_envelope") && typeof binding.source === "string") {
+    return `${bindingType}:${binding.source}`;
+  }
+  return "auto";
+}
+
+function decodeOutputSourceBinding(value: string): GraphNode["config"]["source_binding"] | undefined {
+  if (value === "auto") {
+    return undefined;
+  }
+  if (value === "input_payload") {
+    return { type: "input_payload" };
+  }
+  const [bindingType, sourceId] = value.split(":", 2);
+  if ((bindingType === "latest_payload" || bindingType === "latest_envelope") && sourceId?.trim()) {
+    return { type: bindingType, source: sourceId };
+  }
+  return undefined;
+}
+
+function buildOutputSourceBindingOptions(
+  graph: GraphDefinition,
+  node: GraphNode,
+): Array<{
+  value: string;
+  label: string;
+}> {
+  const incomingSourceIds = uniqueStrings(graph.edges.filter((edge) => edge.target_id === node.id).map((edge) => edge.source_id));
+  const options = [
+    { value: "auto", label: "Automatic upstream payload" },
+    { value: "input_payload", label: "Run input payload" },
+  ];
+  incomingSourceIds.forEach((sourceId) => {
+    const sourceNode = graph.nodes.find((candidate) => candidate.id === sourceId);
+    const sourceLabel = sourceNode ? getNodeInstanceLabel(graph, sourceNode) : sourceId;
+    options.push(
+      { value: `latest_payload:${sourceId}`, label: `Latest payload from ${sourceLabel}` },
+      { value: `latest_envelope:${sourceId}`, label: `Latest envelope from ${sourceLabel}` },
+    );
+  });
+  return options;
 }
 
 export function GraphInspector({
@@ -873,6 +923,10 @@ export function GraphInspector({
       selectedNode.kind === "mcp_tool_executor" ? String(selectedNode.config.response_mode ?? "auto") : "auto";
     const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
     const isDiscordEndNode = selectedNode.kind === "output" && selectedNode.provider_id === "end.discord_message";
+    const isOutlookDraftEndNode = selectedNode.kind === "output" && selectedNode.provider_id === "end.outlook_draft";
+    const microsoftAuthStatus = catalog?.microsoft_auth ?? null;
+    const outputSourceBindingValue = selectedNode.kind === "output" ? encodeOutputSourceBinding(selectedNode.config.source_binding) : "auto";
+    const outputSourceBindingOptions = selectedNode.kind === "output" ? buildOutputSourceBindingOptions(graph, selectedNode) : [];
     const isManualStartNode =
       selectedNode.kind === "input" &&
       (selectedNode.provider_id === "start.manual_run" || selectedNode.provider_id === "core.input");
@@ -1223,13 +1277,50 @@ export function GraphInspector({
           {selectedNode.kind === "output" ? (
             <>
               <div className="contract-card">
-                <strong>{isDiscordEndNode ? "Discord Side-Effect End" : "Canonical Output End"}</strong>
+                <strong>
+                  {isDiscordEndNode
+                    ? "Discord Side-Effect End"
+                    : isOutlookDraftEndNode
+                      ? "Outlook Draft End"
+                      : "Canonical Output End"}
+                </strong>
                 <span>
                   {isDiscordEndNode
                     ? "Sends the resolved payload to a Discord channel and leaves run final_output unchanged."
-                    : "Promotes the resolved payload into the run final_output when this branch completes."}
+                    : isOutlookDraftEndNode
+                      ? "Creates a draft email in Outlook using Microsoft Graph and never sends it automatically."
+                      : "Promotes the resolved payload into the run final_output when this branch completes."}
                 </span>
               </div>
+              <label>
+                Body Source
+                <select
+                  value={outputSourceBindingValue}
+                  onChange={(event) =>
+                    onGraphChange(
+                      updateNode(graph, selectedNode.id, (node) => {
+                        const nextConfig = { ...node.config };
+                        const nextBinding = decodeOutputSourceBinding(event.target.value);
+                        if (nextBinding) {
+                          nextConfig.source_binding = nextBinding;
+                        } else {
+                          delete nextConfig.source_binding;
+                        }
+                        return {
+                          ...node,
+                          config: nextConfig,
+                        };
+                      }),
+                    )
+                  }
+                >
+                  {outputSourceBindingOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
               {isDiscordEndNode ? (
                 <>
                   <label>
@@ -1291,6 +1382,64 @@ export function GraphInspector({
                     <strong>Template Variables</strong>
                     <span><code>{"{message_payload}"}</code> renders the resolved payload as text.</span>
                     <span><code>{"{message_json}"}</code> renders JSON for structured payloads.</span>
+                  </div>
+                </>
+              ) : null}
+              {isOutlookDraftEndNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Microsoft Account</strong>
+                    <span>
+                      {microsoftAuthStatus?.connected
+                        ? microsoftAuthStatus.account_username
+                          ? `Connected as ${microsoftAuthStatus.account_username}.`
+                          : "Connected."
+                        : microsoftAuthStatus?.pending
+                          ? "Connection pending. Finish device-code sign-in in the Environment panel."
+                          : "No Microsoft account connected. Use the Environment panel to connect one before running this node."}
+                    </span>
+                  </div>
+                  <label>
+                    To
+                    <input
+                      value={String(selectedNode.config.to ?? "")}
+                      placeholder="person@example.com, teammate@example.com"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              to: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Subject
+                    <input
+                      value={String(selectedNode.config.subject ?? "")}
+                      placeholder="Draft subject"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              subject: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="contract-card">
+                    <strong>Draft Behavior</strong>
+                    <span>The body comes from the selected Body Source and is stored as plain text in Outlook.</span>
+                    <span>Use <code>{"{input_payload}"}</code>, <code>{"{message_payload}"}</code>, or <code>{"{message_json}"}</code> in the subject if you want it templated.</span>
+                    <span>Authentication is handled globally through Microsoft device-code sign-in, not graph env vars.</span>
                   </div>
                 </>
               ) : null}

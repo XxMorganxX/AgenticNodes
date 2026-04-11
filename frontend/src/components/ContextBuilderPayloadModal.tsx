@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import type { MouseEvent } from "react";
 
+import {
+  getContextBuilderBindings,
+  normalizeContextBuilderHeader,
+  type ContextBuilderBindingRow,
+} from "../lib/contextBuilderBindings";
 import type { ContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import type { GraphDefinition, GraphNode, RunState } from "../lib/types";
@@ -26,6 +31,11 @@ function formatContextBuilderSourceValue(value: unknown): string {
 type ContextValueSection = {
   label: string;
   value: unknown;
+};
+
+type ContextBuilderStructuredEntry = {
+  header: string;
+  body: unknown;
 };
 
 function formatContextBuilderValueSections(value: unknown, fallbackLabel = "Value"): ContextValueSection[] {
@@ -64,6 +74,28 @@ function formatContextBuilderValueSections(value: unknown, fallbackLabel = "Valu
   return [{ label: fallbackLabel, value }];
 }
 
+function extractStructuredContextEntries(value: unknown): ContextBuilderStructuredEntry[] | null {
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  const entries: ContextBuilderStructuredEntry[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) {
+      return null;
+    }
+    const pairs = Object.entries(item);
+    if (pairs.length !== 1) {
+      return null;
+    }
+    const [header, body] = pairs[0];
+    if (!header.trim()) {
+      return null;
+    }
+    entries.push({ header, body });
+  }
+  return entries;
+}
+
 function resolveContextBuilderSourceValue(runState: RunState | null, sourceNodeId: string): unknown {
   const sourceError = runState?.node_errors?.[sourceNodeId];
   if (sourceError !== undefined) {
@@ -78,10 +110,18 @@ type ContextBuilderPayloadModalProps = {
   node: GraphNode;
   runState: RunState | null;
   runtimeView: ContextBuilderRuntimeView | null;
+  onGraphChange: (graph: GraphDefinition) => void;
   onClose: () => void;
 };
 
-export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView, onClose }: ContextBuilderPayloadModalProps) {
+function updateNode(graph: GraphDefinition, nodeId: string, updater: (node: GraphNode) => GraphNode): GraphDefinition {
+  return {
+    ...graph,
+    nodes: graph.nodes.map((candidate) => (candidate.id === nodeId ? updater(candidate) : candidate)),
+  };
+}
+
+export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView, onGraphChange, onClose }: ContextBuilderPayloadModalProps) {
   const nodeLabel = getNodeInstanceLabel(graph, node);
   const [expandedSourceNodeId, setExpandedSourceNodeId] = useState<string | null>(null);
 
@@ -101,6 +141,7 @@ export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView,
     () => formatContextBuilderValueSections(mergedOutput, "Merged payload"),
     [mergedOutput],
   );
+  const contextBuilderBindings = useMemo(() => getContextBuilderBindings(node, graph), [graph, node]);
 
   useEffect(() => {
     if (!runtimeView || runtimeView.sources.length === 0) {
@@ -127,6 +168,23 @@ export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView,
       : runtimeView?.totalCount
         ? "Waiting for upstream nodes to produce output or errors for each bound input."
         : "Connect inputs to this context builder to track them here.";
+
+  function updateContextBuilderBindings(bindings: ContextBuilderBindingRow[]) {
+    onGraphChange(
+      updateNode(graph, node.id, (candidate) => ({
+        ...candidate,
+        config: {
+          ...candidate.config,
+          input_bindings: bindings.map((binding) => ({
+            source_node_id: binding.sourceNodeId,
+            header: binding.rawHeader,
+            placeholder: binding.placeholder,
+            binding: binding.binding,
+          })),
+        },
+      })),
+    );
+  }
 
   return (
     <div className="tool-details-modal-backdrop" onClick={handleOverlayClick} role="presentation">
@@ -174,20 +232,34 @@ export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView,
                   const isExpanded = expandedSourceNodeId === slot.sourceNodeId;
                   const contextValue = resolveContextBuilderSourceValue(runState, slot.sourceNodeId);
                   const detailId = `context-builder-input-detail-${slot.sourceNodeId}`;
+                  const matchingBinding = contextBuilderBindings.find((binding) => binding.sourceNodeId === slot.sourceNodeId) ?? null;
                   return (
                     <li
                       key={slot.sourceNodeId}
                       className={`context-builder-input-row context-builder-input-row--${slot.status}${isExpanded ? " is-expanded" : ""}`}
                     >
-                      <button
-                        type="button"
-                        className="context-builder-input-row-button"
-                        aria-expanded={isExpanded}
-                        aria-controls={detailId}
-                        onClick={() => setExpandedSourceNodeId(isExpanded ? null : slot.sourceNodeId)}
-                      >
+                      <div className="context-builder-input-row-button">
                         <div className="context-builder-input-row-main">
-                          <span className="context-builder-input-label">{slot.header}</span>
+                          <label className="context-builder-input-header-editor">
+                            <span className="context-builder-input-header-label">Section header</span>
+                            <input
+                              className="context-builder-input-header-input"
+                              value={matchingBinding?.rawHeader ?? ""}
+                              placeholder={slot.sourceLabel}
+                              onChange={(event) => {
+                                const nextBindings = contextBuilderBindings.map((candidate) =>
+                                  candidate.sourceNodeId === slot.sourceNodeId
+                                    ? {
+                                        ...candidate,
+                                        rawHeader: event.target.value,
+                                        header: normalizeContextBuilderHeader(event.target.value, candidate.sourceLabel),
+                                      }
+                                    : candidate,
+                                );
+                                updateContextBuilderBindings(nextBindings);
+                              }}
+                            />
+                          </label>
                           <span className="context-builder-input-source">{slot.sourceLabel}</span>
                           <span className="context-builder-input-placeholder">{`{${slot.placeholder}}`}</span>
                         </div>
@@ -195,9 +267,17 @@ export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView,
                           {slot.status === "pending" ? "Waiting…" : null}
                           {slot.status === "fulfilled" ? "Ready" : null}
                           {slot.status === "error" ? <span className="context-builder-input-error">{slot.errorSummary ?? "Error"}</span> : null}
-                          <span className="context-builder-input-toggle">{isExpanded ? "Hide context" : "Show context"}</span>
+                          <button
+                            type="button"
+                            className="context-builder-input-toggle"
+                            aria-expanded={isExpanded}
+                            aria-controls={detailId}
+                            onClick={() => setExpandedSourceNodeId(isExpanded ? null : slot.sourceNodeId)}
+                          >
+                            {isExpanded ? "Hide context" : "Show context"}
+                          </button>
                         </div>
-                      </button>
+                      </div>
                       {isExpanded ? (
                         <div id={detailId} className="context-builder-input-detail">
                           <div className="context-builder-input-detail-label">
@@ -235,12 +315,28 @@ export function ContextBuilderPayloadModal({ graph, node, runState, runtimeView,
               </span>
             </div>
             <div className="context-builder-value-sections">
-              {mergedOutputSections.map((section) => (
-                <div key={`merged-${section.label}`} className="context-builder-value-section">
-                  <div className="context-builder-value-section-label">{section.label}</div>
-                  <pre>{formatContextBuilderSourceValue(section.value)}</pre>
-                </div>
-              ))}
+              {mergedOutputSections.map((section) => {
+                const structuredEntries = extractStructuredContextEntries(section.value);
+                return (
+                  <div key={`merged-${section.label}`} className="context-builder-value-section">
+                    {structuredEntries ? (
+                      <div className="context-builder-readable-preview">
+                        {structuredEntries.map((entry, index) => (
+                          <div key={`${section.label}-${entry.header}-${index}`} className="context-builder-readable-entry">
+                            <div className="context-builder-readable-header">{entry.header}</div>
+                            <pre className="context-builder-readable-body">{formatContextBuilderSourceValue(entry.body)}</pre>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <>
+                        <div className="context-builder-value-section-label">{section.label}</div>
+                        <pre>{formatContextBuilderSourceValue(section.value)}</pre>
+                      </>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </section>
         </div>

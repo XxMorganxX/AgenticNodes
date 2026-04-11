@@ -5153,6 +5153,7 @@ export function GraphCanvas({
           node={contextBuilderPayloadNode}
           runState={runState}
           runtimeView={contextBuilderModalRuntime}
+          onGraphChange={onGraphChange}
           onClose={() => setContextBuilderPayloadNodeId(null)}
         />
       ) : null}

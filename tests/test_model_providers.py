@@ -3604,10 +3604,7 @@ class ModelProviderTests(unittest.TestCase):
         self.assertEqual(
             state.final_output,
             [
-                {
-                    "header": "Customer Brief",
-                    "body": {"summary": "Investigate the onboarding issue", "priority": "high"},
-                }
+                {"Customer Brief": {"summary": "Investigate the onboarding issue", "priority": "high"}}
             ],
         )
 
@@ -3923,6 +3920,124 @@ class ModelProviderTests(unittest.TestCase):
         assert isinstance(last_out, dict)
         self.assertTrue(last_out.get("metadata", {}).get("context_builder_complete", False))
         self.assertFalse(bool(compose_events[-1].payload.get("metadata", {}).get("hold_outgoing_edges")))
+
+    def test_context_builder_flattens_upstream_context_builder_sections(self) -> None:
+        services = build_example_services()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "nested-context-builder-flatten",
+                "name": "Nested Context Builder Flatten",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "display",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Incoming Details",
+                        "provider_id": "core.data_display",
+                        "provider_label": "Envelope Display Node",
+                        "config": {
+                            "mode": "passthrough",
+                            "show_input_envelope": False,
+                            "lock_passthrough": True,
+                        },
+                        "position": {"x": 180, "y": 0},
+                    },
+                    {
+                        "id": "compose_a",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Compose A",
+                        "provider_id": "core.context_builder",
+                        "provider_label": "Context Builder",
+                        "config": {
+                            "mode": "context_builder",
+                            "template": "",
+                            "joiner": "\n\n",
+                            "input_bindings": [
+                                {
+                                    "source_node_id": "display",
+                                    "header": "Customer Brief",
+                                    "placeholder": "incoming_details",
+                                    "binding": {"type": "latest_payload", "source": "display"},
+                                }
+                            ],
+                        },
+                        "position": {"x": 360, "y": 0},
+                    },
+                    {
+                        "id": "compose_b",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Compose B",
+                        "provider_id": "core.context_builder",
+                        "provider_label": "Context Builder",
+                        "config": {
+                            "mode": "context_builder",
+                            "template": "",
+                            "joiner": "\n\n",
+                            "input_bindings": [
+                                {
+                                    "source_node_id": "compose_a",
+                                    "header": "Context Builder",
+                                    "placeholder": "compiled_context",
+                                    "binding": {"type": "latest_payload", "source": "compose_a"},
+                                }
+                            ],
+                        },
+                        "position": {"x": 540, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "compose_b"}},
+                        "position": {"x": 720, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-display", "source_id": "start", "target_id": "display", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "display-compose-a", "source_id": "display", "target_id": "compose_a", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "compose-a-compose-b", "source_id": "compose_a", "target_id": "compose_b", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "compose-b-finish", "source_id": "compose_b", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        state = runtime.run(
+            graph,
+            {"summary": "Investigate the onboarding issue", "priority": "high"},
+            run_id="run-nested-context-builder-flatten",
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(
+            state.final_output,
+            [
+                {"Customer Brief": {"summary": "Investigate the onboarding issue", "priority": "high"}},
+            ],
+        )
 
     def test_context_builder_is_ready_when_any_connected_source_has_output(self) -> None:
         services = build_example_services()

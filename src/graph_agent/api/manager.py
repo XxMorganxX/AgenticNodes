@@ -243,6 +243,11 @@ class GraphRunManager:
         return {
             **self._store.catalog(),
             "provider_statuses": self._get_provider_statuses(),
+            "microsoft_auth": (
+                self._services.microsoft_auth_service.connection_status().to_dict()
+                if self._services.microsoft_auth_service is not None
+                else None
+            ),
             "mcp_servers": (
                 self._services.mcp_server_manager.list_servers() if self._services.mcp_server_manager is not None else []
             ),
@@ -487,6 +492,29 @@ class GraphRunManager:
                 response["mcp_auth_valid"] = True
                 response["mcp_server"] = mcp_result
         return response
+
+    def get_microsoft_auth_status(self) -> dict[str, Any]:
+        if self._services.microsoft_auth_service is None:
+            raise RuntimeError("Microsoft auth service is not configured.")
+        return self._services.microsoft_auth_service.connection_status().to_dict()
+
+    def start_microsoft_device_code(self, config: dict[str, Any]) -> dict[str, Any]:
+        if self._services.microsoft_auth_service is None:
+            raise RuntimeError("Microsoft auth service is not configured.")
+        client_id = str(config.get("client_id", "") or "").strip()
+        tenant_id = str(config.get("tenant_id", "") or "").strip()
+        scopes = config.get("scopes")
+        normalized_scopes = [str(scope).strip() for scope in scopes] if isinstance(scopes, list) else None
+        return self._services.microsoft_auth_service.start_device_code(
+            client_id=client_id,
+            tenant_id=tenant_id,
+            scopes=normalized_scopes,
+        ).to_dict()
+
+    def disconnect_microsoft_auth(self) -> dict[str, Any]:
+        if self._services.microsoft_auth_service is None:
+            raise RuntimeError("Microsoft auth service is not configured.")
+        return self._services.microsoft_auth_service.disconnect().to_dict()
 
     def upload_run_documents(self, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return ingest_run_documents(documents)

@@ -1568,7 +1568,13 @@ export default function App() {
 
               <div className="mosaic-tile panel mosaic-env">
                 <h2>Environment</h2>
-                <GraphEnvEditor graph={draftGraph} onGraphChange={setDraftGraph} />
+                <GraphEnvEditor
+                  graph={draftGraph}
+                  onGraphChange={setDraftGraph}
+                  onMicrosoftAuthChanged={async () => {
+                    await refreshCatalog();
+                  }}
+                />
               </div>
 
               <div className="mosaic-tile panel mosaic-execution">

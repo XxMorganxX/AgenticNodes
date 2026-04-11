@@ -129,6 +129,13 @@ function defaultEndConfig(provider: NodeProviderDefinition): GraphNode["config"]
       ...defaultConfig,
     };
   }
+  if (provider.provider_id === "end.outlook_draft") {
+    return {
+      to: "",
+      subject: "",
+      ...defaultConfig,
+    };
+  }
   return {
     ...defaultConfig,
   };
@@ -957,6 +964,9 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
       if (handleRemap.size > 0) {
         logicConditionHandleRemaps.set(node.id, handleRemap);
       }
+    }
+    if (node.provider_id === "end.outlook_draft") {
+      delete nextNode.config.outlook_access_token_env_var;
     }
     return nextNode;
   });

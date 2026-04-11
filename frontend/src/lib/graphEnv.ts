@@ -1,5 +1,14 @@
 import type { GraphDocument } from "./types";
 
+export type StandardGraphEnvField = {
+  key: string;
+  label: string;
+  placeholder: string;
+  tooltipText?: string;
+};
+
+export const NON_PERSISTED_GRAPH_ENV_KEYS = new Set(["MICROSOFT_GRAPH_ACCESS_TOKEN"]);
+
 export const DEFAULT_GRAPH_ENV_VARS: Record<string, string> = {
   OPENAI_API_KEY: "OPENAI_API_KEY",
   ANTHROPIC_API_KEY: "ANTHROPIC_API_KEY",
@@ -10,7 +19,7 @@ export const DEFAULT_GRAPH_ENV_VARS: Record<string, string> = {
   SUPABASE_ACCESS_TOKEN: "",
 };
 
-export const STANDARD_GRAPH_ENV_FIELDS = [
+export const STANDARD_GRAPH_ENV_FIELDS: readonly StandardGraphEnvField[] = [
   {
     key: "OPENAI_API_KEY",
     label: "OpenAI API Key Reference",
@@ -46,13 +55,28 @@ export const STANDARD_GRAPH_ENV_FIELDS = [
     label: "Supabase Access Token Reference",
     placeholder: "SUPABASE_ACCESS_TOKEN",
   },
-] as const;
+];
 
 const GRAPH_ENV_REFERENCE_PATTERN = /\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
+export function sanitizeGraphEnvVars(envVars: Record<string, string> | null | undefined): Record<string, string> {
+  if (!envVars) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(envVars).flatMap(([key, value]) => {
+      const trimmedKey = key.trim();
+      if (!trimmedKey || NON_PERSISTED_GRAPH_ENV_KEYS.has(trimmedKey)) {
+        return [];
+      }
+      return [[trimmedKey, typeof value === "string" ? value : String(value ?? "")]];
+    }),
+  );
+}
+
 export function getGraphEnvVars(graph: GraphDocument | null | undefined): Record<string, string> {
   const nextEnvVars: Record<string, string> = { ...DEFAULT_GRAPH_ENV_VARS };
-  const rawEnvVars = graph?.env_vars;
+  const rawEnvVars = sanitizeGraphEnvVars(graph?.env_vars);
   if (!rawEnvVars) {
     return nextEnvVars;
   }

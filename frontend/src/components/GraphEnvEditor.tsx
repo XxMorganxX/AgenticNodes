@@ -1,15 +1,44 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-import { verifySupabaseAuth } from "../lib/api";
-import { getGraphEnvVars, STANDARD_GRAPH_ENV_FIELDS } from "../lib/graphEnv";
+import { fetchMicrosoftAuthStatus, verifySupabaseAuth } from "../lib/api";
+import { getGraphEnvVars, NON_PERSISTED_GRAPH_ENV_KEYS, STANDARD_GRAPH_ENV_FIELDS, sanitizeGraphEnvVars } from "../lib/graphEnv";
 import { saveSessionSupabaseSchema } from "../lib/sessionSupabaseSchema";
-import type { GraphDocument, SupabaseAuthVerificationResult } from "../lib/types";
+import type { GraphDocument, MicrosoftAuthStatus, SupabaseAuthVerificationResult } from "../lib/types";
+import { MicrosoftAuthModal } from "./MicrosoftAuthModal";
 import { SupabaseAuthModal } from "./SupabaseAuthModal";
 
 type GraphEnvEditorProps = {
   graph: GraphDocument | null;
   onGraphChange: (graph: GraphDocument) => void;
+  onMicrosoftAuthChanged?: () => void | Promise<void>;
 };
+
+function EnvFieldLabel({
+  label,
+  tooltipText,
+  tooltipId,
+}: {
+  label: string;
+  tooltipText?: string;
+  tooltipId: string;
+}) {
+  if (!tooltipText) {
+    return <label className="env-tile-label">{label}</label>;
+  }
+  return (
+    <label className="env-tile-label env-tile-label-with-hint">
+      <span>{label}</span>
+      <span className="env-tile-hint">
+        <button type="button" className="env-tile-hint-button" aria-label={`${label} help`} aria-describedby={tooltipId}>
+          ?
+        </button>
+        <span id={tooltipId} role="tooltip" className="env-tile-tooltip">
+          {tooltipText}
+        </span>
+      </span>
+    </label>
+  );
+}
 
 const GRAPH_ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const STANDARD_GRAPH_ENV_KEYS: ReadonlySet<string> = new Set(STANDARD_GRAPH_ENV_FIELDS.map((field) => field.key));
@@ -40,19 +69,42 @@ function updateGraphEnvVars(
 ): GraphDocument {
   return {
     ...graph,
-    env_vars: updater(getGraphEnvVars(graph)),
+    env_vars: sanitizeGraphEnvVars(updater(getGraphEnvVars(graph))),
   };
 }
 
-export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
+function disconnectedMicrosoftAuthStatus(): MicrosoftAuthStatus {
+  return {
+    status: "disconnected",
+    connected: false,
+    pending: false,
+    client_id: "",
+    tenant_id: "",
+    account_username: "",
+    request_id: "",
+    user_code: "",
+    verification_uri: "",
+    verification_uri_complete: "",
+    message: "",
+    expires_at: "",
+    connected_at: "",
+    last_error: "",
+    scopes: [],
+  };
+}
+
+export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }: GraphEnvEditorProps) {
   const [newEnvKey, setNewEnvKey] = useState("");
   const [newEnvValue, setNewEnvValue] = useState("");
   const [revealedEnvKeys, setRevealedEnvKeys] = useState<Record<string, boolean>>({});
   const [newEnvValueVisible, setNewEnvValueVisible] = useState(false);
   const [supabaseModalOpen, setSupabaseModalOpen] = useState(false);
+  const [microsoftAuthModalOpen, setMicrosoftAuthModalOpen] = useState(false);
   const [lastSupabaseVerification, setLastSupabaseVerification] = useState<SupabaseAuthVerificationResult | null>(null);
   const [supabaseVerificationError, setSupabaseVerificationError] = useState<string | null>(null);
   const [isVerifyingSupabase, setIsVerifyingSupabase] = useState(false);
+  const [microsoftAuthStatus, setMicrosoftAuthStatus] = useState<MicrosoftAuthStatus>(disconnectedMicrosoftAuthStatus());
+  const [microsoftAuthError, setMicrosoftAuthError] = useState<string | null>(null);
 
   const envVars = useMemo(() => getGraphEnvVars(graph), [graph]);
   const visibleStandardFields = useMemo(
@@ -74,9 +126,30 @@ export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
   const newEnvKeyError =
     trimmedNewEnvKey.length === 0
       ? null
+      : NON_PERSISTED_GRAPH_ENV_KEYS.has(trimmedNewEnvKey)
+        ? "Use the Microsoft Auth connection flow instead of storing this token in graph env vars."
       : GRAPH_ENV_KEY_PATTERN.test(trimmedNewEnvKey)
         ? null
         : "Use letters, numbers, and underscores only.";
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchMicrosoftAuthStatus()
+      .then((status) => {
+        if (!cancelled) {
+          setMicrosoftAuthStatus(status);
+          setMicrosoftAuthError(null);
+        }
+      })
+      .catch((error: Error) => {
+        if (!cancelled) {
+          setMicrosoftAuthError(error.message);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   if (!graph) {
     return null;
@@ -148,10 +221,54 @@ export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
         {supabaseVerificationError ? <div className="env-supabase-launcher-error">{supabaseVerificationError}</div> : null}
       </div>
 
+      <div className="env-supabase-launcher">
+        <div className="env-supabase-launcher-copy">
+          <div className="env-supabase-launcher-heading">
+            <strong>Microsoft Auth</strong>
+            <span className={`env-integration-status${microsoftAuthStatus.connected ? " is-ready" : ""}`}>
+              {microsoftAuthStatus.connected ? "Connected" : microsoftAuthStatus.pending ? "Pending" : "Not connected"}
+            </span>
+          </div>
+          <p>
+            Connect a Microsoft account once with device-code sign-in. Outlook draft nodes use the secure local token cache instead of storing Graph access tokens in graph env vars.
+          </p>
+        </div>
+        <div className="env-supabase-launcher-actions">
+          <button
+            type="button"
+            className="primary-button env-supabase-launcher-button"
+            onClick={() => setMicrosoftAuthModalOpen(true)}
+          >
+            {microsoftAuthStatus.connected ? "Manage Microsoft Auth" : "Connect Microsoft Account"}
+          </button>
+        </div>
+        <div className="env-supabase-launcher-meta">
+          {microsoftAuthStatus.account_username ? (
+            <span className="env-integration-status is-ready">{microsoftAuthStatus.account_username}</span>
+          ) : null}
+          {microsoftAuthStatus.client_id ? <span className="env-integration-status">Client configured</span> : null}
+        </div>
+        {microsoftAuthStatus.pending && microsoftAuthStatus.user_code ? (
+          <div className="env-supabase-launcher-verification">
+            Finish Microsoft sign-in with code <code>{microsoftAuthStatus.user_code}</code>
+            {microsoftAuthStatus.verification_uri ? (
+              <>
+                {" "}
+                at <code>{microsoftAuthStatus.verification_uri}</code>.
+              </>
+            ) : (
+              "."
+            )}
+          </div>
+        ) : null}
+        {microsoftAuthStatus.last_error ? <div className="env-supabase-launcher-error">{microsoftAuthStatus.last_error}</div> : null}
+        {microsoftAuthError ? <div className="env-supabase-launcher-error">{microsoftAuthError}</div> : null}
+      </div>
+
       <div className="env-tiles">
         {visibleStandardFields.map((field) => (
           <div key={field.key} className="env-tile">
-            <label className="env-tile-label">{field.label}</label>
+            <EnvFieldLabel label={field.label} tooltipText={field.tooltipText} tooltipId={`env-field-tooltip-${field.key.toLowerCase()}`} />
             <div className="env-tile-value-row">
               <input
                 type={isEnvValueVisible(revealedEnvKeys, field.key) ? "text" : "password"}
@@ -310,6 +427,17 @@ export function GraphEnvEditor({ graph, onGraphChange }: GraphEnvEditorProps) {
             );
           }}
           onClose={() => setSupabaseModalOpen(false)}
+        />
+      ) : null}
+      {microsoftAuthModalOpen ? (
+        <MicrosoftAuthModal
+          initialStatus={microsoftAuthStatus}
+          onStatusChange={(status) => {
+            setMicrosoftAuthStatus(status);
+            setMicrosoftAuthError(null);
+            void onMicrosoftAuthChanged?.();
+          }}
+          onClose={() => setMicrosoftAuthModalOpen(false)}
         />
       ) : null}
     </>

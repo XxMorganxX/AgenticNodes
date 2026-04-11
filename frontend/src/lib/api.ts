@@ -4,6 +4,7 @@ import type {
   McpServerDraft,
   McpServerStatus,
   McpServerTestResult,
+  MicrosoftAuthStatus,
   ProjectFile,
   ProviderDiagnosticsResult,
   ProviderPreflightResult,
@@ -275,6 +276,44 @@ export async function verifySupabaseAuth(config: {
     throw new Error(await readFetchErrorMessage(response, "Failed to verify Supabase authentication."));
   }
   return (await response.json()) as SupabaseAuthVerificationResult;
+}
+
+export async function fetchMicrosoftAuthStatus(): Promise<MicrosoftAuthStatus> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/integrations/microsoft/status`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to load Microsoft authentication status."));
+  }
+  return (await response.json()) as MicrosoftAuthStatus;
+}
+
+export async function startMicrosoftDeviceCode(config: {
+  client_id: string;
+  tenant_id: string;
+  scopes?: string[];
+}): Promise<MicrosoftAuthStatus> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/integrations/microsoft/device/start`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to start Microsoft device sign-in."));
+  }
+  return (await response.json()) as MicrosoftAuthStatus;
+}
+
+export async function disconnectMicrosoftAuth(): Promise<MicrosoftAuthStatus> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/integrations/microsoft`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to disconnect Microsoft account."));
+  }
+  return (await response.json()) as MicrosoftAuthStatus;
 }
 
 export async function uploadRunDocuments(files: File[]): Promise<RunDocument[]> {

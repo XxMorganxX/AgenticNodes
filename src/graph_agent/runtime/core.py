@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
 from graph_agent.providers.discord import DiscordMessageSender
+from graph_agent.providers.outlook import OutlookDraftClient, parse_outlook_recipient_addresses
 from graph_agent.providers.base import (
     ModelMessage,
     ModelProvider,
@@ -60,6 +61,7 @@ from graph_agent.runtime.node_providers import (
     get_category_contract,
     is_valid_category_connection,
 )
+from graph_agent.runtime.microsoft_auth import MicrosoftAuthService
 from graph_agent.runtime.run_documents import normalize_run_documents
 from graph_agent.runtime.spreadsheets import (
     SPREADSHEET_FIRST_DATA_ROW_INDEX,
@@ -87,6 +89,7 @@ PROMPT_BLOCK_MODE = "prompt_block"
 PROMPT_BLOCK_ROLES = {"system", "user", "assistant"}
 DISCORD_END_PROVIDER_ID = "end.discord_message"
 DEFAULT_DISCORD_BOT_TOKEN_ENV_VAR = "{DISCORD_BOT_TOKEN}"
+OUTLOOK_DRAFT_PROVIDER_ID = "end.outlook_draft"
 SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows"
 SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision"
 LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions"
@@ -499,10 +502,20 @@ def _normalize_context_builder_header(value: Any, *, fallback: str = "Context") 
 
 
 def _build_context_builder_section(header: str, body: Any) -> dict[str, Any]:
-    return {
-        "header": _normalize_context_builder_header(header),
-        "body": body,
-    }
+    return {_normalize_context_builder_header(header): body}
+
+
+def _is_context_builder_section_list(value: Any) -> bool:
+    return bool(
+        isinstance(value, list)
+        and value
+        and all(
+            isinstance(item, Mapping)
+            and len(item) == 1
+            and all(isinstance(key, str) and key.strip() for key in item.keys())
+            for item in value
+        )
+    )
 
 
 def resolve_graph_env_value(value: Any, env_vars: Mapping[str, str]) -> Any:
@@ -917,6 +930,8 @@ class RuntimeServices:
     tool_registry: ToolRegistry = field(default_factory=ToolRegistry)
     mcp_server_manager: McpServerManager | None = None
     discord_message_sender: DiscordMessageSender | None = None
+    outlook_draft_client: OutlookDraftClient | None = None
+    microsoft_auth_service: MicrosoftAuthService | None = None
     config: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -1775,12 +1790,15 @@ class DataNode(BaseNode):
             elif value is not None and value != "":
                 saw_non_prompt_value = True
             if value is not None and value != "":
-                ordered_sections.append(
-                    _build_context_builder_section(
-                        header,
-                        rendered_value,
+                if source_node is not None and source_node.provider_id == "core.context_builder" and _is_context_builder_section_list(value):
+                    ordered_sections.extend(dict(item) for item in value)
+                else:
+                    ordered_sections.append(
+                        _build_context_builder_section(
+                            header,
+                            rendered_value,
+                        )
                     )
-                )
 
         template = str(self.config.get("template", "") or "")
         if template.strip():
@@ -5078,6 +5096,19 @@ def _coerce_discord_message_text(value: Any) -> str:
     return _json_safe(value).strip()
 
 
+def _coerce_outlook_body_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, Mapping):
+        for key in ("body", "content", "text", "message", "summary"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return _json_safe(value).strip()
+
+
 class OutputNode(BaseNode):
     kind = "output"
 
@@ -5187,6 +5218,97 @@ class DiscordOutputNode(OutputNode):
         }
 
 
+class OutlookDraftOutputNode(OutputNode):
+    def __init__(
+        self,
+        node_id: str,
+        label: str,
+        provider_id: str = OUTLOOK_DRAFT_PROVIDER_ID,
+        provider_label: str = "Outlook Draft End",
+        description: str = "",
+        config: Mapping[str, Any] | None = None,
+        position: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            node_id=node_id,
+            label=label,
+            provider_id=provider_id,
+            provider_label=provider_label,
+            description=description,
+            config=config,
+            position=position,
+        )
+
+    def _auth_service(self, context: NodeContext) -> MicrosoftAuthService:
+        return context.services.microsoft_auth_service or MicrosoftAuthService()
+
+    def _resolved_to_recipients(self, context: NodeContext) -> list[str]:
+        return parse_outlook_recipient_addresses(context.resolve_graph_env_value(self.config.get("to", "")))
+
+    def _render_subject(self, context: NodeContext, payload: Any) -> str:
+        subject_template = str(self.config.get("subject", "") or "").strip()
+        if not subject_template:
+            raise ValueError("Outlook draft node requires a subject.")
+        subject = context.render_template(
+            subject_template,
+            {
+                "message_payload": payload,
+                "message_json": _json_safe(payload),
+            },
+        ).strip()
+        if not subject:
+            raise ValueError("Outlook draft node requires a subject.")
+        return subject
+
+    def _render_body(self, payload: Any) -> str:
+        body = _coerce_outlook_body_text(payload)
+        if not body:
+            raise ValueError("Outlook draft node could not derive body text from the resolved payload.")
+        return body
+
+    def execute(self, context: NodeContext) -> NodeExecutionResult:
+        payload = _resolve_output_payload(context, self.config.get("source_binding"))
+        recipients = self._resolved_to_recipients(context)
+        subject = self._render_subject(context, payload)
+        body = self._render_body(payload)
+        auth_status = self._auth_service(context).connection_status()
+        access_token = self._auth_service(context).acquire_access_token()
+        draft_client = context.services.outlook_draft_client or OutlookDraftClient()
+        draft = draft_client.create_draft(
+            access_token=access_token,
+            to_recipients=recipients,
+            subject=subject,
+            body=body,
+        )
+        return NodeExecutionResult(
+            status="success",
+            output={
+                "delivery_status": "draft_saved",
+                "draft_id": draft.draft_id,
+                "web_link": draft.web_link,
+                "subject": draft.subject,
+                "body": draft.body,
+                "to_recipients": draft.to_recipients,
+                "created_at": draft.created_at,
+                "last_modified_at": draft.last_modified_at,
+                "account_username": auth_status.account_username,
+                "source_payload": payload,
+            },
+            summary=f"Saved Outlook draft for {', '.join(draft.to_recipients)}.",
+            metadata={"outlook_draft_saved": True},
+        )
+
+    def runtime_input_preview(self, context: NodeContext) -> Any:
+        payload = _resolve_output_payload(context, self.config.get("source_binding"))
+        auth_status = self._auth_service(context).connection_status()
+        return {
+            "microsoft_auth": auth_status.to_dict(),
+            "to_recipients": self._resolved_to_recipients(context),
+            "subject": self._render_subject(context, payload),
+            "body": self._render_body(payload),
+        }
+
+
 class GraphValidationError(ValueError):
     pass
 
@@ -5276,6 +5398,12 @@ def _node_from_dict(payload: Mapping[str, Any]) -> BaseNode:
         provider_label = str(payload.get("provider_label", "Core Output Node"))
         if provider_id == DISCORD_END_PROVIDER_ID:
             return DiscordOutputNode(
+                provider_id=provider_id,
+                provider_label=provider_label,
+                **common,
+            )
+        if provider_id == OUTLOOK_DRAFT_PROVIDER_ID:
+            return OutlookDraftOutputNode(
                 provider_id=provider_id,
                 provider_label=provider_label,
                 **common,
