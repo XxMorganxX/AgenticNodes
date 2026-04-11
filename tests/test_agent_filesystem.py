@@ -287,7 +287,8 @@ class AgentFilesystemTests(unittest.TestCase):
 
             self.assertEqual(state.status, "completed")
             writer_output = state.node_outputs["writer"]
-            file_record = writer_output["payload"]["file"]
+            self.assertEqual(writer_output["payload"], "Workspace output from the model.")
+            file_record = writer_output["artifacts"]["workspace_file"]
             self.assertEqual(file_record["path"], "outputs/result.txt")
             self.assertEqual(file_record["write_mode"], "created")
             stored_path = workspace_root / "run-writer-runtime" / "agents" / "agent-alpha" / "workspace" / "outputs" / "result.txt"
@@ -324,7 +325,8 @@ class AgentFilesystemTests(unittest.TestCase):
             self.assertEqual(first_state.status, "completed")
             self.assertEqual(second_state.status, "completed")
             writer_output = second_state.node_outputs["writer"]
-            self.assertEqual(writer_output["payload"]["write_mode"], "overwritten")
+            self.assertEqual(writer_output["payload"], "Second version")
+            self.assertEqual(writer_output["metadata"]["write_mode"], "overwritten")
             stored_path = workspace_root / "run-writer-overwrite" / "agents" / "agent-alpha" / "workspace" / "outputs" / "result.txt"
             self.assertEqual(stored_path.read_text(encoding="utf-8"), "Second version")
 
@@ -351,9 +353,10 @@ class AgentFilesystemTests(unittest.TestCase):
 
             self.assertEqual(state.status, "completed")
             writer_output = state.node_outputs["writer"]
-            self.assertEqual(writer_output["payload"]["write_mode"], "created")
+            self.assertIn("Spreadsheet record 2", writer_output["payload"])
+            self.assertEqual(writer_output["metadata"]["write_mode"], "created")
             self.assertTrue(writer_output["metadata"]["loop_execution"])
-            self.assertEqual(writer_output["payload"]["configured_path"], "outputs/rows.txt")
+            self.assertEqual(writer_output["metadata"]["configured_path"], "outputs/rows.txt")
             first_path = workspace_root / "run-writer-append-loop" / "agents" / "agent-alpha" / "workspace" / "outputs" / "rows-sheet-row-1.txt"
             second_path = workspace_root / "run-writer-append-loop" / "agents" / "agent-alpha" / "workspace" / "outputs" / "rows-sheet-row-2.txt"
             self.assertTrue(first_path.exists())
@@ -390,7 +393,8 @@ class AgentFilesystemTests(unittest.TestCase):
 
             self.assertEqual(state.status, "completed")
             writer_output = state.node_outputs["writer"]
-            self.assertEqual(writer_output["payload"]["write_mode"], "created")
+            self.assertIn("Spreadsheet record 2", writer_output["payload"])
+            self.assertEqual(writer_output["metadata"]["write_mode"], "created")
             first_path = workspace_root / "run-writer-overwrite-loop" / "agents" / "agent-alpha" / "workspace" / "outputs" / "rows-sheet-row-1.txt"
             second_path = workspace_root / "run-writer-overwrite-loop" / "agents" / "agent-alpha" / "workspace" / "outputs" / "rows-sheet-row-2.txt"
             self.assertTrue(first_path.exists())

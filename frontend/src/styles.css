@@ -3949,6 +3949,25 @@ pre {
   line-height: 1.4;
 }
 
+.graph-inspector-inline-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 0.45rem;
+}
+
+.graph-inspector-inline-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  color: #d9def8;
+}
+
+.graph-inspector-inline-toggle input {
+  margin: 0;
+}
+
 .tool-details-modal-backdrop {
   position: fixed;
   inset: 0;

@@ -1399,6 +1399,65 @@ export function GraphInspector({
                           : "No Microsoft account connected. Use the Environment panel to connect one before running this node."}
                     </span>
                   </div>
+                  <div className="contract-card">
+                    <strong>Required Fields</strong>
+                    <div className="graph-inspector-inline-toggles">
+                      <label className="graph-inspector-inline-toggle">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(selectedNode.config.require_to ?? true)}
+                          onChange={(event) =>
+                            onGraphChange(
+                              updateNode(graph, selectedNode.id, (node) => ({
+                                ...node,
+                                config: {
+                                  ...node.config,
+                                  require_to: event.target.checked,
+                                },
+                              })),
+                            )
+                          }
+                        />
+                        <span>Email</span>
+                      </label>
+                      <label className="graph-inspector-inline-toggle">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(selectedNode.config.require_subject ?? true)}
+                          onChange={(event) =>
+                            onGraphChange(
+                              updateNode(graph, selectedNode.id, (node) => ({
+                                ...node,
+                                config: {
+                                  ...node.config,
+                                  require_subject: event.target.checked,
+                                },
+                              })),
+                            )
+                          }
+                        />
+                        <span>Subject</span>
+                      </label>
+                      <label className="graph-inspector-inline-toggle">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(selectedNode.config.require_body ?? true)}
+                          onChange={(event) =>
+                            onGraphChange(
+                              updateNode(graph, selectedNode.id, (node) => ({
+                                ...node,
+                                config: {
+                                  ...node.config,
+                                  require_body: event.target.checked,
+                                },
+                              })),
+                            )
+                          }
+                        />
+                        <span>Body</span>
+                      </label>
+                    </div>
+                  </div>
                   <label>
                     To
                     <input
@@ -1440,6 +1499,7 @@ export function GraphInspector({
                     <span>The body comes from the selected Body Source and is stored as plain text in Outlook.</span>
                     <span>Use <code>{"{input_payload}"}</code>, <code>{"{message_payload}"}</code>, or <code>{"{message_json}"}</code> in the subject if you want it templated.</span>
                     <span>Authentication is handled globally through Microsoft device-code sign-in, not graph env vars.</span>
+                    <span>Only the toggled fields are required before saving the draft.</span>
                   </div>
                 </>
               ) : null}

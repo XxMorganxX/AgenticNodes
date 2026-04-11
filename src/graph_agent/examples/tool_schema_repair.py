@@ -790,6 +790,9 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             default_config={
                 "to": "",
                 "subject": "",
+                "require_to": True,
+                "require_subject": True,
+                "require_body": True,
             },
             config_fields=[
                 ProviderConfigFieldDefinition(

@@ -133,6 +133,9 @@ function defaultEndConfig(provider: NodeProviderDefinition): GraphNode["config"]
     return {
       to: "",
       subject: "",
+      require_to: true,
+      require_subject: true,
+      require_body: true,
       ...defaultConfig,
     };
   }

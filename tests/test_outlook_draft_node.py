@@ -151,6 +151,9 @@ def build_outlook_draft_graph_payload() -> dict[str, object]:
                 "config": {
                     "to": "alex@example.com; taylor@example.com",
                     "subject": "Follow-up for {graph_id}",
+                    "require_to": True,
+                    "require_subject": True,
+                    "require_body": True,
                 },
             },
         ],
@@ -204,6 +207,96 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertEqual(state.node_outputs["draft"]["account_username"], "morgan@example.com")
         self.assertEqual(state.final_output["subject"], "Follow-up for outlook-draft-agent")
         self.assertEqual(state.final_output["body"], "Draft this exact email body.")
+
+    def test_outlook_draft_node_allows_optional_fields_when_toggles_are_disabled(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph_payload = build_outlook_draft_graph_payload()
+        draft_node = graph_payload["nodes"][1]
+        assert isinstance(draft_node, dict)
+        draft_node["config"] = {
+            "to": "",
+            "subject": "",
+            "require_to": False,
+            "require_subject": False,
+            "require_body": False,
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        state = runtime.run(graph, "")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(len(fake_client.calls), 1)
+        self.assertEqual(fake_client.calls[0]["to_recipients"], [])
+        self.assertEqual(fake_client.calls[0]["subject"], "")
+        self.assertEqual(fake_client.calls[0]["body"], "")
+        self.assertEqual(state.node_outputs["draft"]["to_recipients"], [])
+        self.assertEqual(state.node_outputs["draft"]["subject"], "")
+        self.assertEqual(state.node_outputs["draft"]["body"], "")
+
+    def test_outlook_draft_node_parses_subject_and_unescapes_body_from_message_payload(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph_payload = build_outlook_draft_graph_payload()
+        draft_node = graph_payload["nodes"][1]
+        assert isinstance(draft_node, dict)
+        draft_node["config"] = {
+            "to": "brian@example.com",
+            "subject": "",
+            "require_to": True,
+            "require_subject": True,
+            "require_body": True,
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        payload = (
+            "Subject: Fellow Cornellian -> Exploring OpenAI + Strong Engineering Pipeline\\n\\n"
+            "Hi Brian,\\n\\n"
+            "I came across your profile and wanted to reach out.\\n\\n"
+            "Would love to grab 15 minutes to learn what you're hiring for."
+        )
+        state = runtime.run(graph, payload)
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(len(fake_client.calls), 1)
+        self.assertEqual(
+            fake_client.calls[0]["subject"],
+            "Fellow Cornellian -> Exploring OpenAI + Strong Engineering Pipeline",
+        )
+        self.assertEqual(
+            fake_client.calls[0]["body"],
+            "Hi Brian,\n\n"
+            "I came across your profile and wanted to reach out.\n\n"
+            "Would love to grab 15 minutes to learn what you're hiring for.",
+        )
+        self.assertEqual(
+            state.final_output["subject"],
+            "Fellow Cornellian -> Exploring OpenAI + Strong Engineering Pipeline",
+        )
+        self.assertEqual(
+            state.final_output["body"],
+            "Hi Brian,\n\n"
+            "I came across your profile and wanted to reach out.\n\n"
+            "Would love to grab 15 minutes to learn what you're hiring for.",
+        )
 
     def test_outlook_client_uses_draft_endpoint_only(self) -> None:
         with OutlookHttpStubServer() as server_url:

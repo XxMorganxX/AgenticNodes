@@ -1990,8 +1990,17 @@ class DataNode(BaseNode):
         configured_relative_path = str(self.config.get("relative_path", "response.txt") or "response.txt").strip() or "response.txt"
         relative_path = _resolve_write_text_file_relative_path(configured_relative_path, context=context)
         source_value = context.resolve_binding(self.config.get("input_binding"))
-        if isinstance(source_value, Mapping) and "payload" in source_value:
-            source_value = source_value.get("payload")
+        if isinstance(source_value, Mapping) and "schema_version" in source_value and "payload" in source_value:
+            source_envelope = MessageEnvelope.from_dict(source_value)
+        else:
+            source_envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id="",
+                from_category="",
+                payload=source_value,
+                metadata={"contract": "data_envelope", "node_kind": self.kind},
+            )
+        source_value = source_envelope.payload
         rendered_content = _render_workspace_file_content(source_value)
         is_loop_execution = context.is_loop_execution()
         resolved_exists_behavior = normalize_workspace_text_write_behavior(self.config.get("exists_behavior"))
@@ -2010,18 +2019,19 @@ class DataNode(BaseNode):
         preview_limit = 500
         content_preview = rendered_content if len(rendered_content) <= preview_limit else f"{rendered_content[:preview_limit].rstrip()}..."
         envelope = MessageEnvelope(
-            schema_version="1.0",
+            schema_version=source_envelope.schema_version,
             from_node_id=self.id,
             from_category=self.category.value,
-            payload={
-                "file": file_record,
-                "content_preview": content_preview,
-                "write_mode": write_mode,
-                "configured_path": configured_relative_path,
+            payload=source_envelope.payload,
+            artifacts={
+                **dict(source_envelope.artifacts),
+                "workspace_file": file_record,
             },
-            artifacts={"workspace_file": file_record},
+            errors=list(source_envelope.errors),
+            tool_calls=list(source_envelope.tool_calls),
             metadata={
-                "contract": "data_envelope",
+                **dict(source_envelope.metadata),
+                "contract": str(source_envelope.metadata.get("contract", "") or "data_envelope"),
                 "node_kind": self.kind,
                 "data_mode": "write_text_file",
                 "provider_id": self.provider_id,
@@ -2031,6 +2041,8 @@ class DataNode(BaseNode):
                 "append_newline": append_newline,
                 "loop_execution": is_loop_execution,
                 "configured_path": configured_relative_path,
+                "workspace_file": file_record,
+                "content_preview": content_preview,
             },
         )
         action_label = {
@@ -5109,6 +5121,34 @@ def _coerce_outlook_body_text(value: Any) -> str:
     return _json_safe(value).strip()
 
 
+def _normalize_outlook_text_formatting(value: str) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
+    return normalized.strip()
+
+
+def _parse_outlook_message_content(value: Any) -> tuple[str, str]:
+    subject = ""
+    body_source = value
+    if isinstance(value, Mapping):
+        subject_candidate = value.get("subject")
+        if isinstance(subject_candidate, str) and subject_candidate.strip():
+            subject = _normalize_outlook_text_formatting(subject_candidate)
+        for key in ("body", "content", "text", "message", "summary"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                body_source = candidate
+                break
+    body = _normalize_outlook_text_formatting(_coerce_outlook_body_text(body_source))
+    subject_match = re.match(r"(?is)^subject:\s*(.+?)(?:\n+|$)", body)
+    if subject_match is not None:
+        parsed_subject = _normalize_outlook_text_formatting(subject_match.group(1))
+        if parsed_subject:
+            subject = parsed_subject
+        body = body[subject_match.end() :].lstrip("\n").strip()
+    return subject, body
+
+
 class OutputNode(BaseNode):
     kind = "output"
 
@@ -5242,27 +5282,45 @@ class OutlookDraftOutputNode(OutputNode):
     def _auth_service(self, context: NodeContext) -> MicrosoftAuthService:
         return context.services.microsoft_auth_service or MicrosoftAuthService()
 
+    def _require_to(self) -> bool:
+        return bool(self.config.get("require_to", True))
+
+    def _require_subject(self) -> bool:
+        return bool(self.config.get("require_subject", True))
+
+    def _require_body(self) -> bool:
+        return bool(self.config.get("require_body", True))
+
     def _resolved_to_recipients(self, context: NodeContext) -> list[str]:
-        return parse_outlook_recipient_addresses(context.resolve_graph_env_value(self.config.get("to", "")))
+        return parse_outlook_recipient_addresses(
+            context.resolve_graph_env_value(self.config.get("to", "")),
+            required=self._require_to(),
+        )
 
     def _render_subject(self, context: NodeContext, payload: Any) -> str:
         subject_template = str(self.config.get("subject", "") or "").strip()
-        if not subject_template:
-            raise ValueError("Outlook draft node requires a subject.")
-        subject = context.render_template(
-            subject_template,
-            {
-                "message_payload": payload,
-                "message_json": _json_safe(payload),
-            },
-        ).strip()
+        derived_subject, _ = _parse_outlook_message_content(payload)
+        if subject_template:
+            subject = context.render_template(
+                subject_template,
+                {
+                    "message_payload": payload,
+                    "message_json": _json_safe(payload),
+                },
+            ).strip()
+        else:
+            subject = derived_subject
         if not subject:
+            if not self._require_subject():
+                return ""
             raise ValueError("Outlook draft node requires a subject.")
         return subject
 
     def _render_body(self, payload: Any) -> str:
-        body = _coerce_outlook_body_text(payload)
+        _, body = _parse_outlook_message_content(payload)
         if not body:
+            if not self._require_body():
+                return ""
             raise ValueError("Outlook draft node could not derive body text from the resolved payload.")
         return body
 

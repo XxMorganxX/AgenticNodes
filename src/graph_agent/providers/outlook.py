@@ -12,7 +12,7 @@ OUTLOOK_DRAFT_USER_AGENT = "graph-agent-outlook-draft/1.0"
 RECIPIENT_SPLIT_PATTERN = re.compile(r"[\n,;]+")
 
 
-def parse_outlook_recipient_addresses(value: Any) -> list[str]:
+def parse_outlook_recipient_addresses(value: Any, *, required: bool = True) -> list[str]:
     if isinstance(value, str):
         candidates = [candidate.strip() for candidate in RECIPIENT_SPLIT_PATTERN.split(value)]
     elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
@@ -21,6 +21,8 @@ def parse_outlook_recipient_addresses(value: Any) -> list[str]:
         candidates = [str(value).strip()] if value is not None else []
     recipients = [candidate for candidate in candidates if candidate]
     if not recipients:
+        if not required:
+            return []
         raise ValueError("Outlook draft node requires at least one recipient email address.")
     invalid_recipients = [candidate for candidate in recipients if "@" not in candidate]
     if invalid_recipients:
@@ -53,38 +55,34 @@ class OutlookDraftClient:
         *,
         access_token: str,
         to_recipients: Sequence[str],
-        subject: str,
-        body: str,
+        subject: str = "",
+        body: str = "",
     ) -> OutlookDraftResult:
         normalized_token = access_token.strip()
-        normalized_recipients = parse_outlook_recipient_addresses(list(to_recipients))
+        normalized_recipients = parse_outlook_recipient_addresses(list(to_recipients), required=False)
         normalized_subject = subject.strip()
         normalized_body = body.strip()
 
         if not normalized_token:
             raise ValueError("Microsoft Graph access token is required to create an Outlook draft.")
-        if not normalized_subject:
-            raise ValueError("Outlook draft subject is required.")
-        if not normalized_body:
-            raise ValueError("Outlook draft body is empty.")
-
-        request_body = json.dumps(
-            {
-                "subject": normalized_subject,
-                "body": {
-                    "contentType": "Text",
-                    "content": normalized_body,
-                },
-                "toRecipients": [
-                    {
-                        "emailAddress": {
-                            "address": recipient,
-                        }
-                    }
-                    for recipient in normalized_recipients
-                ],
+        payload: dict[str, Any] = {}
+        if normalized_subject:
+            payload["subject"] = normalized_subject
+        if normalized_body:
+            payload["body"] = {
+                "contentType": "Text",
+                "content": normalized_body,
             }
-        ).encode("utf-8")
+        if normalized_recipients:
+            payload["toRecipients"] = [
+                {
+                    "emailAddress": {
+                        "address": recipient,
+                    }
+                }
+                for recipient in normalized_recipients
+            ]
+        request_body = json.dumps(payload).encode("utf-8")
         request = urllib_request.Request(
             url=f"{self._api_base_url}/me/messages",
             data=request_body,
