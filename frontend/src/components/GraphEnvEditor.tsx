@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { fetchMicrosoftAuthStatus } from "../lib/api";
+import { fetchMicrosoftAuthStatus, verifySupabaseAuth } from "../lib/api";
 import { getGraphEnvVars, NON_PERSISTED_GRAPH_ENV_KEYS, STANDARD_GRAPH_ENV_FIELDS, sanitizeGraphEnvVars } from "../lib/graphEnv";
 import { saveSessionSupabaseSchema } from "../lib/sessionSupabaseSchema";
 import type { GraphDocument, MicrosoftAuthStatus, SupabaseAuthVerificationResult } from "../lib/types";
@@ -58,6 +58,20 @@ function normalizedSupabaseValue(envVars: Record<string, string>, key: string): 
   return value === key ? "" : value;
 }
 
+function deriveSupabaseProjectRef(rawUrl: string): string {
+  const trimmedUrl = rawUrl.trim();
+  if (!trimmedUrl) {
+    return "";
+  }
+  try {
+    const parsed = new URL(trimmedUrl);
+    const match = parsed.hostname.match(/^([a-z0-9-]+)\.supabase\.co$/i);
+    return match?.[1] ?? "";
+  } catch {
+    return "";
+  }
+}
+
 function updateGraphEnvVars(
   graph: GraphDocument,
   updater: (envVars: Record<string, string>) => Record<string, string>,
@@ -96,6 +110,9 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
   const [supabaseModalOpen, setSupabaseModalOpen] = useState(false);
   const [microsoftAuthModalOpen, setMicrosoftAuthModalOpen] = useState(false);
   const [lastSupabaseVerification, setLastSupabaseVerification] = useState<SupabaseAuthVerificationResult | null>(null);
+  const [isVerifyingAllSupabaseConnections, setIsVerifyingAllSupabaseConnections] = useState(false);
+  const [supabaseBatchVerificationSummary, setSupabaseBatchVerificationSummary] = useState<string | null>(null);
+  const [supabaseBatchVerificationError, setSupabaseBatchVerificationError] = useState<string | null>(null);
   const [microsoftAuthStatus, setMicrosoftAuthStatus] = useState<MicrosoftAuthStatus>(disconnectedMicrosoftAuthStatus());
   const [microsoftAuthError, setMicrosoftAuthError] = useState<string | null>(null);
 
@@ -103,6 +120,18 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
   const managedConnectionEnvKeys = useMemo(() => managedSupabaseEnvKeys(graph), [graph]);
   const supabaseConnections = useMemo(() => getSupabaseConnections(graph), [graph]);
   const explicitSupabaseConnections = useMemo(() => supabaseConnections.filter((connection) => !connection.isImplicit), [supabaseConnections]);
+  const verifiableSupabaseConnections = useMemo(
+    () =>
+      supabaseConnections
+        .map((connection) => ({
+          connection,
+          supabaseUrl: normalizedSupabaseValue(envVars, connection.supabase_url_env_var).trim(),
+          supabaseKey: normalizedSupabaseValue(envVars, connection.supabase_key_env_var).trim(),
+          accessToken: normalizedSupabaseValue(envVars, connection.access_token_env_var).trim(),
+        }))
+        .filter(({ supabaseUrl, supabaseKey }) => Boolean(supabaseUrl && supabaseKey)),
+    [envVars, supabaseConnections],
+  );
   const referencedSupabaseConnectionIds = useMemo(() => collectReferencedSupabaseConnectionIds(graph), [graph]);
   const defaultSupabaseConnection = useMemo(
     () => getSupabaseConnectionById(graph, String(graph?.default_supabase_connection_id ?? "")),
@@ -151,6 +180,62 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
     };
   }, []);
 
+  async function handleVerifyAllSupabaseConnections(): Promise<void> {
+    if (!graph || verifiableSupabaseConnections.length === 0) {
+      return;
+    }
+
+    setIsVerifyingAllSupabaseConnections(true);
+    setSupabaseBatchVerificationSummary(null);
+    setSupabaseBatchVerificationError(null);
+
+    let verifiedCount = 0;
+    const failures: string[] = [];
+
+    try {
+      for (const { connection, supabaseUrl, supabaseKey, accessToken } of verifiableSupabaseConnections) {
+        try {
+          const result = await verifySupabaseAuth({
+            supabase_url: supabaseUrl,
+            supabase_key: supabaseKey,
+            schema: "public",
+            project_ref: deriveSupabaseProjectRef(supabaseUrl),
+            access_token: accessToken,
+          });
+          verifiedCount += 1;
+          saveSessionSupabaseSchema(
+            graph,
+            {
+              schema: result.schema,
+              source_count: result.source_count,
+              sources: result.sources,
+            },
+            {
+              connectionScope: connection.connection_id || "graph-connections",
+              schemaName: result.schema,
+            },
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Verification failed.";
+          failures.push(`${connection.name}: ${message}`);
+        }
+      }
+
+      const skippedCount = supabaseConnections.length - verifiableSupabaseConnections.length;
+      const summaryParts = [`Verified ${verifiedCount} of ${supabaseConnections.length} connection${supabaseConnections.length === 1 ? "" : "s"}.`];
+      if (skippedCount > 0) {
+        summaryParts.push(`Skipped ${skippedCount} incomplete connection${skippedCount === 1 ? "" : "s"}.`);
+      }
+      if (failures.length > 0) {
+        summaryParts.push(`${failures.length} failed.`);
+      }
+      setSupabaseBatchVerificationSummary(summaryParts.join(" "));
+      setSupabaseBatchVerificationError(failures.length > 0 ? failures.join(" ") : null);
+    } finally {
+      setIsVerifyingAllSupabaseConnections(false);
+    }
+  }
+
   if (!graph) {
     return null;
   }
@@ -173,6 +258,14 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
           <button type="button" className="primary-button env-supabase-launcher-button" onClick={() => setSupabaseModalOpen(true)}>
             Manage Supabase Connections
           </button>
+          <button
+            type="button"
+            className="secondary-button env-supabase-verify-button"
+            onClick={() => void handleVerifyAllSupabaseConnections()}
+            disabled={isVerifyingAllSupabaseConnections || verifiableSupabaseConnections.length === 0}
+          >
+            {isVerifyingAllSupabaseConnections ? "Verifying..." : "Verify All"}
+          </button>
         </div>
         <div className="env-supabase-launcher-meta">
           <span className={`env-integration-status${supabaseConfiguredCount ? " is-ready" : ""}`}>
@@ -180,6 +273,10 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
           </span>
           {defaultSupabaseConnection ? <span className="env-integration-status is-ready">Default: {defaultSupabaseConnection.name}</span> : null}
         </div>
+        {supabaseBatchVerificationSummary ? (
+          <div className="env-supabase-launcher-verification">{supabaseBatchVerificationSummary}</div>
+        ) : null}
+        {supabaseBatchVerificationError ? <div className="env-supabase-launcher-error">{supabaseBatchVerificationError}</div> : null}
         {lastSupabaseVerification ? (
           <div className="env-supabase-launcher-verification">
             Verified schema <code>{lastSupabaseVerification.schema}</code> with {lastSupabaseVerification.source_count} discovered source
