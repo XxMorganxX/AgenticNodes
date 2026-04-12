@@ -26,6 +26,7 @@ import { PromptBlockDetailsModal } from "./PromptBlockDetailsModal";
 import { ProviderSummary } from "./ProviderSummary";
 import { ProviderDetailsModal } from "./ProviderDetailsModal";
 import { ToolDetailsModal } from "./ToolDetailsModal";
+import { validateOutboundEmailLogTable } from "../lib/api";
 import {
   API_FINAL_MESSAGE_HANDLE_ID,
   API_TOOL_CALL_HANDLE_ID,
@@ -40,7 +41,7 @@ import {
   defaultMcpTerminalOutputCondition,
   defaultToolFailureCondition,
   duplicateGraphNode,
-  getApiToolContextTargetAnchorRatio,
+  getNodeTargetAnchorRatio,
   getNextAvailableParallelSplitterOutputHandleId,
   getNodeSourceHandleAnchorRatio,
   getParallelSplitterOutputHandleIds,
@@ -48,11 +49,13 @@ import {
   isApiModelNode,
   isApiOutputHandleId,
   isMcpContextProviderNode,
+  isOutboundEmailLoggerNode,
   isPromptBlockNode,
   isRoutableToolNode,
   isWireJunctionNode,
   MCP_TERMINAL_OUTPUT_HANDLE_ID,
   normalizeParallelSplitterHandleAssignments,
+  OUTLOOK_DRAFT_EMAIL_LOG_TARGET_HANDLE_ID,
   TOOL_CONTEXT_HANDLE_ID,
   TOOL_FAILURE_HANDLE_ID,
   TOOL_SUCCESS_HANDLE_ID,
@@ -64,6 +67,7 @@ import type { HotbarFavorites } from "../lib/hotbarFavorites";
 import { deleteSavedNode, getSavedNodes, saveNodeToLibrary } from "../lib/savedNodes";
 import type { SavedNode } from "../lib/savedNodes";
 import { buildContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
+import { resolveSupabaseBinding } from "../lib/supabaseConnections";
 import {
   formatRunStatusLabel,
   type AgentRunLane,
@@ -72,7 +76,18 @@ import {
   type FocusedRunProjection,
   type FocusedRunSummary,
 } from "../lib/runVisualization";
-import type { EditorCatalog, GraphDefinition, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition, ProjectFile, RunState, RuntimeEvent } from "../lib/types";
+import type {
+  EditorCatalog,
+  GraphDefinition,
+  GraphEdge,
+  GraphNode,
+  GraphPosition,
+  NodeProviderDefinition,
+  OutboundEmailLogTableValidationResult,
+  ProjectFile,
+  RunState,
+  RuntimeEvent,
+} from "../lib/types";
 
 type GraphCanvasProps = {
   graph: GraphDefinition | null;
@@ -105,6 +120,123 @@ type GraphCanvasProps = {
   backgroundDragSensitivity?: number;
   onSelectionChange: (nodeId: string | null, edgeId: string | null) => void;
 };
+
+type OutboundEmailLoggerEdgeValidationState = {
+  status: "idle" | "loading" | "valid" | "invalid" | "error";
+  label: string;
+  routeTone?: "validation-valid" | "validation-invalid" | "validation-pending";
+  details?: OutboundEmailLogTableValidationResult | null;
+  error?: string | null;
+};
+
+function buildOutboundEmailLoggerLabel(validation: OutboundEmailLogTableValidationResult): string {
+  if (!validation.configured) {
+    return "email log: choose table";
+  }
+  if (!validation.table_found) {
+    return "email log: table missing";
+  }
+  if (!validation.valid) {
+    if (validation.missing_required_columns.length > 0) {
+      return `email log: ${validation.missing_required_columns.length} cols missing`;
+    }
+    if (validation.type_mismatches.length > 0) {
+      return "email log: type mismatch";
+    }
+    return "email log: invalid";
+  }
+  if (validation.warnings.length > 0 || validation.missing_optional_columns.length > 0) {
+    return "email log: ready + warns";
+  }
+  return "email log: ready";
+}
+
+function buildOutboundEmailLoggerState(
+  validation: OutboundEmailLogTableValidationResult,
+): OutboundEmailLoggerEdgeValidationState {
+  if (validation.valid) {
+    return {
+      status: "valid",
+      label: buildOutboundEmailLoggerLabel(validation),
+      routeTone: "validation-valid",
+      details: validation,
+      error: null,
+    };
+  }
+  return {
+    status: "invalid",
+    label: buildOutboundEmailLoggerLabel(validation),
+    routeTone: "validation-invalid",
+    details: validation,
+    error: null,
+  };
+}
+
+function buildOutboundEmailLoggerTooltip(
+  validationState: OutboundEmailLoggerEdgeValidationState | null,
+): string | undefined {
+  if (!validationState) {
+    return undefined;
+  }
+  if (validationState.status === "loading") {
+    return "Checking the selected Supabase table against the outbound email schema.";
+  }
+  if (validationState.status === "error") {
+    return validationState.error?.trim() || "Validation failed before the table could be checked.";
+  }
+  const validation = validationState.details;
+  if (!validation) {
+    return undefined;
+  }
+  const lines: string[] = [];
+  if (!validation.configured) {
+    lines.push("Choose a Supabase table in the logger node settings.");
+  }
+  if (validation.configured && !validation.table_found) {
+    lines.push(`Table '${validation.table_name}' was not found in schema '${validation.schema}'.`);
+  }
+  if (validation.missing_required_columns.length > 0) {
+    lines.push(`Missing required columns: ${validation.missing_required_columns.join(", ")}`);
+  }
+  if (validation.type_mismatches.length > 0) {
+    lines.push(
+      "Type mismatches: "
+      + validation.type_mismatches
+          .map((mismatch) => `${mismatch.column_name} expected ${mismatch.expected_types.join("/")} but found ${mismatch.actual_type}`)
+          .join("; "),
+    );
+  }
+  if (validation.warnings.length > 0) {
+    lines.push(...validation.warnings);
+  }
+  if (lines.length === 0 && validation.valid) {
+    lines.push(`Table '${validation.table_name}' matches the outbound email schema.`);
+  }
+  return lines.join("\n");
+}
+
+function isOutboundEmailLoggerBindingTarget(
+  sourceNode: GraphNode | undefined,
+  targetNode: GraphNode | undefined,
+  targetHandleId: string | null,
+): boolean {
+  return (
+    isOutboundEmailLoggerNode(sourceNode) &&
+    targetNode?.provider_id === "end.outlook_draft" &&
+    targetHandleId === OUTLOOK_DRAFT_EMAIL_LOG_TARGET_HANDLE_ID
+  );
+}
+
+function getRenderedLoggerTargetHandleId(
+  sourceNode: GraphNode | undefined,
+  targetNode: GraphNode | undefined,
+  targetHandleId: string | null,
+): string | null {
+  if (isOutboundEmailLoggerNode(sourceNode) && targetNode?.provider_id === "end.outlook_draft" && !targetHandleId) {
+    return OUTLOOK_DRAFT_EMAIL_LOG_TARGET_HANDLE_ID;
+  }
+  return targetHandleId ?? null;
+}
 
 type DrawerTab = "add" | "inspect" | "run";
 
@@ -897,6 +1029,7 @@ export function GraphCanvas({
 }: GraphCanvasProps) {
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance | null>(null);
   const [editorMessage, setEditorMessage] = useState<string | null>(null);
+  const [outboundEmailLoggerEdgeValidation, setOutboundEmailLoggerEdgeValidation] = useState<Record<string, OutboundEmailLoggerEdgeValidationState>>({});
   const [toolDetailsNodeId, setToolDetailsNodeId] = useState<string | null>(null);
   const [providerDetailsNodeId, setProviderDetailsNodeId] = useState<string | null>(null);
   const [conditionDetailsNodeId, setConditionDetailsNodeId] = useState<string | null>(null);
@@ -968,6 +1101,110 @@ export function GraphCanvas({
   const dragDiagnosticSessionIdRef = useRef(0);
   const zoomAnimationDuration = 120;
   const vizLocked = panLocked || isCommandHeld;
+  const outboundEmailLoggerValidationRequests = useMemo(() => {
+    if (!graph) {
+      return [] as Array<{
+        edgeId: string;
+        schema: string;
+        tableName: string;
+        supabaseUrlEnvVar: string;
+        supabaseKeyEnvVar: string;
+        graphEnvVars: Record<string, string>;
+      }>;
+    }
+    return graph.edges.flatMap((edge) => {
+      if (edge.kind !== "binding") {
+        return [];
+      }
+      const sourceNode = graph.nodes.find((node) => node.id === edge.source_id);
+      const targetNode = graph.nodes.find((node) => node.id === edge.target_id);
+      if (!sourceNode || !isOutboundEmailLoggerNode(sourceNode) || targetNode?.provider_id !== "end.outlook_draft") {
+        return [];
+      }
+      const resolvedBinding = resolveSupabaseBinding(graph, sourceNode.config as Record<string, unknown>);
+      return [
+        {
+          edgeId: edge.id,
+          schema: String(sourceNode.config.schema ?? "public") || "public",
+          tableName: String(sourceNode.config.table_name ?? ""),
+          supabaseUrlEnvVar: resolvedBinding.supabaseUrlEnvVar,
+          supabaseKeyEnvVar: resolvedBinding.supabaseKeyEnvVar,
+          graphEnvVars: graph.env_vars ?? {},
+        },
+      ];
+    });
+  }, [graph]);
+  const outboundEmailLoggerValidationSignature = useMemo(
+    () =>
+      JSON.stringify(
+        outboundEmailLoggerValidationRequests.map((request) => ({
+          edgeId: request.edgeId,
+          schema: request.schema,
+          tableName: request.tableName,
+          supabaseUrlEnvVar: request.supabaseUrlEnvVar,
+          supabaseKeyEnvVar: request.supabaseKeyEnvVar,
+          graphEnvVars: request.graphEnvVars,
+        })),
+      ),
+    [outboundEmailLoggerValidationRequests],
+  );
+
+  useEffect(() => {
+    if (outboundEmailLoggerValidationRequests.length === 0) {
+      setOutboundEmailLoggerEdgeValidation({});
+      return;
+    }
+    let cancelled = false;
+    setOutboundEmailLoggerEdgeValidation((current) =>
+      Object.fromEntries(
+        outboundEmailLoggerValidationRequests.map((request) => [
+          request.edgeId,
+          current[request.edgeId] ?? {
+            status: "loading",
+            label: "email log: checking...",
+            routeTone: "validation-pending",
+            details: null,
+            error: null,
+          },
+        ]),
+      ),
+    );
+    void Promise.all(
+      outboundEmailLoggerValidationRequests.map(async (request) => {
+        try {
+          const validation = await validateOutboundEmailLogTable({
+            supabase_url_env_var: request.supabaseUrlEnvVar,
+            supabase_key_env_var: request.supabaseKeyEnvVar,
+            schema: request.schema,
+            table_name: request.tableName,
+            graph_env_vars: request.graphEnvVars,
+          });
+          return [request.edgeId, buildOutboundEmailLoggerState(validation)] as const;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return [
+            request.edgeId,
+            {
+              status: "error",
+              label: "email log: check failed",
+              routeTone: "validation-invalid" as const,
+              details: null,
+              error: message,
+            },
+          ] as const;
+        }
+      }),
+    ).then((entries) => {
+      if (cancelled) {
+        return;
+      }
+      setOutboundEmailLoggerEdgeValidation(Object.fromEntries(entries));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [outboundEmailLoggerValidationRequests, outboundEmailLoggerValidationSignature]);
+
   const toolDetailsNode = useMemo(
     () =>
       graph?.nodes.find((node) => node.id === toolDetailsNodeId && node.category === "tool") ??
@@ -1381,6 +1618,30 @@ export function GraphCanvas({
     [availableProjectFiles, graph, onGraphChange],
   );
 
+  const handleSelectSupabaseConnection = useCallback(
+    (nodeId: string, connectionId: string) => {
+      if (!graph) {
+        return;
+      }
+      onGraphChange(
+        updateNode(graph, nodeId, (node) => {
+          const nextConfig = { ...node.config } as Record<string, unknown>;
+          const normalizedConnectionId = connectionId.trim();
+          if (normalizedConnectionId) {
+            nextConfig.supabase_connection_id = normalizedConnectionId;
+          } else {
+            delete nextConfig.supabase_connection_id;
+          }
+          return {
+            ...node,
+            config: nextConfig,
+          };
+        }),
+      );
+    },
+    [graph, onGraphChange],
+  );
+
   const handleFlowInit = useCallback((instance: ReactFlowInstance) => {
     const viewport = instance.getViewport();
     setFlowInstance(instance);
@@ -1435,8 +1696,8 @@ export function GraphCanvas({
           const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, baseGraph);
           const sourceAnchorRatio = getNodeSourceHandleAnchorRatio(sourceNode, sourceHandleId, baseGraph);
           const targetDimensions = getNodeDimensions(targetNode);
-          const targetAnchorRatio =
-            targetNode.kind === "model" ? getApiToolContextTargetAnchorRatio(edge.target_handle_id ?? null) : 0.5;
+          const targetHandleId = getRenderedLoggerTargetHandleId(sourceNode, targetNode, edge.target_handle_id ?? null);
+          const targetAnchorRatio = getNodeTargetAnchorRatio(targetNode, targetHandleId);
           const desiredTop = sourceNode.position.y + sourceDimensions.height * sourceAnchorRatio - targetDimensions.height * targetAnchorRatio;
 
           return {
@@ -1849,8 +2110,7 @@ export function GraphCanvas({
         return null;
       }
       const dimensions = getNodeDimensions(targetNode);
-      const verticalRatio =
-        targetNode.kind === "model" ? getApiToolContextTargetAnchorRatio(targetHandleId) : 0.5;
+      const verticalRatio = getNodeTargetAnchorRatio(targetNode, targetHandleId);
       return {
         x: targetNode.position.x,
         y: targetNode.position.y + dimensions.height * verticalRatio,
@@ -1888,7 +2148,8 @@ export function GraphCanvas({
           }
           const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, graph);
           const sourceAnchor = getSourceAnchorPosition(edge.source_id, sourceHandleId);
-          const targetAnchor = getTargetAnchorPosition(edge.target_id, edge.target_handle_id ?? null);
+          const targetHandleId = getRenderedLoggerTargetHandleId(sourceNode, targetNode, edge.target_handle_id ?? null);
+          const targetAnchor = getTargetAnchorPosition(edge.target_id, targetHandleId);
           if (!sourceAnchor || !targetAnchor) {
             return false;
           }
@@ -2035,11 +2296,16 @@ export function GraphCanvas({
             ? node.kind === "model"
               ? API_TOOL_CONTEXT_HANDLE_ID
               : null
-            : null;
+            : isOutboundEmailLoggerNode(sourceNode) && node.provider_id === "end.outlook_draft"
+              ? OUTLOOK_DRAFT_EMAIL_LOG_TARGET_HANDLE_ID
+              : null;
         if (
           sourceHandleId === TOOL_CONTEXT_HANDLE_ID &&
           targetHandleId === null
         ) {
+          return;
+        }
+        if (isOutboundEmailLoggerNode(sourceNode) && targetHandleId === null) {
           return;
         }
         const anchor = getTargetAnchorPosition(node.id, targetHandleId);
@@ -2073,7 +2339,9 @@ export function GraphCanvas({
     (edge: GraphEdge, sourceNode: GraphNode | undefined) => {
       const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, graph);
       const sourceAnchor = getSourceAnchorPosition(edge.source_id, sourceHandleId);
-      const targetAnchor = getTargetAnchorPosition(edge.target_id, edge.target_handle_id ?? null);
+      const targetNode = graph?.nodes.find((node) => node.id === edge.target_id);
+      const targetHandleId = getRenderedLoggerTargetHandleId(sourceNode, targetNode, edge.target_handle_id ?? null);
+      const targetAnchor = getTargetAnchorPosition(edge.target_id, targetHandleId);
       if (!sourceAnchor || !targetAnchor) {
         return null;
       }
@@ -2082,7 +2350,7 @@ export function GraphCanvas({
         .map((point) => `${Math.round(point.x / 12)}:${Math.round(point.y / 12)}`)
         .join("|");
     },
-    [getSourceAnchorPosition, getTargetAnchorPosition],
+    [getSourceAnchorPosition, getTargetAnchorPosition, graph],
   );
 
   const pruneDisconnectedWireJunctions = useCallback((baseGraph: GraphDefinition): GraphDefinition => {
@@ -2207,14 +2475,16 @@ export function GraphCanvas({
       const isBindingConnection =
         isToolContextBindingConnection(sourceNode, targetNode, effectiveSourceHandleId, effectiveTargetHandleId) ||
         isPromptBlockBindingConnection(sourceNode, targetNode) ||
-        isContextBuilderBindingConnection(sourceNode, targetNode);
+        isContextBuilderBindingConnection(sourceNode, targetNode) ||
+        isOutboundEmailLoggerBindingTarget(sourceNode, targetNode, effectiveTargetHandleId);
       const duplicateEdgeId =
         baseGraph.edges.find((edge) => {
           if (edge.source_id !== sourceId || edge.target_id !== targetId) {
             return false;
           }
           const existingSourceHandleId = sourceNode ? inferToolEdgeSourceHandle(edge, sourceNode, baseGraph) : (edge.source_handle_id ?? null);
-          return existingSourceHandleId === effectiveSourceHandleId && (edge.target_handle_id ?? null) === effectiveTargetHandleId;
+          const existingTargetHandleId = getRenderedLoggerTargetHandleId(sourceNode, targetNode, edge.target_handle_id ?? null);
+          return existingSourceHandleId === effectiveSourceHandleId && existingTargetHandleId === effectiveTargetHandleId;
         })?.id ?? null;
       if (isBindingConnection) {
         return { effectiveSourceHandleId, effectiveTargetHandleId, duplicateEdgeId, conflictingEdgeIds: [] as string[] };
@@ -2372,6 +2642,10 @@ export function GraphCanvas({
         setEditorMessage("Prompt Block nodes are source-only and cannot receive incoming connections.");
         return null;
       }
+      if (isOutboundEmailLoggerNode(targetNode)) {
+        setEditorMessage("Outbound email logger nodes are source-only and cannot receive incoming connections.");
+        return null;
+      }
       const { effectiveSourceHandleId, effectiveTargetHandleId, duplicateEdgeId, conflictingEdgeIds } = getConnectionConflictState(
         baseGraph,
         sourceId,
@@ -2395,6 +2669,10 @@ export function GraphCanvas({
         setEditorMessage("MCP context providers can only create tool-context bindings into API nodes.");
         return null;
       }
+      if (!isOutboundEmailLoggerBindingTarget(sourceNode, targetNode, effectiveTargetHandleId) && isOutboundEmailLoggerNode(sourceNode)) {
+        setEditorMessage("Outbound email logger nodes must connect to the Email Log handle on an Outlook draft end node.");
+        return null;
+      }
       if (isPromptBlockNode(sourceNode) && !isPromptBlockBindingConnection(sourceNode, targetNode)) {
         setEditorMessage("Prompt Block nodes can only create binding connections into model or data nodes.");
         return null;
@@ -2408,6 +2686,20 @@ export function GraphCanvas({
           source_handle_id: effectiveSourceHandleId,
           target_handle_id: effectiveTargetHandleId,
           label: "context input",
+          kind: "binding",
+          priority: 0,
+          waypoints,
+          condition: null,
+        };
+      }
+      if (isOutboundEmailLoggerBindingTarget(sourceNode, targetNode, effectiveTargetHandleId)) {
+        return {
+          id: nextEdgeId,
+          source_id: sourceId,
+          target_id: targetId,
+          source_handle_id: effectiveSourceHandleId,
+          target_handle_id: effectiveTargetHandleId,
+          label: "email log",
           kind: "binding",
           priority: 0,
           waypoints,
@@ -2668,7 +2960,8 @@ export function GraphCanvas({
       }
       const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, graph);
       const sourceAnchor = getSourceAnchorPosition(edge.source_id, sourceHandleId);
-      const targetAnchor = getTargetAnchorPosition(edge.target_id, edge.target_handle_id ?? null);
+      const targetHandleId = getRenderedLoggerTargetHandleId(sourceNode, targetNode, edge.target_handle_id ?? null);
+      const targetAnchor = getTargetAnchorPosition(edge.target_id, targetHandleId);
       if (!sourceAnchor || !targetAnchor) {
         return;
       }
@@ -2851,8 +3144,8 @@ export function GraphCanvas({
           x: sourceNode.position.x + sourceDimensions.width,
           y: sourceNode.position.y + sourceDimensions.height * verticalRatio,
         };
-        const targetVerticalRatio =
-          targetNode.kind === "model" ? getApiToolContextTargetAnchorRatio(edge.target_handle_id ?? null) : 0.5;
+        const targetHandleId = getRenderedLoggerTargetHandleId(sourceNode, targetNode, edge.target_handle_id ?? null);
+        const targetVerticalRatio = getNodeTargetAnchorRatio(targetNode, targetHandleId);
         const targetAnchor = {
           x: targetNode.position.x,
           y: targetNode.position.y + targetDimensions.height * targetVerticalRatio,
@@ -3666,6 +3959,7 @@ export function GraphCanvas({
                 onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
                 onOpenConditionResults: handleOpenConditionResults,
                 onSelectSpreadsheetFile: handleSelectSpreadsheetFile,
+                onSelectSupabaseConnection: handleSelectSupabaseConnection,
                 onHandlePointerDown: handleNodeHandlePointerDown,
                 onJunctionPointerDown: handleJunctionPointerDown,
               },
@@ -3767,6 +4061,7 @@ export function GraphCanvas({
         previousData.onOpenContextBuilderPayload === handleOpenContextBuilderPayload &&
         previousData.onOpenConditionResults === handleOpenConditionResults &&
         previousData.onSelectSpreadsheetFile === handleSelectSpreadsheetFile &&
+        previousData.onSelectSupabaseConnection === handleSelectSupabaseConnection &&
         previousData.onHandlePointerDown === handleNodeHandlePointerDown &&
         previousData.onJunctionPointerDown === handleJunctionPointerDown
           ? previousData
@@ -3794,6 +4089,7 @@ export function GraphCanvas({
               onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
               onOpenConditionResults: handleOpenConditionResults,
               onSelectSpreadsheetFile: handleSelectSpreadsheetFile,
+              onSelectSupabaseConnection: handleSelectSupabaseConnection,
               onHandlePointerDown: handleNodeHandlePointerDown,
               onJunctionPointerDown: handleJunctionPointerDown,
             };
@@ -3851,6 +4147,7 @@ export function GraphCanvas({
     handleOpenPromptBlockDetails,
     handleOpenProviderDetails,
     handleOpenConditionResults,
+    handleSelectSupabaseConnection,
     handleSelectSpreadsheetFile,
     handleToggleExecutorRetries,
     handleOpenToolDetails,
@@ -3988,7 +4285,7 @@ export function GraphCanvas({
       }
       const dimensions = getNodeDimensions(targetNode);
       const verticalRatio =
-        targetNode.kind === "model" ? getApiToolContextTargetAnchorRatio(targetHandleId) : 0.5;
+        getNodeTargetAnchorRatio(targetNode, targetHandleId);
       return {
         x: targetNode.position.x,
         y: targetNode.position.y + dimensions.height * verticalRatio,
@@ -3997,7 +4294,9 @@ export function GraphCanvas({
     const getEdgeRouteSignatureForLookup = (edge: GraphEdge, sourceNode: GraphNode | undefined) => {
       const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, graph);
       const sourceAnchor = getSourceAnchorForLookup(edge.source_id, sourceHandleId);
-      const targetAnchor = getTargetAnchorForLookup(edge.target_id, edge.target_handle_id ?? null);
+      const targetNode = nodeLookup.get(edge.target_id);
+      const targetHandleId = getRenderedLoggerTargetHandleId(sourceNode, targetNode, edge.target_handle_id ?? null);
+      const targetAnchor = getTargetAnchorForLookup(edge.target_id, targetHandleId);
       if (!sourceAnchor || !targetAnchor) {
         return null;
       }
@@ -4051,10 +4350,18 @@ export function GraphCanvas({
       const sourceNode = nodeLookup.get(edge.source_id);
       const targetNode = nodeLookup.get(edge.target_id);
       const touchesWireJunction = isWireJunctionNode(sourceNode) || isWireJunctionNode(targetNode);
-      const labelText = touchesWireJunction ? "" : String(edge.condition?.label ?? edge.label ?? "");
+      const outboundEmailLoggerValidationState =
+        isOutboundEmailLoggerNode(sourceNode) && targetNode?.provider_id === "end.outlook_draft"
+          ? outboundEmailLoggerEdgeValidation[edge.id] ?? null
+          : null;
+      const labelTooltip = buildOutboundEmailLoggerTooltip(outboundEmailLoggerValidationState);
+      const labelText = touchesWireJunction
+        ? ""
+        : outboundEmailLoggerValidationState?.label ?? String(edge.condition?.label ?? edge.label ?? "");
       const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, graph);
       const sourceAnchor = getSourceAnchorForLookup(edge.source_id, sourceHandleId);
-      const targetAnchor = getTargetAnchorForLookup(edge.target_id, edge.target_handle_id ?? null);
+      const targetHandleId = getRenderedLoggerTargetHandleId(sourceNode, targetNode, edge.target_handle_id ?? null);
+      const targetAnchor = getTargetAnchorForLookup(edge.target_id, targetHandleId);
       const routeSignature = getEdgeRouteSignatureForLookup(edge, sourceNode);
       const overlappingEdges = routeSignature ? routeSignatureGroups.get(routeSignature) ?? [edge] : [edge];
       const siblingEdges = siblingEdgesByTarget.get(edge.target_id) ?? [edge];
@@ -4072,6 +4379,7 @@ export function GraphCanvas({
                 ? API_EDGE_TONES.message
                 : null
           : null;
+      const edgeRouteTone = outboundEmailLoggerValidationState?.routeTone ?? toolEdgeTone?.routeTone;
       const isActiveEdge = runState?.current_edge_id === edge.id;
       const siblingIndex = siblingEdges.findIndex((candidate) => candidate.id === edge.id);
       const overlappingIndex = overlappingEdges.findIndex((candidate) => candidate.id === edge.id);
@@ -4142,10 +4450,11 @@ export function GraphCanvas({
         data: {
           kind: edge.kind,
           isActive: isActiveEdge,
+          labelTooltip,
           routePoints,
           sourceColor: toolEdgeTone?.sourceColor ?? KIND_COLORS[sourceNode?.kind ?? ""] ?? "#6ea8ff",
           targetColor: toolEdgeTone?.targetColor ?? KIND_COLORS[targetNode?.kind ?? ""] ?? "#6ea8ff",
-          routeTone: toolEdgeTone?.routeTone,
+          routeTone: edgeRouteTone,
           routeShiftX,
           routeShiftY,
           labelOffset,
@@ -4207,7 +4516,7 @@ export function GraphCanvas({
       cachedEdgesRef.current = result;
     }
     return result;
-  }, [dragRenderTick, getNodeDimensions, graph, handleWaypointPointerDown, isNodeDragActive, junctionDrag, runState?.current_edge_id, selectedEdgeIdSet, waypointDrag]);
+  }, [dragRenderTick, getNodeDimensions, graph, handleWaypointPointerDown, isNodeDragActive, junctionDrag, outboundEmailLoggerEdgeValidation, runState?.current_edge_id, selectedEdgeIdSet, waypointDrag]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -4357,6 +4666,9 @@ export function GraphCanvas({
       if (!canConnectNodes(sourceNode, targetNode, catalog)) {
         return false;
       }
+      if (isOutboundEmailLoggerNode(targetNode)) {
+        return false;
+      }
       if (sourceNode?.provider_id === "core.parallel_splitter") {
         const splitterHandles = getParallelSplitterOutputHandleIds(graph, sourceNode);
         const usedHandles = new Set(
@@ -4375,6 +4687,9 @@ export function GraphCanvas({
         (effectiveSourceHandleId === TOOL_CONTEXT_HANDLE_ID || effectiveTargetHandleId === API_TOOL_CONTEXT_HANDLE_ID) &&
         !isToolContextBindingConnection(sourceNode, targetNode, effectiveSourceHandleId, effectiveTargetHandleId)
       ) {
+        return false;
+      }
+      if (isOutboundEmailLoggerNode(sourceNode) && !isOutboundEmailLoggerBindingTarget(sourceNode, targetNode, effectiveTargetHandleId)) {
         return false;
       }
       const { duplicateEdgeId } = getConnectionConflictState(

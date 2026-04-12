@@ -449,6 +449,8 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             node_kind="data",
             description="Shows the exact incoming envelope in the visualizer while passing the original payload through unchanged.",
             capabilities=["envelope inspection", "visualizer display", "payload passthrough"],
+            produces_side_effects=True,
+            preserves_input_payload=True,
             default_config={"mode": "passthrough", "show_input_envelope": True, "lock_passthrough": True},
         )
     )
@@ -460,6 +462,8 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             node_kind="data",
             description="Writes the incoming payload into a sandboxed text file inside the active agent workspace for this run.",
             capabilities=["sandboxed file output", "text serialization", "agent workspace artifacts"],
+            produces_side_effects=True,
+            preserves_input_payload=True,
             default_config={
                 "mode": "write_text_file",
                 "relative_path": "response.txt",
@@ -604,6 +608,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             node_kind="data",
             description="Writes a single row to an existing Supabase table using a mix of runtime-bound values, literals, and omitted columns so database defaults can apply.",
             capabilities=["supabase inserts", "supabase upserts", "runtime column mapping", "database default preservation"],
+            produces_side_effects=True,
             default_config={
                 "mode": "supabase_row_write",
                 "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_URL",
@@ -660,6 +665,75 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                         '{"email":{"mode":"path","path":"contact.email"},"status":{"mode":"literal","value":"pending"},"created_at":{"mode":"default"}}.'
                     ),
                     placeholder='{\n  "email": {"mode": "path", "path": "contact.email"},\n  "status": {"mode": "literal", "value": "pending"},\n  "created_at": {"mode": "default"}\n}',
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="core.outbound_email_logger",
+            display_name="Outbound Email Logger",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Attaches to an Outlook draft end node, validates the target Supabase table against the outbound email schema, and logs each created draft as a new row during runtime.",
+            capabilities=["binding-only Outlook draft logging", "Supabase schema validation", "outbound email persistence"],
+            produces_side_effects=True,
+            default_config={
+                "mode": "outbound_email_logger",
+                "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_URL",
+                "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_SECRET_KEY",
+                "schema": "public",
+                "table_name": "outbound_email_messages",
+                "message_type": "initial",
+                "outreach_step": 0,
+                "sales_approach": "",
+                "sales_approach_version": "",
+                "parent_outbound_email_id": "",
+                "root_outbound_email_id": "",
+                "metadata_json": "{}",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(key="schema", label="Schema"),
+                ProviderConfigFieldDefinition(key="table_name", label="Table Name"),
+                ProviderConfigFieldDefinition(
+                    key="message_type",
+                    label="Message Type",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="initial", label="Initial Outreach"),
+                        ProviderConfigOptionDefinition(value="follow_up", label="Follow Up"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(key="outreach_step", label="Outreach Step", input_type="number"),
+                ProviderConfigFieldDefinition(
+                    key="sales_approach",
+                    label="Sales Approach",
+                    help_text="Supports graph env refs and runtime template variables like {run_id} and {graph_id}.",
+                    placeholder="value-led personalization",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="sales_approach_version",
+                    label="Sales Approach Version",
+                    placeholder="v1",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="parent_outbound_email_id",
+                    label="Parent Outbound Email Id",
+                    help_text="Optional template for follow-up chains.",
+                    placeholder="{input_payload[parent_outbound_email_id]}",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="root_outbound_email_id",
+                    label="Root Outbound Email Id",
+                    help_text="Optional template for grouping a full outreach chain.",
+                    placeholder="{input_payload[root_outbound_email_id]}",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="metadata_json",
+                    label="Metadata JSON",
+                    input_type="textarea",
+                    help_text="Optional JSON object merged into the stored metadata after template rendering.",
+                    placeholder='{\n  "campaign_id": "spring-launch",\n  "run_id": "{run_id}"\n}',
                 ),
             ],
         )
@@ -830,6 +904,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             node_kind="output",
             description="Sends the resolved output to a designated Discord channel without replacing the canonical run final output.",
             capabilities=["discord delivery", "side-effect output"],
+            produces_side_effects=True,
             default_config={
                 "discord_bot_token_env_var": "{DISCORD_BOT_TOKEN}",
                 "discord_channel_id": "",
@@ -864,6 +939,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             node_kind="output",
             description="Creates a draft email in Outlook using Microsoft Graph and never sends it automatically.",
             capabilities=["outlook draft creation", "email drafting", "side-effect output"],
+            produces_side_effects=True,
             default_config={
                 "to": "",
                 "subject": "",

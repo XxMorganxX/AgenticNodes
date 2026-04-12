@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { fetchMicrosoftAuthStatus, verifySupabaseAuth } from "../lib/api";
+import { fetchMicrosoftAuthStatus } from "../lib/api";
 import { getGraphEnvVars, NON_PERSISTED_GRAPH_ENV_KEYS, STANDARD_GRAPH_ENV_FIELDS, sanitizeGraphEnvVars } from "../lib/graphEnv";
 import { saveSessionSupabaseSchema } from "../lib/sessionSupabaseSchema";
 import type { GraphDocument, MicrosoftAuthStatus, SupabaseAuthVerificationResult } from "../lib/types";
+import { collectReferencedSupabaseConnectionIds, getSupabaseConnectionById, getSupabaseConnections, managedSupabaseEnvKeys } from "../lib/supabaseConnections";
 import { MicrosoftAuthModal } from "./MicrosoftAuthModal";
-import { SupabaseAuthModal } from "./SupabaseAuthModal";
+import { SupabaseConnectionsModal } from "./SupabaseConnectionsModal";
 
 type GraphEnvEditorProps = {
   graph: GraphDocument | null;
@@ -42,12 +43,6 @@ function EnvFieldLabel({
 
 const GRAPH_ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const STANDARD_GRAPH_ENV_KEYS: ReadonlySet<string> = new Set(STANDARD_GRAPH_ENV_FIELDS.map((field) => field.key));
-const SUPABASE_ENV_KEYS = new Set([
-  "GRAPH_AGENT_SUPABASE_URL",
-  "GRAPH_AGENT_SUPABASE_SECRET_KEY",
-  "SUPABASE_PROJECT_REF",
-  "SUPABASE_ACCESS_TOKEN",
-]);
 const SENSITIVE_ENV_KEY_PATTERN = /(password|passwd|passphrase|secret|token|api[_-]?key|private[_-]?key|credential)/i;
 
 function isSensitiveEnvKey(key: string): boolean {
@@ -101,28 +96,33 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
   const [supabaseModalOpen, setSupabaseModalOpen] = useState(false);
   const [microsoftAuthModalOpen, setMicrosoftAuthModalOpen] = useState(false);
   const [lastSupabaseVerification, setLastSupabaseVerification] = useState<SupabaseAuthVerificationResult | null>(null);
-  const [supabaseVerificationError, setSupabaseVerificationError] = useState<string | null>(null);
-  const [isVerifyingSupabase, setIsVerifyingSupabase] = useState(false);
   const [microsoftAuthStatus, setMicrosoftAuthStatus] = useState<MicrosoftAuthStatus>(disconnectedMicrosoftAuthStatus());
   const [microsoftAuthError, setMicrosoftAuthError] = useState<string | null>(null);
 
   const envVars = useMemo(() => getGraphEnvVars(graph), [graph]);
+  const managedConnectionEnvKeys = useMemo(() => managedSupabaseEnvKeys(graph), [graph]);
+  const supabaseConnections = useMemo(() => getSupabaseConnections(graph), [graph]);
+  const explicitSupabaseConnections = useMemo(() => supabaseConnections.filter((connection) => !connection.isImplicit), [supabaseConnections]);
+  const referencedSupabaseConnectionIds = useMemo(() => collectReferencedSupabaseConnectionIds(graph), [graph]);
+  const defaultSupabaseConnection = useMemo(
+    () => getSupabaseConnectionById(graph, String(graph?.default_supabase_connection_id ?? "")),
+    [graph],
+  );
   const visibleStandardFields = useMemo(
-    () => STANDARD_GRAPH_ENV_FIELDS.filter((field) => !SUPABASE_ENV_KEYS.has(field.key)),
-    [],
+    () => STANDARD_GRAPH_ENV_FIELDS.filter((field) => !managedConnectionEnvKeys.has(field.key)),
+    [managedConnectionEnvKeys],
   );
   const customEnvEntries = useMemo(
-    () => Object.entries(envVars).filter(([key]) => !STANDARD_GRAPH_ENV_KEYS.has(key) && !SUPABASE_ENV_KEYS.has(key)),
-    [envVars],
+    () => Object.entries(envVars).filter(([key]) => !STANDARD_GRAPH_ENV_KEYS.has(key) && !managedConnectionEnvKeys.has(key)),
+    [envVars, managedConnectionEnvKeys],
   );
   const trimmedNewEnvKey = newEnvKey.trim();
   const newEnvValueInputVisible = newEnvValueVisible || !isSensitiveEnvKey(trimmedNewEnvKey);
-  const supabaseUrl = normalizedSupabaseValue(envVars, "GRAPH_AGENT_SUPABASE_URL");
-  const supabaseKey = normalizedSupabaseValue(envVars, "GRAPH_AGENT_SUPABASE_SECRET_KEY");
-  const supabaseProjectRef = normalizedSupabaseValue(envVars, "SUPABASE_PROJECT_REF");
-  const supabaseAccessToken = normalizedSupabaseValue(envVars, "SUPABASE_ACCESS_TOKEN");
-  const supabaseConfigured = Boolean(supabaseUrl.trim() && supabaseKey.trim());
-  const supabaseMcpConfigured = Boolean(supabaseProjectRef.trim() && supabaseAccessToken.trim());
+  const supabaseConfiguredCount = explicitSupabaseConnections.filter((connection) => {
+    const url = normalizedSupabaseValue(envVars, connection.supabase_url_env_var).trim();
+    const key = normalizedSupabaseValue(envVars, connection.supabase_key_env_var).trim();
+    return Boolean(url && key);
+  }).length;
   const newEnvKeyError =
     trimmedNewEnvKey.length === 0
       ? null
@@ -155,61 +155,30 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
     return null;
   }
 
-  async function handleVerifySupabase() {
-    setIsVerifyingSupabase(true);
-    setSupabaseVerificationError(null);
-    setLastSupabaseVerification(null);
-    try {
-      const result = await verifySupabaseAuth({
-        supabase_url: supabaseUrl,
-        supabase_key: supabaseKey,
-        schema: "public",
-        project_ref: supabaseProjectRef,
-        access_token: supabaseAccessToken,
-      });
-      saveSessionSupabaseSchema(graph, {
-        schema: result.schema,
-        source_count: result.source_count,
-        sources: result.sources,
-      });
-      setLastSupabaseVerification(result);
-    } catch (error) {
-      setSupabaseVerificationError(error instanceof Error ? error.message : "Unable to verify Supabase authentication.");
-    } finally {
-      setIsVerifyingSupabase(false);
-    }
-  }
-
   return (
     <>
       <div className="env-supabase-launcher">
         <div className="env-supabase-launcher-copy">
           <div className="env-supabase-launcher-heading">
-            <strong>Supabase Auth</strong>
-            <span className={`env-integration-status${supabaseConfigured ? " is-ready" : ""}`}>
-              {supabaseConfigured ? "Saved" : "Not set"}
+            <strong>Supabase Connections</strong>
+            <span className={`env-integration-status${explicitSupabaseConnections.length ? " is-ready" : ""}`}>
+              {explicitSupabaseConnections.length ? `${explicitSupabaseConnections.length} saved` : "Not set"}
             </span>
           </div>
           <p>
-            Store the Supabase URL, service role key, and optional hosted MCP token here. Saving opens verification immediately so invalid auth is rejected before it is kept.
+            Manage multiple Supabase projects for this graph. Nodes can target a named connection while secrets continue to live in graph env vars behind the scenes.
           </p>
         </div>
         <div className="env-supabase-launcher-actions">
           <button type="button" className="primary-button env-supabase-launcher-button" onClick={() => setSupabaseModalOpen(true)}>
-            Manage Supabase Auth
-          </button>
-          <button
-            type="button"
-            className="secondary-button env-supabase-verify-button"
-            onClick={() => void handleVerifySupabase()}
-            disabled={isVerifyingSupabase || !supabaseUrl.trim() || !supabaseKey.trim()}
-          >
-            {isVerifyingSupabase ? "Verifying..." : "Verify"}
+            Manage Supabase Connections
           </button>
         </div>
         <div className="env-supabase-launcher-meta">
-          <span className={`env-integration-status${supabaseConfigured ? " is-ready" : ""}`}>{supabaseConfigured ? "Static auth saved" : "Static auth not set"}</span>
-          {supabaseMcpConfigured ? <span className="env-integration-status is-ready">MCP auth saved</span> : null}
+          <span className={`env-integration-status${supabaseConfiguredCount ? " is-ready" : ""}`}>
+            {supabaseConfiguredCount ? `${supabaseConfiguredCount} ready for static auth` : "No connection values saved yet"}
+          </span>
+          {defaultSupabaseConnection ? <span className="env-integration-status is-ready">Default: {defaultSupabaseConnection.name}</span> : null}
         </div>
         {lastSupabaseVerification ? (
           <div className="env-supabase-launcher-verification">
@@ -218,7 +187,6 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
             {lastSupabaseVerification.mcp_auth_checked ? " Hosted MCP auth also passed." : ""}
           </div>
         ) : null}
-        {supabaseVerificationError ? <div className="env-supabase-launcher-error">{supabaseVerificationError}</div> : null}
       </div>
 
       <div className="env-supabase-launcher">
@@ -399,31 +367,30 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
       </div>
 
       {supabaseModalOpen ? (
-        <SupabaseAuthModal
-          initialValues={{
-            supabaseUrl,
-            supabaseKey,
-            projectRef: supabaseProjectRef,
-            accessToken: supabaseAccessToken,
-          }}
-          onSave={(values, verification) => {
-            setLastSupabaseVerification(verification ?? null);
-            setSupabaseVerificationError(null);
+        <SupabaseConnectionsModal
+          connections={supabaseConnections}
+          envVars={envVars}
+          defaultConnectionId={String(graph.default_supabase_connection_id ?? "")}
+          referencedConnectionIds={referencedSupabaseConnectionIds}
+          onSave={({ connections, defaultConnectionId, envVars: nextEnvVars, verification }) => {
+            setLastSupabaseVerification(verification);
             if (verification) {
               saveSessionSupabaseSchema(graph, {
                 schema: verification.schema,
                 source_count: verification.source_count,
                 sources: verification.sources,
+              }, {
+                connectionScope: defaultConnectionId || "graph-connections",
+                schemaName: verification.schema,
               });
             }
             onGraphChange(
-              updateGraphEnvVars(graph, (currentEnvVars) => ({
-                ...currentEnvVars,
-                GRAPH_AGENT_SUPABASE_URL: values.supabaseUrl,
-                GRAPH_AGENT_SUPABASE_SECRET_KEY: values.supabaseKey,
-                SUPABASE_PROJECT_REF: values.projectRef,
-                SUPABASE_ACCESS_TOKEN: values.accessToken,
-              })),
+              {
+                ...graph,
+                env_vars: sanitizeGraphEnvVars(nextEnvVars),
+                supabase_connections: connections,
+                default_supabase_connection_id: defaultConnectionId,
+              },
             );
           }}
           onClose={() => setSupabaseModalOpen(false)}

@@ -9,8 +9,19 @@ type CachedSupabaseSchemaRecord = {
   saved_at: string;
 };
 
-function storageKeyForGraph(graph: Pick<GraphDefinition, "graph_id"> | null | undefined): string {
-  return String(graph?.graph_id ?? "").trim() || "__draft__";
+type SchemaCacheScope = {
+  connectionScope?: string;
+  schemaName?: string;
+};
+
+function storageKeyForGraph(
+  graph: Pick<GraphDefinition, "graph_id"> | null | undefined,
+  scope: SchemaCacheScope = {},
+): string {
+  const graphKey = String(graph?.graph_id ?? "").trim() || "__draft__";
+  const connectionScope = String(scope.connectionScope ?? "default").trim() || "default";
+  const schemaName = String(scope.schemaName ?? "public").trim() || "public";
+  return `${graphKey}::${connectionScope}::${schemaName}`;
 }
 
 function loadCacheMap(): Record<string, CachedSupabaseSchemaRecord> {
@@ -49,8 +60,11 @@ function saveCacheMap(nextMap: Record<string, CachedSupabaseSchemaRecord>): void
   }
 }
 
-export function loadSessionSupabaseSchema(graph: Pick<GraphDefinition, "graph_id"> | null | undefined): SupabaseSchemaPreviewResult | null {
-  const cached = loadCacheMap()[storageKeyForGraph(graph)];
+export function loadSessionSupabaseSchema(
+  graph: Pick<GraphDefinition, "graph_id"> | null | undefined,
+  scope: SchemaCacheScope = {},
+): SupabaseSchemaPreviewResult | null {
+  const cached = loadCacheMap()[storageKeyForGraph(graph, scope)];
   if (!cached) {
     return null;
   }
@@ -64,9 +78,10 @@ export function loadSessionSupabaseSchema(graph: Pick<GraphDefinition, "graph_id
 export function saveSessionSupabaseSchema(
   graph: Pick<GraphDefinition, "graph_id"> | null | undefined,
   payload: SupabaseSchemaPreviewResult,
+  scope: SchemaCacheScope = {},
 ): void {
   const current = loadCacheMap();
-  current[storageKeyForGraph(graph)] = {
+  current[storageKeyForGraph(graph, scope)] = {
     schema: payload.schema,
     source_count: payload.source_count,
     sources: payload.sources,
@@ -75,9 +90,12 @@ export function saveSessionSupabaseSchema(
   saveCacheMap(current);
 }
 
-export function clearSessionSupabaseSchema(graph: Pick<GraphDefinition, "graph_id"> | null | undefined): void {
+export function clearSessionSupabaseSchema(
+  graph: Pick<GraphDefinition, "graph_id"> | null | undefined,
+  scope: SchemaCacheScope = {},
+): void {
   const current = loadCacheMap();
-  const key = storageKeyForGraph(graph);
+  const key = storageKeyForGraph(graph, scope);
   if (!(key in current)) {
     return;
   }

@@ -183,6 +183,8 @@ export function createBlankGraph(): GraphDefinition {
     default_input: "",
     start_node_id: "",
     env_vars: { ...DEFAULT_GRAPH_ENV_VARS },
+    supabase_connections: [],
+    default_supabase_connection_id: "",
     nodes: [],
     edges: [],
     node_providers: [],
@@ -322,6 +324,12 @@ export function createNodeFromProvider(
 
   if (provider.node_kind === "data") {
     const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
+    const defaultSupabaseConnectionId = String(graph.default_supabase_connection_id ?? "").trim();
+    const maybeSupabaseConnectionConfig =
+      defaultSupabaseConnectionId &&
+      ["core.supabase_data", "core.supabase_row_write", "core.outbound_email_logger"].includes(provider.provider_id)
+        ? { supabase_connection_id: defaultSupabaseConnectionId }
+        : {};
     if (provider.provider_id === "core.context_builder") {
       return {
         ...baseNode,
@@ -329,6 +337,7 @@ export function createNodeFromProvider(
           template: "",
           input_bindings: [],
           joiner: "\n\n",
+          ...maybeSupabaseConnectionConfig,
           ...defaultConfig,
         },
       };
@@ -341,6 +350,7 @@ export function createNodeFromProvider(
           role: "user",
           content: "",
           name: "",
+          ...maybeSupabaseConnectionConfig,
           ...defaultConfig,
         },
       };
@@ -356,6 +366,7 @@ export function createNodeFromProvider(
           header_row_index: 1,
           start_row_index: 2,
           empty_row_policy: "skip",
+          ...maybeSupabaseConnectionConfig,
           ...defaultConfig,
         },
       };
@@ -364,6 +375,7 @@ export function createNodeFromProvider(
       ...baseNode,
       config: {
         mode: "passthrough",
+        ...maybeSupabaseConnectionConfig,
         ...defaultConfig,
       },
     };
@@ -473,6 +485,10 @@ export function isPromptBlockNode(node: GraphNode | null | undefined): boolean {
   return Boolean(node && node.kind === "data" && node.provider_id === "core.prompt_block");
 }
 
+export function isOutboundEmailLoggerNode(node: GraphNode | null | undefined): boolean {
+  return Boolean(node && node.kind === "data" && node.provider_id === "core.outbound_email_logger");
+}
+
 export function isControlFlowNode(node: GraphNode | null | undefined): boolean {
   return Boolean(node && node.kind === "control_flow_unit");
 }
@@ -489,6 +505,7 @@ export const API_TOOL_CALL_HANDLE_ID = "api-tool-call";
 export const API_FINAL_MESSAGE_HANDLE_ID = "api-message";
 export const API_MESSAGE_HANDLE_ID = API_FINAL_MESSAGE_HANDLE_ID;
 export const MCP_TERMINAL_OUTPUT_HANDLE_ID = "mcp-terminal-output";
+export const OUTLOOK_DRAFT_EMAIL_LOG_TARGET_HANDLE_ID = "outlook-draft-email-log";
 export const PROMPT_BLOCK_PROVIDER_ID = "core.prompt_block";
 export const CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body";
 export const CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if";
@@ -1104,7 +1121,10 @@ function getLayoutNodeDimensions(node: GraphNode, options?: GraphLayoutOptions):
   };
 }
 
-function getNodeTargetAnchorRatio(node: GraphNode, targetHandleId: string | null | undefined): number {
+export function getNodeTargetAnchorRatio(node: GraphNode, targetHandleId: string | null | undefined): number {
+  if (node.provider_id === "end.outlook_draft" && targetHandleId === OUTLOOK_DRAFT_EMAIL_LOG_TARGET_HANDLE_ID) {
+    return 0.78;
+  }
   return node.kind === "model" ? getApiToolContextTargetAnchorRatio(targetHandleId) : 0.5;
 }
 

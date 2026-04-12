@@ -33,6 +33,17 @@ class DataDrivenGraphTests(unittest.TestCase):
     def setUp(self) -> None:
         self.services = build_example_services()
 
+    def test_catalog_marks_pass_through_side_effect_nodes(self) -> None:
+        catalog = GraphStore(self.services).catalog()
+        providers = {provider["provider_id"]: provider for provider in catalog["node_providers"]}
+
+        self.assertTrue(providers["core.data_display"]["produces_side_effects"])
+        self.assertTrue(providers["core.data_display"]["preserves_input_payload"])
+        self.assertTrue(providers["core.write_text_file"]["produces_side_effects"])
+        self.assertTrue(providers["core.write_text_file"]["preserves_input_payload"])
+        self.assertTrue(providers["end.discord_message"]["produces_side_effects"])
+        self.assertFalse(providers["end.discord_message"]["preserves_input_payload"])
+
     def test_example_graph_runs_end_to_end(self) -> None:
         graph = GraphDefinition.from_dict(build_example_graph_payload())
         graph.validate_against_services(self.services)

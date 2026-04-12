@@ -25,7 +25,12 @@ from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
 from graph_agent.runtime.run_documents import ingest_run_documents, normalize_run_documents
 from graph_agent.runtime.spreadsheets import SpreadsheetParseError, parse_spreadsheet
-from graph_agent.runtime.supabase_data import SupabaseDataError, fetch_supabase_schema_catalog, verify_supabase_mcp_auth
+from graph_agent.runtime.supabase_data import (
+    SupabaseDataError,
+    fetch_supabase_schema_catalog,
+    validate_outbound_email_log_schema,
+    verify_supabase_mcp_auth,
+)
 from graph_agent.tools.mcp import McpServerDefinition
 
 
@@ -409,6 +414,33 @@ class GraphRunManager:
             "source_count": len(sources),
             "sources": [source.to_dict() for source in sources],
         }
+
+    def validate_outbound_email_log_table(self, config: dict[str, Any]) -> dict[str, Any]:
+        graph_env_vars = config.get("graph_env_vars", {})
+        resolved_env_vars = graph_env_vars if isinstance(graph_env_vars, dict) else {}
+        supabase_url = resolve_graph_process_env(
+            str(config.get("supabase_url_env_var", "GRAPH_AGENT_SUPABASE_URL") or "GRAPH_AGENT_SUPABASE_URL"),
+            resolved_env_vars,
+        )
+        supabase_key = resolve_graph_process_env(
+            str(config.get("supabase_key_env_var", "GRAPH_AGENT_SUPABASE_SECRET_KEY") or "GRAPH_AGENT_SUPABASE_SECRET_KEY"),
+            resolved_env_vars,
+        )
+        schema = str(config.get("schema", "public") or "public").strip() or "public"
+        table_name = str(config.get("table_name", "") or "").strip()
+        try:
+            sources = fetch_supabase_schema_catalog(
+                supabase_url=supabase_url,
+                supabase_key=supabase_key,
+                schema=schema,
+            )
+        except SupabaseDataError as exc:
+            raise ValueError(str(exc)) from exc
+        return validate_outbound_email_log_schema(
+            sources=sources,
+            schema=schema,
+            table_name=table_name,
+        ).to_dict()
 
     def inspect_supabase_runtime(self, config: dict[str, Any]) -> dict[str, Any]:
         graph_env_vars = config.get("graph_env_vars", {})

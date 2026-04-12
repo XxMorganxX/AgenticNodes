@@ -11,6 +11,7 @@ import {
   CONTROL_FLOW_IF_HANDLE_ID,
   CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
   createParallelSplitterOutputHandleId,
+  getNodeTargetAnchorRatio,
   getParallelSplitterOutputHandleIds,
   inferModelResponseMode,
   getApiToolContextTargetAnchorRatio,
@@ -18,10 +19,12 @@ import {
   isApiModelNode,
   isControlFlowNode,
   isMcpContextProviderNode,
+  isOutboundEmailLoggerNode,
   isPromptBlockNode,
   isRoutableToolNode,
   isWireJunctionNode,
   MCP_TERMINAL_OUTPUT_HANDLE_ID,
+  OUTLOOK_DRAFT_EMAIL_LOG_TARGET_HANDLE_ID,
   TOOL_CONTEXT_HANDLE_ID,
   TOOL_FAILURE_HANDLE_ID,
   TOOL_SUCCESS_HANDLE_ID,
@@ -34,6 +37,7 @@ import type { NodeTooltipData } from "../lib/nodeTooltip";
 import { getContextBuilderBindings } from "../lib/contextBuilderBindings";
 import type { ContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
 import { formatRunStatusLabel } from "../lib/runVisualization";
+import { getSupabaseConnections, resolveSupabaseBinding } from "../lib/supabaseConnections";
 import type { EditorCatalog, GraphDefinition, GraphNode, ProjectFile, RunState } from "../lib/types";
 
 export type GraphCanvasNodeData = {
@@ -60,6 +64,7 @@ export type GraphCanvasNodeData = {
   onOpenContextBuilderPayload: (nodeId: string) => void;
   onOpenConditionResults: (nodeId: string) => void;
   onSelectSpreadsheetFile: (nodeId: string, fileId: string) => void;
+  onSelectSupabaseConnection: (nodeId: string, connectionId: string) => void;
   onHandlePointerDown: (nodeId: string, handleType: "source" | "target", handleId: string | null) => boolean;
   onJunctionPointerDown: (nodeId: string, clientPosition: { x: number; y: number }) => void;
 };
@@ -217,6 +222,7 @@ function GraphCanvasNodeComponent({
     onOpenContextBuilderPayload,
     onOpenConditionResults,
     onSelectSpreadsheetFile,
+    onSelectSupabaseConnection,
     onJunctionPointerDown,
   } = data;
   const isWireJunction = isWireJunctionNode(node);
@@ -231,7 +237,14 @@ function GraphCanvasNodeComponent({
   const isRuntimeNormalizerNode = node.provider_id === "core.runtime_normalizer";
   const isSupabaseDataNode = node.provider_id === "core.supabase_data";
   const isSupabaseRowWriteNode = node.provider_id === "core.supabase_row_write";
+  const isOutboundEmailLogger = isOutboundEmailLoggerNode(node);
+  const isSupabaseNode = isSupabaseDataNode || isSupabaseRowWriteNode || isOutboundEmailLogger;
+  const isOutlookDraftNode = node.provider_id === "end.outlook_draft";
   const displayLabel = getNodeInstanceLabel(graph, node);
+  const supabaseConnections = isSupabaseNode ? getSupabaseConnections(graph) : [];
+  const resolvedSupabaseBinding = isSupabaseNode ? resolveSupabaseBinding(graph, node.config as Record<string, unknown>) : null;
+  const supabaseConnectionMissing = resolvedSupabaseBinding?.missingConnection ?? false;
+  const supabaseSelectValue = String(node.config.supabase_connection_id ?? "");
   const displayEnvelope =
     isDisplayNode &&
     runtimeOutput &&
@@ -294,7 +307,7 @@ function GraphCanvasNodeComponent({
       tooltip = FALLBACK_TOOLTIP;
     }
   }
-  const showTargetHandle = !preview && node.category !== "start";
+  const showTargetHandle = !preview && node.category !== "start" && !isOutboundEmailLogger;
   const showPromptBlockTargetHandle = !isPromptBlockNode(node);
   const showSourceHandle = !preview && node.category !== "end";
   const successHandleStyle = {
@@ -349,6 +362,9 @@ function GraphCanvasNodeComponent({
   } satisfies CSSProperties;
   const contextTargetHandleStyle = {
     top: `${getApiToolContextTargetAnchorRatio(API_TOOL_CONTEXT_HANDLE_ID) * 100}%`,
+  } satisfies CSSProperties;
+  const outlookDraftEmailLogTargetHandleStyle = {
+    top: `${getNodeTargetAnchorRatio(node, OUTLOOK_DRAFT_EMAIL_LOG_TARGET_HANDLE_ID) * 100}%`,
   } satisfies CSSProperties;
   const iconLabel = KIND_LABELS[node.kind] ?? node.kind.slice(0, 2).toUpperCase();
   const subtitle =
@@ -574,6 +590,20 @@ function GraphCanvasNodeComponent({
           />
         </>
       ) : null}
+      {showTargetHandle && isOutlookDraftNode ? (
+        <>
+          <div className="graph-node-input-port graph-node-input-port--email-log" style={outlookDraftEmailLogTargetHandleStyle} aria-hidden="true">
+            <span className="graph-node-output-port-label">Email Log</span>
+          </div>
+          <Handle
+            id={OUTLOOK_DRAFT_EMAIL_LOG_TARGET_HANDLE_ID}
+            type="target"
+            position={Position.Left}
+            className={`graph-node-handle graph-node-handle-target graph-node-handle-target--email-log ${isConnectionMagnetized ? "graph-node-handle-valid is-magnetized" : ""}`}
+            style={outlookDraftEmailLogTargetHandleStyle}
+          />
+        </>
+      ) : null}
       <div className="graph-node-card-inner">
         <div className="graph-node-header">
           <div className="graph-node-icon" aria-hidden="true">
@@ -648,7 +678,7 @@ function GraphCanvasNodeComponent({
           <div className="graph-node-inline-select-row">
             <span className="graph-node-inline-toggle-label">Spreadsheet</span>
             <select
-              className="graph-node-inline-select"
+              className="graph-node-inline-select nodrag"
               value={spreadsheetSelectValue}
               aria-label={`Select spreadsheet for ${displayLabel}`}
               onMouseDown={(event) => event.stopPropagation()}
@@ -671,6 +701,41 @@ function GraphCanvasNodeComponent({
               ))}
             </select>
           </div>
+        ) : null}
+        {!preview && isSupabaseNode ? (
+          <>
+            <div className="graph-node-inline-select-row">
+              <span className="graph-node-inline-toggle-label">Project</span>
+              <select
+                className="graph-node-inline-select nodrag"
+                value={supabaseSelectValue}
+                aria-label={`Select Supabase project for ${displayLabel}`}
+                onMouseDown={(event) => event.stopPropagation()}
+                onClick={(event) => event.stopPropagation()}
+                onChange={(event) => {
+                  event.stopPropagation();
+                  onSelectSupabaseConnection(node.id, event.target.value);
+                }}
+              >
+                <option value="">Compatibility mode</option>
+                {supabaseConnections.map((connection) => (
+                  <option key={connection.connection_id} value={connection.connection_id}>
+                    {connection.name}{connection.isImplicit ? " (legacy)" : ""}
+                  </option>
+                ))}
+                {supabaseConnectionMissing && resolvedSupabaseBinding?.connectionId ? (
+                  <option value={resolvedSupabaseBinding.connectionId}>
+                    Missing: {resolvedSupabaseBinding.connectionName}
+                  </option>
+                ) : null}
+              </select>
+            </div>
+            {supabaseConnectionMissing ? (
+              <div className="graph-node-summary graph-node-summary--warning">
+                Assigned project is missing. Pick another connection or switch to compatibility mode.
+              </div>
+            ) : null}
+          </>
         ) : null}
         {logicConditionDisplayText ? (
           <div
@@ -744,7 +809,7 @@ function GraphCanvasNodeComponent({
             <span className="graph-node-inline-display-hint">Click to expand</span>
           </div>
         ) : null}
-        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isRuntimeNormalizerNode || isSupabaseDataNode || isSupabaseRowWriteNode) ? (
+        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isRuntimeNormalizerNode || isSupabaseDataNode || isSupabaseRowWriteNode || isOutboundEmailLogger) ? (
           <div className="graph-node-card-actions" aria-hidden="false">
             <button
               type="button"
@@ -772,6 +837,8 @@ function GraphCanvasNodeComponent({
                 : isSupabaseDataNode
                   ? "Learn More"
                 : isSupabaseRowWriteNode
+                  ? "Learn More"
+                : isOutboundEmailLogger
                   ? "Learn More"
                 : isPromptBlockNode(node)
                   ? "More Info"

@@ -18,9 +18,18 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from graph_agent.api.graph_store import GraphStore
+from graph_agent.api.supabase_run_store import SupabaseRunStore
 from graph_agent.examples.tool_schema_repair import build_example_services
-from graph_agent.runtime.core import GraphDefinition
+from graph_agent.runtime.core import GraphDefinition, GraphValidationError
 from graph_agent.runtime.engine import GraphRuntime
+from graph_agent.runtime.supabase_data import (
+    SupabaseSchemaColumn,
+    SupabaseSchemaSource,
+    SupabaseRowWriteRequest,
+    fetch_supabase_schema_catalog,
+    validate_outbound_email_log_schema,
+    write_supabase_row,
+)
 
 
 class _SupabaseStubHandler(BaseHTTPRequestHandler):
@@ -602,10 +611,130 @@ class SupabaseDataNodeTests(unittest.TestCase):
                 graph,
                 {"event": {"email": "person@example.com", "type": "signup"}},
                 run_id="run-supabase-row-write-invalid-mapping",
-            )
+        )
 
         self.assertEqual(state.status, "failed")
         self.assertEqual(state.terminal_error["type"], "invalid_supabase_row_mapping")
+
+    def test_outbound_email_log_schema_validation_reports_required_missing_columns(self) -> None:
+        result = validate_outbound_email_log_schema(
+            sources=[
+                SupabaseSchemaSource(
+                    name="outbound_email_messages",
+                    source_kind="table",
+                    description="Outbound drafts",
+                    columns=[
+                        SupabaseSchemaColumn(name="provider", data_type="string", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="mailbox_account", data_type="string", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="recipient_email", data_type="string", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="subject", data_type="string", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="body_text", data_type="string", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="message_type", data_type="string", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="outreach_step", data_type="integer", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="sales_approach", data_type="string", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="provider_draft_id", data_type="string", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="provider_message_id", data_type="string", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="drafted_at", data_type="string", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="metadata", data_type="object", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="raw_provider_payload", data_type="object", nullable=False, description=""),
+                    ],
+                )
+            ],
+            schema="public",
+            table_name="outbound_email_messages",
+        )
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.table_name, "outbound_email_messages")
+        self.assertIn("internet_message_id", result.missing_required_columns)
+        self.assertIn("conversation_id", result.missing_required_columns)
+
+    def test_supabase_connection_id_uses_named_graph_connection(self) -> None:
+        with SupabaseStubServer() as base_url:
+            graph = GraphDefinition.from_dict(
+                supabase_graph_payload(
+                    "supabase-data-connection-id",
+                    node_config={
+                        "supabase_connection_id": "analytics-db",
+                    },
+                )
+                | {
+                    "env_vars": {
+                        "GRAPH_AGENT_SUPABASE_ANALYTICS_URL": base_url,
+                        "GRAPH_AGENT_SUPABASE_ANALYTICS_SECRET_KEY": "analytics-secret",
+                    },
+                    "supabase_connections": [
+                        {
+                            "connection_id": "analytics-db",
+                            "name": "Analytics DB",
+                            "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_URL",
+                            "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_SECRET_KEY",
+                            "project_ref_env_var": "SUPABASE_ANALYTICS_PROJECT_REF",
+                            "access_token_env_var": "SUPABASE_ANALYTICS_ACCESS_TOKEN",
+                        }
+                    ],
+                    "default_supabase_connection_id": "analytics-db",
+                },
+            )
+            runtime = self._runtime()
+
+            state = runtime.run(
+                graph,
+                {"event": {"email": "person@example.com", "type": "signup"}},
+                run_id="run-supabase-connection-id",
+            )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(_SupabaseStubHandler.last_headers.get("apikey"), "analytics-secret")
+
+    def test_supabase_connection_id_validation_rejects_missing_connection(self) -> None:
+        with self.assertRaisesRegex(GraphValidationError, "unknown Supabase connection 'missing-db'"):
+            GraphDefinition.from_dict(
+                supabase_graph_payload(
+                    "supabase-data-missing-connection",
+                    node_config={"supabase_connection_id": "missing-db"},
+                )
+            )
+
+    def test_supabase_secret_key_omits_authorization_header(self) -> None:
+        with SupabaseStubServer() as base_url:
+            fetch_supabase_schema_catalog(
+                supabase_url=base_url,
+                supabase_key="sb_secret_example",
+                schema="public",
+            )
+            self.assertEqual(_SupabaseStubHandler.last_headers.get("apikey"), "sb_secret_example")
+            self.assertNotIn("authorization", _SupabaseStubHandler.last_headers)
+
+            write_supabase_row(
+                SupabaseRowWriteRequest(
+                    supabase_url=base_url,
+                    supabase_key="sb_secret_example",
+                    schema="public",
+                    table_name="projects",
+                    row={"id": 1, "name": "Alpha"},
+                )
+            )
+            self.assertEqual(_SupabaseStubHandler.last_headers.get("apikey"), "sb_secret_example")
+            self.assertNotIn("authorization", _SupabaseStubHandler.last_headers)
+
+    def test_supabase_run_store_can_select_custom_env_vars(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_RUN_STORE_SUPABASE_URL_ENV_VAR": "CUSTOM_SUPABASE_URL",
+                "GRAPH_AGENT_RUN_STORE_SUPABASE_SECRET_KEY_ENV_VAR": "CUSTOM_SUPABASE_SECRET_KEY",
+                "CUSTOM_SUPABASE_URL": "https://db.example.supabase.co",
+                "CUSTOM_SUPABASE_SECRET_KEY": "sb_secret_custom",
+                "GRAPH_AGENT_SUPABASE_URL": "https://default.example.supabase.co",
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "default-secret",
+            },
+            clear=False,
+        ):
+            store = SupabaseRunStore.from_env()
+
+        self.assertEqual(store.url, "https://db.example.supabase.co")
+        self.assertEqual(store.service_role_key, "sb_secret_custom")
 
 
 if __name__ == "__main__":

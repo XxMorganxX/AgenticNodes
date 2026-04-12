@@ -50,6 +50,8 @@ export type GraphDefinition = {
   default_input?: string;
   start_node_id: string;
   env_vars?: Record<string, string>;
+  supabase_connections?: SupabaseConnectionDefinition[];
+  default_supabase_connection_id?: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
   node_providers?: NodeProviderDefinition[];
@@ -74,6 +76,8 @@ export type TestEnvironmentDefinition = {
   graph_type: "test_environment" | "graph";
   default_input?: string;
   env_vars?: Record<string, string>;
+  supabase_connections?: SupabaseConnectionDefinition[];
+  default_supabase_connection_id?: string;
   agents: AgentDefinition[];
   node_providers?: NodeProviderDefinition[];
 };
@@ -101,6 +105,8 @@ export type NodeProviderDefinition = {
   node_kind: string;
   description: string;
   capabilities: string[];
+  produces_side_effects?: boolean;
+  preserves_input_payload?: boolean;
   model_provider_name?: string | null;
   default_config?: Record<string, unknown>;
   config_fields?: ProviderConfigFieldDefinition[];
@@ -288,6 +294,15 @@ export type SupabaseSchemaColumn = {
   description: string;
 };
 
+export type SupabaseConnectionDefinition = {
+  connection_id: string;
+  name: string;
+  supabase_url_env_var: string;
+  supabase_key_env_var: string;
+  project_ref_env_var: string;
+  access_token_env_var: string;
+};
+
 export type SupabaseSchemaSource = {
   name: string;
   source_kind: string;
@@ -308,6 +323,26 @@ export type SupabaseRuntimeStatusResult = {
   supabase_key_env_present: boolean;
   missing_env_vars: string[];
   ready: boolean;
+};
+
+export type SupabaseSchemaTypeMismatch = {
+  column_name: string;
+  expected_types: string[];
+  actual_type: string;
+  required: boolean;
+};
+
+export type OutboundEmailLogTableValidationResult = {
+  schema: string;
+  table_name: string;
+  configured: boolean;
+  table_found: boolean;
+  valid: boolean;
+  available_columns: string[];
+  missing_required_columns: string[];
+  missing_optional_columns: string[];
+  type_mismatches: SupabaseSchemaTypeMismatch[];
+  warnings: string[];
 };
 
 export type SupabaseAuthVerificationResult = {

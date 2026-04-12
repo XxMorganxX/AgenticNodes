@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any
+from typing import Any, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -117,6 +117,90 @@ class SupabaseSchemaSource:
         }
 
 
+@dataclass(frozen=True)
+class SupabaseExpectedColumn:
+    name: str
+    accepted_types: tuple[str, ...]
+    required: bool = True
+
+
+@dataclass(frozen=True)
+class SupabaseSchemaTypeMismatch:
+    column_name: str
+    expected_types: tuple[str, ...]
+    actual_type: str
+    required: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "column_name": self.column_name,
+            "expected_types": list(self.expected_types),
+            "actual_type": self.actual_type,
+            "required": self.required,
+        }
+
+
+@dataclass(frozen=True)
+class SupabaseSchemaValidationResult:
+    schema: str
+    table_name: str
+    configured: bool
+    table_found: bool
+    valid: bool
+    available_columns: list[str]
+    missing_required_columns: list[str]
+    missing_optional_columns: list[str]
+    type_mismatches: list[SupabaseSchemaTypeMismatch]
+    warnings: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "table_name": self.table_name,
+            "configured": self.configured,
+            "table_found": self.table_found,
+            "valid": self.valid,
+            "available_columns": list(self.available_columns),
+            "missing_required_columns": list(self.missing_required_columns),
+            "missing_optional_columns": list(self.missing_optional_columns),
+            "type_mismatches": [mismatch.to_dict() for mismatch in self.type_mismatches],
+            "warnings": list(self.warnings),
+        }
+
+
+OUTBOUND_EMAIL_LOG_EXPECTED_COLUMNS: tuple[SupabaseExpectedColumn, ...] = (
+    SupabaseExpectedColumn("provider", ("string",)),
+    SupabaseExpectedColumn("mailbox_account", ("string",)),
+    SupabaseExpectedColumn("recipient_email", ("string",)),
+    SupabaseExpectedColumn("subject", ("string",)),
+    SupabaseExpectedColumn("body_text", ("string",)),
+    SupabaseExpectedColumn("message_type", ("string",)),
+    SupabaseExpectedColumn("outreach_step", ("integer", "number")),
+    SupabaseExpectedColumn("sales_approach", ("string",)),
+    SupabaseExpectedColumn("provider_draft_id", ("string",)),
+    SupabaseExpectedColumn("provider_message_id", ("string",)),
+    SupabaseExpectedColumn("internet_message_id", ("string",)),
+    SupabaseExpectedColumn("conversation_id", ("string",)),
+    SupabaseExpectedColumn("drafted_at", ("string",)),
+    SupabaseExpectedColumn("metadata", ("object",)),
+    SupabaseExpectedColumn("raw_provider_payload", ("object",)),
+    SupabaseExpectedColumn("source_run_id", ("string",), required=False),
+    SupabaseExpectedColumn("sales_approach_version", ("string",), required=False),
+    SupabaseExpectedColumn("parent_outbound_email_id", ("string",), required=False),
+    SupabaseExpectedColumn("root_outbound_email_id", ("string",), required=False),
+    SupabaseExpectedColumn("observed_sent_at", ("string",), required=False),
+    SupabaseExpectedColumn("created_at", ("string",), required=False),
+)
+
+
+def build_supabase_rest_auth_headers(supabase_key: str) -> dict[str, str]:
+    normalized_key = str(supabase_key or "").strip()
+    headers = {"apikey": normalized_key}
+    if normalized_key and not normalized_key.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {normalized_key}"
+    return headers
+
+
 def parse_supabase_filter_lines(raw_filters: str) -> list[tuple[str, str]]:
     parsed: list[tuple[str, str]] = []
     for raw_line in str(raw_filters or "").splitlines():
@@ -133,6 +217,102 @@ def parse_supabase_filter_lines(raw_filters: str) -> list[tuple[str, str]]:
             )
         parsed.append((normalized_key, normalized_value))
     return parsed
+
+
+def validate_supabase_source_schema(
+    *,
+    sources: list[SupabaseSchemaSource],
+    schema: str,
+    table_name: str,
+    expected_columns: Sequence[SupabaseExpectedColumn],
+) -> SupabaseSchemaValidationResult:
+    normalized_schema = str(schema or "public").strip() or "public"
+    normalized_table_name = str(table_name or "").strip()
+    if not normalized_table_name:
+        return SupabaseSchemaValidationResult(
+            schema=normalized_schema,
+            table_name="",
+            configured=False,
+            table_found=False,
+            valid=False,
+            available_columns=[],
+            missing_required_columns=[],
+            missing_optional_columns=[],
+            type_mismatches=[],
+            warnings=["Choose a Supabase table to validate the outbound email logger attachment."],
+        )
+
+    source = next((candidate for candidate in sources if candidate.name == normalized_table_name and candidate.source_kind == "table"), None)
+    if source is None:
+        return SupabaseSchemaValidationResult(
+            schema=normalized_schema,
+            table_name=normalized_table_name,
+            configured=True,
+            table_found=False,
+            valid=False,
+            available_columns=[],
+            missing_required_columns=[column.name for column in expected_columns if column.required],
+            missing_optional_columns=[column.name for column in expected_columns if not column.required],
+            type_mismatches=[],
+            warnings=[f"Table '{normalized_table_name}' was not found in the '{normalized_schema}' schema preview."],
+        )
+
+    available_by_name = {column.name: column for column in source.columns}
+    missing_required_columns: list[str] = []
+    missing_optional_columns: list[str] = []
+    type_mismatches: list[SupabaseSchemaTypeMismatch] = []
+    for expected in expected_columns:
+        actual = available_by_name.get(expected.name)
+        if actual is None:
+            if expected.required:
+                missing_required_columns.append(expected.name)
+            else:
+                missing_optional_columns.append(expected.name)
+            continue
+        normalized_type = str(actual.data_type or "unknown").strip().lower() or "unknown"
+        if expected.accepted_types and normalized_type not in set(expected.accepted_types):
+            type_mismatches.append(
+                SupabaseSchemaTypeMismatch(
+                    column_name=expected.name,
+                    expected_types=tuple(expected.accepted_types),
+                    actual_type=normalized_type,
+                    required=expected.required,
+                )
+            )
+
+    warnings: list[str] = []
+    if missing_optional_columns:
+        warnings.append(
+            "Optional columns are missing and will be omitted from runtime writes: "
+            + ", ".join(missing_optional_columns)
+        )
+
+    return SupabaseSchemaValidationResult(
+        schema=normalized_schema,
+        table_name=normalized_table_name,
+        configured=True,
+        table_found=True,
+        valid=not missing_required_columns and not type_mismatches,
+        available_columns=sorted(available_by_name),
+        missing_required_columns=missing_required_columns,
+        missing_optional_columns=missing_optional_columns,
+        type_mismatches=type_mismatches,
+        warnings=warnings,
+    )
+
+
+def validate_outbound_email_log_schema(
+    *,
+    sources: list[SupabaseSchemaSource],
+    schema: str,
+    table_name: str,
+) -> SupabaseSchemaValidationResult:
+    return validate_supabase_source_schema(
+        sources=sources,
+        schema=schema,
+        table_name=table_name,
+        expected_columns=OUTBOUND_EMAIL_LOG_EXPECTED_COLUMNS,
+    )
 
 
 def _render_markdown_table(rows: list[dict[str, Any]]) -> str:
@@ -232,8 +412,7 @@ def fetch_supabase_data(request: SupabaseDataRequest) -> SupabaseDataResult:
         request_url = f"{request_url}?{urlencode(query_pairs)}"
 
     headers = {
-        "apikey": supabase_key,
-        "Authorization": f"Bearer {supabase_key}",
+        **build_supabase_rest_auth_headers(supabase_key),
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Accept-Profile": schema,
@@ -339,8 +518,7 @@ def write_supabase_row(request: SupabaseRowWriteRequest) -> SupabaseRowWriteResu
         prefer_values.append("resolution=ignore-duplicates" if request.ignore_duplicates else "resolution=merge-duplicates")
 
     headers = {
-        "apikey": supabase_key,
-        "Authorization": f"Bearer {supabase_key}",
+        **build_supabase_rest_auth_headers(supabase_key),
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Accept-Profile": schema,
@@ -465,8 +643,7 @@ def fetch_supabase_schema_catalog(*, supabase_url: str, supabase_key: str, schem
         f"{normalized_url}/rest/v1/",
         method="GET",
         headers={
-            "apikey": normalized_key,
-            "Authorization": f"Bearer {normalized_key}",
+            **build_supabase_rest_auth_headers(normalized_key),
             "Accept": "application/openapi+json",
             "Accept-Profile": normalized_schema,
             "Content-Profile": normalized_schema,

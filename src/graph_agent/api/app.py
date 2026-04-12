@@ -71,6 +71,14 @@ class SupabaseRuntimeStatusRequest(BaseModel):
     graph_env_vars: Optional[dict[str, str]] = None
 
 
+class OutboundEmailLogTableValidationRequest(BaseModel):
+    supabase_url_env_var: str = "GRAPH_AGENT_SUPABASE_URL"
+    supabase_key_env_var: str = "GRAPH_AGENT_SUPABASE_SECRET_KEY"
+    schema_name: str = Field(default="public", alias="schema")
+    table_name: str = ""
+    graph_env_vars: Optional[dict[str, str]] = None
+
+
 class SupabaseAuthVerifyRequest(BaseModel):
     supabase_url: str
     supabase_key: str
@@ -300,6 +308,14 @@ def preview_supabase_schema(request: SupabaseSchemaPreviewRequest) -> dict[str, 
 def inspect_supabase_runtime(request: SupabaseRuntimeStatusRequest) -> dict[str, Any]:
     try:
         return manager.inspect_supabase_runtime(request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/editor/data/supabase/outbound-email-log/validate")
+def validate_outbound_email_log_table(request: OutboundEmailLogTableValidationRequest) -> dict[str, Any]:
+    try:
+        return manager.validate_outbound_email_log_table(request.model_dump(by_alias=True))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

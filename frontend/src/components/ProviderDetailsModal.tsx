@@ -14,6 +14,7 @@ import {
 } from "../lib/responseSchema";
 import { loadSessionSupabaseSchema, saveSessionSupabaseSchema } from "../lib/sessionSupabaseSchema";
 import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "../lib/spreadsheetMatrixPrompt";
+import { getSupabaseConnections, resolveSupabaseBinding } from "../lib/supabaseConnections";
 import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
 import { NodeDetailsForm } from "./NodeDetailsForm";
 import type {
@@ -269,7 +270,8 @@ export function ProviderDetailsModal({
   const providerConfigFields = provider?.config_fields ?? [];
   const isSupabaseDataNode = node.provider_id === "core.supabase_data";
   const isSupabaseRowWriteNode = node.provider_id === "core.supabase_row_write";
-  const isSupabaseCatalogNode = isSupabaseDataNode || isSupabaseRowWriteNode;
+  const isOutboundEmailLoggerNode = node.provider_id === "core.outbound_email_logger";
+  const isSupabaseCatalogNode = isSupabaseDataNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
   const displayedUserMessageTemplate =
     node.provider_id === "core.spreadsheet_matrix_decision" &&
     (!String(node.config.user_message_template ?? "").trim() ||
@@ -735,16 +737,23 @@ export function ProviderDetailsModal({
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
-  const supabaseUrlEnvVarName = String(node.config.supabase_url_env_var ?? "GRAPH_AGENT_SUPABASE_URL") || "GRAPH_AGENT_SUPABASE_URL";
-  const supabaseKeyEnvVarName =
-    String(node.config.supabase_key_env_var ?? "GRAPH_AGENT_SUPABASE_SECRET_KEY") || "GRAPH_AGENT_SUPABASE_SECRET_KEY";
+  const supabaseConnections = useMemo(() => getSupabaseConnections(graph), [graph]);
+  const resolvedSupabaseBinding = useMemo(
+    () => resolveSupabaseBinding(graph, node.config as Record<string, unknown>),
+    [graph, node.config],
+  );
+  const supabaseConnectionId = resolvedSupabaseBinding.connectionId;
+  const supabaseConnectionMissing = resolvedSupabaseBinding.missingConnection;
+  const supabaseUrlEnvVarName = resolvedSupabaseBinding.supabaseUrlEnvVar;
+  const supabaseKeyEnvVarName = resolvedSupabaseBinding.supabaseKeyEnvVar;
+  const supabaseSchemaCacheScope = `${supabaseConnectionId || `${supabaseUrlEnvVarName}:${supabaseKeyEnvVarName}`}:${String(node.config.schema ?? "public") || "public"}`;
   const localSupabaseUrlValue = normalizedGraphEnvValue(graph, supabaseUrlEnvVarName);
   const localSupabaseKeyValue = normalizedGraphEnvValue(graph, supabaseKeyEnvVarName);
-  const hasLocalSupabaseRuntimeValues = Boolean(localSupabaseUrlValue && localSupabaseKeyValue);
+  const hasLocalSupabaseRuntimeValues = Boolean(!supabaseConnectionMissing && localSupabaseUrlValue && localSupabaseKeyValue);
   const hasSupabaseSchemaMemory = Boolean((supabaseSchemaPreview?.sources.length ?? 0) > 0);
-  const isSupabaseRuntimeReady = hasLocalSupabaseRuntimeValues || supabaseRuntimeStatus?.ready === true;
+  const isSupabaseRuntimeReady = !supabaseConnectionMissing && (hasLocalSupabaseRuntimeValues || supabaseRuntimeStatus?.ready === true);
   const isSupabaseRuntimePending = isSupabaseCatalogNode && supabaseRuntimeStatus === null && isLoadingSupabaseRuntimeStatus;
-  const isSupabaseBrowserLocked = isSupabaseCatalogNode && !isSupabaseRuntimeReady && !hasSupabaseSchemaMemory;
+  const isSupabaseBrowserLocked = isSupabaseCatalogNode && (supabaseConnectionMissing || (!isSupabaseRuntimeReady && !hasSupabaseSchemaMemory));
 
   useEffect(() => {
     if (
@@ -760,7 +769,9 @@ export function ProviderDetailsModal({
   }, [activeTab, isLoadingSupabaseSchema, isSupabaseCatalogNode, isSupabaseRuntimeReady, supabaseSchemaPreview]);
 
   const filteredSupabaseSources = useMemo(() => {
-    const sources = (supabaseSchemaPreview?.sources ?? []).filter((source) => !isSupabaseRowWriteNode || source.source_kind === "table");
+    const sources = (supabaseSchemaPreview?.sources ?? []).filter(
+      (source) => !(isSupabaseRowWriteNode || isOutboundEmailLoggerNode) || source.source_kind === "table",
+    );
     const query = supabaseSourceSearch.trim().toLowerCase();
     if (!query) {
       return sources;
@@ -775,7 +786,7 @@ export function ProviderDetailsModal({
         .toLowerCase();
       return haystack.includes(query);
     });
-  }, [supabaseSchemaPreview, supabaseSourceSearch]);
+  }, [isOutboundEmailLoggerNode, isSupabaseRowWriteNode, supabaseSchemaPreview, supabaseSourceSearch]);
   const selectedSupabaseSource = useMemo<SupabaseSchemaSource | null>(() => {
     const availableSources = supabaseSchemaPreview?.sources ?? [];
     if (availableSources.length === 0) {
@@ -784,12 +795,12 @@ export function ProviderDetailsModal({
     if (selectedSupabaseSourceName) {
       return availableSources.find((source) => source.name === selectedSupabaseSourceName) ?? null;
     }
-    const configuredSourceName = String(isSupabaseRowWriteNode ? node.config.table_name ?? "" : node.config.source_name ?? "").trim();
+    const configuredSourceName = String((isSupabaseRowWriteNode || isOutboundEmailLoggerNode) ? node.config.table_name ?? "" : node.config.source_name ?? "").trim();
     if (configuredSourceName) {
       return availableSources.find((source) => source.name === configuredSourceName) ?? null;
     }
     return availableSources[0] ?? null;
-  }, [isSupabaseRowWriteNode, node.config.source_name, node.config.table_name, selectedSupabaseSourceName, supabaseSchemaPreview]);
+  }, [isOutboundEmailLoggerNode, isSupabaseRowWriteNode, node.config.source_name, node.config.table_name, selectedSupabaseSourceName, supabaseSchemaPreview]);
   const selectedSupabaseColumnNames = useMemo(() => {
     if (isSupabaseRowWriteNode) {
       return [];
@@ -809,12 +820,15 @@ export function ProviderDetailsModal({
       setSelectedSupabaseSourceName("");
       return;
     }
-    const cachedSchema = loadSessionSupabaseSchema(graph);
+    const cachedSchema = loadSessionSupabaseSchema(graph, {
+      connectionScope: supabaseSchemaCacheScope,
+      schemaName: String(node.config.schema ?? "public") || "public",
+    });
     if (cachedSchema) {
       setSupabaseSchemaPreview(cachedSchema);
     }
-    setSelectedSupabaseSourceName(String(isSupabaseRowWriteNode ? node.config.table_name ?? "" : node.config.source_name ?? "").trim());
-  }, [graph, isSupabaseCatalogNode, isSupabaseRowWriteNode, node.config.source_name, node.config.table_name]);
+    setSelectedSupabaseSourceName(String((isSupabaseRowWriteNode || isOutboundEmailLoggerNode) ? node.config.table_name ?? "" : node.config.source_name ?? "").trim());
+  }, [graph, isOutboundEmailLoggerNode, isSupabaseCatalogNode, isSupabaseRowWriteNode, node.config.schema, node.config.source_name, node.config.table_name, supabaseSchemaCacheScope]);
 
   useEffect(() => {
     if (!isSupabaseCatalogNode) {
@@ -822,33 +836,43 @@ export function ProviderDetailsModal({
     }
     setSupabaseRuntimeStatus(null);
     setSupabaseSchemaError(null);
-    const cachedSchema = loadSessionSupabaseSchema(graph);
+    const cachedSchema = loadSessionSupabaseSchema(graph, {
+      connectionScope: supabaseSchemaCacheScope,
+      schemaName: String(node.config.schema ?? "public") || "public",
+    });
     setSupabaseSchemaPreview(cachedSchema);
-  }, [graph, isSupabaseCatalogNode, graph.env_vars, supabaseKeyEnvVarName, supabaseUrlEnvVarName]);
+  }, [graph, isSupabaseCatalogNode, graph.env_vars, node.config.schema, supabaseKeyEnvVarName, supabaseSchemaCacheScope, supabaseUrlEnvVarName]);
 
   useEffect(() => {
     if (!isSupabaseCatalogNode || activeTab !== "config" || supabaseRuntimeStatus !== null || isLoadingSupabaseRuntimeStatus) {
       return;
     }
     void handleLoadSupabaseRuntimeStatus();
-  }, [activeTab, isLoadingSupabaseRuntimeStatus, isSupabaseCatalogNode, supabaseRuntimeStatus, supabaseKeyEnvVarName, supabaseUrlEnvVarName]);
+  }, [activeTab, isLoadingSupabaseRuntimeStatus, isSupabaseCatalogNode, supabaseConnectionId, supabaseConnectionMissing, supabaseRuntimeStatus, supabaseKeyEnvVarName, supabaseUrlEnvVarName]);
 
   async function handleLoadSupabaseSchema() {
     if (!isSupabaseCatalogNode || !isSupabaseRuntimeReady) {
+      return;
+    }
+    if (supabaseConnectionMissing) {
+      setSupabaseSchemaError(`Supabase connection "${supabaseConnectionId}" was not found.`);
       return;
     }
     setIsLoadingSupabaseSchema(true);
     setSupabaseSchemaError(null);
     try {
       const result = await previewSupabaseSchema({
-        supabase_url_env_var: String(resolvedPreviewConfig.supabase_url_env_var ?? "GRAPH_AGENT_SUPABASE_URL"),
-        supabase_key_env_var: String(resolvedPreviewConfig.supabase_key_env_var ?? "GRAPH_AGENT_SUPABASE_SECRET_KEY"),
+        supabase_url_env_var: supabaseUrlEnvVarName,
+        supabase_key_env_var: supabaseKeyEnvVarName,
         schema: String(resolvedPreviewConfig.schema ?? "public") || "public",
         graph_env_vars: getGraphEnvVars(graph),
       });
-      saveSessionSupabaseSchema(graph, result);
+      saveSessionSupabaseSchema(graph, result, {
+        connectionScope: supabaseSchemaCacheScope,
+        schemaName: result.schema,
+      });
       setSupabaseSchemaPreview(result);
-      const configuredSourceName = String(node.config.source_name ?? "").trim();
+      const configuredSourceName = String((isSupabaseRowWriteNode || isOutboundEmailLoggerNode) ? node.config.table_name ?? "" : node.config.source_name ?? "").trim();
       const firstSource = result.sources[0]?.name ?? "";
       setSelectedSupabaseSourceName(configuredSourceName || firstSource);
     } catch (error) {
@@ -861,6 +885,18 @@ export function ProviderDetailsModal({
 
   async function handleLoadSupabaseRuntimeStatus() {
     if (!isSupabaseCatalogNode) {
+      return;
+    }
+    if (supabaseConnectionMissing) {
+      setSupabaseRuntimeStatus({
+        supabase_url_env_var: "",
+        supabase_key_env_var: "",
+        supabase_url_env_present: false,
+        supabase_key_env_present: false,
+        missing_env_vars: supabaseConnectionId ? [supabaseConnectionId] : [],
+        ready: false,
+      });
+      setSupabaseSchemaError(`Supabase connection "${supabaseConnectionId}" was not found.`);
       return;
     }
     if (hasLocalSupabaseRuntimeValues) {
@@ -903,7 +939,7 @@ export function ProviderDetailsModal({
         ...currentNode,
         config: {
           ...currentNode.config,
-          ...(isSupabaseRowWriteNode
+          ...((isSupabaseRowWriteNode || isOutboundEmailLoggerNode)
             ? {
                 table_name: source.name,
               }
@@ -1128,7 +1164,7 @@ export function ProviderDetailsModal({
                     </div>
                   )}
                   </section>
-                  {isSupabaseDataNode ? (
+                  {isSupabaseCatalogNode ? (
                     <section className="provider-details-status-card">
                       <div className="provider-details-status-card-header">
                         <strong>Runtime Inputs</strong>
@@ -1136,9 +1172,11 @@ export function ProviderDetailsModal({
                       </div>
                       <div className="tool-details-modal-help">
                         <div>
-                          {isSupabaseRuntimeReady
-                            ? "This node is using the verified Supabase credentials saved from the hero Environment section."
-                            : "Set the Supabase runtime values from the hero Environment section's Supabase button before using the schema browser."}
+                          {supabaseConnectionMissing
+                            ? `This node points at a missing Supabase connection (${supabaseConnectionId}).`
+                            : resolvedSupabaseBinding.isNamedConnection
+                              ? `This node is using the named Supabase connection "${resolvedSupabaseBinding.connectionName}".`
+                              : "This node is in compatibility mode and still reads its raw Supabase env-var names directly."}
                         </div>
                         <div>
                           URL env var: <code>{supabaseUrlEnvVarName}</code>
@@ -1148,6 +1186,7 @@ export function ProviderDetailsModal({
                           Key env var: <code>{supabaseKeyEnvVarName}</code>
                           {supabaseRuntimeStatus ? ` (${supabaseRuntimeStatus.supabase_key_env_present ? "present" : "missing"})` : ""}
                         </div>
+                        {resolvedSupabaseBinding.isNamedConnection ? <div>Connection: <code>{resolvedSupabaseBinding.connectionName}</code></div> : null}
                         <div>Schema: <code>{String(node.config.schema ?? "public")}</code></div>
                         <div>Select: <code>{String(node.config.select ?? "*") || "*"}</code></div>
                         {supabaseRuntimeStatus?.missing_env_vars.length ? (
@@ -1542,12 +1581,55 @@ export function ProviderDetailsModal({
             {activeTab === "config" ? (
               <div className="modal-folder-section provider-details-config-layout">
                 {isSupabaseCatalogNode ? (
-                  <section className="provider-details-schema-browser">
+                  <>
+                    <section className="provider-details-status-card">
+                      <div className="provider-details-status-card-header">
+                        <strong>Supabase Connection</strong>
+                        <span>{resolvedSupabaseBinding.isNamedConnection ? "Named" : "Compatibility"}</span>
+                      </div>
+                      <div className="tool-details-modal-help">
+                        <label>
+                          Connection target
+                          <select
+                            value={String(node.config.supabase_connection_id ?? "")}
+                            onChange={(event) =>
+                              onGraphChange(
+                                updateModelNode(graph, node.id, (currentNode) => {
+                                  const nextConfig = { ...currentNode.config };
+                                  if (event.target.value) {
+                                    nextConfig.supabase_connection_id = event.target.value;
+                                  } else {
+                                    delete nextConfig.supabase_connection_id;
+                                  }
+                                  return { ...currentNode, config: nextConfig };
+                                }),
+                              )
+                            }
+                          >
+                            <option value="">Compatibility mode (raw env vars)</option>
+                            {supabaseConnections.map((connection) => (
+                              <option key={connection.connection_id} value={connection.connection_id}>
+                                {connection.name}{connection.isImplicit ? " (legacy)" : ""}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <div>
+                          {resolvedSupabaseBinding.isNamedConnection
+                            ? "Named connections are managed from the Environment panel and keep node bindings stable when credentials change."
+                            : "Compatibility mode preserves the node's existing raw Supabase env-var names without forcing a migration."}
+                        </div>
+                        {supabaseConnectionMissing ? <div>Missing connection id: <code>{supabaseConnectionId}</code></div> : null}
+                      </div>
+                    </section>
+                    <section className="provider-details-schema-browser">
                     {isSupabaseBrowserLocked ? (
                       <div className="tool-details-modal-help provider-details-schema-lock-banner">
-                        <strong>Supabase access is locked until the graph has verified Supabase auth.</strong>
+                        <strong>Supabase access is locked until this node resolves a usable Supabase connection.</strong>
                         <div>
-                          Open the Environment section's Supabase button, save and verify the connection, then come back here to browse tables and columns.
+                          {supabaseConnectionMissing
+                            ? "Pick an existing Supabase connection or switch back to compatibility mode."
+                            : "Open the Environment section's Supabase Connections manager, save the connection values, then come back here to browse tables and columns."}
                           {isSupabaseRuntimePending ? " Checking the runtime status now." : ""}
                         </div>
                         <div>
@@ -1592,7 +1674,7 @@ export function ProviderDetailsModal({
                         <span>Schema: {String(resolvedPreviewConfig.schema ?? "public") || "public"}</span>
                       </div>
                     </div>
-                    {supabaseSchemaError ? <p className="error-text">{supabaseSchemaError}</p> : null}
+                      {supabaseSchemaError ? <p className="error-text">{supabaseSchemaError}</p> : null}
                     <div className="provider-details-schema-browser-layout">
                       <div className="provider-details-schema-source-list">
                         {filteredSupabaseSources.length > 0 ? (
@@ -1632,14 +1714,14 @@ export function ProviderDetailsModal({
                                   onClick={() =>
                                     applySupabaseSourceSelection(
                                       selectedSupabaseSource,
-                                      isSupabaseRowWriteNode ? undefined : selectedSupabaseColumnNames,
+                                      (isSupabaseRowWriteNode || isOutboundEmailLoggerNode) ? undefined : selectedSupabaseColumnNames,
                                     )
                                   }
                                   disabled={isSupabaseBrowserLocked}
                                 >
-                                  {isSupabaseRowWriteNode ? "Use Table" : "Apply Selection"}
+                                  {isSupabaseRowWriteNode || isOutboundEmailLoggerNode ? "Use Table" : "Apply Selection"}
                                 </button>
-                                {!isSupabaseRowWriteNode ? (
+                                {!isSupabaseRowWriteNode && !isOutboundEmailLoggerNode ? (
                                   <button
                                     type="button"
                                     className="secondary-button"
@@ -1659,7 +1741,7 @@ export function ProviderDetailsModal({
                                 const checked = selectedSupabaseColumnNames.includes(column.name);
                                 return (
                                   <label key={column.name} className="provider-details-schema-column-row">
-                                    {!isSupabaseRowWriteNode ? (
+                                    {!isSupabaseRowWriteNode && !isOutboundEmailLoggerNode ? (
                                       <input
                                         type="checkbox"
                                         checked={checked}
@@ -1684,7 +1766,8 @@ export function ProviderDetailsModal({
                         )}
                       </div>
                     </div>
-                  </section>
+                    </section>
+                  </>
                 ) : null}
                 <div className="provider-details-grid">
                   {isModelNode ? (
@@ -1805,6 +1888,13 @@ export function ProviderDetailsModal({
                     <div>Use the schema browser above to choose a destination table, then build the row with <code>base_row_json_path</code> and <code>column_values_json</code>.</div>
                     <div>Set a column spec to <code>{"{\"mode\":\"default\"}"}</code> to omit that column so the database default can apply.</div>
                     <div>Use <code>{"{\"mode\":\"path\",\"path\":\"customer.email\"}"}</code> for runtime values and <code>{"{\"mode\":\"literal\",\"value\":\"pending\"}"}</code> for fixed values.</div>
+                  </div>
+                ) : isOutboundEmailLoggerNode ? (
+                  <div className="tool-details-modal-help">
+                    <strong>Outbound email logger notes</strong>
+                    <div>Connect this node with a binding edge into an Outlook Draft End node to validate the target table and log each created draft.</div>
+                    <div>Choose the destination table from the schema browser above, then set <code>message_type</code>, <code>outreach_step</code>, and <code>sales_approach</code>.</div>
+                    <div>Use <code>metadata_json</code> for any extra campaign or sequencing fields you want merged into the stored metadata object.</div>
                   </div>
                 ) : null}
 

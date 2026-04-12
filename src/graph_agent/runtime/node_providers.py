@@ -55,6 +55,8 @@ class NodeProviderDefinition:
     node_kind: str
     description: str
     capabilities: list[str] = field(default_factory=list)
+    produces_side_effects: bool = False
+    preserves_input_payload: bool = False
     model_provider_name: str | None = None
     default_config: dict[str, Any] = field(default_factory=dict)
     config_fields: list[ProviderConfigFieldDefinition] = field(default_factory=list)

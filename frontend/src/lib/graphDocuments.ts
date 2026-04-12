@@ -47,6 +47,8 @@ export function getCanvasGraph(
     graph_type: "graph",
     start_node_id: agent.start_node_id,
     env_vars: mergeEnvVars(graph.env_vars, agent.env_vars),
+    supabase_connections: graph.supabase_connections,
+    default_supabase_connection_id: graph.default_supabase_connection_id,
     nodes: agent.nodes,
     edges: agent.edges,
     node_providers: graph.node_providers,

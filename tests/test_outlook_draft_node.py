@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -47,7 +49,11 @@ class FakeOutlookDraftClient:
             web_link="https://outlook.office.com/mail/draft-123",
             created_at="2026-04-10T12:00:00Z",
             last_modified_at="2026-04-10T12:00:00Z",
-            raw_response={"id": "draft-123"},
+            raw_response={
+                "id": "draft-123",
+                "conversationId": "conversation-123",
+                "internetMessageId": "internet-message-123",
+            },
         )
 
 
@@ -90,6 +96,8 @@ class _OutlookDraftStubHandler(BaseHTTPRequestHandler):
             {
                 "id": "draft-http-1",
                 "subject": payload.get("subject", ""),
+                "conversationId": "conversation-http-1",
+                "internetMessageId": "internet-http-1",
                 "webLink": "https://outlook.office.com/mail/draft-http-1",
                 "createdDateTime": "2026-04-10T14:00:00Z",
                 "lastModifiedDateTime": "2026-04-10T14:00:00Z",
@@ -109,6 +117,113 @@ class OutlookHttpStubServer:
     def __enter__(self) -> str:
         _OutlookDraftStubHandler.requests = []
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _OutlookDraftStubHandler)
+        self._thread = Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        host, port = self._server.server_address
+        return f"http://{host}:{port}"
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
+
+
+class _SupabaseEmailLogStubHandler(BaseHTTPRequestHandler):
+    last_headers: dict[str, str] = {}
+    last_path: str = ""
+    last_json_body: object | None = None
+
+    def do_GET(self) -> None:  # noqa: N802
+        type(self).last_headers = {str(key).lower(): str(value) for key, value in self.headers.items()}
+        type(self).last_path = self.path
+        if self.path == "/rest/v1/":
+            payload = {
+                "openapi": "3.0.0",
+                "paths": {
+                    "/outbound_email_messages": {
+                        "get": {
+                            "summary": "Outbound email messages",
+                            "responses": {
+                                "200": {
+                                    "content": {
+                                        "application/json": {
+                                            "schema": {
+                                                "type": "array",
+                                                "items": {"$ref": "#/components/schemas/outbound_email_messages"},
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    }
+                },
+                "components": {
+                    "schemas": {
+                        "outbound_email_messages": {
+                            "type": "object",
+                            "properties": {
+                                "provider": {"type": "string"},
+                                "mailbox_account": {"type": "string"},
+                                "recipient_email": {"type": "string"},
+                                "subject": {"type": "string"},
+                                "body_text": {"type": "string"},
+                                "message_type": {"type": "string"},
+                                "outreach_step": {"type": "integer"},
+                                "sales_approach": {"type": "string"},
+                                "sales_approach_version": {"type": "string", "nullable": True},
+                                "parent_outbound_email_id": {"type": "string", "nullable": True},
+                                "root_outbound_email_id": {"type": "string", "nullable": True},
+                                "provider_draft_id": {"type": "string"},
+                                "provider_message_id": {"type": "string"},
+                                "internet_message_id": {"type": "string"},
+                                "conversation_id": {"type": "string"},
+                                "drafted_at": {"type": "string"},
+                                "observed_sent_at": {"type": "string", "nullable": True},
+                                "metadata": {"type": "object"},
+                                "raw_provider_payload": {"type": "object"},
+                            },
+                        }
+                    }
+                },
+            }
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        type(self).last_headers = {str(key).lower(): str(value) for key, value in self.headers.items()}
+        type(self).last_path = self.path
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        raw_body = self.rfile.read(content_length).decode("utf-8")
+        type(self).last_json_body = json.loads(raw_body or "{}")
+        if self.path == "/rest/v1/outbound_email_messages":
+            body = json.dumps(type(self).last_json_body).encode("utf-8")
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+        return
+
+
+class SupabaseEmailLogStubServer:
+    def __enter__(self) -> str:
+        _SupabaseEmailLogStubHandler.last_headers = {}
+        _SupabaseEmailLogStubHandler.last_path = ""
+        _SupabaseEmailLogStubHandler.last_json_body = None
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _SupabaseEmailLogStubHandler)
         self._thread = Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         host, port = self._server.server_address
@@ -171,6 +286,50 @@ def build_outlook_draft_graph_payload() -> dict[str, object]:
     }
 
 
+def build_outlook_draft_graph_with_logger_payload() -> dict[str, object]:
+    payload = build_outlook_draft_graph_payload()
+    nodes = list(payload["nodes"])
+    edges = list(payload["edges"])
+    nodes.append(
+        {
+            "id": "logger",
+            "kind": "data",
+            "category": "data",
+            "label": "Outbound Email Logger",
+            "provider_id": "core.outbound_email_logger",
+            "provider_label": "Outbound Email Logger",
+            "description": "",
+            "position": {"x": 280, "y": 140},
+            "config": {
+                "mode": "outbound_email_logger",
+                "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_URL",
+                "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_SECRET_KEY",
+                "schema": "public",
+                "table_name": "outbound_email_messages",
+                "message_type": "initial",
+                "outreach_step": 0,
+                "sales_approach": "warm intro",
+                "sales_approach_version": "v1",
+                "metadata_json": "{\"campaign\":\"spring-launch\",\"run_id\":\"{run_id}\"}",
+            },
+        }
+    )
+    edges.append(
+        {
+            "id": "edge-logger-draft",
+            "source_id": "logger",
+            "target_id": "draft",
+            "label": "email log",
+            "kind": "binding",
+            "priority": 0,
+            "condition": None,
+        }
+    )
+    payload["nodes"] = nodes
+    payload["edges"] = edges
+    return payload
+
+
 class OutlookDraftNodeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.services = build_example_services()
@@ -178,6 +337,7 @@ class OutlookDraftNodeTests(unittest.TestCase):
     def test_catalog_includes_outlook_draft_provider(self) -> None:
         provider_ids = {provider.provider_id for provider in self.services.node_provider_registry.list_definitions()}
         self.assertIn("end.outlook_draft", provider_ids)
+        self.assertIn("core.outbound_email_logger", provider_ids)
 
     def test_outlook_draft_node_uses_connected_microsoft_account(self) -> None:
         fake_client = FakeOutlookDraftClient()
@@ -324,6 +484,59 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertEqual(request["body"]["subject"], "Quarterly update")
         self.assertEqual(request["body"]["body"]["contentType"], "Text")
         self.assertEqual(request["body"]["body"]["content"], "Please review the attached progress summary.")
+
+    def test_outlook_draft_node_logs_outbound_email_row_when_logger_is_bound(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph = GraphDefinition.from_dict(build_outlook_draft_graph_with_logger_payload())
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        with SupabaseEmailLogStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_SUPABASE_URL": base_url,
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+            },
+            clear=False,
+        ):
+            state = runtime.run(graph, "Draft this exact email body.", run_id="run-outlook-log")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(_SupabaseEmailLogStubHandler.last_path, "/rest/v1/outbound_email_messages")
+        self.assertEqual(_SupabaseEmailLogStubHandler.last_headers.get("apikey"), "service-role-key")
+        self.assertEqual(_SupabaseEmailLogStubHandler.last_headers.get("authorization"), "Bearer service-role-key")
+        self.assertEqual(_SupabaseEmailLogStubHandler.last_headers.get("accept-profile"), "public")
+        self.assertIsInstance(_SupabaseEmailLogStubHandler.last_json_body, dict)
+        row = _SupabaseEmailLogStubHandler.last_json_body
+        assert isinstance(row, dict)
+        self.assertEqual(row["provider"], "outlook")
+        self.assertEqual(row["mailbox_account"], "morgan@example.com")
+        self.assertEqual(row["recipient_email"], "alex@example.com")
+        self.assertEqual(row["subject"], "Follow-up for outlook-draft-agent")
+        self.assertEqual(row["body_text"], "Draft this exact email body.")
+        self.assertEqual(row["message_type"], "initial")
+        self.assertEqual(row["outreach_step"], 0)
+        self.assertEqual(row["sales_approach"], "warm intro")
+        self.assertEqual(row["sales_approach_version"], "v1")
+        self.assertEqual(row["provider_draft_id"], "draft-123")
+        self.assertEqual(row["provider_message_id"], "draft-123")
+        self.assertEqual(row["internet_message_id"], "internet-message-123")
+        self.assertEqual(row["conversation_id"], "conversation-123")
+        self.assertEqual(row["drafted_at"], "2026-04-10T12:00:00Z")
+        self.assertEqual(row["metadata"]["campaign"], "spring-launch")
+        self.assertEqual(row["metadata"]["run_id"], "run-outlook-log")
+        self.assertEqual(row["metadata"]["logger_node_id"], "logger")
+        self.assertEqual(row["raw_provider_payload"]["conversationId"], "conversation-123")
+        self.assertEqual(state.final_output["outbound_email_log"]["table_name"], "outbound_email_messages")
+        self.assertTrue(state.node_outputs["draft"]["outbound_email_log"])
 
 
 if __name__ == "__main__":

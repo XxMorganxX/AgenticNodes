@@ -5,6 +5,7 @@ import type {
   McpServerStatus,
   McpServerTestResult,
   MicrosoftAuthStatus,
+  OutboundEmailLogTableValidationResult,
   ProjectFile,
   ProviderDiagnosticsResult,
   ProviderPreflightResult,
@@ -256,6 +257,26 @@ export async function inspectSupabaseRuntimeStatus(config: {
     throw new Error(await readFetchErrorMessage(response, "Failed to inspect Supabase runtime environment."));
   }
   return (await response.json()) as SupabaseRuntimeStatusResult;
+}
+
+export async function validateOutboundEmailLogTable(config: {
+  supabase_url_env_var: string;
+  supabase_key_env_var: string;
+  schema: string;
+  table_name: string;
+  graph_env_vars?: Record<string, string>;
+}): Promise<OutboundEmailLogTableValidationResult> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/data/supabase/outbound-email-log/validate`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to validate the outbound email log table."));
+  }
+  return (await response.json()) as OutboundEmailLogTableValidationResult;
 }
 
 export async function verifySupabaseAuth(config: {

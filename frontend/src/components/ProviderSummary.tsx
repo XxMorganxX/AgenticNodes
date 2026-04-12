@@ -72,6 +72,10 @@ function compactDescription(description: string): string {
   return sentence.length > 0 ? sentence : description;
 }
 
+function isPassThroughSideEffect(provider: NodeProviderDefinition): boolean {
+  return provider.produces_side_effects === true && provider.preserves_input_payload === true;
+}
+
 function groupProviders(providers: NodeProviderDefinition[]): Array<[string, NodeProviderDefinition[]]> {
   const grouped = new Map<string, NodeProviderDefinition[]>();
 
@@ -115,6 +119,8 @@ export function ProviderSummary({
           provider.node_kind,
           provider.description,
           provider.capabilities.join(" "),
+          provider.produces_side_effects ? "side effect" : "",
+          provider.preserves_input_payload ? "pass through passthrough unchanged input" : "",
         ]
           .join(" ")
           .toLowerCase();
@@ -148,6 +154,8 @@ export function ProviderSummary({
       item.provider.provider_id,
       item.provider.description,
       item.provider.capabilities.join(" "),
+      item.provider.produces_side_effects ? "side effect" : "",
+      item.provider.preserves_input_payload ? "pass through passthrough unchanged input" : "",
     ]
       .join(" ")
       .toLowerCase();
@@ -360,6 +368,7 @@ export function ProviderSummary({
               <div className={`provider-list${variant === "drawer" ? " provider-list--tiles" : ""}`}>
                 {categoryProviders.map((provider) => {
                   const isHotbarFavorite = hotbarFavorites[provider.category] === provider.provider_id;
+                  const showPassThroughNote = isPassThroughSideEffect(provider);
                   return (
                     <section
                       key={provider.provider_id}
@@ -415,6 +424,12 @@ export function ProviderSummary({
                             <strong>{provider.display_name}</strong>
                           </div>
                           <p>{compactDescription(provider.description)}.</p>
+                          {showPassThroughNote ? (
+                            <div className="provider-behavior-note">
+                              <span className="provider-behavior-badge">Pass-through effect</span>
+                              <span>Acts on the payload and forwards it unchanged.</span>
+                            </div>
+                          ) : null}
                           {onProviderClick ? (
                             <div className="provider-action-hint">
                               {isHotbarFavorite ? "Pinned to hotbar. Add or drag" : "Add or drag"}
@@ -433,6 +448,12 @@ export function ProviderSummary({
                             <strong>{provider.display_name}</strong>
                           </div>
                           <p>{provider.description}</p>
+                          {showPassThroughNote ? (
+                            <div className="provider-behavior-note">
+                              <span className="provider-behavior-badge">Pass-through effect</span>
+                              <span>Acts on the payload and forwards it unchanged.</span>
+                            </div>
+                          ) : null}
                           <div className="provider-meta">
                             <span>Kind: {provider.node_kind}</span>
                           </div>

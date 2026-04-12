@@ -50,6 +50,11 @@ import {
   persistedGraphEnvStorageKey,
   savePersistedGraphEnvVars,
 } from "./lib/persistedGraphEnv";
+import {
+  clearPersistedSupabaseConnectionState,
+  loadPersistedSupabaseConnectionState,
+  savePersistedSupabaseConnectionState,
+} from "./lib/persistedSupabaseConnections";
 import { clearSessionSupabaseSchema } from "./lib/sessionSupabaseSchema";
 import { clearAllPersistedRunSnapshots, clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
 import type { PersistedRunSnapshot } from "./lib/runSnapshots";
@@ -619,6 +624,18 @@ function applyPersistedEnvVars(graph: GraphDocument, storageKey: string | null |
   };
 }
 
+function applyPersistedSupabaseConnectionState(graph: GraphDocument, storageKey: string | null | undefined): GraphDocument {
+  const persistedState = loadPersistedSupabaseConnectionState(storageKey);
+  if (!persistedState) {
+    return graph;
+  }
+  return {
+    ...graph,
+    supabase_connections: persistedState.supabase_connections,
+    default_supabase_connection_id: persistedState.default_supabase_connection_id,
+  };
+}
+
 function mergeCatalogServerStatus(catalog: EditorCatalog | null, serverStatus: McpServerStatus): EditorCatalog | null {
   if (!catalog) {
     return catalog;
@@ -826,7 +843,10 @@ export default function App() {
   }, []);
 
   const hydrateSelectedGraph = useCallback((graph: GraphDocument) => {
-    const nextGraph = applyPersistedEnvVars(normalizeGraphDocument(graph), graph.graph_id);
+    const nextGraph = applyPersistedSupabaseConnectionState(
+      applyPersistedEnvVars(normalizeGraphDocument(graph), graph.graph_id),
+      graph.graph_id,
+    );
     resetHistory(nextGraph);
     setSavedGraphSnapshot(serializeGraphSnapshot(nextGraph));
     const nextInput = getSavedInputPrompt(nextGraph);
@@ -1130,7 +1150,10 @@ export default function App() {
           }
           setSelectedGraphId(defaultGraphId);
         } else {
-          const blankGraph = applyPersistedEnvVars(createBlankGraph(), draftGraphEnvStorageKey());
+          const blankGraph = applyPersistedSupabaseConnectionState(
+            applyPersistedEnvVars(createBlankGraph(), draftGraphEnvStorageKey()),
+            draftGraphEnvStorageKey(),
+          );
           resetHistory(blankGraph);
           setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
           setInput(DEFAULT_INPUT);
@@ -1212,6 +1235,19 @@ export default function App() {
       Object.fromEntries(Object.entries(draftGraph.env_vars).map(([key, value]) => [key, String(value ?? "")])),
     );
   }, [draftGraph?.env_vars, draftGraph?.graph_id, selectedGraphId]);
+
+  useEffect(() => {
+    if (!draftGraph) {
+      return;
+    }
+    savePersistedSupabaseConnectionState(
+      persistedGraphEnvStorageKey(draftGraph.graph_id, selectedGraphId),
+      {
+        supabase_connections: draftGraph.supabase_connections ?? [],
+        default_supabase_connection_id: draftGraph.default_supabase_connection_id ?? "",
+      },
+    );
+  }, [draftGraph, draftGraph?.default_supabase_connection_id, draftGraph?.supabase_connections, selectedGraphId]);
 
   useEffect(() => {
     setSelectedNodeId(null);
@@ -1309,6 +1345,11 @@ export default function App() {
           savePersistedGraphEnvVars(savedGraph.graph_id, draftEnvVars);
           clearPersistedGraphEnvVars(draftStorageKey);
         }
+        const draftSupabaseState = loadPersistedSupabaseConnectionState(draftStorageKey);
+        if (draftSupabaseState) {
+          savePersistedSupabaseConnectionState(savedGraph.graph_id, draftSupabaseState);
+          clearPersistedSupabaseConnectionState(draftStorageKey);
+        }
       }
       await refreshGraphs(savedGraph.graph_id);
       setSavedGraphSnapshot(serializeGraphSnapshot(savedGraph));
@@ -1342,6 +1383,7 @@ export default function App() {
 
   function handleCreateGraph() {
     clearPersistedGraphEnvVars(draftGraphEnvStorageKey());
+    clearPersistedSupabaseConnectionState(draftGraphEnvStorageKey());
     clearSessionSupabaseSchema({ graph_id: draftGraphEnvStorageKey() });
     const blankGraph = createBlankGraph();
     clearLiveRunState();
@@ -1365,6 +1407,7 @@ export default function App() {
       cancelPersistedRunSnapshot(selectedGraphId);
       clearPersistedRunSnapshot(selectedGraphId);
       clearPersistedGraphEnvVars(selectedGraphId);
+      clearPersistedSupabaseConnectionState(selectedGraphId);
       clearSessionSupabaseSchema({ graph_id: selectedGraphId });
       await deleteGraph(selectedGraphId);
       const loadedGraphs = await fetchGraphs();

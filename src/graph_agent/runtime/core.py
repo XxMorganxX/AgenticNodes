@@ -53,9 +53,11 @@ from graph_agent.runtime.runtime_normalizer import (
 from graph_agent.runtime.supabase_data import (
     SupabaseDataError,
     SupabaseDataRequest,
+    fetch_supabase_schema_catalog,
     fetch_supabase_data,
-    write_supabase_row,
     SupabaseRowWriteRequest,
+    validate_outbound_email_log_schema,
+    write_supabase_row,
 )
 from graph_agent.runtime.node_providers import (
     NodeCategory,
@@ -63,7 +65,7 @@ from graph_agent.runtime.node_providers import (
     get_category_contract,
     is_valid_category_connection,
 )
-from graph_agent.runtime.microsoft_auth import MicrosoftAuthService
+from graph_agent.runtime.microsoft_auth import MicrosoftAuthService, MicrosoftAuthStatus
 from graph_agent.runtime.run_documents import normalize_run_documents
 from graph_agent.runtime.spreadsheets import (
     SPREADSHEET_FIRST_DATA_ROW_INDEX,
@@ -105,6 +107,8 @@ SUPABASE_DATA_PROVIDER_ID = "core.supabase_data"
 SUPABASE_DATA_MODE = "supabase_data"
 SUPABASE_ROW_WRITE_PROVIDER_ID = "core.supabase_row_write"
 SUPABASE_ROW_WRITE_MODE = "supabase_row_write"
+OUTBOUND_EMAIL_LOGGER_PROVIDER_ID = "core.outbound_email_logger"
+OUTBOUND_EMAIL_LOGGER_MODE = "outbound_email_logger"
 SPREADSHEET_MATRIX_DECISION_MODE = "spreadsheet_matrix_decision"
 CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body"
 CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if"
@@ -482,10 +486,65 @@ DEFAULT_GRAPH_ENV_VARS = {
     "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
     "DISCORD_BOT_TOKEN": "DISCORD_BOT_TOKEN",
 }
+DEFAULT_SUPABASE_URL_ENV_VAR = "GRAPH_AGENT_SUPABASE_URL"
+DEFAULT_SUPABASE_KEY_ENV_VAR = "GRAPH_AGENT_SUPABASE_SECRET_KEY"
+DEFAULT_SUPABASE_PROJECT_REF_ENV_VAR = "SUPABASE_PROJECT_REF"
+DEFAULT_SUPABASE_ACCESS_TOKEN_ENV_VAR = "SUPABASE_ACCESS_TOKEN"
 
 GRAPH_ENV_REFERENCE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 CONTEXT_BUILDER_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 CONTEXT_BUILDER_SLUG_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
+
+
+@dataclass(frozen=True)
+class SupabaseConnectionDefinition:
+    connection_id: str
+    name: str
+    supabase_url_env_var: str = DEFAULT_SUPABASE_URL_ENV_VAR
+    supabase_key_env_var: str = DEFAULT_SUPABASE_KEY_ENV_VAR
+    project_ref_env_var: str = DEFAULT_SUPABASE_PROJECT_REF_ENV_VAR
+    access_token_env_var: str = DEFAULT_SUPABASE_ACCESS_TOKEN_ENV_VAR
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> SupabaseConnectionDefinition | None:
+        connection_id = str(payload.get("connection_id", "") or "").strip()
+        name = str(payload.get("name", "") or "").strip()
+        if not connection_id or not name:
+            return None
+        return cls(
+            connection_id=connection_id,
+            name=name,
+            supabase_url_env_var=str(payload.get("supabase_url_env_var", DEFAULT_SUPABASE_URL_ENV_VAR) or DEFAULT_SUPABASE_URL_ENV_VAR).strip() or DEFAULT_SUPABASE_URL_ENV_VAR,
+            supabase_key_env_var=str(payload.get("supabase_key_env_var", DEFAULT_SUPABASE_KEY_ENV_VAR) or DEFAULT_SUPABASE_KEY_ENV_VAR).strip() or DEFAULT_SUPABASE_KEY_ENV_VAR,
+            project_ref_env_var=str(payload.get("project_ref_env_var", DEFAULT_SUPABASE_PROJECT_REF_ENV_VAR) or DEFAULT_SUPABASE_PROJECT_REF_ENV_VAR).strip() or DEFAULT_SUPABASE_PROJECT_REF_ENV_VAR,
+            access_token_env_var=str(payload.get("access_token_env_var", DEFAULT_SUPABASE_ACCESS_TOKEN_ENV_VAR) or DEFAULT_SUPABASE_ACCESS_TOKEN_ENV_VAR).strip() or DEFAULT_SUPABASE_ACCESS_TOKEN_ENV_VAR,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "connection_id": self.connection_id,
+            "name": self.name,
+            "supabase_url_env_var": self.supabase_url_env_var,
+            "supabase_key_env_var": self.supabase_key_env_var,
+            "project_ref_env_var": self.project_ref_env_var,
+            "access_token_env_var": self.access_token_env_var,
+        }
+
+
+def _normalize_supabase_connections(payload: Any) -> list[SupabaseConnectionDefinition]:
+    if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes, bytearray)):
+        return []
+    connections: list[SupabaseConnectionDefinition] = []
+    seen_ids: set[str] = set()
+    for raw_item in payload:
+        if not isinstance(raw_item, Mapping):
+            continue
+        connection = SupabaseConnectionDefinition.from_dict(raw_item)
+        if connection is None or connection.connection_id in seen_ids:
+            continue
+        seen_ids.add(connection.connection_id)
+        connections.append(connection)
+    return connections
 
 
 def _normalize_graph_env_vars(payload: Mapping[str, Any] | None) -> dict[str, str]:
@@ -566,6 +625,26 @@ def resolve_graph_process_env(value: str, env_vars: Mapping[str, str]) -> str:
     if graph_value and graph_value != env_var_name:
         return graph_value
     return ""
+
+
+def resolve_supabase_runtime_env_var_names(
+    config: Mapping[str, Any],
+    graph: GraphDefinition,
+) -> tuple[str, str]:
+    connection_id = str(config.get("supabase_connection_id", "") or "").strip()
+    if connection_id:
+        connection = graph.get_supabase_connection(connection_id)
+        if connection is None:
+            raise SupabaseDataError(
+                f"Supabase connection '{connection_id}' was not found.",
+                error_type="missing_supabase_connection",
+                details={"connection_id": connection_id},
+            )
+        return connection.supabase_url_env_var, connection.supabase_key_env_var
+    return (
+        str(config.get("supabase_url_env_var", DEFAULT_SUPABASE_URL_ENV_VAR) or DEFAULT_SUPABASE_URL_ENV_VAR).strip() or DEFAULT_SUPABASE_URL_ENV_VAR,
+        str(config.get("supabase_key_env_var", DEFAULT_SUPABASE_KEY_ENV_VAR) or DEFAULT_SUPABASE_KEY_ENV_VAR).strip() or DEFAULT_SUPABASE_KEY_ENV_VAR,
+    )
 
 
 class ResolvedConfigMapping(MappingABC[str, Any]):
@@ -1555,6 +1634,22 @@ def _incoming_edges_are_all_binding(graph: Any, node_id: str) -> bool:
     return all(edge.kind == "binding" for edge in edges)
 
 
+@dataclass(frozen=True)
+class OutboundEmailLoggerBinding:
+    node_id: str
+    schema: str
+    table_name: str
+    supabase_url: str
+    supabase_key: str
+    message_type: str
+    outreach_step: int
+    sales_approach_template: str
+    sales_approach_version_template: str
+    parent_outbound_email_id_template: str
+    root_outbound_email_id_template: str
+    metadata_json_template: str
+
+
 class InputNode(BaseNode):
     kind = "input"
 
@@ -2414,13 +2509,14 @@ class DataNode(BaseNode):
                 "Supabase rpc_params_json must be valid JSON.",
                 error_type="invalid_supabase_rpc_params",
             ) from exc
+        supabase_url_env_var, supabase_key_env_var = resolve_supabase_runtime_env_var_names(resolved, context.graph)
         return SupabaseDataRequest(
             supabase_url=resolve_graph_process_env(
-                str(resolved.get("supabase_url_env_var", "GRAPH_AGENT_SUPABASE_URL") or "GRAPH_AGENT_SUPABASE_URL"),
+                supabase_url_env_var,
                 context.graph.env_vars,
             ),
             supabase_key=resolve_graph_process_env(
-                str(resolved.get("supabase_key_env_var", "GRAPH_AGENT_SUPABASE_SECRET_KEY") or "GRAPH_AGENT_SUPABASE_SECRET_KEY"),
+                supabase_key_env_var,
                 context.graph.env_vars,
             ),
             schema=str(resolved.get("schema", "public") or "public").strip() or "public",
@@ -2556,14 +2652,15 @@ class DataNode(BaseNode):
     def _supabase_row_write_request(self, context: NodeContext) -> tuple[SupabaseRowWriteRequest, Any]:
         resolved = context.resolve_graph_env_value(dict(self.config))
         row_payload, source_value = self._supabase_row_write_payload(context)
+        supabase_url_env_var, supabase_key_env_var = resolve_supabase_runtime_env_var_names(resolved, context.graph)
         return (
             SupabaseRowWriteRequest(
                 supabase_url=resolve_graph_process_env(
-                    str(resolved.get("supabase_url_env_var", "GRAPH_AGENT_SUPABASE_URL") or "GRAPH_AGENT_SUPABASE_URL"),
+                    supabase_url_env_var,
                     context.graph.env_vars,
                 ),
                 supabase_key=resolve_graph_process_env(
-                    str(resolved.get("supabase_key_env_var", "GRAPH_AGENT_SUPABASE_SECRET_KEY") or "GRAPH_AGENT_SUPABASE_SECRET_KEY"),
+                    supabase_key_env_var,
                     context.graph.env_vars,
                 ),
                 schema=str(resolved.get("schema", "public") or "public").strip() or "public",
@@ -2762,6 +2859,28 @@ class DataNode(BaseNode):
                 "supabase_url_present": bool(request.supabase_url),
                 "supabase_key_present": bool(request.supabase_key),
             }
+        if self.provider_id == OUTBOUND_EMAIL_LOGGER_PROVIDER_ID or mode == OUTBOUND_EMAIL_LOGGER_MODE:
+            resolved = context.resolve_graph_env_value(dict(self.config))
+            return {
+                "schema": str(resolved.get("schema", "public") or "public").strip() or "public",
+                "table_name": str(resolved.get("table_name", "") or "").strip(),
+                "message_type": str(resolved.get("message_type", "initial") or "initial").strip().lower() or "initial",
+                "outreach_step": _coerce_int(resolved.get("outreach_step"), default=0, minimum=0),
+                "sales_approach": str(resolved.get("sales_approach", "") or "").strip(),
+                "sales_approach_version": str(resolved.get("sales_approach_version", "") or "").strip(),
+                "supabase_url_present": bool(
+                    resolve_graph_process_env(
+                        str(resolved.get("supabase_url_env_var", "GRAPH_AGENT_SUPABASE_URL") or "GRAPH_AGENT_SUPABASE_URL"),
+                        context.graph.env_vars,
+                    )
+                ),
+                "supabase_key_present": bool(
+                    resolve_graph_process_env(
+                        str(resolved.get("supabase_key_env_var", "GRAPH_AGENT_SUPABASE_SECRET_KEY") or "GRAPH_AGENT_SUPABASE_SECRET_KEY"),
+                        context.graph.env_vars,
+                    )
+                ),
+            }
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return context.prompt_block_payload_for_node(self.id)
         if mode == "context_builder":
@@ -2807,6 +2926,18 @@ class DataNode(BaseNode):
             return self._execute_supabase_data(context)
         if self.provider_id == SUPABASE_ROW_WRITE_PROVIDER_ID or mode == SUPABASE_ROW_WRITE_MODE:
             return self._execute_supabase_row_write(context)
+        if self.provider_id == OUTBOUND_EMAIL_LOGGER_PROVIDER_ID or mode == OUTBOUND_EMAIL_LOGGER_MODE:
+            resolved = context.resolve_graph_env_value(dict(self.config))
+            return NodeExecutionResult(
+                status="success",
+                output={
+                    "schema": str(resolved.get("schema", "public") or "public").strip() or "public",
+                    "table_name": str(resolved.get("table_name", "") or "").strip(),
+                    "message_type": str(resolved.get("message_type", "initial") or "initial").strip().lower() or "initial",
+                },
+                summary="Outbound email logger binding is available for Outlook draft nodes.",
+                metadata={"binding_only": True, "outbound_email_logger": True},
+            )
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return self._execute_prompt_block(context)
         source_value = context.resolve_binding(self.config.get("input_binding"))
@@ -5566,11 +5697,275 @@ class OutlookDraftOutputNode(OutputNode):
             raise ValueError("Outlook draft node could not derive body text from the resolved payload.")
         return body
 
+    def _outbound_email_logger_binding(self, context: NodeContext) -> OutboundEmailLoggerBinding | None:
+        for edge in context.graph.get_incoming_edges(self.id):
+            if edge.kind != "binding":
+                continue
+            candidate = context.graph.nodes.get(edge.source_id)
+            if candidate is None or candidate.provider_id != OUTBOUND_EMAIL_LOGGER_PROVIDER_ID:
+                continue
+            supabase_url_env_var, supabase_key_env_var = resolve_supabase_runtime_env_var_names(candidate.config, context.graph)
+            return OutboundEmailLoggerBinding(
+                node_id=candidate.id,
+                schema=str(candidate.config.get("schema", "public") or "public").strip() or "public",
+                table_name=str(candidate.config.get("table_name", "") or "").strip(),
+                supabase_url=resolve_graph_process_env(
+                    supabase_url_env_var,
+                    context.graph.env_vars,
+                ),
+                supabase_key=resolve_graph_process_env(
+                    supabase_key_env_var,
+                    context.graph.env_vars,
+                ),
+                message_type=str(candidate.config.get("message_type", "initial") or "initial").strip().lower() or "initial",
+                outreach_step=_coerce_int(candidate.config.get("outreach_step"), default=0, minimum=0),
+                sales_approach_template=str(candidate.config.get("sales_approach", "") or ""),
+                sales_approach_version_template=str(candidate.config.get("sales_approach_version", "") or ""),
+                parent_outbound_email_id_template=str(candidate.config.get("parent_outbound_email_id", "") or ""),
+                root_outbound_email_id_template=str(candidate.config.get("root_outbound_email_id", "") or ""),
+                metadata_json_template=str(candidate.config.get("metadata_json", "{}") or "{}"),
+            )
+        return None
+
+    def _validate_outbound_email_logger_binding(self, binding: OutboundEmailLoggerBinding) -> dict[str, Any]:
+        sources = fetch_supabase_schema_catalog(
+            supabase_url=binding.supabase_url,
+            supabase_key=binding.supabase_key,
+            schema=binding.schema,
+        )
+        validation = validate_outbound_email_log_schema(
+            sources=sources,
+            schema=binding.schema,
+            table_name=binding.table_name,
+        )
+        if validation.valid:
+            return validation.to_dict()
+        details: list[str] = []
+        if validation.missing_required_columns:
+            details.append("missing required columns: " + ", ".join(validation.missing_required_columns))
+        if validation.type_mismatches:
+            details.append(
+                "type mismatches: "
+                + ", ".join(
+                    f"{mismatch.column_name} expected {'/'.join(mismatch.expected_types)} but found {mismatch.actual_type}"
+                    for mismatch in validation.type_mismatches
+                )
+            )
+        if validation.warnings:
+            details.extend(validation.warnings)
+        raise SupabaseDataError(
+            (
+                f"Outbound email logger binding cannot use Supabase table '{binding.table_name}'. "
+                + ("; ".join(details) if details else "Choose a table that matches the outbound email schema.")
+            ).strip(),
+            error_type="invalid_outbound_email_log_table",
+            details=validation.to_dict(),
+        )
+
+    def _render_outbound_email_logger_value(self, context: NodeContext, template: str, extra: Mapping[str, Any]) -> str:
+        normalized_template = str(template or "")
+        if not normalized_template.strip():
+            return ""
+        return context.render_template(normalized_template, extra).strip()
+
+    def _render_outbound_email_logger_metadata_value(
+        self,
+        context: NodeContext,
+        value: Any,
+        extra: Mapping[str, Any],
+    ) -> Any:
+        if isinstance(value, str):
+            return context.render_template(value, extra)
+        if isinstance(value, Mapping):
+            rendered: dict[str, Any] = {}
+            for raw_key, raw_value in value.items():
+                rendered_key = context.render_template(str(raw_key), extra)
+                rendered[rendered_key] = self._render_outbound_email_logger_metadata_value(context, raw_value, extra)
+            return rendered
+        if isinstance(value, list):
+            return [self._render_outbound_email_logger_metadata_value(context, item, extra) for item in value]
+        return value
+
+    def _render_outbound_email_logger_metadata(
+        self,
+        context: NodeContext,
+        binding: OutboundEmailLoggerBinding,
+        extra: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        metadata_template = str(binding.metadata_json_template or "").strip()
+        if not metadata_template:
+            return {}
+        try:
+            parsed_template = json.loads(metadata_template)
+        except json.JSONDecodeError:
+            parsed_template = None
+        if isinstance(parsed_template, Mapping):
+            try:
+                rendered_metadata = self._render_outbound_email_logger_metadata_value(context, parsed_template, extra)
+            except ValueError as exc:
+                raise SupabaseDataError(
+                    "Outbound email logger metadata_json contains an invalid template expression.",
+                    error_type="invalid_outbound_email_logger_metadata",
+                    details={"node_id": binding.node_id},
+                ) from exc
+            return {str(key): value for key, value in rendered_metadata.items()}
+        if parsed_template is not None:
+            raise SupabaseDataError(
+                "Outbound email logger metadata_json must resolve to a JSON object.",
+                error_type="invalid_outbound_email_logger_metadata",
+                details={"node_id": binding.node_id},
+            )
+        rendered = context.render_template(metadata_template, extra).strip()
+        if not rendered:
+            return {}
+        try:
+            parsed = json.loads(rendered)
+        except json.JSONDecodeError as exc:
+            raise SupabaseDataError(
+                "Outbound email logger metadata_json must be valid JSON after template rendering.",
+                error_type="invalid_outbound_email_logger_metadata",
+                details={"node_id": binding.node_id},
+            ) from exc
+        if not isinstance(parsed, Mapping):
+            raise SupabaseDataError(
+                "Outbound email logger metadata_json must resolve to a JSON object.",
+                error_type="invalid_outbound_email_logger_metadata",
+                details={"node_id": binding.node_id},
+            )
+        return {str(key): value for key, value in parsed.items()}
+
+    def _write_outbound_email_log(
+        self,
+        context: NodeContext,
+        *,
+        payload: Any,
+        auth_status: MicrosoftAuthStatus,
+        draft: Any,
+        binding: OutboundEmailLoggerBinding,
+        validation: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        available_columns = set(validation.get("available_columns", []))
+        raw_provider_payload = dict(draft.raw_response) if isinstance(draft.raw_response, Mapping) else {}
+        provider_message_id = str(raw_provider_payload.get("id", draft.draft_id) or draft.draft_id or "").strip()
+        internet_message_id = str(raw_provider_payload.get("internetMessageId", "") or "").strip()
+        conversation_id = str(raw_provider_payload.get("conversationId", "") or "").strip()
+        primary_recipient = str(draft.to_recipients[0] if draft.to_recipients else "").strip()
+        if not primary_recipient:
+            raise SupabaseDataError(
+                "Outbound email logger requires at least one draft recipient email address.",
+                error_type="missing_outbound_email_log_recipient",
+                details={"node_id": binding.node_id},
+            )
+
+        metadata_extra = {
+            "message_payload": payload,
+            "message_json": _json_safe(payload),
+            "draft_id": draft.draft_id,
+            "provider_message_id": provider_message_id,
+            "internet_message_id": internet_message_id,
+            "conversation_id": conversation_id,
+            "recipient_email": primary_recipient,
+            "to_recipients": draft.to_recipients,
+            "mailbox_account": auth_status.account_username,
+            "draft_created_at": draft.created_at or utc_now_iso(),
+            "run_id": context.state.run_id,
+            "graph_id": context.state.graph_id,
+        }
+        sales_approach = self._render_outbound_email_logger_value(context, binding.sales_approach_template, metadata_extra)
+        if not sales_approach:
+            raise SupabaseDataError(
+                "Outbound email logger requires a non-empty sales_approach value.",
+                error_type="missing_outbound_email_log_sales_approach",
+                details={"node_id": binding.node_id},
+            )
+        if binding.message_type not in {"initial", "follow_up"}:
+            raise SupabaseDataError(
+                f"Outbound email logger uses unsupported message_type '{binding.message_type}'.",
+                error_type="invalid_outbound_email_log_message_type",
+                details={"node_id": binding.node_id},
+            )
+        sales_approach_version = self._render_outbound_email_logger_value(
+            context,
+            binding.sales_approach_version_template,
+            metadata_extra,
+        )
+        parent_outbound_email_id = self._render_outbound_email_logger_value(
+            context,
+            binding.parent_outbound_email_id_template,
+            metadata_extra,
+        )
+        root_outbound_email_id = self._render_outbound_email_logger_value(
+            context,
+            binding.root_outbound_email_id_template,
+            metadata_extra,
+        )
+        metadata = {
+            "run_id": context.state.run_id,
+            "graph_id": context.state.graph_id,
+            "logger_node_id": binding.node_id,
+            "to_recipients": list(draft.to_recipients),
+            "web_link": draft.web_link,
+            "last_modified_at": draft.last_modified_at,
+            "source_payload": payload,
+        }
+        metadata.update(self._render_outbound_email_logger_metadata(context, binding, metadata_extra))
+
+        row: dict[str, Any] = {}
+
+        def include(column_name: str, value: Any) -> None:
+            if column_name in available_columns:
+                row[column_name] = value
+
+        include("provider", "outlook")
+        include("mailbox_account", auth_status.account_username)
+        include("recipient_email", primary_recipient)
+        include("subject", draft.subject)
+        include("body_text", draft.body)
+        include("message_type", binding.message_type)
+        include("outreach_step", binding.outreach_step)
+        include("sales_approach", sales_approach)
+        include("provider_draft_id", draft.draft_id or None)
+        include("provider_message_id", provider_message_id or None)
+        include("internet_message_id", internet_message_id or None)
+        include("conversation_id", conversation_id or None)
+        include("drafted_at", draft.created_at or utc_now_iso())
+        include("metadata", metadata)
+        include("raw_provider_payload", raw_provider_payload)
+        if sales_approach_version:
+            include("sales_approach_version", sales_approach_version)
+        if parent_outbound_email_id:
+            include("parent_outbound_email_id", parent_outbound_email_id)
+        if root_outbound_email_id:
+            include("root_outbound_email_id", root_outbound_email_id)
+
+        result = write_supabase_row(
+            SupabaseRowWriteRequest(
+                supabase_url=binding.supabase_url,
+                supabase_key=binding.supabase_key,
+                schema=binding.schema,
+                table_name=binding.table_name,
+                row=row,
+                write_mode="insert",
+                returning="representation",
+            )
+        )
+        return {
+            "schema": result.schema,
+            "table_name": result.table_name,
+            "row_count": result.row_count,
+            "inserted_row": result.inserted_row,
+            "written_columns": sorted(result.inserted_row.keys()),
+        }
+
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         payload = _resolve_output_payload(context, self.config.get("source_binding"))
         recipients = self._resolved_to_recipients(context)
         subject = self._render_subject(context, payload)
         body = self._render_body(payload)
+        logger_binding = self._outbound_email_logger_binding(context)
+        logger_validation: dict[str, Any] | None = None
+        if logger_binding is not None:
+            logger_validation = self._validate_outbound_email_logger_binding(logger_binding)
         auth_status = self._auth_service(context).connection_status()
         access_token = self._auth_service(context).acquire_access_token()
         draft_client = context.services.outlook_draft_client or OutlookDraftClient()
@@ -5580,11 +5975,39 @@ class OutlookDraftOutputNode(OutputNode):
             subject=subject,
             body=body,
         )
+        raw_provider_payload = dict(draft.raw_response) if isinstance(draft.raw_response, Mapping) else {}
+        provider_message_id = str(raw_provider_payload.get("id", draft.draft_id) or draft.draft_id or "").strip()
+        internet_message_id = str(raw_provider_payload.get("internetMessageId", "") or "").strip()
+        conversation_id = str(raw_provider_payload.get("conversationId", "") or "").strip()
+        logged_outbound_email: dict[str, Any] | None = None
+        if logger_binding is not None and logger_validation is not None:
+            try:
+                logged_outbound_email = self._write_outbound_email_log(
+                    context,
+                    payload=payload,
+                    auth_status=auth_status,
+                    draft=draft,
+                    binding=logger_binding,
+                    validation=logger_validation,
+                )
+            except SupabaseDataError as exc:
+                error_payload = exc.to_error_payload()
+                error_payload["draft_id"] = draft.draft_id
+                error_payload["provider_draft_saved"] = True
+                return NodeExecutionResult(
+                    status="failed",
+                    error=error_payload,
+                    summary=str(exc),
+                    metadata={"outlook_draft_saved": True, "outbound_email_log_failed": True},
+                )
         return NodeExecutionResult(
             status="success",
             output={
                 "delivery_status": "draft_saved",
                 "draft_id": draft.draft_id,
+                "provider_message_id": provider_message_id,
+                "internet_message_id": internet_message_id,
+                "conversation_id": conversation_id,
                 "web_link": draft.web_link,
                 "subject": draft.subject,
                 "body": draft.body,
@@ -5592,20 +6015,33 @@ class OutlookDraftOutputNode(OutputNode):
                 "created_at": draft.created_at,
                 "last_modified_at": draft.last_modified_at,
                 "account_username": auth_status.account_username,
+                "raw_provider_payload": raw_provider_payload,
+                "outbound_email_log": logged_outbound_email,
                 "source_payload": payload,
             },
             summary=f"Saved Outlook draft for {', '.join(draft.to_recipients)}.",
-            metadata={"outlook_draft_saved": True},
+            metadata={
+                "outlook_draft_saved": True,
+                "outbound_email_logged": logged_outbound_email is not None,
+            },
         )
 
     def runtime_input_preview(self, context: NodeContext) -> Any:
         payload = _resolve_output_payload(context, self.config.get("source_binding"))
         auth_status = self._auth_service(context).connection_status()
+        logger_binding = self._outbound_email_logger_binding(context)
         return {
             "microsoft_auth": auth_status.to_dict(),
             "to_recipients": self._resolved_to_recipients(context),
             "subject": self._render_subject(context, payload),
             "body": self._render_body(payload),
+            "outbound_email_logger": {
+                "node_id": logger_binding.node_id,
+                "schema": logger_binding.schema,
+                "table_name": logger_binding.table_name,
+                "message_type": logger_binding.message_type,
+                "outreach_step": logger_binding.outreach_step,
+            } if logger_binding is not None else None,
         }
 
 
@@ -5729,6 +6165,8 @@ class GraphDefinition:
         version: str = "1.0",
         default_input: str = "",
         env_vars: Mapping[str, Any] | None = None,
+        supabase_connections: Sequence[SupabaseConnectionDefinition] | None = None,
+        default_supabase_connection_id: str = "",
     ) -> None:
         node_ids = [node.id for node in nodes]
         if len(node_ids) != len(set(node_ids)):
@@ -5740,6 +6178,8 @@ class GraphDefinition:
         self.default_input = default_input
         self.start_node_id = start_node_id
         self.env_vars = _normalize_graph_env_vars(env_vars)
+        self.supabase_connections = list(supabase_connections or [])
+        self.default_supabase_connection_id = str(default_supabase_connection_id or "").strip()
         for node in nodes:
             node.attach_graph_env_vars(self.env_vars)
         self.nodes = {node.id: node for node in nodes}
@@ -5758,6 +6198,8 @@ class GraphDefinition:
             default_input=str(payload.get("default_input", "")),
             start_node_id=str(payload["start_node_id"]),
             env_vars=payload.get("env_vars"),
+            supabase_connections=_normalize_supabase_connections(payload.get("supabase_connections")),
+            default_supabase_connection_id=str(payload.get("default_supabase_connection_id", "") or "").strip(),
             nodes=nodes,
             edges=edges,
         )
@@ -5767,6 +6209,15 @@ class GraphDefinition:
             raise GraphValidationError(f"Unknown start node '{self.start_node_id}'.")
         if not self.nodes:
             raise GraphValidationError("Graphs must contain at least one node.")
+        seen_supabase_connection_ids: set[str] = set()
+        for connection in self.supabase_connections:
+            if connection.connection_id in seen_supabase_connection_ids:
+                raise GraphValidationError(f"Duplicate Supabase connection '{connection.connection_id}'.")
+            seen_supabase_connection_ids.add(connection.connection_id)
+        if self.default_supabase_connection_id and self.get_supabase_connection(self.default_supabase_connection_id) is None:
+            raise GraphValidationError(
+                f"Unknown default Supabase connection '{self.default_supabase_connection_id}'."
+            )
         start_node = self.nodes[self.start_node_id]
         if start_node.category != NodeCategory.START:
             raise GraphValidationError("The graph start node must use the 'start' category.")
@@ -5774,6 +6225,14 @@ class GraphDefinition:
         output_nodes = [node for node in self.nodes.values() if node.category == NodeCategory.END]
         if not output_nodes:
             raise GraphValidationError("Graphs must include at least one 'end' category node.")
+        for node in self.nodes.values():
+            if node.provider_id not in {SUPABASE_DATA_PROVIDER_ID, SUPABASE_ROW_WRITE_PROVIDER_ID, OUTBOUND_EMAIL_LOGGER_PROVIDER_ID}:
+                continue
+            connection_id = str(node.config.get("supabase_connection_id", "") or "").strip()
+            if connection_id and self.get_supabase_connection(connection_id) is None:
+                raise GraphValidationError(
+                    f"Node '{node.id}' references unknown Supabase connection '{connection_id}'."
+                )
 
         standard_edge_counts: dict[str, int] = {}
         for edge in self.edges:
@@ -5790,6 +6249,19 @@ class GraphDefinition:
                 )
             if source_node.category == NodeCategory.END:
                 raise GraphValidationError(f"End node '{source_node.id}' cannot have outgoing edges.")
+            if source_node.provider_id == OUTBOUND_EMAIL_LOGGER_PROVIDER_ID:
+                if edge.kind != "binding":
+                    raise GraphValidationError(
+                        f"Outbound email logger '{source_node.id}' can only create binding edges."
+                    )
+                if target_node.provider_id != OUTLOOK_DRAFT_PROVIDER_ID:
+                    raise GraphValidationError(
+                        f"Outbound email logger '{source_node.id}' can only bind into Outlook draft end nodes."
+                    )
+            if target_node.provider_id == OUTBOUND_EMAIL_LOGGER_PROVIDER_ID:
+                raise GraphValidationError(
+                    f"Outbound email logger '{target_node.id}' is source-only and cannot receive incoming edges."
+                )
             if source_node.kind == "data" and source_node.provider_id == PROMPT_BLOCK_PROVIDER_ID:
                 if edge.kind != "binding":
                     raise GraphValidationError(
@@ -5859,6 +6331,28 @@ class GraphDefinition:
                 if provider_name not in services.model_providers:
                     raise GraphValidationError(
                         f"Provider node '{node.id}' references unknown model provider '{provider_name}'."
+                    )
+            if node.provider_id == OUTBOUND_EMAIL_LOGGER_PROVIDER_ID:
+                incoming_edges = self.get_incoming_edges(node.id)
+                if incoming_edges:
+                    raise GraphValidationError(
+                        f"Outbound email logger '{node.id}' cannot receive incoming edges."
+                    )
+                outgoing_edges = self.get_outgoing_edges(node.id)
+                if any(edge.kind != "binding" for edge in outgoing_edges):
+                    raise GraphValidationError(
+                        f"Outbound email logger '{node.id}' can only create binding edges."
+                    )
+                message_type = str(node.config.get("message_type", "initial") or "initial").strip().lower() or "initial"
+                if message_type not in {"initial", "follow_up"}:
+                    raise GraphValidationError(
+                        f"Outbound email logger '{node.id}' uses unsupported message_type '{message_type}'."
+                    )
+            if node.provider_id in {SUPABASE_DATA_PROVIDER_ID, SUPABASE_ROW_WRITE_PROVIDER_ID, OUTBOUND_EMAIL_LOGGER_PROVIDER_ID}:
+                connection_id = str(node.config.get("supabase_connection_id", "") or "").strip()
+                if connection_id and self.get_supabase_connection(connection_id) is None:
+                    raise GraphValidationError(
+                        f"Node '{node.id}' references unknown Supabase connection '{connection_id}'."
                     )
             if node.kind == "model":
                 bound_provider = self._resolve_provider_binding(node)
@@ -6239,6 +6733,18 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Prompt block '{node.id}' uses unsupported role '{raw_role}'."
                     )
+            if node.kind == "output" and node.provider_id == OUTLOOK_DRAFT_PROVIDER_ID:
+                logger_binding_edges = [
+                    edge
+                    for edge in self.get_incoming_edges(node.id)
+                    if edge.kind == "binding"
+                    and (source_node := self.nodes.get(edge.source_id)) is not None
+                    and source_node.provider_id == OUTBOUND_EMAIL_LOGGER_PROVIDER_ID
+                ]
+                if len(logger_binding_edges) > 1:
+                    raise GraphValidationError(
+                        f"Outlook draft node '{node.id}' can only have one outbound email logger binding."
+                    )
             if node.kind == "data" and node.provider_id == LINKEDIN_PROFILE_FETCH_PROVIDER_ID:
                 url_field = str(node.config.get("url_field", "url") or "").strip()
                 if not url_field:
@@ -6432,8 +6938,17 @@ class GraphDefinition:
     def get_incoming_edges(self, node_id: str) -> list[Edge]:
         return [edge for edge in self.edges if edge.target_id == node_id]
 
+    def get_supabase_connection(self, connection_id: str) -> SupabaseConnectionDefinition | None:
+        normalized_connection_id = str(connection_id or "").strip()
+        if not normalized_connection_id:
+            return None
+        return next(
+            (connection for connection in self.supabase_connections if connection.connection_id == normalized_connection_id),
+            None,
+        )
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "graph_id": self.graph_id,
             "name": self.name,
             "description": self.description,
@@ -6444,3 +6959,8 @@ class GraphDefinition:
             "nodes": [node.to_dict() for node in self.nodes.values()],
             "edges": [edge.to_dict() for edge in self.edges],
         }
+        if self.supabase_connections:
+            payload["supabase_connections"] = [connection.to_dict() for connection in self.supabase_connections]
+        if self.default_supabase_connection_id:
+            payload["default_supabase_connection_id"] = self.default_supabase_connection_id
+        return payload

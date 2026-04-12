@@ -1,4 +1,4 @@
-import { memo, useMemo } from "react";
+import { memo, useMemo, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
 import { EdgeLabelRenderer, getSmoothStepPath } from "reactflow";
 import type { ConnectionLineComponentProps, EdgeProps } from "reactflow";
@@ -13,13 +13,14 @@ type GraphPosition = {
 export type GraphCanvasEdgeData = {
   kind: string;
   isActive?: boolean;
+  labelTooltip?: string;
   labelOffset?: number;
   labelShiftX?: number;
   labelShiftY?: number;
   routePoints?: GraphPosition[];
   sourceColor?: string;
   targetColor?: string;
-  routeTone?: "tool-success" | "tool-failure" | "api-tool-call" | "api-message";
+  routeTone?: "tool-success" | "tool-failure" | "api-tool-call" | "api-message" | "validation-valid" | "validation-invalid" | "validation-pending";
   routeShiftX?: number;
   routeShiftY?: number;
   showWaypointHandles?: boolean;
@@ -415,6 +416,7 @@ function GraphCanvasEdgeComponent({
   const waypointSelected = data?.waypointSelected ?? false;
   const waypointDragActive = data?.waypointDragActive ?? false;
   const onWaypointPointerDown = data?.onWaypointPointerDown;
+  const [showLabelTooltip, setShowLabelTooltip] = useState(false);
   const { edgePath, point: labelPosition } = useMemo(
     () =>
       getEdgeLabelPlacement({
@@ -433,6 +435,9 @@ function GraphCanvasEdgeComponent({
 
   const labelStyle = {
     transform: `translate(-50%, -50%) translate(${labelPosition.x + routeShiftX + labelShiftX}px, ${labelPosition.y + routeShiftY + labelShiftY}px)`,
+  } satisfies CSSProperties;
+  const labelTooltipStyle = {
+    transform: `translate(-50%, calc(-100% - 10px)) translate(${labelPosition.x + routeShiftX + labelShiftX}px, ${labelPosition.y + routeShiftY + labelShiftY}px)`,
   } satisfies CSSProperties;
   const strokeWidth = typeof style?.strokeWidth === "number" ? style.strokeWidth : Number(style?.strokeWidth ?? 1.5);
   const interactionStrokeWidth = Math.max(strokeWidth + 18, 24);
@@ -475,7 +480,7 @@ function GraphCanvasEdgeComponent({
       {label ? (
         <EdgeLabelRenderer>
           <div
-            className={`graph-edge-label ${data?.kind === "conditional" ? "graph-edge-label--conditional" : ""} ${
+            className={`graph-edge-label nopan nodrag ${data?.kind === "conditional" ? "graph-edge-label--conditional" : ""} ${
               data?.routeTone ? `graph-edge-label--${data.routeTone}` : ""
             } ${
               selected ? "is-selected" : ""
@@ -483,9 +488,16 @@ function GraphCanvasEdgeComponent({
               data?.isActive ? "is-active" : ""
             }`}
             style={labelStyle}
+            onMouseEnter={() => setShowLabelTooltip(true)}
+            onMouseLeave={() => setShowLabelTooltip(false)}
           >
             {String(label)}
           </div>
+          {showLabelTooltip && data?.labelTooltip ? (
+            <div className="graph-edge-tooltip nopan nodrag" style={labelTooltipStyle}>
+              {String(data.labelTooltip)}
+            </div>
+          ) : null}
         </EdgeLabelRenderer>
       ) : null}
       {routePoints.length > 0 && (showWaypointHandles || waypointDragActive) ? (

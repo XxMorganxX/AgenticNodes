@@ -11,6 +11,12 @@ from urllib.request import Request, urlopen
 from graph_agent.api.run_state_reducer import build_run_state, replay_events
 from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
 from graph_agent.runtime.core import utc_now_iso
+from graph_agent.runtime.supabase_data import build_supabase_rest_auth_headers
+
+
+def _process_env_by_selector(selector_name: str, fallback_name: str) -> str:
+    env_var_name = os.environ.get(selector_name, "").strip() or fallback_name
+    return os.environ.get(env_var_name, "").strip()
 
 
 def _merge_snapshot_metadata(recovered: dict[str, Any], snapshot: dict[str, Any] | None) -> dict[str, Any]:
@@ -53,11 +59,11 @@ class SupabaseRunStore:
     @classmethod
     def from_env(cls) -> "SupabaseRunStore":
         url = (
-            os.environ.get("GRAPH_AGENT_SUPABASE_URL", "").strip()
+            _process_env_by_selector("GRAPH_AGENT_RUN_STORE_SUPABASE_URL_ENV_VAR", "GRAPH_AGENT_SUPABASE_URL")
             or os.environ.get("SUPABASE_URL", "").strip()
         )
         service_role_key = (
-            os.environ.get("GRAPH_AGENT_SUPABASE_SECRET_KEY", "").strip()
+            _process_env_by_selector("GRAPH_AGENT_RUN_STORE_SUPABASE_SECRET_KEY_ENV_VAR", "GRAPH_AGENT_SUPABASE_SECRET_KEY")
             or os.environ.get("GRAPH_AGENT_SUPABASE_SERVICE_ROLE_KEY", "").strip()
             or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
             or os.environ.get("SUPABASE_SECRET_KEY", "").strip()
@@ -265,8 +271,7 @@ class SupabaseRunStore:
         if query:
             url = f"{url}?{urlencode(query)}"
         headers = {
-            "apikey": self.service_role_key,
-            "Authorization": f"Bearer {self.service_role_key}",
+            **build_supabase_rest_auth_headers(self.service_role_key),
             "Accept": "application/json",
             "Content-Type": "application/json",
             "Accept-Profile": self.schema,
