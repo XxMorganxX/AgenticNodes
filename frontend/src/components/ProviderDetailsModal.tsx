@@ -13,6 +13,7 @@ import {
   RESPONSE_SCHEMA_TEXT_CONFIG_KEY,
 } from "../lib/responseSchema";
 import { loadSessionSupabaseSchema, saveSessionSupabaseSchema } from "../lib/sessionSupabaseSchema";
+import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "../lib/spreadsheetMatrixPrompt";
 import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
 import { NodeDetailsForm } from "./NodeDetailsForm";
 import type {
@@ -267,7 +268,15 @@ export function ProviderDetailsModal({
     : String(provider?.provider_id ?? node.provider_id ?? "not-set");
   const providerConfigFields = provider?.config_fields ?? [];
   const isSupabaseDataNode = node.provider_id === "core.supabase_data";
-  const displayedProviderConfigFields = isSupabaseDataNode
+  const isSupabaseRowWriteNode = node.provider_id === "core.supabase_row_write";
+  const isSupabaseCatalogNode = isSupabaseDataNode || isSupabaseRowWriteNode;
+  const displayedUserMessageTemplate =
+    node.provider_id === "core.spreadsheet_matrix_decision" &&
+    (!String(node.config.user_message_template ?? "").trim() ||
+      String(node.config.user_message_template ?? "").trim() === "{input_payload}")
+      ? SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE
+      : String(node.config.user_message_template ?? "{input_payload}");
+  const displayedProviderConfigFields = isSupabaseCatalogNode
     ? providerConfigFields.filter((field) => !["supabase_url_env_var", "supabase_key_env_var"].includes(field.key))
     : providerConfigFields;
   const supportsLiveVerification = isModelNode && providerName !== "mock";
@@ -734,12 +743,12 @@ export function ProviderDetailsModal({
   const hasLocalSupabaseRuntimeValues = Boolean(localSupabaseUrlValue && localSupabaseKeyValue);
   const hasSupabaseSchemaMemory = Boolean((supabaseSchemaPreview?.sources.length ?? 0) > 0);
   const isSupabaseRuntimeReady = hasLocalSupabaseRuntimeValues || supabaseRuntimeStatus?.ready === true;
-  const isSupabaseRuntimePending = isSupabaseDataNode && supabaseRuntimeStatus === null && isLoadingSupabaseRuntimeStatus;
-  const isSupabaseBrowserLocked = isSupabaseDataNode && !isSupabaseRuntimeReady && !hasSupabaseSchemaMemory;
+  const isSupabaseRuntimePending = isSupabaseCatalogNode && supabaseRuntimeStatus === null && isLoadingSupabaseRuntimeStatus;
+  const isSupabaseBrowserLocked = isSupabaseCatalogNode && !isSupabaseRuntimeReady && !hasSupabaseSchemaMemory;
 
   useEffect(() => {
     if (
-      !isSupabaseDataNode ||
+      !isSupabaseCatalogNode ||
       activeTab !== "config" ||
       supabaseSchemaPreview !== null ||
       isLoadingSupabaseSchema ||
@@ -748,10 +757,10 @@ export function ProviderDetailsModal({
       return;
     }
     void handleLoadSupabaseSchema();
-  }, [activeTab, isLoadingSupabaseSchema, isSupabaseDataNode, isSupabaseRuntimeReady, supabaseSchemaPreview]);
+  }, [activeTab, isLoadingSupabaseSchema, isSupabaseCatalogNode, isSupabaseRuntimeReady, supabaseSchemaPreview]);
 
   const filteredSupabaseSources = useMemo(() => {
-    const sources = supabaseSchemaPreview?.sources ?? [];
+    const sources = (supabaseSchemaPreview?.sources ?? []).filter((source) => !isSupabaseRowWriteNode || source.source_kind === "table");
     const query = supabaseSourceSearch.trim().toLowerCase();
     if (!query) {
       return sources;
@@ -775,19 +784,22 @@ export function ProviderDetailsModal({
     if (selectedSupabaseSourceName) {
       return availableSources.find((source) => source.name === selectedSupabaseSourceName) ?? null;
     }
-    const configuredSourceName = String(node.config.source_name ?? "").trim();
+    const configuredSourceName = String(isSupabaseRowWriteNode ? node.config.table_name ?? "" : node.config.source_name ?? "").trim();
     if (configuredSourceName) {
       return availableSources.find((source) => source.name === configuredSourceName) ?? null;
     }
     return availableSources[0] ?? null;
-  }, [node.config.source_name, selectedSupabaseSourceName, supabaseSchemaPreview]);
+  }, [isSupabaseRowWriteNode, node.config.source_name, node.config.table_name, selectedSupabaseSourceName, supabaseSchemaPreview]);
   const selectedSupabaseColumnNames = useMemo(() => {
+    if (isSupabaseRowWriteNode) {
+      return [];
+    }
     const availableColumns = selectedSupabaseSource?.columns.map((column) => column.name) ?? [];
     return parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns);
-  }, [node.config.select, selectedSupabaseSource]);
+  }, [isSupabaseRowWriteNode, node.config.select, selectedSupabaseSource]);
 
   useEffect(() => {
-    if (!isSupabaseDataNode) {
+    if (!isSupabaseCatalogNode) {
       setSupabaseRuntimeStatus(null);
       setIsLoadingSupabaseRuntimeStatus(false);
       setSupabaseSchemaPreview(null);
@@ -801,28 +813,28 @@ export function ProviderDetailsModal({
     if (cachedSchema) {
       setSupabaseSchemaPreview(cachedSchema);
     }
-    setSelectedSupabaseSourceName(String(node.config.source_name ?? "").trim());
-  }, [graph, isSupabaseDataNode, node.config.source_name]);
+    setSelectedSupabaseSourceName(String(isSupabaseRowWriteNode ? node.config.table_name ?? "" : node.config.source_name ?? "").trim());
+  }, [graph, isSupabaseCatalogNode, isSupabaseRowWriteNode, node.config.source_name, node.config.table_name]);
 
   useEffect(() => {
-    if (!isSupabaseDataNode) {
+    if (!isSupabaseCatalogNode) {
       return;
     }
     setSupabaseRuntimeStatus(null);
     setSupabaseSchemaError(null);
     const cachedSchema = loadSessionSupabaseSchema(graph);
     setSupabaseSchemaPreview(cachedSchema);
-  }, [graph, isSupabaseDataNode, graph.env_vars, supabaseKeyEnvVarName, supabaseUrlEnvVarName]);
+  }, [graph, isSupabaseCatalogNode, graph.env_vars, supabaseKeyEnvVarName, supabaseUrlEnvVarName]);
 
   useEffect(() => {
-    if (!isSupabaseDataNode || activeTab !== "config" || supabaseRuntimeStatus !== null || isLoadingSupabaseRuntimeStatus) {
+    if (!isSupabaseCatalogNode || activeTab !== "config" || supabaseRuntimeStatus !== null || isLoadingSupabaseRuntimeStatus) {
       return;
     }
     void handleLoadSupabaseRuntimeStatus();
-  }, [activeTab, isLoadingSupabaseRuntimeStatus, isSupabaseDataNode, supabaseRuntimeStatus, supabaseKeyEnvVarName, supabaseUrlEnvVarName]);
+  }, [activeTab, isLoadingSupabaseRuntimeStatus, isSupabaseCatalogNode, supabaseRuntimeStatus, supabaseKeyEnvVarName, supabaseUrlEnvVarName]);
 
   async function handleLoadSupabaseSchema() {
-    if (!isSupabaseDataNode || !isSupabaseRuntimeReady) {
+    if (!isSupabaseCatalogNode || !isSupabaseRuntimeReady) {
       return;
     }
     setIsLoadingSupabaseSchema(true);
@@ -848,7 +860,7 @@ export function ProviderDetailsModal({
   }
 
   async function handleLoadSupabaseRuntimeStatus() {
-    if (!isSupabaseDataNode) {
+    if (!isSupabaseCatalogNode) {
       return;
     }
     if (hasLocalSupabaseRuntimeValues) {
@@ -886,19 +898,27 @@ export function ProviderDetailsModal({
   }
 
   function applySupabaseSourceSelection(source: SupabaseSchemaSource, nextColumns?: string[]) {
-    const availableColumns = source.columns.map((column) => column.name);
-    const resolvedColumns = nextColumns ?? parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns);
     onGraphChange(
       updateModelNode(graph, node.id, (currentNode) => ({
         ...currentNode,
         config: {
           ...currentNode.config,
-          source_kind: source.source_kind,
-          source_name: source.name,
-          select:
-            resolvedColumns.length === 0 || resolvedColumns.length === availableColumns.length
-              ? "*"
-              : resolvedColumns.join(","),
+          ...(isSupabaseRowWriteNode
+            ? {
+                table_name: source.name,
+              }
+            : (() => {
+                const availableColumns = source.columns.map((column) => column.name);
+                const resolvedColumns = nextColumns ?? parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns);
+                return {
+                  source_kind: source.source_kind,
+                  source_name: source.name,
+                  select:
+                    resolvedColumns.length === 0 || resolvedColumns.length === availableColumns.length
+                      ? "*"
+                      : resolvedColumns.join(","),
+                };
+              })()),
         },
       })),
     );
@@ -906,7 +926,7 @@ export function ProviderDetailsModal({
   }
 
   function toggleSupabaseColumn(columnName: string) {
-    if (!selectedSupabaseSource) {
+    if (!selectedSupabaseSource || isSupabaseRowWriteNode) {
       return;
     }
     const availableColumns = selectedSupabaseSource.columns.map((column) => column.name);
@@ -1217,7 +1237,7 @@ export function ProviderDetailsModal({
                   User Message Template
                   <textarea
                     rows={5}
-                    value={String(node.config.user_message_template ?? "{input_payload}")}
+                    value={displayedUserMessageTemplate}
                     onChange={handleTextInputChange("user_message_template")}
                   />
                 </label>
@@ -1521,7 +1541,7 @@ export function ProviderDetailsModal({
 
             {activeTab === "config" ? (
               <div className="modal-folder-section provider-details-config-layout">
-                {isSupabaseDataNode ? (
+                {isSupabaseCatalogNode ? (
                   <section className="provider-details-schema-browser">
                     {isSupabaseBrowserLocked ? (
                       <div className="tool-details-modal-help provider-details-schema-lock-banner">
@@ -1541,7 +1561,9 @@ export function ProviderDetailsModal({
                         <span>
                           {isSupabaseBrowserLocked
                             ? "Verify Supabase auth to browse tables and columns."
-                            : "Browse live tables and columns, then apply the source and selected columns to this node."}
+                            : isSupabaseRowWriteNode
+                              ? "Browse live tables and inspect columns, then apply the selected table to this node."
+                              : "Browse live tables and columns, then apply the source and selected columns to this node."}
                         </span>
                       </div>
                       <div className="provider-details-schema-browser-actions">
@@ -1576,7 +1598,7 @@ export function ProviderDetailsModal({
                         {filteredSupabaseSources.length > 0 ? (
                           filteredSupabaseSources.map((source) => {
                             const isActive = selectedSupabaseSource?.name === source.name;
-                            const isConfigured = String(node.config.source_name ?? "").trim() === source.name;
+                            const isConfigured = String(isSupabaseRowWriteNode ? node.config.table_name ?? "" : node.config.source_name ?? "").trim() === source.name;
                             return (
                               <button
                                 key={source.name}
@@ -1607,19 +1629,26 @@ export function ProviderDetailsModal({
                                 <button
                                   type="button"
                                   className="secondary-button"
-                                  onClick={() => applySupabaseSourceSelection(selectedSupabaseSource, selectedSupabaseSource.columns.map((column) => column.name))}
+                                  onClick={() =>
+                                    applySupabaseSourceSelection(
+                                      selectedSupabaseSource,
+                                      isSupabaseRowWriteNode ? undefined : selectedSupabaseColumnNames,
+                                    )
+                                  }
                                   disabled={isSupabaseBrowserLocked}
                                 >
-                                  Use All Columns
+                                  {isSupabaseRowWriteNode ? "Use Table" : "Apply Selection"}
                                 </button>
-                                <button
-                                  type="button"
-                                  className="secondary-button"
-                                  onClick={() => applySupabaseSourceSelection(selectedSupabaseSource, selectedSupabaseColumnNames)}
-                                  disabled={isSupabaseBrowserLocked}
-                                >
-                                  Apply Selection
-                                </button>
+                                {!isSupabaseRowWriteNode ? (
+                                  <button
+                                    type="button"
+                                    className="secondary-button"
+                                    onClick={() => applySupabaseSourceSelection(selectedSupabaseSource, selectedSupabaseSource.columns.map((column) => column.name))}
+                                    disabled={isSupabaseBrowserLocked}
+                                  >
+                                    Use All Columns
+                                  </button>
+                                ) : null}
                               </div>
                             </div>
                             {selectedSupabaseSource.description ? (
@@ -1630,12 +1659,14 @@ export function ProviderDetailsModal({
                                 const checked = selectedSupabaseColumnNames.includes(column.name);
                                 return (
                                   <label key={column.name} className="provider-details-schema-column-row">
-                                    <input
-                                      type="checkbox"
-                                      checked={checked}
-                                      onChange={() => toggleSupabaseColumn(column.name)}
-                                      disabled={isSupabaseBrowserLocked}
-                                    />
+                                    {!isSupabaseRowWriteNode ? (
+                                      <input
+                                        type="checkbox"
+                                        checked={checked}
+                                        onChange={() => toggleSupabaseColumn(column.name)}
+                                        disabled={isSupabaseBrowserLocked}
+                                      />
+                                    ) : <span />}
                                     <span className="provider-details-schema-column-main">
                                       <strong>{column.name}</strong>
                                       <small>{column.data_type}{column.nullable ? " · nullable" : ""}</small>
@@ -1767,6 +1798,13 @@ export function ProviderDetailsModal({
                     <div>Use <code>filters_text</code> as one PostgREST query parameter per line, like <code>status=eq.active</code>.</div>
                     <div>Choose <code>records</code> when downstream nodes need structured JSON, or <code>markdown</code> when you want prompt-ready text.</div>
                     <div>Use <code>single_row</code> when the result should collapse to one record instead of an array.</div>
+                  </div>
+                ) : isSupabaseRowWriteNode ? (
+                  <div className="tool-details-modal-help">
+                    <strong>Supabase row write node notes</strong>
+                    <div>Use the schema browser above to choose a destination table, then build the row with <code>base_row_json_path</code> and <code>column_values_json</code>.</div>
+                    <div>Set a column spec to <code>{"{\"mode\":\"default\"}"}</code> to omit that column so the database default can apply.</div>
+                    <div>Use <code>{"{\"mode\":\"path\",\"path\":\"customer.email\"}"}</code> for runtime values and <code>{"{\"mode\":\"literal\",\"value\":\"pending\"}"}</code> for fixed values.</div>
                   </div>
                 ) : null}
 

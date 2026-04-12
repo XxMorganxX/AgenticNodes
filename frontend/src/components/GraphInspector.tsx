@@ -30,6 +30,7 @@ import {
 } from "../lib/contextBuilderBindings";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import { insertTokenAtEnd, listPromptBlockAvailableVariables, PROMPT_BLOCK_STARTERS, renderPromptBlockPreview } from "../lib/promptBlockEditor";
+import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "../lib/spreadsheetMatrixPrompt";
 import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
 import { useRenderDiagnostics } from "../lib/dragDiagnostics";
 import type {
@@ -941,6 +942,12 @@ export function GraphInspector({
     const isSpreadsheetRowNode = isControlFlowUnitNode && selectedNode.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
     const isSpreadsheetMatrixNode =
       selectedNode.kind === "model" && selectedNode.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID;
+    const displayedUserMessageTemplate =
+      isSpreadsheetMatrixNode &&
+      (!String(selectedNode.config.user_message_template ?? "").trim() ||
+        String(selectedNode.config.user_message_template ?? "").trim() === "{input_payload}")
+        ? SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE
+        : String(selectedNode.config.user_message_template ?? "{input_payload}");
     const isLogicConditionsNode = isControlFlowUnitNode && selectedNode.provider_id === LOGIC_CONDITIONS_PROVIDER_ID;
     const isParallelSplitterNode = isControlFlowUnitNode && selectedNode.provider_id === PARALLEL_SPLITTER_PROVIDER_ID;
     const spreadsheetNode = isSpreadsheetRowNode || isSpreadsheetMatrixNode ? selectedNode : null;
@@ -1877,7 +1884,7 @@ export function GraphInspector({
                 User Message Template
                 <textarea
                   rows={5}
-                  value={String(selectedNode.config.user_message_template ?? "{input_payload}")}
+                  value={displayedUserMessageTemplate}
                   onChange={(event) =>
                     onGraphChange(
                       updateNode(graph, selectedNode.id, (node) => ({

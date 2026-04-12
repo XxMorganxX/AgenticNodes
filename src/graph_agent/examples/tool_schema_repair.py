@@ -165,9 +165,18 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 "model": "mock-default",
                 "mode": "spreadsheet_matrix_decision",
                 "system_prompt": (
-                    "Use the spreadsheet decision matrix to select the best matching row and column for the user's request."
+                    "Use the spreadsheet decision matrix to select the single best matching row and column for the user's request. "
+                    "Infer the strongest fit from the full context, reconcile ambiguous titles using actual responsibilities and scope, "
+                    "and avoid shallow keyword matching."
                 ),
-                "user_message_template": "{input_payload}",
+                "user_message_template": (
+                    "Analyze the context below and choose the matrix cell that best matches the strongest underlying fit.\n\n"
+                    "Pay close attention to what the subject is most likely to care about or respond to.\n"
+                    "If a role title is broad, ambiguous, or prestige-coded, use the detailed responsibilities, tools, "
+                    "and outcomes to interpret it more precisely.\n\n"
+                    "Context:\n"
+                    "{input_payload}"
+                ),
                 "response_mode": "message",
                 "file_format": "auto",
                 "file_path": "",
@@ -583,6 +592,74 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                     label="RPC Params JSON",
                     input_type="textarea",
                     placeholder="{\n  \"project_id\": \"123\"\n}",
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="core.supabase_row_write",
+            display_name="Supabase Row Write",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Writes a single row to an existing Supabase table using a mix of runtime-bound values, literals, and omitted columns so database defaults can apply.",
+            capabilities=["supabase inserts", "supabase upserts", "runtime column mapping", "database default preservation"],
+            default_config={
+                "mode": "supabase_row_write",
+                "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_URL",
+                "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_SECRET_KEY",
+                "schema": "public",
+                "table_name": "",
+                "write_mode": "insert",
+                "on_conflict": "",
+                "ignore_duplicates": False,
+                "returning": "representation",
+                "base_row_json_path": "",
+                "column_values_json": "{}",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(key="schema", label="Schema"),
+                ProviderConfigFieldDefinition(key="table_name", label="Table Name"),
+                ProviderConfigFieldDefinition(
+                    key="write_mode",
+                    label="Write Mode",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="insert", label="Insert"),
+                        ProviderConfigOptionDefinition(value="upsert", label="Upsert"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(
+                    key="on_conflict",
+                    label="On Conflict Columns",
+                    help_text="Optional comma-separated unique key columns for upserts, like id or workspace_id,slug.",
+                    placeholder="id",
+                ),
+                ProviderConfigFieldDefinition(key="ignore_duplicates", label="Ignore Duplicate Upserts", input_type="checkbox"),
+                ProviderConfigFieldDefinition(
+                    key="returning",
+                    label="Returning",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="representation", label="Return Inserted Row"),
+                        ProviderConfigOptionDefinition(value="minimal", label="Return Write Summary"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(
+                    key="base_row_json_path",
+                    label="Base Row JSON Path",
+                    help_text="Optional path inside the incoming payload to use as the starting row object. Use $ for the full payload.",
+                    placeholder="$ or row_data",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="column_values_json",
+                    label="Column Values JSON",
+                    input_type="textarea",
+                    help_text=(
+                        "Map column names to literal values or specs like "
+                        '{"email":{"mode":"path","path":"contact.email"},"status":{"mode":"literal","value":"pending"},"created_at":{"mode":"default"}}.'
+                    ),
+                    placeholder='{\n  "email": {"mode": "path", "path": "contact.email"},\n  "status": {"mode": "literal", "value": "pending"},\n  "created_at": {"mode": "default"}\n}',
                 ),
             ],
         )

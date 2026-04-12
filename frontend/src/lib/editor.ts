@@ -1,5 +1,6 @@
 import dagre from "dagre";
 
+import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "./spreadsheetMatrixPrompt";
 import { DEFAULT_GRAPH_ENV_VARS, getGraphEnvVars } from "./graphEnv";
 import { isTestEnvironment } from "./graphDocuments";
 import { createLogicConditionBranch, normalizeLogicConditionConfig } from "./logicConditions";
@@ -958,6 +959,12 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
       const toolNames = Array.isArray(node.config.tool_names) ? node.config.tool_names : [];
       nextNode.config.tool_names = toolNames.map((toolName) => String(toolName)).filter((toolName) => toolName.trim().length > 0);
       nextNode.config.expose_mcp_tools = nextNode.config.expose_mcp_tools !== false;
+    }
+    if (node.provider_id === "core.spreadsheet_matrix_decision") {
+      const currentTemplate = String(nextNode.config.user_message_template ?? "").trim();
+      if (!currentTemplate || currentTemplate === "{input_payload}") {
+        nextNode.config.user_message_template = SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE;
+      }
     }
     if (node.provider_id === "core.logic_conditions") {
       const { normalized, handleRemap } = normalizeLogicConditionConfig(nextNode.config);

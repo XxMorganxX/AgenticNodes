@@ -42,7 +42,8 @@ To keep implementation and product conversations aligned, this project uses a fe
 - `Node instance`: a specific node placed on the canvas inside a graph.
 - `Provider card`: the draggable Studio item that creates a node instance from a provider definition.
 - `Tooltip`: the hover or focus summary shown for a node card on the canvas.
-- `Tool details modal`: the deeper tool-specific modal opened from a tool node's `Learn More` action.
+- `Provider details modal` or `Learn More modal`: the deeper node-specific modal opened from a node's `Learn More` action. This is the default home for user-facing node parameters and provider-specific configuration unless a node intentionally uses a more specialized editor.
+- `Tool details modal`: the tool-specific version of that deeper modal opened from a tool node's `Learn More` action.
 - `Inspector`: the right-hand editing surface for graph, node, and edge configuration.
 
 The important distinction is:
@@ -50,6 +51,17 @@ The important distinction is:
 - `category` answers "what can this connect to?"
 - `kind` answers "what does this do at runtime?"
 - `provider` answers "which concrete implementation powers it?"
+
+## Studio Configuration Rule
+
+When adding a new node that introduces user-facing parameters which define runtime behavior, those parameters should live in the node's `Learn More` modal by default unless there is an explicit reason to use a different specialized editor.
+
+In practice this means:
+
+- new configurable providers should be designed with the provider-details modal in mind
+- configurable nodes placed on the canvas should expose a visible `Learn More` action
+- the main inspector should stay focused on lightweight graph editing and routing, while deeper provider behavior belongs in the modal
+- exceptions should be intentional and documented, such as nodes that already have a dedicated editor experience
 
 ## Standardized Node Providers
 

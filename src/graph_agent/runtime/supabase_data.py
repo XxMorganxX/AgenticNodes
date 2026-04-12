@@ -10,6 +10,8 @@ from urllib.request import Request, urlopen
 
 SUPPORTED_SUPABASE_SOURCE_KINDS = {"table", "rpc"}
 SUPPORTED_SUPABASE_OUTPUT_MODES = {"records", "markdown"}
+SUPPORTED_SUPABASE_WRITE_MODES = {"insert", "upsert"}
+SUPPORTED_SUPABASE_RETURNING_MODES = {"representation", "minimal"}
 
 
 class SupabaseDataError(RuntimeError):
@@ -54,6 +56,33 @@ class SupabaseDataResult:
     source_name: str
     schema: str
     output_mode: str
+
+
+@dataclass(frozen=True)
+class SupabaseRowWriteRequest:
+    supabase_url: str
+    supabase_key: str
+    schema: str
+    table_name: str
+    row: dict[str, Any]
+    write_mode: str = "insert"
+    on_conflict: str = ""
+    ignore_duplicates: bool = False
+    returning: str = "representation"
+
+
+@dataclass(frozen=True)
+class SupabaseRowWriteResult:
+    payload: Any
+    raw_payload: Any
+    row_count: int | None
+    request_url: str
+    source_path: str
+    schema: str
+    table_name: str
+    write_mode: str
+    returning: str
+    inserted_row: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -261,6 +290,125 @@ def fetch_supabase_data(request: SupabaseDataRequest) -> SupabaseDataResult:
         source_name=source_name,
         schema=schema,
         output_mode=output_mode,
+    )
+
+
+def write_supabase_row(request: SupabaseRowWriteRequest) -> SupabaseRowWriteResult:
+    supabase_url = str(request.supabase_url or "").strip().rstrip("/")
+    supabase_key = str(request.supabase_key or "").strip()
+    schema = str(request.schema or "public").strip() or "public"
+    table_name = str(request.table_name or "").strip()
+    write_mode = str(request.write_mode or "insert").strip().lower() or "insert"
+    returning = str(request.returning or "representation").strip().lower() or "representation"
+    on_conflict = str(request.on_conflict or "").strip()
+    row = dict(request.row or {})
+
+    if not supabase_url:
+        raise SupabaseDataError("Supabase URL is required.", error_type="missing_supabase_url")
+    if not supabase_key:
+        raise SupabaseDataError("Supabase key is required.", error_type="missing_supabase_key")
+    if not table_name:
+        raise SupabaseDataError("Supabase table_name is required.", error_type="missing_supabase_table_name")
+    if write_mode not in SUPPORTED_SUPABASE_WRITE_MODES:
+        raise SupabaseDataError(
+            f"Unsupported Supabase write mode '{write_mode}'.",
+            error_type="invalid_supabase_write_mode",
+        )
+    if returning not in SUPPORTED_SUPABASE_RETURNING_MODES:
+        raise SupabaseDataError(
+            f"Unsupported Supabase returning mode '{returning}'.",
+            error_type="invalid_supabase_returning_mode",
+        )
+    if not row:
+        raise SupabaseDataError(
+            "Supabase row payload must include at least one column value.",
+            error_type="empty_supabase_row_payload",
+        )
+
+    query_pairs: list[tuple[str, str]] = []
+    if write_mode == "upsert" and on_conflict:
+        query_pairs.append(("on_conflict", on_conflict))
+
+    source_path = f"/rest/v1/{quote(table_name, safe='')}"
+    request_url = f"{supabase_url}{source_path}"
+    if query_pairs:
+        request_url = f"{request_url}?{urlencode(query_pairs)}"
+
+    prefer_values = [f"return={returning}"]
+    if write_mode == "upsert":
+        prefer_values.append("resolution=ignore-duplicates" if request.ignore_duplicates else "resolution=merge-duplicates")
+
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Accept-Profile": schema,
+        "Content-Profile": schema,
+        "Prefer": ",".join(prefer_values),
+    }
+    body = json.dumps(row).encode("utf-8")
+    http_request = Request(request_url, data=body, method="POST", headers=headers)
+    try:
+        with urlopen(http_request) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise SupabaseDataError(
+            f"Supabase write request failed: {exc.code} {detail}".strip(),
+            error_type="supabase_write_request_failed",
+            details={"status_code": exc.code, "table_name": table_name, "write_mode": write_mode},
+        ) from exc
+    except URLError as exc:
+        raise SupabaseDataError(
+            f"Supabase write request failed: {exc.reason}",
+            error_type="supabase_write_request_failed",
+            details={"table_name": table_name, "write_mode": write_mode},
+        ) from exc
+
+    if not raw_body.strip():
+        decoded: Any = None
+    else:
+        try:
+            decoded = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            raise SupabaseDataError(
+                "Supabase write response was not valid JSON.",
+                error_type="invalid_supabase_write_response",
+                details={"table_name": table_name, "write_mode": write_mode},
+            ) from exc
+
+    row_count: int | None = None
+    if isinstance(decoded, list):
+        row_count = len(decoded)
+    elif isinstance(decoded, dict):
+        row_count = 1 if decoded else 0
+    elif decoded is None:
+        row_count = 1
+
+    payload: Any
+    if returning == "representation":
+        payload = decoded
+    else:
+        payload = {
+            "table_name": table_name,
+            "schema": schema,
+            "write_mode": write_mode,
+            "row_count": row_count,
+            "returning": returning,
+        }
+
+    return SupabaseRowWriteResult(
+        payload=payload,
+        raw_payload=decoded,
+        row_count=row_count,
+        request_url=request_url,
+        source_path=source_path,
+        schema=schema,
+        table_name=table_name,
+        write_mode=write_mode,
+        returning=returning,
+        inserted_row=row,
     )
 
 

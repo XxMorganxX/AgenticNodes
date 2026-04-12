@@ -27,6 +27,7 @@ class _SupabaseStubHandler(BaseHTTPRequestHandler):
     last_headers: dict[str, str] = {}
     last_query: dict[str, list[str]] = {}
     last_path: str = ""
+    last_json_body: Any = None
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -95,6 +96,12 @@ class _SupabaseStubHandler(BaseHTTPRequestHandler):
         type(self).last_headers = {str(key).lower(): str(value) for key, value in self.headers.items()}
         type(self).last_query = parse_qs(parsed.query)
         type(self).last_path = parsed.path
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b""
+        try:
+            type(self).last_json_body = json.loads(raw_body.decode("utf-8")) if raw_body else None
+        except json.JSONDecodeError:
+            type(self).last_json_body = raw_body.decode("utf-8", errors="replace")
         if parsed.path == "/mcp":
             body = json.dumps(
                 {
@@ -112,6 +119,19 @@ class _SupabaseStubHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if parsed.path.startswith("/rest/v1/") and parsed.path != "/rest/v1/":
+            prefer = str(self.headers.get("Prefer", ""))
+            if "return=minimal" in prefer:
+                self.send_response(201)
+                self.end_headers()
+                return
+            body = json.dumps(type(self).last_json_body).encode("utf-8")
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(404)
         self.end_headers()
 
@@ -124,6 +144,7 @@ class SupabaseStubServer:
         _SupabaseStubHandler.last_headers = {}
         _SupabaseStubHandler.last_query = {}
         _SupabaseStubHandler.last_path = ""
+        _SupabaseStubHandler.last_json_body = None
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _SupabaseStubHandler)
         self._thread = Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
@@ -204,6 +225,79 @@ def supabase_graph_payload(
     }
 
 
+def supabase_row_write_graph_payload(
+    graph_id: str = "supabase-row-write-graph",
+    *,
+    node_config: dict[str, object] | None = None,
+) -> dict[str, object]:
+    resolved_node_config: dict[str, object] = {
+        "mode": "supabase_row_write",
+        "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_URL",
+        "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_SECRET_KEY",
+        "schema": "public",
+        "table_name": "audit_logs",
+        "write_mode": "insert",
+        "on_conflict": "",
+        "ignore_duplicates": False,
+        "returning": "representation",
+        "base_row_json_path": "",
+        "column_values_json": json.dumps(
+            {
+                "email": {"mode": "path", "path": "event.email"},
+                "event_type": {"mode": "path", "path": "event.type"},
+                "status": {"mode": "literal", "value": "queued"},
+                "metadata": {"mode": "path", "path": "event.metadata"},
+                "created_at": {"mode": "default"},
+            }
+        ),
+    }
+    if node_config:
+        resolved_node_config.update(node_config)
+    return {
+        "graph_id": graph_id,
+        "name": "Supabase Row Write Graph",
+        "description": "",
+        "version": "1.0",
+        "start_node_id": "start",
+        "nodes": [
+            {
+                "id": "start",
+                "kind": "input",
+                "category": "start",
+                "label": "Start",
+                "provider_id": "start.manual_run",
+                "provider_label": "Run Button Start",
+                "config": {"input_binding": {"type": "input_payload"}},
+                "position": {"x": 0, "y": 0},
+            },
+            {
+                "id": "writer",
+                "kind": "data",
+                "category": "data",
+                "label": "Supabase Row Write",
+                "provider_id": "core.supabase_row_write",
+                "provider_label": "Supabase Row Write",
+                "config": resolved_node_config,
+                "position": {"x": 240, "y": 0},
+            },
+            {
+                "id": "finish",
+                "kind": "output",
+                "category": "end",
+                "label": "Finish",
+                "provider_id": "core.output",
+                "provider_label": "Core Output Node",
+                "config": {"source_binding": {"type": "latest_payload", "source": "writer"}},
+                "position": {"x": 460, "y": 0},
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source_id": "start", "target_id": "writer", "label": "", "kind": "standard", "priority": 100},
+            {"id": "e2", "source_id": "writer", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+        ],
+    }
+
+
 class SupabaseDataNodeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.services = build_example_services()
@@ -224,6 +318,16 @@ class SupabaseDataNodeTests(unittest.TestCase):
         self.assertEqual(provider["default_config"]["mode"], "supabase_data")
         self.assertEqual(provider["default_config"]["source_kind"], "table")
         self.assertEqual(provider["default_config"]["output_mode"], "records")
+
+    def test_supabase_row_write_provider_appears_in_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = GraphStore(self.services, path=Path(directory) / "graphs.json")
+            catalog = store.catalog()
+
+        provider = next(candidate for candidate in catalog["node_providers"] if candidate["provider_id"] == "core.supabase_row_write")
+        self.assertEqual(provider["default_config"]["mode"], "supabase_row_write")
+        self.assertEqual(provider["default_config"]["write_mode"], "insert")
+        self.assertEqual(provider["default_config"]["returning"], "representation")
 
     def test_supabase_data_node_fetches_rows_and_emits_data_envelope(self) -> None:
         graph = GraphDefinition.from_dict(supabase_graph_payload())
@@ -416,6 +520,92 @@ class SupabaseDataNodeTests(unittest.TestCase):
 
         self.assertEqual(state.status, "failed")
         self.assertEqual(state.terminal_error["type"], "invalid_supabase_rpc_params")
+
+    def test_supabase_row_write_node_writes_runtime_row_and_preserves_defaults(self) -> None:
+        graph = GraphDefinition.from_dict(supabase_row_write_graph_payload())
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with SupabaseStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_SUPABASE_URL": base_url,
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+            },
+            clear=False,
+        ):
+            state = runtime.run(
+                graph,
+                {
+                    "event": {
+                        "email": "person@example.com",
+                        "type": "signup",
+                        "metadata": {"plan": "pro"},
+                    }
+                },
+                run_id="run-supabase-row-write",
+            )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(
+            state.final_output,
+            {
+                "email": "person@example.com",
+                "event_type": "signup",
+                "status": "queued",
+                "metadata": {"plan": "pro"},
+            },
+        )
+        self.assertEqual(state.node_outputs["writer"]["metadata"]["data_mode"], "supabase_row_write")
+        self.assertEqual(state.node_outputs["writer"]["metadata"]["table_name"], "audit_logs")
+        self.assertEqual(_SupabaseStubHandler.last_path, "/rest/v1/audit_logs")
+        self.assertEqual(
+            _SupabaseStubHandler.last_json_body,
+            {
+                "email": "person@example.com",
+                "event_type": "signup",
+                "status": "queued",
+                "metadata": {"plan": "pro"},
+            },
+        )
+        self.assertNotIn("created_at", _SupabaseStubHandler.last_json_body)
+        self.assertEqual(_SupabaseStubHandler.last_headers.get("prefer"), "return=representation")
+
+    def test_supabase_row_write_node_can_exist_without_table_name_during_editing(self) -> None:
+        graph = GraphDefinition.from_dict(
+            supabase_row_write_graph_payload(
+                "supabase-row-write-missing-table-name",
+                node_config={"table_name": ""},
+            )
+        )
+        graph.validate_against_services(self.services)
+
+    def test_invalid_row_mapping_json_fails_cleanly(self) -> None:
+        graph = GraphDefinition.from_dict(
+            supabase_row_write_graph_payload(
+                "supabase-row-write-invalid-mapping",
+                node_config={"column_values_json": "{not-json}"},
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_SUPABASE_URL": "http://127.0.0.1:9999",
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+            },
+            clear=False,
+        ):
+            state = runtime.run(
+                graph,
+                {"event": {"email": "person@example.com", "type": "signup"}},
+                run_id="run-supabase-row-write-invalid-mapping",
+            )
+
+        self.assertEqual(state.status, "failed")
+        self.assertEqual(state.terminal_error["type"], "invalid_supabase_row_mapping")
 
 
 if __name__ == "__main__":

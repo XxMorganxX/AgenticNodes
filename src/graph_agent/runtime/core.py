@@ -54,6 +54,8 @@ from graph_agent.runtime.supabase_data import (
     SupabaseDataError,
     SupabaseDataRequest,
     fetch_supabase_data,
+    write_supabase_row,
+    SupabaseRowWriteRequest,
 )
 from graph_agent.runtime.node_providers import (
     NodeCategory,
@@ -101,6 +103,8 @@ RUNTIME_NORMALIZER_PROVIDER_ID = "core.runtime_normalizer"
 RUNTIME_NORMALIZER_MODE = "runtime_normalizer"
 SUPABASE_DATA_PROVIDER_ID = "core.supabase_data"
 SUPABASE_DATA_MODE = "supabase_data"
+SUPABASE_ROW_WRITE_PROVIDER_ID = "core.supabase_row_write"
+SUPABASE_ROW_WRITE_MODE = "supabase_row_write"
 SPREADSHEET_MATRIX_DECISION_MODE = "spreadsheet_matrix_decision"
 CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body"
 CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if"
@@ -420,6 +424,25 @@ def _deep_get(value: Any, path: str | None) -> Any:
         else:
             return None
     return current
+
+
+def _deep_get_with_presence(value: Any, path: str | None) -> tuple[bool, Any]:
+    if path in {None, "", "$"}:
+        return True, value
+    current = value
+    for segment in path.split("."):
+        if isinstance(current, Mapping):
+            if segment not in current:
+                return False, None
+            current = current.get(segment)
+        elif isinstance(current, list) and segment.isdigit():
+            index = int(segment)
+            if index >= len(current):
+                return False, None
+            current = current[index]
+        else:
+            return False, None
+    return True, current
 
 
 def _parse_json_object_or_array(value: Any) -> Any:
@@ -2413,6 +2436,190 @@ class DataNode(BaseNode):
             rpc_params=rpc_params if isinstance(rpc_params, dict) else {},
         )
 
+    def _supabase_row_write_source_value(self, context: NodeContext) -> Any:
+        source_value = context.resolve_binding(self.config.get("input_binding"))
+        source_value = _parse_json_object_or_array(source_value)
+        if _is_message_envelope_like(source_value):
+            source_value = _parse_json_object_or_array(source_value.get("payload"))
+        return source_value
+
+    def _supabase_row_write_mapping_specs(self, resolved_config: Mapping[str, Any]) -> dict[str, Any]:
+        raw_mapping_text = str(resolved_config.get("column_values_json", "{}") or "{}").strip() or "{}"
+        try:
+            parsed = json.loads(raw_mapping_text)
+        except json.JSONDecodeError as exc:
+            raise SupabaseDataError(
+                "Supabase column_values_json must be valid JSON.",
+                error_type="invalid_supabase_row_mapping",
+            ) from exc
+        if not isinstance(parsed, Mapping):
+            raise SupabaseDataError(
+                "Supabase column_values_json must be a JSON object keyed by column name.",
+                error_type="invalid_supabase_row_mapping",
+            )
+        mapping_specs: dict[str, Any] = {}
+        for raw_key, raw_value in parsed.items():
+            column_name = str(raw_key or "").strip()
+            if not column_name:
+                raise SupabaseDataError(
+                    "Supabase column_values_json cannot contain empty column names.",
+                    error_type="invalid_supabase_row_mapping",
+                )
+            mapping_specs[column_name] = raw_value
+        return mapping_specs
+
+    def _resolve_supabase_row_write_spec(
+        self,
+        column_name: str,
+        spec: Any,
+        *,
+        source_value: Any,
+        context: NodeContext,
+    ) -> tuple[bool, Any]:
+        if not isinstance(spec, Mapping):
+            return True, spec
+
+        reserved_keys = {"mode", "source", "path", "template", "value", "on_missing"}
+        if not any(key in spec for key in reserved_keys):
+            return True, dict(spec)
+
+        mode = str(spec.get("mode", spec.get("source", "literal")) or "literal").strip().lower() or "literal"
+        if mode in {"default", "omit"}:
+            return False, None
+        if mode == "null":
+            return True, None
+        if mode == "literal":
+            return True, spec.get("value")
+        if mode == "template":
+            template = str(spec.get("template", spec.get("value", "")) or "")
+            return True, context.render_template(template)
+        if mode == "path":
+            path = str(spec.get("path", "$") or "$").strip() or "$"
+            found, resolved_value = _deep_get_with_presence(source_value, path)
+            if found:
+                return True, resolved_value
+            on_missing = str(spec.get("on_missing", "error") or "error").strip().lower() or "error"
+            if on_missing in {"omit", "default"}:
+                return False, None
+            if on_missing == "null":
+                return True, None
+            raise SupabaseDataError(
+                f"Supabase row column '{column_name}' could not resolve path '{path}'.",
+                error_type="missing_supabase_row_value",
+                details={"column_name": column_name, "path": path},
+            )
+        raise SupabaseDataError(
+            f"Supabase row column '{column_name}' uses unsupported mode '{mode}'.",
+            error_type="invalid_supabase_row_mapping",
+            details={"column_name": column_name},
+        )
+
+    def _supabase_row_write_payload(self, context: NodeContext) -> tuple[dict[str, Any], Any]:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        source_value = self._supabase_row_write_source_value(context)
+        row_payload: dict[str, Any] = {}
+
+        base_row_path = str(resolved.get("base_row_json_path", "") or "").strip()
+        if base_row_path:
+            found, base_row_value = _deep_get_with_presence(source_value, base_row_path)
+            if not found:
+                raise SupabaseDataError(
+                    f"Supabase base_row_json_path '{base_row_path}' did not resolve to a value.",
+                    error_type="missing_supabase_base_row",
+                )
+            if not isinstance(base_row_value, Mapping):
+                raise SupabaseDataError(
+                    "Supabase base_row_json_path must resolve to a JSON object.",
+                    error_type="invalid_supabase_base_row",
+                )
+            row_payload = {str(key): value for key, value in base_row_value.items() if str(key).strip()}
+
+        for column_name, spec in self._supabase_row_write_mapping_specs(resolved).items():
+            include_value, resolved_value = self._resolve_supabase_row_write_spec(
+                column_name,
+                spec,
+                source_value=source_value,
+                context=context,
+            )
+            if include_value:
+                row_payload[column_name] = resolved_value
+            else:
+                row_payload.pop(column_name, None)
+
+        if not row_payload:
+            raise SupabaseDataError(
+                "Supabase row payload resolved to an empty object. Add at least one column value or map a base row object.",
+                error_type="empty_supabase_row_payload",
+            )
+        return row_payload, source_value
+
+    def _supabase_row_write_request(self, context: NodeContext) -> tuple[SupabaseRowWriteRequest, Any]:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        row_payload, source_value = self._supabase_row_write_payload(context)
+        return (
+            SupabaseRowWriteRequest(
+                supabase_url=resolve_graph_process_env(
+                    str(resolved.get("supabase_url_env_var", "GRAPH_AGENT_SUPABASE_URL") or "GRAPH_AGENT_SUPABASE_URL"),
+                    context.graph.env_vars,
+                ),
+                supabase_key=resolve_graph_process_env(
+                    str(resolved.get("supabase_key_env_var", "GRAPH_AGENT_SUPABASE_SECRET_KEY") or "GRAPH_AGENT_SUPABASE_SECRET_KEY"),
+                    context.graph.env_vars,
+                ),
+                schema=str(resolved.get("schema", "public") or "public").strip() or "public",
+                table_name=str(resolved.get("table_name", "") or "").strip(),
+                row=row_payload,
+                write_mode=str(resolved.get("write_mode", "insert") or "insert").strip().lower() or "insert",
+                on_conflict=str(resolved.get("on_conflict", "") or "").strip(),
+                ignore_duplicates=_coerce_bool(resolved.get("ignore_duplicates"), default=False),
+                returning=str(resolved.get("returning", "representation") or "representation").strip().lower() or "representation",
+            ),
+            source_value,
+        )
+
+    def _execute_supabase_row_write(self, context: NodeContext) -> NodeExecutionResult:
+        try:
+            request, source_value = self._supabase_row_write_request(context)
+            result = write_supabase_row(request)
+        except SupabaseDataError as exc:
+            return NodeExecutionResult(
+                status="failed",
+                error=exc.to_error_payload(),
+                summary=str(exc),
+            )
+
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=result.payload,
+            artifacts={
+                "supabase_raw_payload": result.raw_payload,
+                "supabase_request_url": result.request_url,
+                "supabase_written_row": result.inserted_row,
+                "supabase_write_source_value": source_value,
+            },
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "data_mode": SUPABASE_ROW_WRITE_MODE,
+                "provider_id": self.provider_id,
+                "schema": result.schema,
+                "table_name": result.table_name,
+                "write_mode": result.write_mode,
+                "returning": result.returning,
+                "row_count": result.row_count,
+                "written_columns": sorted(result.inserted_row.keys()),
+            },
+        )
+        summary_count = "unknown rows" if result.row_count is None else f"{result.row_count} row(s)"
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary=f"Wrote {summary_count} to Supabase table '{result.table_name}'.",
+            metadata=envelope.metadata,
+        )
+
     def _execute_supabase_data(self, context: NodeContext) -> NodeExecutionResult:
         try:
             request = self._supabase_data_request(context)
@@ -2538,6 +2745,23 @@ class DataNode(BaseNode):
                 "supabase_key_present": bool(request.supabase_key),
                 "rpc_params": request.rpc_params,
             }
+        if self.provider_id == SUPABASE_ROW_WRITE_PROVIDER_ID or mode == SUPABASE_ROW_WRITE_MODE:
+            try:
+                request, source_value = self._supabase_row_write_request(context)
+            except SupabaseDataError as exc:
+                return {"error": str(exc)}
+            return {
+                "schema": request.schema,
+                "table_name": request.table_name,
+                "write_mode": request.write_mode,
+                "returning": request.returning,
+                "on_conflict": request.on_conflict,
+                "ignore_duplicates": request.ignore_duplicates,
+                "row_preview": request.row,
+                "source_preview": source_value,
+                "supabase_url_present": bool(request.supabase_url),
+                "supabase_key_present": bool(request.supabase_key),
+            }
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return context.prompt_block_payload_for_node(self.id)
         if mode == "context_builder":
@@ -2581,6 +2805,8 @@ class DataNode(BaseNode):
             return self._execute_runtime_normalizer(context)
         if self.provider_id == SUPABASE_DATA_PROVIDER_ID or mode == SUPABASE_DATA_MODE:
             return self._execute_supabase_data(context)
+        if self.provider_id == SUPABASE_ROW_WRITE_PROVIDER_ID or mode == SUPABASE_ROW_WRITE_MODE:
+            return self._execute_supabase_row_write(context)
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return self._execute_prompt_block(context)
         source_value = context.resolve_binding(self.config.get("input_binding"))
@@ -3728,6 +3954,11 @@ class SpreadsheetMatrixDecisionNode(ModelNode):
                 "You are selecting one cell from a spreadsheet decision matrix.",
                 "The first row contains the column-axis labels and the first column contains the row-axis labels.",
                 "Choose exactly one row_label and one column_label that best answer the user's request.",
+                "Use the full context to infer the strongest fit, not shallow keyword overlap or title matching.",
+                "When the input describes a person, role, or account, reason from responsibilities, incentives, technical depth, seniority, and likely response behavior.",
+                "If a headline title conflicts with the role description, prioritize the day-to-day work, tools, outcomes, and scope in the description.",
+                "Distinguish closely related profiles when the evidence supports it, such as technical versus managerial PMs, operators versus strategists, or practitioners versus decision-makers.",
+                "Prefer the single best-supported row and column rather than averaging across multiple plausible categories.",
                 "Return only structured JSON matching the schema. The row_label and column_label must exactly match the provided labels.",
             ]
         )
@@ -3736,6 +3967,16 @@ class SpreadsheetMatrixDecisionNode(ModelNode):
             str(self.config.get("user_message_template", "{input_payload}") or "{input_payload}"),
             metadata,
         ).strip()
+        decision_guidance = "\n".join(
+            [
+                "Selection guidance:",
+                "- Match on the underlying role, intent, pressure, and likely response pattern, not just literal word overlap.",
+                "- If the input is about a person, infer what they are most likely to respond to from their scope, current responsibilities, technical fluency, seniority, and business context.",
+                "- When a current title sounds broad or generic, use the role description and evidence of day-to-day work to narrow the fit.",
+                "- If title and description point in different directions, trust the detailed responsibilities over the headline title.",
+                "- Make the sharpest supported distinction available, for example technical PM versus people manager or hands-on operator versus executive sponsor.",
+            ]
+        )
         matrix_context = "\n".join(
             [
                 "Spreadsheet Matrix",
@@ -3757,6 +3998,7 @@ class SpreadsheetMatrixDecisionNode(ModelNode):
             section
             for section in [
                 rendered_user_message and f"User question or context:\n{rendered_user_message}",
+                decision_guidance,
                 matrix_context,
             ]
             if section
@@ -6051,6 +6293,17 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Supabase data source node '{node.id}' must declare a positive limit value."
                     ) from exc
+            if node.kind == "data" and node.provider_id == SUPABASE_ROW_WRITE_PROVIDER_ID:
+                write_mode = str(node.config.get("write_mode", "insert") or "insert").strip().lower() or "insert"
+                if write_mode not in {"insert", "upsert"}:
+                    raise GraphValidationError(
+                        f"Supabase row write node '{node.id}' uses unsupported write_mode '{write_mode}'."
+                    )
+                returning = str(node.config.get("returning", "representation") or "representation").strip().lower() or "representation"
+                if returning not in {"representation", "minimal"}:
+                    raise GraphValidationError(
+                        f"Supabase row write node '{node.id}' uses unsupported returning mode '{returning}'."
+                    )
             if node.kind == "control_flow_unit":
                 if node.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
                     allowed_handles = {CONTROL_FLOW_LOOP_BODY_HANDLE_ID, None}

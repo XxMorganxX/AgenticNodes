@@ -183,6 +183,9 @@ class SpreadsheetMatrixDecisionTests(unittest.TestCase):
         self.assertIn("High urgency", provider.user_messages[0])
         self.assertIn("Enterprise", provider.user_messages[0])
         self.assertIn("Escalate to dedicated team", provider.user_messages[0])
+        self.assertIn("likely to respond to", provider.user_messages[0])
+        self.assertIn("trust the detailed responsibilities over the headline title", provider.user_messages[0])
+        self.assertIn("technical PM versus people manager", provider.user_messages[0])
 
     def test_validation_rejects_tool_capable_matrix_node(self) -> None:
         services = build_example_services()
