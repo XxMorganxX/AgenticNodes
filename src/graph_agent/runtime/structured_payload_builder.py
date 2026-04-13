@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 from typing import Any, Mapping, Sequence
-
-from graph_agent.runtime.runtime_normalizer import extract_field_candidates
-
 
 @dataclass(frozen=True)
 class StructuredPayloadBuilderConfig:
@@ -23,6 +21,34 @@ class StructuredPayloadBuildResult:
     field_matches: tuple[dict[str, Any], ...]
 
 
+_WORD_BOUNDARY_PATTERN = re.compile(r"([a-z0-9])([A-Z])")
+_ACRONYM_BOUNDARY_PATTERN = re.compile(r"([A-Z]+)([A-Z][a-z])")
+_NON_ALNUM_PATTERN = re.compile(r"[^A-Za-z0-9]+")
+_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "name": ("full name", "person name", "contact name"),
+    "first name": ("given name", "forename"),
+    "last name": ("family name", "surname"),
+    "email": ("email address", "mail", "work email", "business email"),
+    "linkedin url": ("linkedin", "linkedin profile", "linkedin profile url"),
+    "twitter url": ("twitter", "twitter profile", "twitter profile url", "x", "x profile", "x url"),
+    "organization name": ("organization", "organization title", "company", "company name", "employer", "account name"),
+    "domain": ("company domain", "website domain", "email domain", "company website"),
+    "headline": ("title", "job title", "role"),
+}
+
+
+@dataclass(frozen=True)
+class _FieldCandidate:
+    field: str
+    path: str
+    value: Any
+    field_phrase: str
+    field_tokens: tuple[str, ...]
+    path_tokens: tuple[str, ...]
+    depth: int
+    discovery_index: int
+
+
 def parse_structured_payload_template(value: Any) -> dict[str, Any]:
     candidate = str(value or "").strip() or "{}"
     try:
@@ -34,23 +60,205 @@ def parse_structured_payload_template(value: Any) -> dict[str, Any]:
     return dict(parsed)
 
 
+def _tokenize_keywords(value: Any, *, case_sensitive: bool) -> tuple[str, ...]:
+    text = str(value or "").strip()
+    if not text:
+        return ()
+    text = _WORD_BOUNDARY_PATTERN.sub(r"\1 \2", text)
+    text = _ACRONYM_BOUNDARY_PATTERN.sub(r"\1 \2", text)
+    raw_parts = _NON_ALNUM_PATTERN.split(text)
+    tokens = []
+    for part in raw_parts:
+        normalized_part = str(part or "").strip()
+        if not normalized_part:
+            continue
+        tokens.append(normalized_part if case_sensitive else normalized_part.lower())
+    return tuple(tokens)
+
+
+def _token_phrase(tokens: Sequence[str]) -> str:
+    return " ".join(str(token).strip() for token in tokens if str(token).strip())
+
+
+def _target_keyword_variants(field_name: str, *, case_sensitive: bool) -> tuple[tuple[str, ...], ...]:
+    direct_tokens = _tokenize_keywords(field_name, case_sensitive=case_sensitive)
+    variants: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+
+    def add_variant(tokens: tuple[str, ...]) -> None:
+        if not tokens or tokens in seen:
+            return
+        variants.append(tokens)
+        seen.add(tokens)
+
+    direct_phrase = _token_phrase(direct_tokens)
+    alias_phrases = _FIELD_ALIASES.get(direct_phrase, ())
+    add_variant(direct_tokens)
+    for alias in alias_phrases:
+        add_variant(_tokenize_keywords(alias, case_sensitive=case_sensitive))
+    return tuple(variants)
+
+
+def _walk_field_candidates(
+    value: Any,
+    *,
+    case_sensitive: bool,
+    max_matches: int,
+) -> list[_FieldCandidate]:
+    matches: list[_FieldCandidate] = []
+    discovery_index = 0
+
+    def walk(current: Any, path: str) -> None:
+        nonlocal discovery_index
+        if len(matches) >= max_matches:
+            return
+        if isinstance(current, Mapping):
+            for key, candidate_value in current.items():
+                next_path = f"{path}.{key}" if path else str(key)
+                matches.append(
+                    _FieldCandidate(
+                        field=str(key),
+                        path=next_path,
+                        value=candidate_value,
+                        field_phrase=_token_phrase(_tokenize_keywords(key, case_sensitive=case_sensitive)),
+                        field_tokens=_tokenize_keywords(key, case_sensitive=case_sensitive),
+                        path_tokens=_tokenize_keywords(next_path, case_sensitive=case_sensitive),
+                        depth=next_path.count("."),
+                        discovery_index=discovery_index,
+                    )
+                )
+                discovery_index += 1
+                if len(matches) >= max_matches:
+                    return
+                walk(candidate_value, next_path)
+                if len(matches) >= max_matches:
+                    return
+        elif isinstance(current, Sequence) and not isinstance(current, (str, bytes, bytearray)):
+            for index, item in enumerate(current):
+                next_path = f"{path}.{index}" if path else str(index)
+                walk(item, next_path)
+                if len(matches) >= max_matches:
+                    return
+
+    walk(value, "")
+    return matches
+
+
+def _value_matches_expected_shape(value: Any, expected_shape: str | None) -> bool:
+    if expected_shape == "mapping":
+        return isinstance(value, Mapping)
+    if expected_shape == "list":
+        return isinstance(value, list)
+    if expected_shape == "scalar":
+        return not isinstance(value, (Mapping, list))
+    return True
+
+
+def _match_details_for_candidate(
+    candidate: _FieldCandidate,
+    *,
+    field_name: str,
+    case_sensitive: bool,
+) -> dict[str, Any] | None:
+    target_variants = _target_keyword_variants(field_name, case_sensitive=case_sensitive)
+    if not target_variants:
+        return None
+
+    candidate_field_value = str(candidate.field or "").strip()
+    target_field_value = str(field_name or "").strip()
+    if case_sensitive:
+        is_raw_exact = candidate_field_value == target_field_value
+    else:
+        is_raw_exact = candidate_field_value.lower() == target_field_value.lower()
+    if is_raw_exact:
+        return {
+            "match_type": "exact_key",
+            "matched_keywords": list(_tokenize_keywords(field_name, case_sensitive=False)),
+            "score": (0, 0, 0, candidate.depth, candidate.discovery_index),
+        }
+
+    primary_phrase = _token_phrase(target_variants[0])
+    if candidate.field_phrase == primary_phrase:
+        return {
+            "match_type": "normalized_key",
+            "matched_keywords": list(target_variants[0]),
+            "score": (1, 0, 0, candidate.depth, candidate.discovery_index),
+        }
+
+    candidate_field_token_set = set(candidate.field_tokens)
+    candidate_path_token_set = set(candidate.path_tokens)
+    seen_alias_keywords: set[tuple[str, ...]] = set()
+    for alias_index, alias_tokens in enumerate(target_variants[1:], start=1):
+        alias_phrase = _token_phrase(alias_tokens)
+        if candidate.field_phrase == alias_phrase:
+            return {
+                "match_type": "alias_key",
+                "matched_keywords": list(alias_tokens),
+                "score": (2, alias_index, 0, candidate.depth, candidate.discovery_index),
+            }
+        alias_token_set = set(alias_tokens)
+        if alias_token_set and alias_tokens not in seen_alias_keywords and alias_token_set.issubset(candidate_field_token_set):
+            seen_alias_keywords.add(alias_tokens)
+            return {
+                "match_type": "alias_keywords",
+                "matched_keywords": list(alias_tokens),
+                "score": (3, alias_index, len(candidate_field_token_set) - len(alias_token_set), candidate.depth, candidate.discovery_index),
+            }
+        if alias_token_set and alias_tokens not in seen_alias_keywords and alias_token_set.issubset(candidate_path_token_set):
+            seen_alias_keywords.add(alias_tokens)
+            return {
+                "match_type": "alias_path_keywords",
+                "matched_keywords": list(alias_tokens),
+                "score": (4, alias_index, len(candidate_path_token_set) - len(alias_token_set), candidate.depth, candidate.discovery_index),
+            }
+
+    direct_token_set = set(target_variants[0])
+    if direct_token_set and direct_token_set.issubset(candidate_field_token_set):
+        return {
+            "match_type": "keyword_key",
+            "matched_keywords": list(target_variants[0]),
+            "score": (5, 0, len(candidate_field_token_set) - len(direct_token_set), candidate.depth, candidate.discovery_index),
+        }
+    if direct_token_set and direct_token_set.issubset(candidate_path_token_set):
+        return {
+            "match_type": "keyword_path",
+            "matched_keywords": list(target_variants[0]),
+            "score": (6, 0, len(candidate_path_token_set) - len(direct_token_set), candidate.depth, candidate.discovery_index),
+        }
+    return None
+
+
 def _find_first_match(
     field_name: str,
     source_roots: Sequence[Any],
     *,
     case_sensitive: bool,
     max_matches: int,
+    expected_shape: str | None = None,
 ) -> dict[str, Any] | None:
-    for root in source_roots:
-        matches = extract_field_candidates(
-            root,
-            field_names=[field_name],
-            case_sensitive=case_sensitive,
-            max_matches=max_matches,
-        )
-        if matches:
-            return dict(matches[0])
-    return None
+    best_match: dict[str, Any] | None = None
+    best_score: tuple[Any, ...] | None = None
+    for root_index, root in enumerate(source_roots):
+        candidates = _walk_field_candidates(root, case_sensitive=case_sensitive, max_matches=max_matches)
+        for candidate in candidates:
+            if not _value_matches_expected_shape(candidate.value, expected_shape):
+                continue
+            match_details = _match_details_for_candidate(candidate, field_name=field_name, case_sensitive=case_sensitive)
+            if match_details is None:
+                continue
+            candidate_score = (root_index, *tuple(match_details["score"]))
+            if best_score is not None and candidate_score >= best_score:
+                continue
+            best_score = candidate_score
+            best_match = {
+                "field": candidate.field,
+                "path": candidate.path,
+                "value": candidate.value,
+                "match_type": match_details["match_type"],
+                "matched_keywords": list(match_details["matched_keywords"]),
+                "source_root_index": root_index,
+            }
+    return best_match
 
 
 def _is_missing_template_value(value: Any) -> bool:
@@ -102,6 +310,7 @@ def build_structured_payload(
                     active_source_roots,
                     case_sensitive=case_sensitive,
                     max_matches=max_matches_per_field,
+                    expected_shape="mapping",
                 )
                 if match is not None and isinstance(match.get("value"), Mapping):
                     filled_paths.append(path)
@@ -132,6 +341,7 @@ def build_structured_payload(
                     active_source_roots,
                     case_sensitive=case_sensitive,
                     max_matches=max_matches_per_field,
+                    expected_shape="list",
                 )
                 if match is not None and isinstance(match.get("value"), list):
                     filled_paths.append(path)
@@ -153,6 +363,7 @@ def build_structured_payload(
             active_source_roots,
             case_sensitive=case_sensitive,
             max_matches=max_matches_per_field,
+            expected_shape="scalar",
         )
         if match is None:
             unresolved_paths.append(path)

@@ -61,7 +61,7 @@ import {
   TOOL_SUCCESS_HANDLE_ID,
 } from "../lib/editor";
 import type { GraphLayoutNodeDimensions } from "../lib/editor";
-import { logGraphDiagnostic, useGraphDiagnosticsEnabled, useRenderDiagnostics, warnGraphDiagnostic } from "../lib/dragDiagnostics";
+import { logGraphDiagnostic, useGraphDiagnosticsEnabled, useRenderDiagnostics } from "../lib/dragDiagnostics";
 import { clearHotbarFavorite, getHotbarFavorites, setHotbarFavorite } from "../lib/hotbarFavorites";
 import type { HotbarFavorites } from "../lib/hotbarFavorites";
 import { deleteSavedNode, getSavedNodes, saveNodeToLibrary } from "../lib/savedNodes";
@@ -396,15 +396,7 @@ const SELECTED_EDGE_STROKE_WIDTH = 4.3;
 const DRAFT_WIRE_STROKE_WIDTH = 4.6;
 const EDGE_LANE_SPACING = 12;
 const EDGE_SIBLING_SPACING = 8;
-const EDGE_LABEL_HEIGHT = 26;
-const EDGE_LABEL_HORIZONTAL_PADDING = 24;
-const EDGE_LABEL_CHARACTER_WIDTH = 7.1;
-const EDGE_LABEL_COLLISION_GAP = 10;
-const EDGE_LABEL_COLLISION_STEP = 24;
-const EDGE_LABEL_COLLISION_ATTEMPTS = 8;
-const EDGE_LABEL_EDGE_GAP = 12;
 const AUTO_CONNECT_TARGET_VERTICAL_GAP = 40;
-const EDGE_PATH_SAMPLE_STEP = 18;
 const CONNECTION_HANDLE_SNAP_RADIUS_PX = 44;
 const DRAFT_WIRE_MIN_SEGMENT_PX = 42;
 const TOOL_EDGE_TONES = {
@@ -444,30 +436,11 @@ const JUNCTION_NODE_STYLE = {
   boxShadow: "none",
 } as const;
 
-type LabelCollisionCandidate = {
-  edgeId: string;
-  center: GraphPosition;
-  tangent: GraphPosition;
-  width: number;
-  height: number;
-};
-
-type LabelBounds = {
-  left: number;
-  right: number;
-  top: number;
-  bottom: number;
-};
-
 type DraftConnectionSnapTarget = {
   nodeId: string;
   handleId: string | null;
   anchor: GraphPosition;
   distance: number;
-};
-
-type EdgePathSamplePoint = GraphPosition & {
-  edgeId: string;
 };
 
 type JunctionDragState = {
@@ -747,142 +720,6 @@ function polylineIntersectsSelectionRect(points: GraphPosition[], rect: Selectio
   return false;
 }
 
-function estimateEdgeLabelWidth(label: string) {
-  const trimmedLabel = label.trim();
-  const textWidth = Math.max(trimmedLabel.length, 1) * EDGE_LABEL_CHARACTER_WIDTH;
-  return Math.max(56, Math.round(textWidth + EDGE_LABEL_HORIZONTAL_PADDING));
-}
-
-function getLabelBounds(center: GraphPosition, width: number, height: number): LabelBounds {
-  return {
-    left: center.x - width / 2,
-    right: center.x + width / 2,
-    top: center.y - height / 2,
-    bottom: center.y + height / 2,
-  };
-}
-
-function labelBoundsOverlap(left: LabelBounds, right: LabelBounds, gap: number) {
-  return !(
-    left.right + gap <= right.left ||
-    left.left >= right.right + gap ||
-    left.bottom + gap <= right.top ||
-    left.top >= right.bottom + gap
-  );
-}
-
-function sampleEdgePathPoints(edgeId: string, edgePath: string, shiftX = 0, shiftY = 0): EdgePathSamplePoint[] {
-  if (typeof document === "undefined") {
-    return [];
-  }
-
-  try {
-    const measurementPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    measurementPath.setAttribute("d", edgePath);
-    const totalLength = measurementPath.getTotalLength();
-    if (!Number.isFinite(totalLength) || totalLength < 0.001) {
-      const point = measurementPath.getPointAtLength(0);
-      return [{ edgeId, x: point.x + shiftX, y: point.y + shiftY }];
-    }
-
-    const stepCount = Math.max(2, Math.ceil(totalLength / EDGE_PATH_SAMPLE_STEP));
-    const points: EdgePathSamplePoint[] = [];
-    for (let index = 0; index <= stepCount; index += 1) {
-      const point = measurementPath.getPointAtLength((totalLength * index) / stepCount);
-      points.push({
-        edgeId,
-        x: point.x + shiftX,
-        y: point.y + shiftY,
-      });
-    }
-    return points;
-  } catch (error) {
-    warnGraphDiagnostic("GraphCanvas", "edge path sampling fallback", error, {
-      edgeId,
-      edgePath,
-      shiftX,
-      shiftY,
-    });
-    return [];
-  }
-}
-
-function labelBoundsOverlapEdgePath(bounds: LabelBounds, points: EdgePathSamplePoint[], edgeId: string, gap: number) {
-  return points.some((point) => {
-    if (point.edgeId === edgeId) {
-      return false;
-    }
-    return (
-      point.x >= bounds.left - gap &&
-      point.x <= bounds.right + gap &&
-      point.y >= bounds.top - gap &&
-      point.y <= bounds.bottom + gap
-    );
-  });
-}
-
-function resolveEdgeLabelShifts(candidates: LabelCollisionCandidate[], edgePathPoints: EdgePathSamplePoint[]) {
-  const placedBounds: Array<LabelBounds & { edgeId: string }> = [];
-  const shifts = new Map<string, { x: number; y: number }>();
-  const orderedCandidates = [...candidates].sort((left, right) => {
-    const verticalDelta = left.center.y - right.center.y;
-    if (Math.abs(verticalDelta) > 0.01) {
-      return verticalDelta;
-    }
-    const horizontalDelta = left.center.x - right.center.x;
-    if (Math.abs(horizontalDelta) > 0.01) {
-      return horizontalDelta;
-    }
-    return left.edgeId.localeCompare(right.edgeId);
-  });
-
-  orderedCandidates.forEach((candidate) => {
-    const tangentLength = Math.hypot(candidate.tangent.x, candidate.tangent.y);
-    const normal =
-      tangentLength < 0.001
-        ? { x: 0, y: -1 }
-        : {
-            x: -candidate.tangent.y / tangentLength,
-            y: candidate.tangent.x / tangentLength,
-          };
-
-    let acceptedCenter = candidate.center;
-    let acceptedBounds = getLabelBounds(candidate.center, candidate.width, candidate.height);
-
-    for (let attempt = 0; attempt <= EDGE_LABEL_COLLISION_ATTEMPTS; attempt += 1) {
-      const laneIndex = attempt === 0 ? 0 : Math.ceil(attempt / 2) * (attempt % 2 === 1 ? 1 : -1);
-      const candidateCenter =
-        laneIndex === 0
-          ? candidate.center
-          : {
-              x: candidate.center.x + normal.x * EDGE_LABEL_COLLISION_STEP * laneIndex,
-              y: candidate.center.y + normal.y * EDGE_LABEL_COLLISION_STEP * laneIndex,
-            };
-      const candidateBounds = getLabelBounds(candidateCenter, candidate.width, candidate.height);
-
-      if (
-        !placedBounds.some((placed) => labelBoundsOverlap(candidateBounds, placed, EDGE_LABEL_COLLISION_GAP)) &&
-        !labelBoundsOverlapEdgePath(candidateBounds, edgePathPoints, candidate.edgeId, EDGE_LABEL_EDGE_GAP)
-      ) {
-        acceptedCenter = candidateCenter;
-        acceptedBounds = candidateBounds;
-        break;
-      }
-    }
-
-    shifts.set(candidate.edgeId, {
-      x: acceptedCenter.x - candidate.center.x,
-      y: acceptedCenter.y - candidate.center.y,
-    });
-    placedBounds.push({
-      edgeId: candidate.edgeId,
-      ...acceptedBounds,
-    });
-  });
-
-  return shifts;
-}
-
 const PLACEMENT_UI_SELECTOR = ".graph-toolbar, .graph-quick-add, .graph-hotkey-guide, .react-flow__controls, .react-flow__minimap";
 
 const QUICK_ADD_SLOTS: QuickAddSlot[] = [
@@ -1084,7 +921,6 @@ export function GraphCanvas({
   const pendingDragGraphRef = useRef<GraphDefinition | null>(null);
   const dragPositionMapRef = useRef<Map<string, GraphPosition> | null>(null);
   const nodeDragRafRef = useRef<number | null>(null);
-  const cachedEdgesRef = useRef<FlowEdge<GraphCanvasEdgeData>[]>([]);
   const draftPointerFrameRef = useRef<number | null>(null);
   const pendingDraftPointerPositionRef = useRef<GraphPosition | null>(null);
   const pointerPanStateRef = useRef<{
@@ -4266,7 +4102,6 @@ export function GraphCanvas({
 
   const edges = useMemo<FlowEdge<GraphCanvasEdgeData>[]>(() => {
     if (!graph) {
-      cachedEdgesRef.current = [];
       return [];
     }
     const dragPositions = isNodeDragActive ? dragPositionMapRef.current : null;
@@ -4359,11 +4194,6 @@ export function GraphCanvas({
         return left.id.localeCompare(right.id);
       });
     });
-    const shouldResolveLabelCollisions = !isNodeDragActive && !junctionDrag;
-    const previousEdgeDataById = shouldResolveLabelCollisions
-      ? null
-      : new Map(cachedEdgesRef.current.map((edge) => [edge.id, edge.data]));
-
     const edgeLayouts = graph.edges.map((edge) => {
       const sourceNode = nodeLookup.get(edge.source_id);
       const targetNode = nodeLookup.get(edge.target_id);
@@ -4413,21 +4243,6 @@ export function GraphCanvas({
           ? laneOffset
           : 0;
       const labelOffset = (siblingIndex - (siblingEdges.length - 1) / 2) * 28;
-      const previousEdgeData = previousEdgeDataById?.get(edge.id);
-
-      const edgeGeometry =
-        shouldResolveLabelCollisions && sourceAnchor && targetAnchor
-          ? getEdgeLabelPlacement({
-              sourceX: sourceAnchor.x,
-              sourceY: sourceAnchor.y,
-              targetX: targetAnchor.x,
-              targetY: targetAnchor.y,
-              sourcePosition: "right" as Position,
-              targetPosition: "left" as Position,
-              routePoints: edge.waypoints ?? [],
-              labelOffset,
-            })
-          : null;
       const routePoints = sourceAnchor && targetAnchor
         ? resolveEdgeRoutePoints(sourceAnchor, targetAnchor, edge.waypoints ?? [], { endWithHorizontal: true }).slice(1, -1)
         : [];
@@ -4435,22 +4250,6 @@ export function GraphCanvas({
       return {
         id: edge.id,
         labelText,
-        labelPlacement:
-          edgeGeometry && labelText
-            ? {
-                center: {
-                  x: edgeGeometry.point.x + routeShiftX,
-                  y: edgeGeometry.point.y + routeShiftY,
-                },
-                tangent: edgeGeometry.tangent,
-                width: estimateEdgeLabelWidth(labelText),
-                height: EDGE_LABEL_HEIGHT,
-              }
-            : null,
-        pathSamples:
-          shouldResolveLabelCollisions && edgeGeometry
-            ? sampleEdgePathPoints(edge.id, edgeGeometry.edgePath, routeShiftX, routeShiftY)
-            : [],
         type: "graphEdge",
         source: edge.source_id,
         target: edge.target_id,
@@ -4476,8 +4275,8 @@ export function GraphCanvas({
           routeShiftX,
           routeShiftY,
           labelOffset,
-          labelShiftX: previousEdgeData?.labelShiftX ?? 0,
-          labelShiftY: previousEdgeData?.labelShiftY ?? 0,
+          labelShiftX: 0,
+          labelShiftY: 0,
           showWaypointHandles: (edge.waypoints?.length ?? 0) > 0,
           waypointSelected: selectedEdgeIdSet.has(edge.id),
           waypointDragActive: waypointDrag?.edgeId === edge.id,
@@ -4499,42 +4298,8 @@ export function GraphCanvas({
         },
       };
     });
-
-    const labelShifts = shouldResolveLabelCollisions
-      ? resolveEdgeLabelShifts(
-          edgeLayouts.flatMap((edge) =>
-            edge.labelPlacement
-              ? [
-                  {
-                    edgeId: edge.id,
-                    center: edge.labelPlacement.center,
-                    tangent: edge.labelPlacement.tangent,
-                    width: edge.labelPlacement.width,
-                    height: edge.labelPlacement.height,
-                  },
-                ]
-              : [],
-          ),
-          edgeLayouts.flatMap((edge) => edge.pathSamples),
-        )
-      : new Map<string, { x: number; y: number }>();
-
-    const result = edgeLayouts.map(({ labelPlacement, labelText: _labelText, pathSamples: _pathSamples, data, ...edge }) => {
-      const labelShift = labelShifts.get(edge.id);
-      return {
-        ...edge,
-        data: {
-          ...data,
-          labelShiftX: labelShift?.x ?? data.labelShiftX ?? 0,
-          labelShiftY: labelShift?.y ?? data.labelShiftY ?? 0,
-        },
-      };
-    });
-    if (shouldResolveLabelCollisions) {
-      cachedEdgesRef.current = result;
-    }
-    return result;
-  }, [dragRenderTick, getNodeDimensions, graph, handleWaypointPointerDown, isNodeDragActive, junctionDrag, outboundEmailLoggerEdgeValidation, runState?.current_edge_id, selectedEdgeIdSet, waypointDrag]);
+    return edgeLayouts;
+  }, [dragRenderTick, getNodeDimensions, graph, handleWaypointPointerDown, isNodeDragActive, outboundEmailLoggerEdgeValidation, runState?.current_edge_id, selectedEdgeIdSet, waypointDrag]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {

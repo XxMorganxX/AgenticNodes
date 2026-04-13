@@ -200,6 +200,99 @@ class StructuredPayloadBuilderTests(unittest.TestCase):
         self.assertEqual(state.final_output["name"], "Taylor Doe")
         self.assertEqual(state.final_output["domain"], "example.com")
 
+    def test_builder_reads_from_nested_payload_body_and_ignores_outer_wrapper_fields(self) -> None:
+        graph = GraphDefinition.from_dict(structured_payload_builder_graph_payload("structured-payload-body-only"))
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        state = runtime.run(
+            graph,
+            {
+                "email": "outer@example.com",
+                "domain": "outer.example.com",
+                "payload": {
+                    "person": {
+                        "fullName": "Taylor Doe",
+                    },
+                    "contact": {
+                        "workEmailAddress": "inner@example.com",
+                    },
+                    "company": {
+                        "websiteDomain": "example.com",
+                    },
+                    "profiles": {
+                        "linkedinProfileUrl": "https://www.linkedin.com/in/taylor-doe/",
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(
+            state.final_output,
+            {
+                "name": "Taylor Doe",
+                "domain": "example.com",
+                "linkedin_url": "https://www.linkedin.com/in/taylor-doe/",
+                "email": "inner@example.com",
+            },
+        )
+
+    def test_builder_matches_multi_keyword_alias_fields_deterministically(self) -> None:
+        graph = GraphDefinition.from_dict(
+            structured_payload_builder_graph_payload(
+                "structured-payload-keyword-aliases",
+                node_config={
+                    "template_json": json.dumps(
+                        {
+                            "first_name": "",
+                            "last_name": "",
+                            "organization_name": "",
+                            "email": "",
+                            "linkedin_url": "",
+                        }
+                    )
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        state = runtime.run(
+            graph,
+            {
+                "payload": {
+                    "profile": {
+                        "givenName": "Taylor",
+                        "familyName": "Doe",
+                    },
+                    "account": {
+                        "companyName": "OpenAI",
+                    },
+                    "contact": {
+                        "primaryWorkEmailAddress": "taylor@openai.com",
+                    },
+                    "social": {
+                        "linkedin": {
+                            "url": "https://www.linkedin.com/in/taylor-doe/",
+                        }
+                    },
+                }
+            },
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output["first_name"], "Taylor")
+        self.assertEqual(state.final_output["last_name"], "Doe")
+        self.assertEqual(state.final_output["organization_name"], "OpenAI")
+        self.assertEqual(state.final_output["email"], "taylor@openai.com")
+        self.assertEqual(state.final_output["linkedin_url"], "https://www.linkedin.com/in/taylor-doe/")
+        field_matches = state.node_outputs["builder"]["artifacts"]["field_matches"]
+        email_match = next(match for match in field_matches if match["target_path"] == "email")
+        linkedin_match = next(match for match in field_matches if match["target_path"] == "linkedin_url")
+        self.assertEqual(email_match["match_type"], "alias_keywords")
+        self.assertEqual(linkedin_match["match_type"], "alias_path_keywords")
+
     def test_invalid_template_json_is_rejected_during_validation(self) -> None:
         graph = GraphDefinition.from_dict(
             structured_payload_builder_graph_payload(

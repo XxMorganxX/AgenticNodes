@@ -2654,18 +2654,15 @@ class DataNode(BaseNode):
         if source_value is None:
             source_value = context.resolve_binding(self.config.get("input_binding"))
         source_value = _parse_json_object_or_array(source_value)
+        if _is_message_envelope_like(source_value):
+            source_value = _parse_json_object_or_array(source_value.get("payload"))
         if isinstance(source_value, Mapping) and "payload" in source_value:
-            payload = _parse_json_object_or_array(source_value.get("payload"))
-            if payload is not source_value.get("payload"):
-                source_value = {**dict(source_value), "payload": payload}
+            source_value = _parse_json_object_or_array(source_value.get("payload"))
         return source_value
 
     def _structured_payload_builder_source_roots(self, context: NodeContext) -> tuple[Any, ...]:
         source_value = self._structured_payload_builder_source_value(context)
-        roots: list[Any] = [source_value]
-        if _is_message_envelope_like(source_value):
-            roots.append(source_value.get("payload"))
-        return tuple(roots)
+        return (source_value,)
 
     def _execute_structured_payload_builder(self, context: NodeContext) -> NodeExecutionResult:
         resolved_config = self._structured_payload_builder_config(context)
