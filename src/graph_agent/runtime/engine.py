@@ -282,7 +282,16 @@ class GraphRuntime:
         iteration_context: dict[str, Any] | None = None,
     ) -> None:
         inherited_context = dict(iteration_context or {})
-        for next_edge, edge_result in next_edges:
+        ordered_next_edges = sorted(
+            next_edges,
+            key=lambda item: 0
+            if (
+                (target := graph.nodes.get(item[0].target_id)) is not None
+                and getattr(target, "provider_id", None) == "core.data_display"
+            )
+            else 1,
+        )
+        for next_edge, edge_result in ordered_next_edges:
             if edge_result.output is not None:
                 state.edge_outputs[next_edge.id] = edge_result.output
             state.transition_history.append(

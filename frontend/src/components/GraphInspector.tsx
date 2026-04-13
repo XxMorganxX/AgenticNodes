@@ -5,6 +5,8 @@ import {
   CONTROL_FLOW_ELSE_HANDLE_ID,
   defaultModelName,
   findProviderDefinition,
+  PARALLEL_SPLITTER_HANDLE_COUNT_CONFIG_KEY,
+  getParallelSplitterOutputHandles,
   inferModelResponseMode,
   isControlFlowNode,
   isPromptBlockNode,
@@ -107,6 +109,27 @@ function toolMatchesReference(tool: ToolDefinition, reference: string): boolean 
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
+function parseConfigStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item));
+  }
+  if (typeof value === "string") {
+    return value
+      .replace(/\n/g, ",")
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+  }
+  return [];
+}
+
+function serializeLegacyConfigStringList(values: string[]): string {
+  return values
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+    .join("\n");
 }
 
 type StructuredPayloadTemplateEntry = {
@@ -654,6 +677,29 @@ export function GraphInspector({
     const selectedProviderName = String(selectedNode.config.provider_name ?? selectedNode.model_provider_name ?? "mock");
     const selectedProvider = findProviderDefinition(catalog, selectedProviderName);
     const providerConfigFields = selectedProvider?.config_fields ?? [];
+    const allModelOptions = (() => {
+      const options = new Map<string, { value: string; label: string }>();
+      availableModelProviders.forEach((provider) => {
+        const modelField = (provider.config_fields ?? []).find((field) => field.key === "model");
+        (modelField?.options ?? []).forEach((option) => {
+          const value = String(option.value ?? "").trim();
+          if (!value || options.has(value)) {
+            return;
+          }
+          const label = String(option.label ?? value).trim() || value;
+          options.set(value, { value, label });
+        });
+      });
+      return [...options.values()];
+    })();
+    const displayedProviderConfigFields = providerConfigFields.map((field) =>
+      selectedNode.kind === "model" && field.key === "model" && allModelOptions.length > 0
+        ? {
+            ...field,
+            options: allModelOptions,
+          }
+        : field,
+    );
     const providerStatus = catalog?.provider_statuses?.[selectedProviderName];
     const catalogTools = catalog?.tools ?? [];
     const mcpCatalogTools = catalogTools.filter((tool) => tool.source_type === "mcp");
@@ -719,6 +765,17 @@ export function GraphInspector({
     const graphEnvVars = getGraphEnvVars(graph);
     const modelSystemPromptTemplate = selectedNode.kind === "model" ? String(selectedNode.config.system_prompt ?? "") : "";
     const modelSystemPromptTokens = selectedNode.kind === "model" ? extractTemplateTokens(modelSystemPromptTemplate) : [];
+    const runtimeNormalizerFieldNames =
+      selectedNode.provider_id === RUNTIME_NORMALIZER_PROVIDER_ID
+        ? (() => {
+            const configured = parseConfigStringList(selectedNode.config.field_names);
+            if (configured.length > 0) {
+              return configured;
+            }
+            const legacy = parseConfigStringList(selectedNode.config.field_name);
+            return legacy.length > 0 ? legacy : ["url"];
+          })()
+        : [];
     const modelDirectRegistryToolSummaries =
       selectedNode.kind === "model"
         ? allowedTools
@@ -1032,6 +1089,12 @@ export function GraphInspector({
         : String(selectedNode.config.user_message_template ?? "{input_payload}");
     const isLogicConditionsNode = isControlFlowUnitNode && selectedNode.provider_id === LOGIC_CONDITIONS_PROVIDER_ID;
     const isParallelSplitterNode = isControlFlowUnitNode && selectedNode.provider_id === PARALLEL_SPLITTER_PROVIDER_ID;
+    const parallelSplitterOutgoingEdges = isParallelSplitterNode ? graph.edges.filter((edge) => edge.source_id === selectedNode.id) : [];
+    const parallelSplitterHandles = isParallelSplitterNode ? getParallelSplitterOutputHandles(graph, selectedNode) : [];
+    const parallelSplitterConnectionCount = parallelSplitterOutgoingEdges.length;
+    const parallelSplitterConfiguredHandleCount = isParallelSplitterNode
+      ? Number.parseInt(String(selectedNode.config[PARALLEL_SPLITTER_HANDLE_COUNT_CONFIG_KEY] ?? "1"), 10) || 1
+      : 0;
     const spreadsheetNode = isSpreadsheetRowNode || isSpreadsheetMatrixNode ? selectedNode : null;
     const logicConditionConfig = isLogicConditionsNode ? normalizeLogicConditionConfig(selectedNode.config).normalized : null;
     const logicIncomingContractLabel = isLogicConditionsNode ? incomingEdgeContractLabel(graph, selectedNode) : "";
@@ -1714,7 +1777,7 @@ export function GraphInspector({
                   }
                 />
               </label>
-              {providerConfigFields.map((field) => {
+              {displayedProviderConfigFields.map((field) => {
                 const value = selectedNode.config[field.key];
                 const isNumberField = field.input_type === "number";
                 const isSelectField = field.input_type === "select" && (field.options?.length ?? 0) > 0;
@@ -2810,6 +2873,32 @@ export function GraphInspector({
                     <span>Copies the incoming envelope to every connected downstream standard branch.</span>
                     <span>Use this node when you want one explicit fan-out point instead of giving ordinary nodes multiple outputs.</span>
                   </div>
+                  <label>
+                    Configured Handle Count
+                    <input value={String(parallelSplitterConfiguredHandleCount)} readOnly />
+                  </label>
+                  <label>
+                    Active Connections
+                    <input value={String(parallelSplitterConnectionCount)} readOnly />
+                  </label>
+                  <div className="contract-card">
+                    <strong>Handle State</strong>
+                    <span>{parallelSplitterHandles.length} total visible handle{parallelSplitterHandles.length === 1 ? "" : "s"}.</span>
+                    {parallelSplitterHandles.map((handle) => (
+                      <span key={handle.id}>
+                        {handle.label} {"->"} {handle.id}
+                      </span>
+                    ))}
+                  </div>
+                  <div className="contract-card">
+                    <strong>Outgoing Edges</strong>
+                    <span>{parallelSplitterOutgoingEdges.length} raw outgoing edge{parallelSplitterOutgoingEdges.length === 1 ? "" : "s"} from this splitter.</span>
+                    {parallelSplitterOutgoingEdges.map((edge) => (
+                      <span key={edge.id}>
+                        {edge.id}: {edge.kind} {"->"} {edge.target_id} ({String(edge.source_handle_id ?? "null")})
+                      </span>
+                    ))}
+                  </div>
                   <div className="contract-card">
                     <strong>Branching</strong>
                     <span>Every connected standard outgoing edge runs in parallel from the same input envelope.</span>
@@ -3715,27 +3804,79 @@ export function GraphInspector({
                 <>
                   <div className="contract-card">
                     <strong>Payload Field Extractor</strong>
-                    <span>Searches the incoming payload for one named field and forwards only the matched value.</span>
-                    <span>Use it when the payload structure is unknown but the user knows the variable name they need.</span>
+                    <span>Searches the incoming payload for one or more named fields and forwards the matched value or values.</span>
+                    <span>Use it when the payload structure is unknown but the user knows the variable names they need.</span>
                   </div>
                   <label>
-                    Field Name
-                    <input
-                      value={String(selectedNode.config.field_name ?? "url")}
-                      placeholder="url"
-                      onChange={(event) =>
-                        onGraphChange(
-                          updateNode(graph, selectedNode.id, (node) => ({
-                            ...node,
-                            config: {
-                              ...node.config,
-                              mode: "runtime_normalizer",
-                              field_name: event.target.value,
-                            },
-                          })),
-                        )
-                      }
-                    />
+                    Field Names
+                    <div className="runtime-field-list">
+                      {runtimeNormalizerFieldNames.map((fieldName, index) => (
+                        <div key={`runtime-field-${index}`} className="runtime-field-list-row">
+                          <input
+                            value={fieldName}
+                            placeholder={index === 0 ? "url" : "headline"}
+                            onChange={(event) => {
+                              const nextFieldNames = runtimeNormalizerFieldNames.map((candidate, candidateIndex) =>
+                                candidateIndex === index ? event.target.value : candidate,
+                              );
+                              onGraphChange(
+                                updateNode(graph, selectedNode.id, (node) => ({
+                                  ...node,
+                                  config: {
+                                    ...node.config,
+                                    mode: "runtime_normalizer",
+                                    field_names: nextFieldNames,
+                                    field_name: serializeLegacyConfigStringList(nextFieldNames),
+                                  },
+                                })),
+                              );
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="secondary-button runtime-field-list-button"
+                            onClick={() => {
+                              const nextFieldNames = runtimeNormalizerFieldNames.filter((_, candidateIndex) => candidateIndex !== index);
+                              onGraphChange(
+                                updateNode(graph, selectedNode.id, (node) => ({
+                                  ...node,
+                                  config: {
+                                    ...node.config,
+                                    mode: "runtime_normalizer",
+                                    field_names: nextFieldNames,
+                                    field_name: serializeLegacyConfigStringList(nextFieldNames),
+                                  },
+                                })),
+                              );
+                            }}
+                            disabled={runtimeNormalizerFieldNames.length <= 1}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        className="secondary-button runtime-field-list-add"
+                        onClick={() => {
+                          const nextFieldNames = [...runtimeNormalizerFieldNames, ""];
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                mode: "runtime_normalizer",
+                                field_names: nextFieldNames,
+                                field_name: serializeLegacyConfigStringList(nextFieldNames),
+                              },
+                            })),
+                          );
+                        }}
+                      >
+                        Add Field
+                      </button>
+                    </div>
+                    <small>Add each search field as its own row so order and edits stay explicit.</small>
                   </label>
                   <label>
                     Fallback Field Names
@@ -3822,9 +3963,9 @@ export function GraphInspector({
                     />
                   </label>
                   <div className="inspector-meta">
-                    <span>Output payload: the matched field value only</span>
-                    <span>Metadata includes the matched path and match count; artifacts include all discovered matches</span>
-                    <span>Preferred path is tried first, then the node falls back to recursive key search</span>
+                    <span>Output payload: a single matched value for one field, or an object keyed by field name when multiple fields are requested</span>
+                    <span>Metadata includes matched paths and missing fields; artifacts include all discovered matches</span>
+                    <span>Preferred path is tried first for single-field extraction, then the node falls back to recursive key search</span>
                   </div>
                 </>
               ) : selectedNode.provider_id === "core.data_display" ? (

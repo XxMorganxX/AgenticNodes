@@ -49,6 +49,25 @@ function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+function asDelimitedStringArray(value: unknown): string[] {
+  if (typeof value === "string") {
+    return value
+      .replace(/\n/g, ",")
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+  }
+  return asStringArray(value);
+}
+
+function runtimeFieldNames(node: GraphNode): string[] {
+  const configured = asDelimitedStringArray(node.config.field_names);
+  if (configured.length > 0) {
+    return configured;
+  }
+  return asDelimitedStringArray(node.config.field_name);
+}
+
 function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
@@ -498,10 +517,14 @@ export function buildNodeTooltip(
                   ? truncate(asString(node.config.content) ?? "")
                 : isContextBuilderNode
                   ? truncate(asString(node.config.template) ?? "Generated from connected placeholders")
-                  : isParallelSplitterNode
-                    ? "Fan out to every connected branch"
-                  : isRuntimeFieldExtractorNode
-                    ? truncate(asString(node.config.field_name) ?? "Select a field to isolate from the payload")
+                : isParallelSplitterNode
+                  ? "Fan out to every connected branch"
+                : isRuntimeFieldExtractorNode
+                  ? truncate(
+                      runtimeFieldNames(node).length > 0
+                        ? formatList(runtimeFieldNames(node))
+                        : "Select one or more fields to isolate from the payload",
+                    )
                   : isLogicConditionsNode
                     ? truncate(
                         logicConditionConfig?.branches[0]
@@ -537,11 +560,11 @@ export function buildNodeTooltip(
               : []),
             ...(isRuntimeFieldExtractorNode
               ? [
-                  { label: "Field Name", value: asString(node.config.field_name) ?? "Not set" },
+                  { label: "Field Names", value: formatList(runtimeFieldNames(node)) },
                   { label: "Preferred Path", value: asString(node.config.preferred_path) ?? "Recursive search only" },
                   {
                     label: "Fallback Fields",
-                    value: formatList(asStringArray(node.config.fallback_field_names)),
+                    value: formatList(asDelimitedStringArray(node.config.fallback_field_names)),
                   },
                 ]
               : []),
@@ -577,8 +600,8 @@ export function buildNodeTooltip(
           ? "Add prompt content, then bind this node into a Context Builder or model."
           : isContextBuilderNode && connectedSourceCount === 0
           ? "Connect one or more upstream text nodes to start composing a shared prompt block."
-          : isRuntimeFieldExtractorNode && !(asString(node.config.field_name) ?? "").trim()
-          ? "Set the field name you want this node to isolate from the incoming payload."
+          : isRuntimeFieldExtractorNode && runtimeFieldNames(node).length === 0
+          ? "Set one or more field names you want this node to isolate from the incoming payload."
           : isParallelSplitterNode
           ? "Connect two or more downstream branches to split this signal in parallel."
           : isLogicConditionsNode && (logicConditionConfig?.branches.length ?? 0) === 0

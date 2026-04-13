@@ -322,6 +322,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                     label="Model",
                     input_type="select",
                     options=[
+                        ProviderConfigOptionDefinition(value="haiku", label="haiku"),
                         ProviderConfigOptionDefinition(value="sonnet", label="sonnet"),
                         ProviderConfigOptionDefinition(value="opus", label="opus"),
                     ],
@@ -836,8 +837,8 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             display_name="Payload Field Extractor",
             category=NodeCategory.DATA,
             node_kind="data",
-            description="Finds a named field inside an incoming payload with unknown structure and forwards just that matched value.",
-            capabilities=["recursive field lookup", "unknown payload extraction", "value isolation"],
+            description="Finds one or more named fields inside an incoming payload with unknown structure and forwards the matched value or values.",
+            capabilities=["recursive field lookup", "unknown payload extraction", "value isolation", "multi-field extraction"],
             default_config={
                 "mode": "runtime_normalizer",
                 "input_binding": {"type": "input_payload"},
@@ -850,14 +851,16 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             config_fields=[
                 ProviderConfigFieldDefinition(
                     key="field_name",
-                    label="Field Name",
-                    help_text="The key to look for anywhere in the incoming payload.",
+                    label="Field Names",
+                    input_type="textarea",
+                    help_text="One or more keys to look for anywhere in the incoming payload. Separate multiple field names with commas or new lines.",
+                    placeholder="url\nheadline",
                 ),
                 ProviderConfigFieldDefinition(
                     key="fallback_field_names",
                     label="Fallback Field Names",
                     input_type="textarea",
-                    help_text="Optional alternate field names to try if the primary field is not found.",
+                    help_text="Optional alternate field names to try if a single requested field is not found.",
                     placeholder="profile_url\nlinkedin_url",
                 ),
                 ProviderConfigFieldDefinition(
@@ -975,6 +978,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             capabilities=["parallel branch fan-out", "shared envelope forwarding", "explicit splitter node"],
             default_config={
                 "mode": "parallel_splitter",
+            "output_handle_count": 4,
             },
         )
     )

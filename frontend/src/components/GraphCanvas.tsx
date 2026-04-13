@@ -41,10 +41,10 @@ import {
   defaultMcpTerminalOutputCondition,
   defaultToolFailureCondition,
   duplicateGraphNode,
+  getParallelSplitterConnectionLabel,
+  getParallelSplitterNodeDimensions,
   getNodeTargetAnchorRatio,
-  getNextAvailableParallelSplitterOutputHandleId,
   getNodeSourceHandleAnchorRatio,
-  getParallelSplitterOutputHandleIds,
   inferToolEdgeSourceHandle,
   isApiModelNode,
   isApiOutputHandleId,
@@ -376,9 +376,6 @@ const NODE_STYLE = {
 } as const;
 const NODE_WIDTH = 320;
 const MODEL_NODE_WIDTH = 380;
-const PARALLEL_SPLITTER_NODE_WIDTH = 420;
-const PARALLEL_SPLITTER_NODE_HEIGHT = 356;
-const PARALLEL_SPLITTER_NODE_REGION_HEIGHT = 396;
 const NODE_HEIGHT = 178;
 const NODE_REGION_HEIGHT = 198;
 const MODEL_NODE_HEIGHT = 264;
@@ -1499,10 +1496,10 @@ export function GraphCanvas({
       return { width: MODEL_NODE_WIDTH, height: MODEL_NODE_HEIGHT, regionHeight: MODEL_NODE_REGION_HEIGHT };
     }
     if (node.provider_id === "core.parallel_splitter") {
-      return { width: PARALLEL_SPLITTER_NODE_WIDTH, height: PARALLEL_SPLITTER_NODE_HEIGHT, regionHeight: PARALLEL_SPLITTER_NODE_REGION_HEIGHT };
+      return getParallelSplitterNodeDimensions(graph, node);
     }
     return { width: NODE_WIDTH, height: NODE_HEIGHT, regionHeight: NODE_REGION_HEIGHT };
-  }, []);
+  }, [graph]);
 
   const rebalanceOutgoingTargets = useCallback(
     (baseGraph: GraphDefinition, sourceNodeId: string): GraphDefinition => {
@@ -2304,10 +2301,7 @@ export function GraphCanvas({
       const sourceNode = baseGraph.nodes.find((node) => node.id === sourceId);
       const targetNode = baseGraph.nodes.find((node) => node.id === targetId);
       const requestedSourceHandleId = getEffectiveSourceHandleId(sourceNode, sourceHandleId);
-      const effectiveSourceHandleId =
-        sourceNode?.provider_id === "core.parallel_splitter"
-          ? getNextAvailableParallelSplitterOutputHandleId(baseGraph, sourceNode, requestedSourceHandleId)
-          : requestedSourceHandleId;
+      const effectiveSourceHandleId = requestedSourceHandleId;
       const effectiveTargetHandleId = getEffectiveTargetHandleId(targetNode, targetHandleId);
       const isBindingConnection =
         isToolContextBindingConnection(sourceNode, targetNode, effectiveSourceHandleId, effectiveTargetHandleId) ||
@@ -2363,7 +2357,6 @@ export function GraphCanvas({
     [
       getEffectiveSourceHandleId,
       getEffectiveTargetHandleId,
-      getNextAvailableParallelSplitterOutputHandleId,
       isContextBuilderBindingConnection,
       isPromptBlockBindingConnection,
       isToolContextBindingConnection,
@@ -2699,7 +2692,14 @@ export function GraphCanvas({
         target_id: targetId,
         source_handle_id: effectiveSourceHandleId,
         target_handle_id: effectiveTargetHandleId,
-        label: sourceNode?.provider_id === "core.parallel_splitter" ? "parallel branch" : hasStandardOutgoing ? "conditional route" : "next",
+        label:
+          sourceNode?.provider_id === "core.parallel_splitter"
+            ? getParallelSplitterConnectionLabel(
+                Number.parseInt((effectiveSourceHandleId ?? "").replace(/^parallel-splitter-output-/, ""), 10) || 0,
+              )
+            : hasStandardOutgoing
+              ? "conditional route"
+              : "next",
         kind: sourceNode?.provider_id === "core.parallel_splitter" ? "standard" : hasStandardOutgoing ? "conditional" : "standard",
         priority: sourceNode?.provider_id === "core.parallel_splitter" ? 100 : hasStandardOutgoing ? 10 : 100,
         waypoints,
@@ -2733,18 +2733,6 @@ export function GraphCanvas({
       const nextEdge = buildCommittedEdge(baseGraph, sourceId, targetId, waypoints, sourceHandleId, targetHandleId);
       if (!nextEdge) {
         return false;
-      }
-      const sourceNode = baseGraph.nodes.find((node) => node.id === sourceId);
-      if (sourceNode?.provider_id === "core.parallel_splitter") {
-        const graphAfterConflictRemoval = nextBaseGraph;
-        const correctHandle = getNextAvailableParallelSplitterOutputHandleId(
-          graphAfterConflictRemoval,
-          sourceNode,
-          nextEdge.source_handle_id,
-        );
-        if (correctHandle !== nextEdge.source_handle_id) {
-          nextEdge.source_handle_id = correctHandle;
-        }
       }
       onGraphChange(
         normalizeParallelSplitterHandleAssignments(
@@ -3890,8 +3878,10 @@ export function GraphCanvas({
       }
       const tooltipVisible = tooltipNodeId === node.id;
       const tooltipGraph = tooltipVisible ? graph : null;
+      const isParallelSplitterNode = node.provider_id === "core.parallel_splitter";
       const previousData = nodeDataCacheRef.current.get(node.id);
       const nextData =
+        !isParallelSplitterNode &&
         previousData &&
         previousData.node === node &&
         previousData.graph === graph &&
@@ -3955,6 +3945,7 @@ export function GraphCanvas({
       const previousFlowNode = flowNodeCacheRef.current.get(node.id);
       const nextDimensions = getFlowNodeDimensions(node, previousFlowNode);
       const nextFlowNode =
+        !isParallelSplitterNode &&
         previousFlowNode &&
         previousFlowNode.data === nextData &&
         previousFlowNode.selected === nextSelected &&
@@ -4034,9 +4025,9 @@ export function GraphCanvas({
           minY: Math.min(result.minY, node.position.y),
           maxX: Math.max(
             result.maxX,
-            node.position.x + (typeof node.width === "number" ? node.width : node.data.node.kind === "model" ? MODEL_NODE_WIDTH : node.data.node.provider_id === "core.parallel_splitter" ? PARALLEL_SPLITTER_NODE_WIDTH : NODE_WIDTH),
+            node.position.x + (typeof node.width === "number" ? node.width : getNodeDimensions(node.data.node).width),
           ),
-          maxY: Math.max(result.maxY, node.position.y + (typeof node.height === "number" ? node.height : NODE_HEIGHT)),
+          maxY: Math.max(result.maxY, node.position.y + (typeof node.height === "number" ? node.height : getNodeDimensions(node.data.node).height)),
         }),
         {
           minX: Number.POSITIVE_INFINITY,
@@ -4049,12 +4040,11 @@ export function GraphCanvas({
         return [];
       }
       const largestNodeWidth = memberNodes.reduce(
-        (maxWidth, node) =>
-          Math.max(maxWidth, typeof node.width === "number" ? node.width : node.data.node.kind === "model" ? MODEL_NODE_WIDTH : node.data.node.provider_id === "core.parallel_splitter" ? PARALLEL_SPLITTER_NODE_WIDTH : NODE_WIDTH),
+        (maxWidth, node) => Math.max(maxWidth, typeof node.width === "number" ? node.width : getNodeDimensions(node.data.node).width),
         0,
       );
       const largestNodeHeight = memberNodes.reduce(
-        (maxHeight, node) => Math.max(maxHeight, typeof node.height === "number" ? node.height : NODE_HEIGHT),
+        (maxHeight, node) => Math.max(maxHeight, typeof node.height === "number" ? node.height : getNodeDimensions(node.data.node).height),
         0,
       );
       const trailingPaddingX = Math.min(
@@ -4451,17 +4441,6 @@ export function GraphCanvas({
       }
       if (isOutboundEmailLoggerNode(targetNode)) {
         return false;
-      }
-      if (sourceNode?.provider_id === "core.parallel_splitter") {
-        const splitterHandles = getParallelSplitterOutputHandleIds(graph, sourceNode);
-        const usedHandles = new Set(
-          graph.edges
-            .filter((edge) => edge.source_id === connection.source && edge.kind !== "binding")
-            .map((edge) => edge.source_handle_id ?? ""),
-        );
-        if (usedHandles.size >= splitterHandles.length) {
-          return false;
-        }
       }
       const effectiveSourceHandleId = getEffectiveSourceHandleId(sourceNode, connection.sourceHandle ?? null);
       const effectiveTargetHandleId = getEffectiveTargetHandleId(targetNode, connection.targetHandle ?? null);

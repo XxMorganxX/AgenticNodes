@@ -99,6 +99,27 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
 }
 
+function parseConfigStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item));
+  }
+  if (typeof value === "string") {
+    return value
+      .replace(/\n/g, ",")
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+  }
+  return [];
+}
+
+function serializeLegacyConfigStringList(values: string[]): string {
+  return values
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+    .join("\n");
+}
+
 type StructuredPayloadTemplateEntry = {
   id: string;
   key: string;
@@ -161,6 +182,7 @@ function serializeStructuredPayloadTemplateEntries(entries: StructuredPayloadTem
 }
 
 const STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID = "core.structured_payload_builder";
+const RUNTIME_NORMALIZER_PROVIDER_ID = "core.runtime_normalizer";
 
 function parseSupabaseSelect(selectValue: string, availableColumns: string[]): string[] {
   const trimmed = selectValue.trim();
@@ -331,10 +353,26 @@ export function ProviderDetailsModal({
     ? String(node.config.provider_name ?? node.model_provider_name ?? "not-set")
     : String(provider?.provider_id ?? node.provider_id ?? "not-set");
   const providerConfigFields = provider?.config_fields ?? [];
+  const allModelOptions = useMemo(() => {
+    const options = new Map<string, { value: string; label: string }>();
+    availableProviders.forEach((candidate) => {
+      const modelField = (candidate.config_fields ?? []).find((field) => field.key === "model");
+      (modelField?.options ?? []).forEach((option) => {
+        const value = String(option.value ?? "").trim();
+        if (!value || options.has(value)) {
+          return;
+        }
+        const label = String(option.label ?? value).trim() || value;
+        options.set(value, { value, label });
+      });
+    });
+    return [...options.values()];
+  }, [availableProviders]);
   const isSupabaseDataNode = node.provider_id === "core.supabase_data";
   const isSupabaseRowWriteNode = node.provider_id === "core.supabase_row_write";
   const isOutboundEmailLoggerNode = node.provider_id === "core.outbound_email_logger";
   const isStructuredPayloadBuilderNode = node.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID;
+  const isRuntimeNormalizerNode = node.provider_id === RUNTIME_NORMALIZER_PROVIDER_ID;
   const isSupabaseCatalogNode = isSupabaseDataNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
   const usesSupabaseTableSelection = isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
   const displayedUserMessageTemplate =
@@ -343,9 +381,28 @@ export function ProviderDetailsModal({
       String(node.config.user_message_template ?? "").trim() === "{input_payload}")
       ? SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE
       : String(node.config.user_message_template ?? "{input_payload}");
-  const displayedProviderConfigFields = isSupabaseCatalogNode
+  const displayedProviderConfigFields = (isSupabaseCatalogNode
     ? providerConfigFields.filter((field) => !["supabase_url_env_var", "supabase_key_env_var"].includes(field.key))
-    : providerConfigFields.filter((field) => !(isStructuredPayloadBuilderNode && field.key === "template_json"));
+    : providerConfigFields.filter((field) => !(isStructuredPayloadBuilderNode && field.key === "template_json"))
+  ).map((field) =>
+    isModelNode && field.key === "model" && allModelOptions.length > 0
+      ? {
+          ...field,
+          options: allModelOptions,
+        }
+      : field,
+  );
+  const runtimeNormalizerFieldNames =
+    isRuntimeNormalizerNode
+      ? (() => {
+          const configured = parseConfigStringList(node.config.field_names);
+          if (configured.length > 0) {
+            return configured;
+          }
+          const legacy = parseConfigStringList(node.config.field_name);
+          return legacy.length > 0 ? legacy : ["url"];
+        })()
+      : [];
   const supportsLiveVerification = isModelNode && providerName !== "mock";
   const catalogTools = catalog?.tools ?? [];
   const mcpCatalogTools = catalogTools.filter((tool) => tool.source_type === "mcp");
@@ -1998,6 +2055,7 @@ export function ProviderDetailsModal({
                       {field.label}
                       {(() => {
                         const currentValue = String(node.config[field.key] ?? "");
+                        const isRuntimeFieldNamesField = isRuntimeNormalizerNode && field.key === "field_name";
                         const isSelectField = field.input_type === "select" && (field.options?.length ?? 0) > 0;
                         const isModelSelectField = isSelectField && field.key === "model";
                         const isCheckboxField = field.input_type === "checkbox";
@@ -2009,7 +2067,75 @@ export function ProviderDetailsModal({
                         const datalistId = `${node.id}-${field.key}-modal-options`;
                         return (
                           <>
-                            {isModelSelectField ? (
+                            {isRuntimeFieldNamesField ? (
+                              <div className="runtime-field-list">
+                                {runtimeNormalizerFieldNames.map((fieldName, index) => (
+                                  <div key={`provider-runtime-field-${index}`} className="runtime-field-list-row">
+                                    <input
+                                      value={fieldName}
+                                      placeholder={index === 0 ? "url" : "headline"}
+                                      onChange={(event) => {
+                                        const nextFieldNames = runtimeNormalizerFieldNames.map((candidate, candidateIndex) =>
+                                          candidateIndex === index ? event.target.value : candidate,
+                                        );
+                                        onGraphChange(
+                                          updateModelNode(graph, node.id, (currentNode) => ({
+                                            ...currentNode,
+                                            config: {
+                                              ...currentNode.config,
+                                              mode: "runtime_normalizer",
+                                              field_names: nextFieldNames,
+                                              field_name: serializeLegacyConfigStringList(nextFieldNames),
+                                            },
+                                          })),
+                                        );
+                                      }}
+                                    />
+                                    <button
+                                      type="button"
+                                      className="secondary-button runtime-field-list-button"
+                                      onClick={() => {
+                                        const nextFieldNames = runtimeNormalizerFieldNames.filter((_, candidateIndex) => candidateIndex !== index);
+                                        onGraphChange(
+                                          updateModelNode(graph, node.id, (currentNode) => ({
+                                            ...currentNode,
+                                            config: {
+                                              ...currentNode.config,
+                                              mode: "runtime_normalizer",
+                                              field_names: nextFieldNames,
+                                              field_name: serializeLegacyConfigStringList(nextFieldNames),
+                                            },
+                                          })),
+                                        );
+                                      }}
+                                      disabled={runtimeNormalizerFieldNames.length <= 1}
+                                    >
+                                      Remove
+                                    </button>
+                                  </div>
+                                ))}
+                                <button
+                                  type="button"
+                                  className="secondary-button runtime-field-list-add"
+                                  onClick={() => {
+                                    const nextFieldNames = [...runtimeNormalizerFieldNames, ""];
+                                    onGraphChange(
+                                      updateModelNode(graph, node.id, (currentNode) => ({
+                                        ...currentNode,
+                                        config: {
+                                          ...currentNode.config,
+                                          mode: "runtime_normalizer",
+                                          field_names: nextFieldNames,
+                                          field_name: serializeLegacyConfigStringList(nextFieldNames),
+                                        },
+                                      })),
+                                    );
+                                  }}
+                                >
+                                  Add Field
+                                </button>
+                              </div>
+                            ) : isModelSelectField ? (
                               <>
                                 <input
                                   list={datalistId}
@@ -2061,6 +2187,9 @@ export function ProviderDetailsModal({
                                 }
                               />
                             )}
+                            {isRuntimeFieldNamesField ? (
+                              <small>Add each search field as its own row so order and edits stay explicit.</small>
+                            ) : null}
                           </>
                         );
                       })()}

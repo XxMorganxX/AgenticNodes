@@ -1,6 +1,6 @@
-import { memo } from "react";
+import { memo, useEffect } from "react";
 import type { CSSProperties } from "react";
-import { Handle, Position } from "reactflow";
+import { Handle, Position, useUpdateNodeInternals } from "reactflow";
 import type { NodeProps } from "reactflow";
 
 import {
@@ -12,7 +12,8 @@ import {
   CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
   createParallelSplitterOutputHandleId,
   getNodeTargetAnchorRatio,
-  getParallelSplitterOutputHandleIds,
+  getParallelSplitterNodeDimensions,
+  getParallelSplitterOutputHandles,
   inferModelResponseMode,
   getApiToolContextTargetAnchorRatio,
   getToolSourceHandleAnchorRatio,
@@ -74,6 +75,8 @@ const SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decisio
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
 const STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID = "core.structured_payload_builder";
+const PARALLEL_SPLITTER_HANDLE_SLOT_HEIGHT = 28;
+const PARALLEL_SPLITTER_HANDLE_GAP = 12;
 
 const KIND_LABELS: Record<string, string> = {
   input: "IN",
@@ -200,6 +203,7 @@ function GraphCanvasNodeComponent({
   data,
   selected,
 }: NodeProps<GraphCanvasNodeData>) {
+  const updateNodeInternals = useUpdateNodeInternals();
   const {
     node,
     graph,
@@ -337,8 +341,30 @@ function GraphCanvasNodeComponent({
     top: `${getToolSourceHandleAnchorRatio(CONTROL_FLOW_LOOP_BODY_HANDLE_ID) * 100}%`,
   } satisfies CSSProperties;
   const parallelSplitterOutputHandles = isParallelSplitterNode
-    ? getParallelSplitterOutputHandleIds(graph, node)
-    : [createParallelSplitterOutputHandleId(0)];
+    ? getParallelSplitterOutputHandles(graph, node)
+    : [{ id: createParallelSplitterOutputHandleId(0), label: "connection 1", index: 0 }];
+  const parallelSplitterDimensions = isParallelSplitterNode ? getParallelSplitterNodeDimensions(graph, node) : null;
+  const parallelSplitterHandleStyles = parallelSplitterOutputHandles.map((_, index) => {
+    const slotCount = parallelSplitterOutputHandles.length;
+    const columnHeight =
+      slotCount * PARALLEL_SPLITTER_HANDLE_SLOT_HEIGHT + Math.max(0, slotCount - 1) * PARALLEL_SPLITTER_HANDLE_GAP;
+    const nodeHeight = parallelSplitterDimensions?.height ?? 356;
+    const columnTop = (nodeHeight - columnHeight) / 2;
+    const top = columnTop + index * (PARALLEL_SPLITTER_HANDLE_SLOT_HEIGHT + PARALLEL_SPLITTER_HANDLE_GAP) + PARALLEL_SPLITTER_HANDLE_SLOT_HEIGHT / 2;
+    return {
+      top: `${top}px`,
+    } satisfies CSSProperties;
+  });
+  const parallelSplitterHandleSignature = parallelSplitterOutputHandles.map((handle) => handle.id).join("|");
+  const parallelSplitterRenderKey = isParallelSplitterNode
+    ? `${node.id}:${parallelSplitterHandleSignature}:${parallelSplitterDimensions?.height ?? "auto"}`
+    : node.id;
+  useEffect(() => {
+    if (!isParallelSplitterNode) {
+      return;
+    }
+    updateNodeInternals(node.id);
+  }, [isParallelSplitterNode, node.id, parallelSplitterHandleSignature, parallelSplitterDimensions?.height, updateNodeInternals]);
   const logicConditionConfig = isLogicConditionsNode ? normalizeLogicConditionConfig(node.config).normalized : null;
   const logicConditionOutputHandles = isLogicConditionsNode
     ? [
@@ -556,10 +582,14 @@ function GraphCanvasNodeComponent({
 
   return (
     <div
+      key={parallelSplitterRenderKey}
       className={nodeCardClassName}
       style={
         {
           "--node-kind-color": kindColor,
+          ...(parallelSplitterDimensions
+            ? { "--parallel-splitter-height": `${parallelSplitterDimensions.height}px` }
+            : {}),
         } as CSSProperties
       }
       tabIndex={preview ? -1 : 0}
@@ -987,23 +1017,25 @@ function GraphCanvasNodeComponent({
         </>
       ) : null}
       {showSourceHandle && isControlFlowUnitNode && isParallelSplitterNode ? (
-        <div className="graph-parallel-splitter-handles">
-          {parallelSplitterOutputHandles.map((handleId, index) => {
+        <>
+          {parallelSplitterOutputHandles.map((handle, index) => {
+            const style = parallelSplitterHandleStyles[index];
             return (
-              <div key={handleId} className="graph-parallel-splitter-handle-slot">
-                <div className="graph-node-output-port graph-node-output-port--success graph-parallel-splitter-port" aria-hidden="true">
-                  <span className="graph-node-output-port-label">{`Branch ${index + 1}`}</span>
+              <div key={handle.id}>
+                <div className="graph-node-output-port graph-node-output-port--success graph-parallel-splitter-port" style={style} aria-hidden="true">
+                  <span className="graph-node-output-port-label">{handle.label}</span>
                 </div>
                 <Handle
-                  id={handleId}
+                  id={handle.id}
                   type="source"
                   position={Position.Right}
                   className="graph-node-handle graph-node-handle-source graph-node-handle-source--success graph-parallel-splitter-handle"
+                  style={style}
                 />
               </div>
             );
           })}
-        </div>
+        </>
       ) : null}
       {showSourceHandle && isControlFlowUnitNode && isLogicConditionsNode ? (
         <>

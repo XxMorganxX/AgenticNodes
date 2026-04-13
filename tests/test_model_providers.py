@@ -40,7 +40,7 @@ from graph_agent.providers.base import (
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.mock import MockModelProvider
 from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
-from graph_agent.runtime.core import NO_TOOL_CALL_MESSAGE, GraphDefinition, GraphValidationError, NodeContext, RunState
+from graph_agent.runtime.core import API_MESSAGE_HANDLE_ID, NO_TOOL_CALL_MESSAGE, GraphDefinition, GraphValidationError, NodeContext, RunState
 from graph_agent.runtime.documents import load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.tools.base import ToolContext, ToolDefinition, ToolRegistry, ToolResult
@@ -1193,6 +1193,28 @@ class ModelProviderTests(unittest.TestCase):
         self.assertEqual(provider.last_cwd, str(ROOT))
         self.assertEqual(provider.last_timeout_seconds, 15.0)
 
+    def test_claude_code_provider_accepts_haiku_model_alias(self) -> None:
+        provider = StubClaudeCodeProvider()
+        request = ModelRequest(
+            prompt_name="schema_proposal",
+            messages=[ModelMessage(role="user", content="Build the tool payload.")],
+            provider_config={
+                "model": "haiku",
+                "cli_path": "claude",
+                "working_directory": str(ROOT),
+            },
+            response_mode="tool_call",
+            preferred_tool_name="search_catalog",
+            available_tools=[SEARCH_CATALOG_TOOL],
+        )
+
+        provider.generate(request)
+
+        self.assertIsNotNone(provider.last_command)
+        assert provider.last_command is not None
+        model_index = provider.last_command.index("--model")
+        self.assertEqual(provider.last_command[model_index + 1], "haiku")
+
     def test_claude_code_provider_coerces_labeled_email_text_into_required_message_object(self) -> None:
         class LabeledEmailClaudeCodeProvider(StubClaudeCodeProvider):
             def _run_command(self, command: list[str], cwd: str | None, timeout_seconds: float) -> Mapping[str, Any]:
@@ -1741,6 +1763,8 @@ class ModelProviderTests(unittest.TestCase):
         )
         self.assertEqual(claude_code_provider["model_provider_name"], "claude_code")
         self.assertTrue(claude_code_provider["config_fields"])
+        model_field = next(field for field in claude_code_provider["config_fields"] if field["key"] == "model")
+        self.assertIn({"value": "haiku", "label": "haiku"}, model_field["options"])
 
     def test_manager_catalog_reuses_cached_provider_statuses_within_ttl(self) -> None:
         manager = GraphRunManager(services=build_example_services())
@@ -3051,6 +3075,161 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertEqual(display_output["tool_calls"][0]["tool_name"], WEATHER_TOOL_ID)
             finally:
                 manager.stop_background_services()
+
+    def test_message_fanout_prioritizes_display_nodes_before_sibling_api_branches(self) -> None:
+        services = build_example_services()
+        services.model_providers["auto_message"] = AutoMessageProvider()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "message-display-priority",
+                "name": "Message Display Priority",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "model_a",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model A",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "auto_message",
+                        "prompt_name": "auto_message_a",
+                        "config": {
+                            "provider_name": "auto_message",
+                            "prompt_name": "auto_message_a",
+                            "mode": "auto_message_a",
+                            "system_prompt": "Return a direct reply.",
+                            "user_message_template": "{input_payload}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 180, "y": 0},
+                    },
+                    {
+                        "id": "model_b",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model B",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "auto_message",
+                        "prompt_name": "auto_message_b",
+                        "config": {
+                            "provider_name": "auto_message",
+                            "prompt_name": "auto_message_b",
+                            "mode": "auto_message_b",
+                            "system_prompt": "Return a direct reply.",
+                            "user_message_template": "{input_payload}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 420, "y": -80},
+                    },
+                    {
+                        "id": "display",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Display Envelope",
+                        "provider_id": "core.data_display",
+                        "provider_label": "Envelope Display Node",
+                        "config": {
+                            "mode": "passthrough",
+                            "show_input_envelope": True,
+                            "lock_passthrough": True,
+                        },
+                        "position": {"x": 420, "y": 80},
+                    },
+                    {
+                        "id": "finish_model",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish Model",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "model_b"}},
+                        "position": {"x": 660, "y": -80},
+                    },
+                    {
+                        "id": "finish_display",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish Display",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "display"}},
+                        "position": {"x": 660, "y": 80},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-model-a", "source_id": "start", "target_id": "model_a", "label": "", "kind": "standard", "priority": 100},
+                    {
+                        "id": "model-a-model-b",
+                        "source_id": "model_a",
+                        "target_id": "model_b",
+                        "source_handle_id": API_MESSAGE_HANDLE_ID,
+                        "label": "continue api branch",
+                        "kind": "conditional",
+                        "priority": 10,
+                        "condition": {
+                            "id": "model-a-model-b-message",
+                            "label": "Message output",
+                            "type": "result_payload_path_equals",
+                            "value": "message_envelope",
+                            "path": "metadata.contract",
+                        },
+                    },
+                    {
+                        "id": "model-a-display",
+                        "source_id": "model_a",
+                        "target_id": "display",
+                        "source_handle_id": API_MESSAGE_HANDLE_ID,
+                        "label": "capture envelope",
+                        "kind": "conditional",
+                        "priority": 20,
+                        "condition": {
+                            "id": "model-a-display-message",
+                            "label": "Message output",
+                            "type": "result_payload_path_equals",
+                            "value": "message_envelope",
+                            "path": "metadata.contract",
+                        },
+                    },
+                    {"id": "model-b-finish", "source_id": "model_b", "target_id": "finish_model", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "display-finish", "source_id": "display", "target_id": "finish_display", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, "current request", run_id="run-message-display-priority")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.visit_counts["display"], 1)
+        self.assertEqual(state.visit_counts["model_b"], 1)
+        started_nodes = [
+            event.payload["node_id"]
+            for event in state.event_history
+            if event.event_type == "node.started"
+        ]
+        self.assertLess(started_nodes.index("display"), started_nodes.index("model_b"))
+        display_output = state.node_outputs["display"]
+        assert isinstance(display_output, dict)
+        self.assertEqual(display_output["artifacts"]["display_envelope"]["from_node_id"], "model_a")
 
     def test_mcp_executor_receives_tool_call_through_display_passthrough_when_envelope_preview_is_disabled(self) -> None:
         services, runtime, graph_payload = self._build_auto_branch_graph("auto_tool_call", AutoToolCallProvider())

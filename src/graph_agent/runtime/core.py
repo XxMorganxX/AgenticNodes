@@ -118,6 +118,7 @@ OUTLOOK_DRAFT_PROVIDER_ID = "end.outlook_draft"
 END_AGENT_RUN_PROVIDER_ID = "end.agent_run"
 SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows"
 SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision"
+JSON_CODE_FENCE_PATTERN = re.compile(r"^```(?:[A-Za-z0-9_-]+)?[ \t]*\n(?P<body>.*)\n```$", re.DOTALL)
 LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions"
 PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter"
 WRITE_TEXT_FILE_PROVIDER_ID = "core.write_text_file"
@@ -479,6 +480,11 @@ def _parse_json_object_or_array(value: Any) -> Any:
     if not isinstance(value, str):
         return value
     candidate = value.strip()
+    if not candidate:
+        return value
+    fence_match = JSON_CODE_FENCE_PATTERN.match(candidate)
+    if fence_match is not None:
+        candidate = str(fence_match.group("body") or "").strip()
     if not candidate or candidate[0] not in {"{", "["}:
         return value
     try:
@@ -2720,10 +2726,12 @@ class DataNode(BaseNode):
 
     def _runtime_normalizer_config(self, context: NodeContext) -> RuntimeFieldExtractorConfig:
         resolved = context.resolve_graph_env_value(dict(self.config))
-        field_name = str(resolved.get("field_name", "") or "").strip()
+        field_names = parse_field_name_list(resolved.get("field_names"))
+        if not field_names:
+            field_names = parse_field_name_list(resolved.get("field_name"))
         fallback_field_names = parse_field_name_list(resolved.get("fallback_field_names"))
         return RuntimeFieldExtractorConfig(
-            field_name=field_name,
+            field_names=field_names,
             fallback_field_names=fallback_field_names,
             preferred_path=str(resolved.get("preferred_path", "") or "").strip(),
             case_sensitive=_coerce_bool(resolved.get("case_sensitive"), default=False),
@@ -2747,27 +2755,34 @@ class DataNode(BaseNode):
     def _execute_runtime_normalizer(self, context: NodeContext) -> NodeExecutionResult:
         resolved_config = self._runtime_normalizer_config(context)
         source_roots = self._runtime_normalizer_source_roots(context)
-        if not resolved_config.field_name:
+        if not resolved_config.field_names:
             error = {
                 "type": "missing_field_name",
-                "message": "Runtime field extractor requires a field_name configuration value.",
+                "message": "Runtime field extractor requires at least one configured field name.",
             }
             return NodeExecutionResult(status="failed", error=error, summary=error["message"])
 
+        requested_field_names = resolved_config.field_names
+        single_field_mode = len(requested_field_names) == 1
         matched_value = None
         matched_path = ""
+        matched_values_by_field: dict[str, Any] = {}
+        matched_paths_by_field: dict[str, str] = {}
         all_matches: list[dict[str, Any]] = []
 
-        if resolved_config.preferred_path:
+        if resolved_config.preferred_path and single_field_mode:
             for source_value in source_roots:
                 preferred_value = _deep_get(source_value, resolved_config.preferred_path)
                 if preferred_value is None:
                     continue
                 matched_value = preferred_value
                 matched_path = resolved_config.preferred_path
+                matched_values_by_field[resolved_config.field_name] = preferred_value
+                matched_paths_by_field[resolved_config.field_name] = resolved_config.preferred_path
                 all_matches.append(
                     {
                         "field": resolved_config.field_name,
+                        "requested_field": resolved_config.field_name,
                         "path": resolved_config.preferred_path,
                         "value": preferred_value,
                     }
@@ -2775,29 +2790,55 @@ class DataNode(BaseNode):
                 break
 
         if matched_value is None:
-            search_fields = (resolved_config.field_name, *resolved_config.fallback_field_names)
-            for source_value in source_roots:
-                all_matches = extract_field_candidates(
-                    source_value,
-                    field_names=search_fields,
-                    case_sensitive=resolved_config.case_sensitive,
-                    max_matches=resolved_config.max_matches,
+            for requested_field_name in requested_field_names:
+                search_fields = (
+                    (requested_field_name, *resolved_config.fallback_field_names)
+                    if single_field_mode
+                    else (requested_field_name,)
                 )
-                if not all_matches:
-                    continue
-                matched_value = all_matches[0].get("value")
-                matched_path = str(all_matches[0].get("path", "") or "")
-                break
+                field_matches: list[dict[str, Any]] = []
+                for source_value in source_roots:
+                    field_matches = extract_field_candidates(
+                        source_value,
+                        field_names=search_fields,
+                        case_sensitive=resolved_config.case_sensitive,
+                        max_matches=resolved_config.max_matches,
+                    )
+                    if not field_matches:
+                        continue
+                    first_match = dict(field_matches[0])
+                    matched_values_by_field[requested_field_name] = first_match.get("value")
+                    matched_paths_by_field[requested_field_name] = str(first_match.get("path", "") or "")
+                    if single_field_mode:
+                        matched_value = first_match.get("value")
+                        matched_path = matched_paths_by_field[requested_field_name]
+                    break
+                all_matches.extend(
+                    {
+                        **match,
+                        "requested_field": requested_field_name,
+                    }
+                    for match in field_matches
+                )
+
+        if not single_field_mode:
+            matched_value = {field_name: matched_values_by_field[field_name] for field_name in requested_field_names if field_name in matched_values_by_field}
+
+        missing_field_names = [field_name for field_name in requested_field_names if field_name not in matched_values_by_field]
 
         metadata = {
             "contract": "data_envelope",
             "node_kind": self.kind,
             "data_mode": RUNTIME_NORMALIZER_MODE,
             "provider_id": self.provider_id,
+            "field_names": list(requested_field_names),
             "field_name": resolved_config.field_name,
             "fallback_field_names": list(resolved_config.fallback_field_names),
             "matched_path": matched_path or None,
+            "matched_paths_by_field": matched_paths_by_field,
             "match_count": len(all_matches),
+            "matched_field_names": list(matched_values_by_field.keys()),
+            "missing_field_names": missing_field_names,
             "case_sensitive": resolved_config.case_sensitive,
         }
         artifacts = {"field_matches": all_matches}
@@ -2810,14 +2851,33 @@ class DataNode(BaseNode):
             metadata=metadata,
         )
         error = None
-        summary = f"Extracted '{resolved_config.field_name}' from '{matched_path}'." if matched_path else f"Field '{resolved_config.field_name}' was not found."
+        if single_field_mode:
+            summary = (
+                f"Extracted '{resolved_config.field_name}' from '{matched_path}'."
+                if matched_path
+                else f"Field '{resolved_config.field_name}' was not found."
+            )
+        else:
+            summary = (
+                f"Extracted {len(matched_values_by_field)} of {len(requested_field_names)} requested fields."
+                if not missing_field_names
+                else f"Missing {len(missing_field_names)} of {len(requested_field_names)} requested fields."
+            )
         status = "success"
-        if matched_path == "":
+        if single_field_mode and matched_path == "":
             error = {
                 "type": "field_not_found",
                 "message": f"Field '{resolved_config.field_name}' was not found in the incoming envelope data.",
                 "field_name": resolved_config.field_name,
                 "fallback_field_names": list(resolved_config.fallback_field_names),
+            }
+            status = "failed"
+        elif not single_field_mode and missing_field_names:
+            error = {
+                "type": "fields_not_found",
+                "message": "One or more requested fields were not found in the incoming envelope data.",
+                "field_names": list(requested_field_names),
+                "missing_field_names": missing_field_names,
             }
             status = "failed"
         return NodeExecutionResult(
@@ -7258,9 +7318,13 @@ class GraphDefinition:
                         f"LinkedIn profile fetch node '{node.id}' uses an invalid workspace cache path template."
                     ) from exc
             if node.kind == "data" and node.provider_id == RUNTIME_NORMALIZER_PROVIDER_ID:
-                field_name = str(node.config.get("field_name", "") or "").strip()
-                if not field_name:
-                    raise GraphValidationError(f"Runtime field extractor node '{node.id}' must declare field_name.")
+                field_names = parse_field_name_list(node.config.get("field_names"))
+                if not field_names:
+                    field_names = parse_field_name_list(node.config.get("field_name"))
+                if not field_names:
+                    raise GraphValidationError(
+                        f"Runtime field extractor node '{node.id}' must declare at least one field name."
+                    )
                 try:
                     if int(node.config.get("max_matches", 25)) < 1:
                         raise ValueError("max_matches")

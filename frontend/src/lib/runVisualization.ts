@@ -8,6 +8,7 @@ import type {
   TestEnvironmentDefinition,
 } from "./types";
 import { buildNodeInstanceLabelMap } from "./nodeInstanceLabels";
+import { latestRuntimeResolvedNodeOutputs } from "./runtimeNodeOutputs";
 
 export type EnvironmentRunSummary = {
   runId: string | null;
@@ -984,18 +985,24 @@ function deriveCurrentNodeId(runState: RunState | null, normalizedEvents: Runtim
   return runState?.current_node_id ?? null;
 }
 
-function wasNodeVisited(nodeId: string, runState: RunState | null, completedNodeIdSet: Set<string>): boolean {
+function wasNodeVisited(
+  node: GraphNode,
+  runState: RunState | null,
+  completedNodeIdSet: Set<string>,
+  latestOutput: unknown,
+): boolean {
   if (!runState) {
-    return completedNodeIdSet.has(nodeId);
+    return completedNodeIdSet.has(node.id);
   }
-  const status = runState.node_statuses?.[nodeId] ?? "";
+  const status = runState.node_statuses?.[node.id] ?? "";
   if (status === "active" || status === "success" || status === "failed") {
     return true;
   }
   return (
-    (runState.visit_counts?.[nodeId] ?? 0) > 0 ||
-    hasOwnRecordValue(runState.node_outputs, nodeId) ||
-    hasOwnRecordValue(runState.node_errors, nodeId)
+    (runState.visit_counts?.[node.id] ?? 0) > 0 ||
+    hasOwnRecordValue(runState.node_outputs, node.id) ||
+    hasOwnRecordValue(runState.node_errors, node.id) ||
+    (node.provider_id === "core.data_display" && latestOutput !== undefined)
   );
 }
 
@@ -1015,8 +1022,12 @@ export function latestOutputsFromCompletedNodeEvents(normalizedEvents: RuntimeEv
   return outputs;
 }
 
-function latestNodeOutputsByEvent(normalizedEvents: RuntimeEvent[]): Record<string, unknown> {
-  return latestOutputsFromCompletedNodeEvents(normalizedEvents);
+function latestNodeOutputsByEvent(
+  graph: GraphDefinition | null,
+  runState: RunState | null,
+  normalizedEvents: RuntimeEvent[],
+): Record<string, unknown> {
+  return latestRuntimeResolvedNodeOutputs(graph, runState, normalizedEvents);
 }
 
 function buildFocusedNodeStates(
@@ -1026,7 +1037,7 @@ function buildFocusedNodeStates(
   completedNodeIdSet: Set<string>,
   currentNodeId: string | null,
 ): Record<string, FocusedRunNodeState> {
-  const latestEventOutputs = latestNodeOutputsByEvent(normalizedEvents);
+  const latestEventOutputs = latestNodeOutputsByEvent(graph, runState, normalizedEvents);
   return Object.fromEntries(
     (graph?.nodes ?? []).map((node) => {
       const latestError = runState?.node_errors?.[node.id];
@@ -1039,7 +1050,7 @@ function buildFocusedNodeStates(
         {
           nodeId: node.id,
           isActive: effectiveStatus === "active" || currentNodeId === node.id,
-          wasVisited: wasNodeVisited(node.id, runState, completedNodeIdSet),
+          wasVisited: wasNodeVisited(node, runState, completedNodeIdSet, latestOutput),
           hasError: effectiveStatus === "failed" || latestError != null,
           latestOutput,
           latestError,

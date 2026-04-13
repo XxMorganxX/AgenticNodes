@@ -234,6 +234,78 @@ class RuntimeFieldExtractorTests(unittest.TestCase):
         self.assertEqual(state.final_output, "https://www.linkedin.com/in/example/")
         self.assertEqual(state.node_outputs["extract"]["metadata"]["matched_path"], "payload.person.linkedin_url")
 
+    def test_extracts_multiple_fields_into_an_object_payload(self) -> None:
+        graph = GraphDefinition.from_dict(
+            runtime_field_extractor_graph_payload(
+                "runtime-field-multiple",
+                node_config={"field_name": "headline\ncompany"},
+            )
+        )
+        graph.validate_against_services(self.services)
+
+        runtime = self._runtime()
+        state = runtime.run(
+            graph,
+            {
+                "person": {
+                    "profile": {
+                        "headline": "Engineer",
+                        "company": "Acme",
+                    }
+                }
+            },
+            run_id="run-field-extractor-multiple",
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(
+            state.final_output,
+            {
+                "headline": "Engineer",
+                "company": "Acme",
+            },
+        )
+        self.assertEqual(
+            state.node_outputs["extract"]["metadata"]["matched_paths_by_field"],
+            {
+                "headline": "payload.person.profile.headline",
+                "company": "payload.person.profile.company",
+            },
+        )
+        self.assertEqual(state.node_outputs["extract"]["metadata"]["missing_field_names"], [])
+
+    def test_multiple_fields_fail_when_any_requested_field_is_missing(self) -> None:
+        graph = GraphDefinition.from_dict(
+            runtime_field_extractor_graph_payload(
+                "runtime-field-multiple-missing",
+                node_config={"field_name": "headline\ncompany"},
+            )
+        )
+        graph.validate_against_services(self.services)
+
+        runtime = self._runtime()
+        state = runtime.run(
+            graph,
+            {
+                "person": {
+                    "profile": {
+                        "headline": "Engineer",
+                    }
+                }
+            },
+            run_id="run-field-extractor-multiple-missing",
+        )
+
+        self.assertEqual(state.status, "failed")
+        self.assertEqual(state.terminal_error["type"], "fields_not_found")
+        self.assertEqual(state.terminal_error["missing_field_names"], ["company"])
+        self.assertEqual(
+            state.node_outputs["extract"]["payload"],
+            {
+                "headline": "Engineer",
+            },
+        )
+
     def test_extracts_field_from_full_envelope_not_just_payload(self) -> None:
         graph = GraphDefinition.from_dict(runtime_field_extractor_graph_payload("runtime-field-envelope", node_config={"field_name": "contract"}))
         graph.validate_against_services(self.services)

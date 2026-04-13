@@ -1,5 +1,5 @@
 import { getContextBuilderBindings } from "./contextBuilderBindings";
-import { latestOutputsFromCompletedNodeEvents } from "./runVisualization";
+import { latestRuntimeResolvedNodeOutputs } from "./runtimeNodeOutputs";
 import type { GraphDefinition, GraphNode, RunState, RuntimeEvent } from "./types";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -55,7 +55,7 @@ export function buildContextBuilderRuntimeView(
     return null;
   }
 
-  const latestByNode = latestOutputsFromCompletedNodeEvents(normalizedEvents);
+  const latestByNode = latestRuntimeResolvedNodeOutputs(graph, runState, normalizedEvents);
   const bindings = getContextBuilderBindings(node, graph);
 
   const sources: ContextBuilderSourceSlot[] = bindings.map((binding) => {
@@ -70,9 +70,7 @@ export function buildContextBuilderRuntimeView(
         errorSummary: summarizeNodeError(err),
       };
     }
-    const hasOutput =
-      Object.prototype.hasOwnProperty.call(latestByNode, binding.sourceNodeId) ||
-      (runState?.node_outputs && Object.prototype.hasOwnProperty.call(runState.node_outputs, binding.sourceNodeId));
+    const hasOutput = Object.prototype.hasOwnProperty.call(latestByNode, binding.sourceNodeId);
     return {
       sourceNodeId: binding.sourceNodeId,
       sourceLabel: binding.sourceLabel,
@@ -86,8 +84,7 @@ export function buildContextBuilderRuntimeView(
   const errorCount = sources.filter((s) => s.status === "error").length;
   const totalCount = sources.length;
 
-  const composeOutput =
-    (latestByNode[node.id] as unknown) ?? (runState?.node_outputs?.[node.id] as unknown) ?? null;
+  const composeOutput = (latestByNode[node.id] as unknown) ?? null;
 
   let contextBuilderComplete: boolean | null = null;
   let holdingOutgoing = false;

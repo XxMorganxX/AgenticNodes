@@ -2996,44 +2996,18 @@ pre {
 
 .graph-node-card--parallel-splitter {
   min-width: calc(420px * var(--graph-node-body-scale, 1));
-  min-height: 356px;
+  min-height: var(--parallel-splitter-height, 356px);
   position: relative;
-}
-
-.graph-parallel-splitter-handles {
-  position: absolute;
-  right: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  align-items: flex-end;
-  pointer-events: none;
-  z-index: 3;
-}
-
-.graph-parallel-splitter-handle-slot {
-  position: relative;
-  display: flex;
-  align-items: center;
-  height: 28px;
-  pointer-events: none;
 }
 
 .graph-parallel-splitter-port {
-  position: static;
-  transform: none;
-  right: auto;
+  z-index: 3;
   pointer-events: none;
   padding-right: 18px;
 }
 
 .graph-parallel-splitter-handle {
-  position: absolute;
-  right: -15px;
-  top: 50% !important;
-  transform: translateY(-50%) scale(1);
+  z-index: 4;
   pointer-events: all;
 }
 
@@ -3481,6 +3455,18 @@ pre {
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.graph-node-inline-action-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.graph-node-inline-action-button {
+  padding: 0.32rem 0.62rem;
+  font-size: 0.76rem;
+  line-height: 1.1;
 }
 
 .graph-node-inline-select {
@@ -5804,6 +5790,24 @@ pre {
   background: #1a1b2e;
   border: 1px solid #2e2f48;
   color: #8486a5;
+}
+
+.runtime-field-list {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 0.45rem;
+}
+
+.runtime-field-list-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.55rem;
+  align-items: center;
+}
+
+.runtime-field-list-button,
+.runtime-field-list-add {
+  white-space: nowrap;
 }
 
 .prompt-preview-tool-list {

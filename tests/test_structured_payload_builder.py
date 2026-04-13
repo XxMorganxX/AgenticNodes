@@ -238,6 +238,39 @@ class StructuredPayloadBuilderTests(unittest.TestCase):
             },
         )
 
+    def test_builder_parses_fenced_json_payload_string(self) -> None:
+        graph = GraphDefinition.from_dict(
+            structured_payload_builder_graph_payload(
+                "structured-payload-fenced-json",
+                node_config={
+                    "template_json": json.dumps(
+                        {
+                            "organization": "",
+                            "domain": "",
+                        }
+                    )
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        state = runtime.run(
+            graph,
+            {
+                "payload": "```json\n{\n  \"organization\": \"OpenAI\",\n  \"organization_confidence\": 1.0,\n  \"domain\": \"openai.com\",\n  \"domain_confidence\": 0.95\n}\n```",
+            },
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(
+            state.final_output,
+            {
+                "organization": "OpenAI",
+                "domain": "openai.com",
+            },
+        )
+
     def test_builder_matches_multi_keyword_alias_fields_deterministically(self) -> None:
         graph = GraphDefinition.from_dict(
             structured_payload_builder_graph_payload(

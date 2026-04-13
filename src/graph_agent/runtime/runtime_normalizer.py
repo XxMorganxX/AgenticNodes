@@ -6,11 +6,15 @@ from typing import Any, Mapping, Sequence
 
 @dataclass(frozen=True)
 class RuntimeFieldExtractorConfig:
-    field_name: str
+    field_names: tuple[str, ...]
     fallback_field_names: tuple[str, ...] = ()
     preferred_path: str = ""
     case_sensitive: bool = False
     max_matches: int = 25
+
+    @property
+    def field_name(self) -> str:
+        return self.field_names[0] if self.field_names else ""
 
 
 def parse_field_name_list(value: Any) -> tuple[str, ...]:
