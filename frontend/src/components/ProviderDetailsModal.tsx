@@ -14,7 +14,7 @@ import {
 } from "../lib/responseSchema";
 import { loadSessionSupabaseSchema, saveSessionSupabaseSchema } from "../lib/sessionSupabaseSchema";
 import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "../lib/spreadsheetMatrixPrompt";
-import { getSupabaseConnections, resolveSupabaseBinding } from "../lib/supabaseConnections";
+import { getSupabaseConnectionSelectOptions, resolveSupabaseBinding } from "../lib/supabaseConnections";
 import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
 import { NodeDetailsForm } from "./NodeDetailsForm";
 import type {
@@ -98,6 +98,69 @@ function toolMatchesReference(tool: ToolDefinition, reference: string): boolean 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
 }
+
+type StructuredPayloadTemplateEntry = {
+  id: string;
+  key: string;
+  value: string;
+};
+
+function parseStructuredPayloadTemplateEntries(value: unknown): StructuredPayloadTemplateEntry[] {
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return [];
+    }
+    return Object.entries(parsed).map(([key, entryValue], index) => ({
+      id: `template-entry-${index + 1}-${key}`,
+      key,
+      value:
+        typeof entryValue === "string"
+          ? entryValue
+          : entryValue == null
+            ? ""
+            : JSON.stringify(entryValue),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function serializeStructuredPayloadTemplateEntries(entries: StructuredPayloadTemplateEntry[]): string {
+  const payload: Record<string, unknown> = {};
+  for (const entry of entries) {
+    const key = entry.key.trim();
+    if (!key) {
+      continue;
+    }
+    const rawValue = entry.value;
+    const trimmedValue = rawValue.trim();
+    if (!trimmedValue) {
+      payload[key] = "";
+      continue;
+    }
+    if (trimmedValue === "null") {
+      payload[key] = null;
+      continue;
+    }
+    if (trimmedValue === "{}") {
+      payload[key] = {};
+      continue;
+    }
+    if (trimmedValue === "[]") {
+      payload[key] = [];
+      continue;
+    }
+    payload[key] = rawValue;
+  }
+  return JSON.stringify(payload, null, 2);
+}
+
+const STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID = "core.structured_payload_builder";
 
 function parseSupabaseSelect(selectValue: string, availableColumns: string[]): string[] {
   const trimmed = selectValue.trim();
@@ -271,7 +334,9 @@ export function ProviderDetailsModal({
   const isSupabaseDataNode = node.provider_id === "core.supabase_data";
   const isSupabaseRowWriteNode = node.provider_id === "core.supabase_row_write";
   const isOutboundEmailLoggerNode = node.provider_id === "core.outbound_email_logger";
+  const isStructuredPayloadBuilderNode = node.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID;
   const isSupabaseCatalogNode = isSupabaseDataNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
+  const usesSupabaseTableSelection = isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
   const displayedUserMessageTemplate =
     node.provider_id === "core.spreadsheet_matrix_decision" &&
     (!String(node.config.user_message_template ?? "").trim() ||
@@ -280,7 +345,7 @@ export function ProviderDetailsModal({
       : String(node.config.user_message_template ?? "{input_payload}");
   const displayedProviderConfigFields = isSupabaseCatalogNode
     ? providerConfigFields.filter((field) => !["supabase_url_env_var", "supabase_key_env_var"].includes(field.key))
-    : providerConfigFields;
+    : providerConfigFields.filter((field) => !(isStructuredPayloadBuilderNode && field.key === "template_json"));
   const supportsLiveVerification = isModelNode && providerName !== "mock";
   const catalogTools = catalog?.tools ?? [];
   const mcpCatalogTools = catalogTools.filter((tool) => tool.source_type === "mcp");
@@ -517,6 +582,7 @@ export function ProviderDetailsModal({
   const [isLoadingSupabaseSchema, setIsLoadingSupabaseSchema] = useState(false);
   const [supabaseSourceSearch, setSupabaseSourceSearch] = useState("");
   const [selectedSupabaseSourceName, setSelectedSupabaseSourceName] = useState<string>("");
+  const [structuredPayloadTemplateDraftEntries, setStructuredPayloadTemplateDraftEntries] = useState<StructuredPayloadTemplateEntry[]>([]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -539,6 +605,9 @@ export function ProviderDetailsModal({
     });
     return Object.fromEntries(entries);
   }, [isModelNode, node.config, providerConfigFields, providerName]);
+  const structuredPayloadTemplateEntries = isStructuredPayloadBuilderNode
+    ? structuredPayloadTemplateDraftEntries
+    : [];
   const verificationStorageKey = useMemo(
     () => buildProviderVerificationStorageKey(providerName, preflightConfig),
     [preflightConfig, providerName],
@@ -552,6 +621,13 @@ export function ProviderDetailsModal({
   useEffect(() => {
     setActiveTab("node");
   }, [node.id, providerName]);
+  useEffect(() => {
+    if (isStructuredPayloadBuilderNode) {
+      setStructuredPayloadTemplateDraftEntries(parseStructuredPayloadTemplateEntries(node.config.template_json));
+      return;
+    }
+    setStructuredPayloadTemplateDraftEntries([]);
+  }, [isStructuredPayloadBuilderNode, node.id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -630,6 +706,11 @@ export function ProviderDetailsModal({
         },
       })),
     );
+  }
+
+  function updateStructuredPayloadTemplateEntries(entries: StructuredPayloadTemplateEntry[]) {
+    setStructuredPayloadTemplateDraftEntries(entries);
+    updateProviderConfig("template_json", serializeStructuredPayloadTemplateEntries(entries));
   }
 
   function updateResponseSchemaText(nextText: string) {
@@ -737,9 +818,12 @@ export function ProviderDetailsModal({
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
-  const supabaseConnections = useMemo(() => getSupabaseConnections(graph), [graph]);
   const resolvedSupabaseBinding = useMemo(
     () => resolveSupabaseBinding(graph, node.config as Record<string, unknown>),
+    [graph, node.config],
+  );
+  const supabaseConnectionOptions = useMemo(
+    () => getSupabaseConnectionSelectOptions(graph, node.config as Record<string, unknown>),
     [graph, node.config],
   );
   const supabaseConnectionId = resolvedSupabaseBinding.connectionId;
@@ -770,7 +854,7 @@ export function ProviderDetailsModal({
 
   const filteredSupabaseSources = useMemo(() => {
     const sources = (supabaseSchemaPreview?.sources ?? []).filter(
-      (source) => !(isSupabaseRowWriteNode || isOutboundEmailLoggerNode) || source.source_kind === "table",
+      (source) => !usesSupabaseTableSelection || source.source_kind === "table",
     );
     const query = supabaseSourceSearch.trim().toLowerCase();
     if (!query) {
@@ -786,7 +870,7 @@ export function ProviderDetailsModal({
         .toLowerCase();
       return haystack.includes(query);
     });
-  }, [isOutboundEmailLoggerNode, isSupabaseRowWriteNode, supabaseSchemaPreview, supabaseSourceSearch]);
+  }, [supabaseSchemaPreview, supabaseSourceSearch, usesSupabaseTableSelection]);
   const selectedSupabaseSource = useMemo<SupabaseSchemaSource | null>(() => {
     const availableSources = supabaseSchemaPreview?.sources ?? [];
     if (availableSources.length === 0) {
@@ -795,19 +879,19 @@ export function ProviderDetailsModal({
     if (selectedSupabaseSourceName) {
       return availableSources.find((source) => source.name === selectedSupabaseSourceName) ?? null;
     }
-    const configuredSourceName = String((isSupabaseRowWriteNode || isOutboundEmailLoggerNode) ? node.config.table_name ?? "" : node.config.source_name ?? "").trim();
+    const configuredSourceName = String(usesSupabaseTableSelection ? node.config.table_name ?? "" : node.config.source_name ?? "").trim();
     if (configuredSourceName) {
       return availableSources.find((source) => source.name === configuredSourceName) ?? null;
     }
     return availableSources[0] ?? null;
-  }, [isOutboundEmailLoggerNode, isSupabaseRowWriteNode, node.config.source_name, node.config.table_name, selectedSupabaseSourceName, supabaseSchemaPreview]);
+  }, [node.config.source_name, node.config.table_name, selectedSupabaseSourceName, supabaseSchemaPreview, usesSupabaseTableSelection]);
   const selectedSupabaseColumnNames = useMemo(() => {
-    if (isSupabaseRowWriteNode) {
+    if (usesSupabaseTableSelection) {
       return [];
     }
     const availableColumns = selectedSupabaseSource?.columns.map((column) => column.name) ?? [];
     return parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns);
-  }, [isSupabaseRowWriteNode, node.config.select, selectedSupabaseSource]);
+  }, [node.config.select, selectedSupabaseSource, usesSupabaseTableSelection]);
 
   useEffect(() => {
     if (!isSupabaseCatalogNode) {
@@ -827,8 +911,8 @@ export function ProviderDetailsModal({
     if (cachedSchema) {
       setSupabaseSchemaPreview(cachedSchema);
     }
-    setSelectedSupabaseSourceName(String((isSupabaseRowWriteNode || isOutboundEmailLoggerNode) ? node.config.table_name ?? "" : node.config.source_name ?? "").trim());
-  }, [graph, isOutboundEmailLoggerNode, isSupabaseCatalogNode, isSupabaseRowWriteNode, node.config.schema, node.config.source_name, node.config.table_name, supabaseSchemaCacheScope]);
+    setSelectedSupabaseSourceName(String(usesSupabaseTableSelection ? node.config.table_name ?? "" : node.config.source_name ?? "").trim());
+  }, [graph, isSupabaseCatalogNode, node.config.schema, node.config.source_name, node.config.table_name, supabaseSchemaCacheScope, usesSupabaseTableSelection]);
 
   useEffect(() => {
     if (!isSupabaseCatalogNode) {
@@ -872,7 +956,7 @@ export function ProviderDetailsModal({
         schemaName: result.schema,
       });
       setSupabaseSchemaPreview(result);
-      const configuredSourceName = String((isSupabaseRowWriteNode || isOutboundEmailLoggerNode) ? node.config.table_name ?? "" : node.config.source_name ?? "").trim();
+      const configuredSourceName = String(usesSupabaseTableSelection ? node.config.table_name ?? "" : node.config.source_name ?? "").trim();
       const firstSource = result.sources[0]?.name ?? "";
       setSelectedSupabaseSourceName(configuredSourceName || firstSource);
     } catch (error) {
@@ -939,7 +1023,7 @@ export function ProviderDetailsModal({
         ...currentNode,
         config: {
           ...currentNode.config,
-          ...((isSupabaseRowWriteNode || isOutboundEmailLoggerNode)
+          ...(usesSupabaseTableSelection
             ? {
                 table_name: source.name,
               }
@@ -962,7 +1046,7 @@ export function ProviderDetailsModal({
   }
 
   function toggleSupabaseColumn(columnName: string) {
-    if (!selectedSupabaseSource || isSupabaseRowWriteNode) {
+    if (!selectedSupabaseSource || usesSupabaseTableSelection) {
       return;
     }
     const availableColumns = selectedSupabaseSource.columns.map((column) => column.name);
@@ -1607,9 +1691,9 @@ export function ProviderDetailsModal({
                             }
                           >
                             <option value="">Compatibility mode (raw env vars)</option>
-                            {supabaseConnections.map((connection) => (
-                              <option key={connection.connection_id} value={connection.connection_id}>
-                                {connection.name}{connection.isImplicit ? " (legacy)" : ""}
+                            {supabaseConnectionOptions.map((connection) => (
+                              <option key={connection.value} value={connection.value}>
+                                {connection.label}
                               </option>
                             ))}
                           </select>
@@ -1619,7 +1703,28 @@ export function ProviderDetailsModal({
                             ? "Named connections are managed from the Environment panel and keep node bindings stable when credentials change."
                             : "Compatibility mode preserves the node's existing raw Supabase env-var names without forcing a migration."}
                         </div>
-                        {supabaseConnectionMissing ? <div>Missing connection id: <code>{supabaseConnectionId}</code></div> : null}
+                        {supabaseConnectionMissing ? (
+                          <div>
+                            Missing connection id: <code>{supabaseConnectionId}</code>
+                            <div style={{ marginTop: "0.4rem" }}>
+                              <button
+                                type="button"
+                                className="secondary-button"
+                                onClick={() =>
+                                  onGraphChange(
+                                    updateModelNode(graph, node.id, (currentNode) => {
+                                      const nextConfig = { ...currentNode.config };
+                                      delete nextConfig.supabase_connection_id;
+                                      return { ...currentNode, config: nextConfig };
+                                    }),
+                                  )
+                                }
+                              >
+                                Switch to compatibility mode
+                              </button>
+                            </div>
+                          </div>
+                        ) : null}
                       </div>
                     </section>
                     <section className="provider-details-schema-browser">
@@ -1680,7 +1785,7 @@ export function ProviderDetailsModal({
                         {filteredSupabaseSources.length > 0 ? (
                           filteredSupabaseSources.map((source) => {
                             const isActive = selectedSupabaseSource?.name === source.name;
-                            const isConfigured = String(isSupabaseRowWriteNode ? node.config.table_name ?? "" : node.config.source_name ?? "").trim() === source.name;
+                            const isConfigured = String(usesSupabaseTableSelection ? node.config.table_name ?? "" : node.config.source_name ?? "").trim() === source.name;
                             return (
                               <button
                                 key={source.name}
@@ -1714,14 +1819,14 @@ export function ProviderDetailsModal({
                                   onClick={() =>
                                     applySupabaseSourceSelection(
                                       selectedSupabaseSource,
-                                      (isSupabaseRowWriteNode || isOutboundEmailLoggerNode) ? undefined : selectedSupabaseColumnNames,
+                                      usesSupabaseTableSelection ? undefined : selectedSupabaseColumnNames,
                                     )
                                   }
                                   disabled={isSupabaseBrowserLocked}
                                 >
-                                  {isSupabaseRowWriteNode || isOutboundEmailLoggerNode ? "Use Table" : "Apply Selection"}
+                                  {usesSupabaseTableSelection ? "Use Table" : "Apply Selection"}
                                 </button>
-                                {!isSupabaseRowWriteNode && !isOutboundEmailLoggerNode ? (
+                                {!usesSupabaseTableSelection ? (
                                   <button
                                     type="button"
                                     className="secondary-button"
@@ -1741,7 +1846,7 @@ export function ProviderDetailsModal({
                                 const checked = selectedSupabaseColumnNames.includes(column.name);
                                 return (
                                   <label key={column.name} className="provider-details-schema-column-row">
-                                    {!isSupabaseRowWriteNode && !isOutboundEmailLoggerNode ? (
+                                    {!usesSupabaseTableSelection ? (
                                       <input
                                         type="checkbox"
                                         checked={checked}
@@ -1766,6 +1871,101 @@ export function ProviderDetailsModal({
                         )}
                       </div>
                     </div>
+                    </section>
+                  </>
+                ) : null}
+                {isStructuredPayloadBuilderNode ? (
+                  <>
+                    <section className="provider-details-status-card">
+                      <div className="provider-details-status-card-header">
+                        <strong>Dictionary Entries</strong>
+                        <span>Structured payload shape</span>
+                      </div>
+                      <div className="tool-details-modal-help">
+                        <div>Add one key per row and leave the value blank when you want runtime auto-fill.</div>
+                        <div>Use <code>null</code>, <code>{`{}`}</code>, or <code>[]</code> if you want those missing shapes preserved for auto-fill behavior.</div>
+                      </div>
+                      <div className="context-builder-binding-actions">
+                        <button
+                          type="button"
+                          className="secondary-button context-builder-inline-button"
+                          onClick={() =>
+                            updateStructuredPayloadTemplateEntries([
+                              ...structuredPayloadTemplateEntries,
+                              {
+                                id: `template-entry-new-${structuredPayloadTemplateEntries.length + 1}`,
+                                key: "",
+                                value: "",
+                              },
+                            ])
+                          }
+                        >
+                          Add Entry
+                        </button>
+                      </div>
+                      {structuredPayloadTemplateEntries.length > 0 ? (
+                        <div className="checkbox-grid">
+                          {structuredPayloadTemplateEntries.map((entry, index) => (
+                            <div key={entry.id} className="context-builder-binding-card">
+                              <div className="context-builder-binding-header">
+                                <div>
+                                  <strong>Entry {index + 1}</strong>
+                                  <small>Blank value means auto-fill</small>
+                                </div>
+                                <div className="context-builder-binding-actions">
+                                  <button
+                                    type="button"
+                                    className="secondary-button context-builder-inline-button"
+                                    onClick={() =>
+                                      updateStructuredPayloadTemplateEntries(
+                                        structuredPayloadTemplateEntries.filter((candidate) => candidate.id !== entry.id),
+                                      )
+                                    }
+                                  >
+                                    Remove
+                                  </button>
+                                </div>
+                              </div>
+                              <label>
+                                Key
+                                <input
+                                  value={entry.key}
+                                  placeholder="email"
+                                  onChange={(event) =>
+                                    updateStructuredPayloadTemplateEntries(
+                                      structuredPayloadTemplateEntries.map((candidate) =>
+                                        candidate.id === entry.id
+                                          ? { ...candidate, key: event.target.value }
+                                          : candidate,
+                                      ),
+                                    )
+                                  }
+                                />
+                              </label>
+                              <label>
+                                Value
+                                <input
+                                  value={entry.value}
+                                  placeholder="Leave blank to auto-fill"
+                                  onChange={(event) =>
+                                    updateStructuredPayloadTemplateEntries(
+                                      structuredPayloadTemplateEntries.map((candidate) =>
+                                        candidate.id === entry.id
+                                          ? { ...candidate, value: event.target.value }
+                                          : candidate,
+                                      ),
+                                    )
+                                  }
+                                />
+                              </label>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="tool-details-modal-help">
+                          No entries yet. Add a dictionary entry to start defining the payload shape.
+                        </div>
+                      )}
                     </section>
                   </>
                 ) : null}

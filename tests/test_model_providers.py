@@ -1009,6 +1009,88 @@ class ModelProviderTests(unittest.TestCase):
             provider.last_payload["tools"][0]["function"]["parameters"]["required"],
             ["query", "limit"],
         )
+        self.assertNotIn("response_format", provider.last_payload)
+
+    def test_openai_provider_uses_strict_response_format_for_message_schema(self) -> None:
+        class StructuredMessageOpenAIProvider(StubOpenAIProvider):
+            def _post_json(
+                self,
+                url: str,
+                payload: Mapping[str, Any],
+                headers: Mapping[str, str],
+                timeout_seconds: float,
+            ) -> Mapping[str, Any]:
+                self.last_payload = payload
+                self.last_response_payload = {
+                    "model": payload.get("model"),
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "message": {
+                                            "recipient": "Brian Phillips",
+                                            "subject": "Cornell GenAI Club - exploring OpenAI roles",
+                                            "body": "Hi Brian",
+                                        },
+                                        "need_tool": False,
+                                        "tool_calls": [],
+                                    }
+                                ),
+                                "tool_calls": [],
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 18, "completion_tokens": 9},
+                }
+                return self.last_response_payload
+
+        provider = StructuredMessageOpenAIProvider()
+        request = ModelRequest(
+            prompt_name="compose_email",
+            messages=[ModelMessage(role="user", content="Return the structured email.")],
+            response_schema=api_decision_response_schema(
+                final_message_schema={
+                    "type": "object",
+                    "properties": {
+                        "recipient": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "body": {"type": "string"},
+                    },
+                    "required": ["recipient", "subject", "body"],
+                },
+                allow_tool_calls=False,
+                response_mode="message",
+            ),
+            provider_config={"model": "gpt-4.1-mini"},
+            response_mode="message",
+        )
+
+        response = provider.generate(request)
+
+        self.assertIsNotNone(provider.last_payload)
+        assert provider.last_payload is not None
+        self.assertIn("response_format", provider.last_payload)
+        response_format = provider.last_payload["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertEqual(response_format["json_schema"]["name"], "graph_agent_response")
+        self.assertIs(response_format["json_schema"]["strict"], True)
+        self.assertIs(
+            response_format["json_schema"]["schema"]["properties"]["message"]["additionalProperties"],
+            False,
+        )
+        self.assertEqual(
+            response.structured_output,
+            _decision(
+                message={
+                    "recipient": "Brian Phillips",
+                    "subject": "Cornell GenAI Club - exploring OpenAI roles",
+                    "body": "Hi Brian",
+                },
+                need_tool=False,
+            ),
+        )
 
     def test_claude_provider_normalizes_tool_calls_for_tool_call_nodes(self) -> None:
         provider = StubClaudeProvider()
@@ -1110,6 +1192,195 @@ class ModelProviderTests(unittest.TestCase):
         self.assertEqual(provider.last_command[turns_index + 1], "2")
         self.assertEqual(provider.last_cwd, str(ROOT))
         self.assertEqual(provider.last_timeout_seconds, 15.0)
+
+    def test_claude_code_provider_coerces_labeled_email_text_into_required_message_object(self) -> None:
+        class LabeledEmailClaudeCodeProvider(StubClaudeCodeProvider):
+            def _run_command(self, command: list[str], cwd: str | None, timeout_seconds: float) -> Mapping[str, Any]:
+                self.last_command = command
+                self.last_cwd = cwd
+                self.last_timeout_seconds = timeout_seconds
+                self.last_payload = {
+                    "result": (
+                        "**To:** Brian Phillips\n\n"
+                        "**Subject:** Cornell GenAI Club - exploring roles at OpenAI\n\n"
+                        "**Body:**\n\n"
+                        "Hi Brian,\n\n"
+                        "I run Cornell's GenAI Club and wanted to reach out."
+                    ),
+                    "structured_output": None,
+                    "session_id": "session-structured-email",
+                    "duration_ms": 35,
+                    "usage": {"input_tokens": 12, "output_tokens": 24},
+                }
+                return self.last_payload
+
+        provider = LabeledEmailClaudeCodeProvider()
+        request = ModelRequest(
+            prompt_name="compose_email",
+            messages=[ModelMessage(role="user", content="Return the structured email.")],
+            provider_config={"cli_path": "claude", "working_directory": str(ROOT)},
+            response_mode="message",
+            response_schema=api_decision_response_schema(
+                final_message_schema={
+                    "type": "object",
+                    "properties": {
+                        "recipient": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "body": {"type": "string"},
+                    },
+                    "required": ["recipient", "subject", "body"],
+                },
+                allow_tool_calls=False,
+                response_mode="message",
+            ),
+        )
+
+        response = provider.generate(request)
+
+        self.assertEqual(
+            response.structured_output,
+            _decision(
+                message={
+                    "recipient": "Brian Phillips",
+                    "subject": "Cornell GenAI Club - exploring roles at OpenAI",
+                    "body": "Hi Brian,\n\nI run Cornell's GenAI Club and wanted to reach out.",
+                },
+                need_tool=False,
+            ),
+        )
+        self.assertEqual(response.tool_calls, [])
+
+    def test_openai_provider_keeps_plain_text_when_schema_response_is_not_json(self) -> None:
+        class PlainTextOpenAIProvider(StubOpenAIProvider):
+            def _post_json(
+                self,
+                url: str,
+                payload: Mapping[str, Any],
+                headers: Mapping[str, str],
+                timeout_seconds: float,
+            ) -> Mapping[str, Any]:
+                self.last_payload = payload
+                self.last_response_payload = {
+                    "model": payload.get("model"),
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": "Not JSON at all.",
+                                "tool_calls": [],
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+                }
+                return self.last_response_payload
+
+        provider = PlainTextOpenAIProvider()
+        request = ModelRequest(
+            prompt_name="spreadsheet_matrix_prompt",
+            messages=[ModelMessage(role="user", content="Pick a matrix cell.")],
+            response_schema={
+                "type": "object",
+                "properties": {
+                    "row_label": {"type": "string"},
+                    "column_label": {"type": "string"},
+                },
+                "required": ["row_label", "column_label"],
+            },
+            provider_config={"model": "gpt-4.1-mini"},
+            response_mode="message",
+        )
+
+        response = provider.generate(request)
+
+        self.assertEqual(response.content, "Not JSON at all.")
+        self.assertEqual(response.structured_output, _decision(final_message="Not JSON at all.", need_tool=False))
+        self.assertEqual(response.tool_calls, [])
+
+    def test_claude_provider_keeps_plain_text_when_schema_response_is_not_json(self) -> None:
+        class PlainTextClaudeProvider(StubClaudeProvider):
+            def _post_json(
+                self,
+                url: str,
+                payload: Mapping[str, Any],
+                headers: Mapping[str, str],
+                timeout_seconds: float,
+            ) -> Mapping[str, Any]:
+                self.last_payload = payload
+                self.last_response_payload = {
+                    "model": payload.get("model"),
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Still plain text.",
+                        }
+                    ],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 11, "output_tokens": 4},
+                }
+                return self.last_response_payload
+
+        provider = PlainTextClaudeProvider()
+        request = ModelRequest(
+            prompt_name="spreadsheet_matrix_prompt",
+            messages=[ModelMessage(role="user", content="Pick a matrix cell.")],
+            response_schema={
+                "type": "object",
+                "properties": {
+                    "row_label": {"type": "string"},
+                    "column_label": {"type": "string"},
+                },
+                "required": ["row_label", "column_label"],
+            },
+            provider_config={"model": "claude-3-5-haiku-latest"},
+            response_mode="message",
+        )
+
+        response = provider.generate(request)
+
+        self.assertEqual(response.content, "Still plain text.")
+        self.assertEqual(response.structured_output, _decision(final_message="Still plain text.", need_tool=False))
+        self.assertEqual(response.tool_calls, [])
+
+    def test_claude_code_provider_keeps_plain_text_when_schema_response_is_not_json(self) -> None:
+        class PlainTextClaudeCodeProvider(StubClaudeCodeProvider):
+            def _run_command(self, command: list[str], cwd: str | None, timeout_seconds: float) -> Mapping[str, Any]:
+                self.last_command = command
+                self.last_cwd = cwd
+                self.last_timeout_seconds = timeout_seconds
+                self.last_payload = {
+                    "result": "Definitely not JSON.",
+                    "structured_output": None,
+                    "session_id": "session-456",
+                    "duration_ms": 21,
+                    "usage": {"input_tokens": 9, "output_tokens": 2},
+                }
+                return self.last_payload
+
+        provider = PlainTextClaudeCodeProvider()
+        request = ModelRequest(
+            prompt_name="spreadsheet_matrix_prompt",
+            messages=[ModelMessage(role="user", content="Pick a matrix cell.")],
+            response_schema={
+                "type": "object",
+                "properties": {
+                    "row_label": {"type": "string"},
+                    "column_label": {"type": "string"},
+                },
+                "required": ["row_label", "column_label"],
+            },
+            provider_config={"cli_path": "claude", "working_directory": str(ROOT)},
+            response_mode="message",
+        )
+
+        response = provider.generate(request)
+
+        self.assertEqual(response.content, "Definitely not JSON.")
+        self.assertEqual(
+            response.structured_output,
+            _decision(final_message="Definitely not JSON.", need_tool=False),
+        )
+        self.assertEqual(response.tool_calls, [])
 
     def test_claude_code_provider_uses_discriminated_tool_schema_for_multiple_tools(self) -> None:
         provider = ClaudeCodeCLIModelProvider()
@@ -3920,6 +4191,100 @@ class ModelProviderTests(unittest.TestCase):
         assert isinstance(last_out, dict)
         self.assertTrue(last_out.get("metadata", {}).get("context_builder_complete", False))
         self.assertFalse(bool(compose_events[-1].payload.get("metadata", {}).get("hold_outgoing_edges")))
+
+    def test_context_builder_ignores_stale_disconnected_input_bindings(self) -> None:
+        services = build_example_services()
+        services.model_providers["auto_message"] = AutoMessageProvider()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "context-builder-stale-binding",
+                "name": "Context Builder Stale Binding",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "model",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "auto_message",
+                        "prompt_name": "auto_message",
+                        "config": {
+                            "provider_name": "auto_message",
+                            "prompt_name": "auto_message",
+                            "mode": "auto_message",
+                            "system_prompt": "Return a direct reply.",
+                            "user_message_template": "{input_payload}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 180, "y": 0},
+                    },
+                    {
+                        "id": "context-builder",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Context Builder",
+                        "provider_id": "core.context_builder",
+                        "provider_label": "Context Builder",
+                        "config": {
+                            "mode": "context_builder",
+                            "template": "",
+                            "joiner": "\n\n",
+                            "input_bindings": [
+                                {
+                                    "source_node_id": "parallel-splitter",
+                                    "placeholder": "parallel_splitter",
+                                    "binding": {"type": "latest_payload", "source": "parallel-splitter"},
+                                }
+                            ],
+                        },
+                        "position": {"x": 380, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "context-builder"}},
+                        "position": {"x": 560, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-model", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "model-context-builder", "source_id": "model", "target_id": "context-builder", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "context-builder-finish", "source_id": "context-builder", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, "current request", run_id="run-context-builder-stale-binding")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(
+            state.final_output,
+            [{"role": "assistant", "content": "A direct reply is enough."}],
+        )
 
     def test_context_builder_flattens_upstream_context_builder_sections(self) -> None:
         services = build_example_services()

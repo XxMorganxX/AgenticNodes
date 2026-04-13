@@ -459,6 +459,82 @@ class DataDrivenGraphTests(unittest.TestCase):
         self.assertEqual(display_output["metadata"]["contract"], "message_envelope")
         self.assertTrue(display_output["metadata"]["display_only"])
 
+    def test_envelope_display_node_can_complete_without_outgoing_execution_edges(self) -> None:
+        payload: dict[str, Any] = {
+            "graph_id": "display-without-outgoing-edge",
+            "name": "Display Without Outgoing Edge",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "description": "",
+                    "position": {"x": 0, "y": 0},
+                    "config": {"input_binding": {"type": "input_payload"}},
+                },
+                {
+                    "id": "display",
+                    "kind": "data",
+                    "category": "data",
+                    "label": "Display Envelope",
+                    "provider_id": "core.data_display",
+                    "provider_label": "Envelope Display Node",
+                    "description": "",
+                    "position": {"x": 240, "y": 0},
+                    "config": {
+                        "mode": "passthrough",
+                        "show_input_envelope": True,
+                        "lock_passthrough": True,
+                    },
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Unused Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "description": "",
+                    "position": {"x": 480, "y": 160},
+                    "config": {"source_binding": {"type": "latest_payload", "source": "display"}},
+                },
+            ],
+            "edges": [
+                {
+                    "id": "edge-start-display",
+                    "source_id": "start",
+                    "target_id": "display",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                    "condition": None,
+                }
+            ],
+        }
+
+        graph = GraphDefinition.from_dict(payload)
+        graph.validate_against_services(self.services)
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        state = runtime.run(graph, "hello display")
+
+        self.assertEqual(state.status, "completed")
+        self.assertIsNone(state.final_output)
+        self.assertEqual(state.visit_counts["display"], 1)
+        self.assertIn("display", state.node_outputs)
+        self.assertTrue(any(event.event_type == "run.completed" for event in state.event_history))
+        self.assertFalse(any(event.event_type == "run.failed" for event in state.event_history))
+
 
 if __name__ == "__main__":
     unittest.main()

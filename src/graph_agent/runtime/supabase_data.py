@@ -13,6 +13,31 @@ SUPPORTED_SUPABASE_OUTPUT_MODES = {"records", "markdown"}
 SUPPORTED_SUPABASE_WRITE_MODES = {"insert", "upsert"}
 SUPPORTED_SUPABASE_RETURNING_MODES = {"representation", "minimal"}
 
+POSTGRES_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "string": (
+        "string",
+        "text",
+        "character varying",
+        "varchar",
+        "character",
+        "char",
+        "uuid",
+        "date",
+        "timestamp",
+        "timestamp with time zone",
+        "timestamp without time zone",
+        "timestamptz",
+        "time with time zone",
+        "time without time zone",
+        "timetz",
+        "time",
+    ),
+    "integer": ("integer", "smallint", "bigint", "int2", "int4", "int8"),
+    "number": ("number", "numeric", "decimal", "real", "double precision", "float4", "float8"),
+    "object": ("object", "json", "jsonb"),
+    "boolean": ("boolean", "bool"),
+}
+
 
 class SupabaseDataError(RuntimeError):
     def __init__(self, message: str, *, error_type: str = "supabase_data_error", details: dict[str, Any] | None = None) -> None:
@@ -122,6 +147,25 @@ class SupabaseExpectedColumn:
     name: str
     accepted_types: tuple[str, ...]
     required: bool = True
+
+
+def _canonical_supabase_type_name(raw_type: str) -> str:
+    normalized = str(raw_type or "unknown").strip().lower() or "unknown"
+    candidates = [normalized]
+    if normalized.endswith(")") and "(" in normalized:
+        base_type, _, format_suffix = normalized.partition("(")
+        stripped_base_type = base_type.strip()
+        stripped_format_suffix = format_suffix[:-1].strip()
+        candidates = [
+            candidate
+            for candidate in (stripped_format_suffix, stripped_base_type, normalized)
+            if candidate
+        ]
+    for candidate in candidates:
+        for canonical, aliases in POSTGRES_TYPE_ALIASES.items():
+            if candidate == canonical or candidate in aliases:
+                return canonical
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -269,12 +313,13 @@ def validate_supabase_source_schema(
             else:
                 missing_optional_columns.append(expected.name)
             continue
-        normalized_type = str(actual.data_type or "unknown").strip().lower() or "unknown"
-        if expected.accepted_types and normalized_type not in set(expected.accepted_types):
+        normalized_type = _canonical_supabase_type_name(actual.data_type)
+        normalized_expected_types = tuple(_canonical_supabase_type_name(expected_type) for expected_type in expected.accepted_types)
+        if normalized_expected_types and normalized_type not in set(normalized_expected_types):
             type_mismatches.append(
                 SupabaseSchemaTypeMismatch(
                     column_name=expected.name,
-                    expected_types=tuple(expected.accepted_types),
+                    expected_types=normalized_expected_types,
                     actual_type=normalized_type,
                     required=expected.required,
                 )

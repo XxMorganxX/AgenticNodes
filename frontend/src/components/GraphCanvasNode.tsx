@@ -37,7 +37,7 @@ import type { NodeTooltipData } from "../lib/nodeTooltip";
 import { getContextBuilderBindings } from "../lib/contextBuilderBindings";
 import type { ContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
 import { formatRunStatusLabel } from "../lib/runVisualization";
-import { getSupabaseConnections, resolveSupabaseBinding } from "../lib/supabaseConnections";
+import { getSupabaseConnectionSelectOptions, resolveSupabaseBinding } from "../lib/supabaseConnections";
 import type { EditorCatalog, GraphDefinition, GraphNode, ProjectFile, RunState } from "../lib/types";
 
 export type GraphCanvasNodeData = {
@@ -73,6 +73,7 @@ const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
 const SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision";
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
+const STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID = "core.structured_payload_builder";
 
 const KIND_LABELS: Record<string, string> = {
   input: "IN",
@@ -234,6 +235,7 @@ function GraphCanvasNodeComponent({
   const isContextBuilderNode = node.provider_id === "core.context_builder";
   const isLogicConditionsNode = node.provider_id === LOGIC_CONDITIONS_PROVIDER_ID;
   const isParallelSplitterNode = node.provider_id === PARALLEL_SPLITTER_PROVIDER_ID;
+  const isStructuredPayloadBuilderNode = node.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID;
   const isRuntimeNormalizerNode = node.provider_id === "core.runtime_normalizer";
   const isSupabaseDataNode = node.provider_id === "core.supabase_data";
   const isSupabaseRowWriteNode = node.provider_id === "core.supabase_row_write";
@@ -241,10 +243,13 @@ function GraphCanvasNodeComponent({
   const isSupabaseNode = isSupabaseDataNode || isSupabaseRowWriteNode || isOutboundEmailLogger;
   const isOutlookDraftNode = node.provider_id === "end.outlook_draft";
   const displayLabel = getNodeInstanceLabel(graph, node);
-  const supabaseConnections = isSupabaseNode ? getSupabaseConnections(graph) : [];
   const resolvedSupabaseBinding = isSupabaseNode ? resolveSupabaseBinding(graph, node.config as Record<string, unknown>) : null;
+  const supabaseConnectionOptions = isSupabaseNode ? getSupabaseConnectionSelectOptions(graph, node.config as Record<string, unknown>) : [];
   const supabaseConnectionMissing = resolvedSupabaseBinding?.missingConnection ?? false;
   const supabaseSelectValue = String(node.config.supabase_connection_id ?? "");
+  const stopInlineControlPropagation = (event: { stopPropagation: () => void }) => {
+    event.stopPropagation();
+  };
   const displayEnvelope =
     isDisplayNode &&
     runtimeOutput &&
@@ -681,8 +686,10 @@ function GraphCanvasNodeComponent({
               className="graph-node-inline-select nodrag"
               value={spreadsheetSelectValue}
               aria-label={`Select spreadsheet for ${displayLabel}`}
-              onMouseDown={(event) => event.stopPropagation()}
-              onClick={(event) => event.stopPropagation()}
+              onMouseDown={stopInlineControlPropagation}
+              onPointerDown={stopInlineControlPropagation}
+              onClick={stopInlineControlPropagation}
+              onKeyDown={stopInlineControlPropagation}
               onChange={(event) => {
                 event.stopPropagation();
                 const nextFileId = event.target.value;
@@ -710,24 +717,21 @@ function GraphCanvasNodeComponent({
                 className="graph-node-inline-select nodrag"
                 value={supabaseSelectValue}
                 aria-label={`Select Supabase project for ${displayLabel}`}
-                onMouseDown={(event) => event.stopPropagation()}
-                onClick={(event) => event.stopPropagation()}
+                onMouseDown={stopInlineControlPropagation}
+                onPointerDown={stopInlineControlPropagation}
+                onClick={stopInlineControlPropagation}
+                onKeyDown={stopInlineControlPropagation}
                 onChange={(event) => {
                   event.stopPropagation();
                   onSelectSupabaseConnection(node.id, event.target.value);
                 }}
               >
                 <option value="">Compatibility mode</option>
-                {supabaseConnections.map((connection) => (
-                  <option key={connection.connection_id} value={connection.connection_id}>
-                    {connection.name}{connection.isImplicit ? " (legacy)" : ""}
+                {supabaseConnectionOptions.map((connection) => (
+                  <option key={connection.value} value={connection.value}>
+                    {connection.label}
                   </option>
                 ))}
-                {supabaseConnectionMissing && resolvedSupabaseBinding?.connectionId ? (
-                  <option value={resolvedSupabaseBinding.connectionId}>
-                    Missing: {resolvedSupabaseBinding.connectionName}
-                  </option>
-                ) : null}
               </select>
             </div>
             {supabaseConnectionMissing ? (
@@ -809,7 +813,7 @@ function GraphCanvasNodeComponent({
             <span className="graph-node-inline-display-hint">Click to expand</span>
           </div>
         ) : null}
-        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isRuntimeNormalizerNode || isSupabaseDataNode || isSupabaseRowWriteNode || isOutboundEmailLogger) ? (
+        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isStructuredPayloadBuilderNode || isRuntimeNormalizerNode || isSupabaseDataNode || isSupabaseRowWriteNode || isOutboundEmailLogger) ? (
           <div className="graph-node-card-actions" aria-hidden="false">
             <button
               type="button"
@@ -831,6 +835,8 @@ function GraphCanvasNodeComponent({
               {node.category === "tool"
                 ? "Learn More"
                 : isLogicConditionsNode
+                  ? "Learn More"
+                : isStructuredPayloadBuilderNode
                   ? "Learn More"
                 : isRuntimeNormalizerNode
                   ? "Learn More"

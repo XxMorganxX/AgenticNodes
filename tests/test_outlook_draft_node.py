@@ -538,6 +538,50 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertEqual(state.final_output["outbound_email_log"]["table_name"], "outbound_email_messages")
         self.assertTrue(state.node_outputs["draft"]["outbound_email_log"])
 
+    def test_outlook_draft_node_skips_outbound_email_log_when_recipient_is_missing(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph_payload = build_outlook_draft_graph_with_logger_payload()
+        draft_node = graph_payload["nodes"][1]
+        assert isinstance(draft_node, dict)
+        draft_node["config"] = {
+            "to": "",
+            "subject": "",
+            "require_to": False,
+            "require_subject": False,
+            "require_body": False,
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        with SupabaseEmailLogStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_SUPABASE_URL": base_url,
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+            },
+            clear=False,
+        ):
+            state = runtime.run(graph, "", run_id="run-outlook-log-skip")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(len(fake_client.calls), 1)
+        self.assertEqual(fake_client.calls[0]["to_recipients"], [])
+        self.assertEqual(state.final_output["to_recipients"], [])
+        self.assertEqual(state.final_output["outbound_email_log"]["reason"], "missing_recipient_email")
+        self.assertTrue(state.final_output["outbound_email_log"]["skipped"])
+        self.assertEqual(state.final_output["outbound_email_log"]["table_name"], "outbound_email_messages")
+        self.assertEqual(_SupabaseEmailLogStubHandler.last_path, "/rest/v1/")
+        self.assertIsNone(_SupabaseEmailLogStubHandler.last_json_body)
+
 
 if __name__ == "__main__":
     unittest.main()

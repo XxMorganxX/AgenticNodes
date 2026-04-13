@@ -742,15 +742,15 @@ class GraphRunManager:
         if self._services.mcp_server_manager is not None:
             self._services.mcp_server_manager.shutdown_all(preserve_desired_running=True)
 
+    def stop_runtime(self) -> dict[str, Any]:
+        active_run_ids = self._request_active_run_cancellation()
+        return {
+            "stopping_run_ids": active_run_ids,
+            "stopping_run_count": len(active_run_ids),
+        }
+
     def reset_runtime(self) -> dict[str, Any]:
-        with self._lock:
-            active_controls = [
-                control
-                for control in self._run_controls.values()
-                if control.thread is not None and control.thread.is_alive()
-            ]
-            for control in active_controls:
-                control.cancel_event.set()
+        active_run_ids = self._request_active_run_cancellation()
 
         running_server_ids: list[str] = []
         if self._services.mcp_server_manager is not None:
@@ -765,8 +765,8 @@ class GraphRunManager:
             self._services.mcp_server_manager.shutdown_all(preserve_desired_running=False)
 
         return {
-            "cancelled_run_ids": [control.run_id for control in active_controls],
-            "cancelled_run_count": len(active_controls),
+            "cancelled_run_ids": active_run_ids,
+            "cancelled_run_count": len(active_run_ids),
             "stopped_mcp_server_ids": running_server_ids,
             "stopped_mcp_server_count": len(running_server_ids),
             "discord_stopped": True,
@@ -923,7 +923,12 @@ class GraphRunManager:
             ],
             cancel_requested=lambda current_run_id=parent_run_id: self._cancel_requested(current_run_id),
         )
-        graph = agent.to_graph(graph_id=document.graph_id, shared_env_vars=document.env_vars)
+        graph = agent.to_graph(
+            graph_id=document.graph_id,
+            shared_env_vars=document.env_vars,
+            supabase_connections=document.supabase_connections,
+            default_supabase_connection_id=document.default_supabase_connection_id,
+        )
         self._hydrate_spreadsheet_project_files(graph)
         runtime.run(
             graph,
@@ -1070,6 +1075,17 @@ class GraphRunManager:
         with self._lock:
             control = self._run_controls.get(run_id)
             return bool(control is not None and control.cancel_event.is_set())
+
+    def _request_active_run_cancellation(self) -> list[str]:
+        with self._lock:
+            active_controls = [
+                control
+                for control in self._run_controls.values()
+                if control.thread is not None and control.thread.is_alive()
+            ]
+            for control in active_controls:
+                control.cancel_event.set()
+            return [control.run_id for control in active_controls]
 
     def _release_run_control(self, run_id: str) -> None:
         with self._lock:
@@ -1365,7 +1381,12 @@ class GraphRunManager:
                 input_payload,
                 documents=documents,
                 execution_node_ids=_execution_node_ids_for_graph(
-                    agent.to_graph(graph_id=document.graph_id, shared_env_vars=document.env_vars)
+                    agent.to_graph(
+                        graph_id=document.graph_id,
+                        shared_env_vars=document.env_vars,
+                        supabase_connections=document.supabase_connections,
+                        default_supabase_connection_id=document.default_supabase_connection_id,
+                    )
                 ),
                 agent_id=agent.agent_id,
                 parent_run_id=run_id,

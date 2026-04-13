@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
 import { EdgeLabelRenderer, getSmoothStepPath } from "reactflow";
 import type { ConnectionLineComponentProps, EdgeProps } from "reactflow";
@@ -417,6 +417,7 @@ function GraphCanvasEdgeComponent({
   const waypointDragActive = data?.waypointDragActive ?? false;
   const onWaypointPointerDown = data?.onWaypointPointerDown;
   const [showLabelTooltip, setShowLabelTooltip] = useState(false);
+  const hideLabelTooltipTimeoutRef = useRef<number | null>(null);
   const { edgePath, point: labelPosition } = useMemo(
     () =>
       getEdgeLabelPlacement({
@@ -472,6 +473,32 @@ function GraphCanvasEdgeComponent({
     onWaypointPointerDown?.(id, waypointIndex, { x: event.clientX, y: event.clientY });
   };
 
+  const showEdgeTooltip = () => {
+    if (hideLabelTooltipTimeoutRef.current !== null) {
+      window.clearTimeout(hideLabelTooltipTimeoutRef.current);
+      hideLabelTooltipTimeoutRef.current = null;
+    }
+    setShowLabelTooltip(true);
+  };
+
+  const hideEdgeTooltip = () => {
+    if (hideLabelTooltipTimeoutRef.current !== null) {
+      window.clearTimeout(hideLabelTooltipTimeoutRef.current);
+    }
+    hideLabelTooltipTimeoutRef.current = window.setTimeout(() => {
+      hideLabelTooltipTimeoutRef.current = null;
+      setShowLabelTooltip(false);
+    }, 80);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (hideLabelTooltipTimeoutRef.current !== null) {
+        window.clearTimeout(hideLabelTooltipTimeoutRef.current);
+      }
+    };
+  }, []);
+
   return (
     <>
       <path d={edgePath} fill="none" className="react-flow__edge-interaction graph-edge-hitbox" style={interactionEdgeStyle} transform={pathTransform} />
@@ -488,13 +515,18 @@ function GraphCanvasEdgeComponent({
               data?.isActive ? "is-active" : ""
             }`}
             style={labelStyle}
-            onMouseEnter={() => setShowLabelTooltip(true)}
-            onMouseLeave={() => setShowLabelTooltip(false)}
+            onMouseEnter={showEdgeTooltip}
+            onMouseLeave={hideEdgeTooltip}
           >
             {String(label)}
           </div>
           {showLabelTooltip && data?.labelTooltip ? (
-            <div className="graph-edge-tooltip nopan nodrag" style={labelTooltipStyle}>
+            <div
+              className="graph-edge-tooltip nopan nodrag"
+              style={labelTooltipStyle}
+              onMouseEnter={showEdgeTooltip}
+              onMouseLeave={hideEdgeTooltip}
+            >
               {String(data.labelTooltip)}
             </div>
           ) : null}

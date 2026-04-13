@@ -236,6 +236,12 @@ Spreadsheet uploads can be previewed from the editor, and uploaded `.xlsx` docum
 5. Run the graph or selected environment agents.
 6. Inspect the timeline, active nodes, errors, generated files, and final output.
 
+## Apollo Email Lookup Node
+
+The `core.apollo_email_lookup` data node performs one Apollo `people/match` lookup, returns the full Apollo response payload, and stores successful or deterministic negative results in a shared cache under `.graph-agent/cache/apollo-email/`.
+
+Set `APOLLO_API_KEY` in the environment, then provide either a direct identifier like `linkedin_url` or enough person-plus-organization fields for Apollo to match without extra retries.
+
 ## Tests
 
 Run the backend test suite from the repo root:

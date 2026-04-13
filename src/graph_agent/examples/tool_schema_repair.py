@@ -491,6 +491,62 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="core.apollo_email_lookup",
+            display_name="Apollo Email Lookup",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Looks up a person in Apollo, returns the full people/match response, and reuses a shared cache across runs.",
+            capabilities=["apollo people match", "email lookup", "shared cache reuse"],
+            default_config={
+                "mode": "apollo_email_lookup",
+                "input_binding": {"type": "input_payload"},
+                "api_key_env_var": "APOLLO_API_KEY",
+                "name": "",
+                "domain": "",
+                "organization_name": "",
+                "first_name": "",
+                "last_name": "",
+                "linkedin_url": "",
+                "email": "",
+                "twitter_url": "",
+                "conversation": "",
+                "reveal_personal_emails": False,
+                "use_cache": True,
+                "force_refresh": False,
+                "workspace_cache_path_template": "cache/apollo-email/{cache_key}.json",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(key="api_key_env_var", label="Apollo API Key Env Var"),
+                ProviderConfigFieldDefinition(key="name", label="Name"),
+                ProviderConfigFieldDefinition(key="domain", label="Domain"),
+                ProviderConfigFieldDefinition(key="organization_name", label="Organization Name"),
+                ProviderConfigFieldDefinition(key="first_name", label="First Name"),
+                ProviderConfigFieldDefinition(key="last_name", label="Last Name"),
+                ProviderConfigFieldDefinition(key="linkedin_url", label="LinkedIn URL"),
+                ProviderConfigFieldDefinition(key="email", label="Email"),
+                ProviderConfigFieldDefinition(key="twitter_url", label="Twitter URL"),
+                ProviderConfigFieldDefinition(
+                    key="conversation",
+                    label="Optional Conversation",
+                    input_type="textarea",
+                    help_text="Optional operator context saved on the node for reference in the details UI.",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="reveal_personal_emails",
+                    label="Reveal Personal Emails",
+                    input_type="checkbox",
+                ),
+                ProviderConfigFieldDefinition(key="use_cache", label="Use Cache", input_type="checkbox"),
+                ProviderConfigFieldDefinition(key="force_refresh", label="Force Refresh", input_type="checkbox"),
+                ProviderConfigFieldDefinition(
+                    key="workspace_cache_path_template",
+                    label="Workspace Cache Path Template",
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.linkedin_profile_fetch",
             display_name="LinkedIn Profile Fetch",
             category=NodeCategory.DATA,
@@ -530,6 +586,42 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 ProviderConfigFieldDefinition(
                     key="workspace_cache_path_template",
                     label="Workspace Cache Path Template",
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="core.structured_payload_builder",
+            display_name="Structured Payload Builder",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Lets the user sketch a JSON object, then auto-fills missing fields from the incoming payload by matching field names.",
+            capabilities=["json template merge", "auto-filled missing fields", "payload shaping"],
+            default_config={
+                "mode": "structured_payload_builder",
+                "input_binding": {"type": "input_payload"},
+                "template_json": "{\n  \"name\": \"\",\n  \"domain\": \"\",\n  \"linkedin_url\": \"\",\n  \"email\": \"\"\n}",
+                "case_sensitive": False,
+                "max_matches_per_field": 25,
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="template_json",
+                    label="Template JSON",
+                    input_type="textarea",
+                    help_text="Provide the object shape you want. Any empty string, null, empty object, or empty array field is eligible for auto-fill from the incoming payload.",
+                    placeholder='{\n  "name": "",\n  "domain": "",\n  "linkedin_url": "",\n  "email": ""\n}',
+                ),
+                ProviderConfigFieldDefinition(
+                    key="case_sensitive",
+                    label="Case Sensitive",
+                    input_type="checkbox",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="max_matches_per_field",
+                    label="Max Matches Per Field",
+                    input_type="number",
                 ),
             ],
         )
@@ -884,6 +976,16 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             default_config={
                 "mode": "parallel_splitter",
             },
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="end.agent_run",
+            display_name="End Agent Run",
+            category=NodeCategory.END,
+            node_kind="output",
+            description="Stops the current run immediately when reached, even from inside iterator executions.",
+            capabilities=["immediate termination", "iterator halt", "terminal output"],
         )
     )
     node_providers.register(

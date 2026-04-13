@@ -8,9 +8,11 @@ from uuid import uuid4
 from graph_agent.runtime.core import (
     API_MESSAGE_HANDLE_ID,
     API_TOOL_CALL_HANDLE_ID,
+    CONTROL_FLOW_ELSE_HANDLE_ID,
     CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
     Edge,
     GraphDefinition,
+    LOGIC_CONDITIONS_PROVIDER_ID,
     MCP_TERMINAL_OUTPUT_HANDLE_ID,
     NodeContext,
     NodeExecutionResult,
@@ -110,15 +112,34 @@ class GraphRuntime:
         outgoing_edges = graph.get_outgoing_edges(node_id)
         available_routes = [self._describe_edge(edge, graph) for edge in outgoing_edges]
         result_contract = self._result_contract(result)
+        result_output_metadata = result.output.get("metadata") if isinstance(result.output, dict) else None
+        selected_handle_id = None
+        matched_branch_label = None
+        if isinstance(result_output_metadata, dict):
+            selected_handle_id = result_output_metadata.get("selected_handle_id") or result_output_metadata.get("control_flow_handle_id")
+            matched_branch_label = result_output_metadata.get("matched_branch_label")
+        if selected_handle_id is None:
+            selected_handle_id = result.metadata.get("selected_handle_id") or result.metadata.get("control_flow_handle_id")
+        if matched_branch_label is None:
+            matched_branch_label = result.metadata.get("matched_branch_label")
+        emitted_route_handles = sorted(handle_id for handle_id in result.route_outputs.keys() if isinstance(handle_id, str) and handle_id.strip())
         route_count = len(outgoing_edges)
         if route_count == 0:
             message = f"Node '{node_label}' completed, but it has no outgoing execution edges."
         else:
             route_target_labels = ", ".join(route["target_node_label"] for route in available_routes) or "none"
             contract_clause = f" Output contract was '{result_contract}'." if result_contract else ""
+            selected_handle_clause = f" Selected output handle was '{selected_handle_id}'." if selected_handle_id else ""
+            matched_branch_clause = f" Matched branch was '{matched_branch_label}'." if matched_branch_label else ""
+            emitted_handles_clause = (
+                f" Emitted route handles: {', '.join(emitted_route_handles)}."
+                if emitted_route_handles
+                else ""
+            )
             message = (
                 f"Node '{node_label}' completed, but no outgoing edge matched its result."
-                f"{contract_clause} Available routes: {route_target_labels}."
+                f"{contract_clause}{selected_handle_clause}{matched_branch_clause}{emitted_handles_clause}"
+                f" Available routes: {route_target_labels}."
             )
         error = {
             "type": "no_matching_edge",
@@ -129,11 +150,37 @@ class GraphRuntime:
             "node_provider_label": node.provider_label if node is not None else None,
             "result_status": result.status,
             "result_contract": result_contract,
+            "selected_handle_id": selected_handle_id,
+            "matched_branch_label": matched_branch_label,
+            "emitted_route_handles": emitted_route_handles,
             "available_routes": available_routes,
             "message": message,
         }
         summary = f"No outgoing edge matched after node '{node_label}'."
         return summary, error
+
+    def _allows_missing_edge_fallthrough(
+        self,
+        graph: GraphDefinition,
+        node_id: str,
+        result: NodeExecutionResult,
+    ) -> bool:
+        node = graph.nodes.get(node_id)
+        if node is None:
+            return False
+        outgoing_execution_edges = [edge for edge in graph.get_outgoing_edges(node_id) if edge.kind != "binding"]
+        if node.provider_id == "core.data_display":
+            return result.status == "success" and not outgoing_execution_edges
+        if node.provider_id != LOGIC_CONDITIONS_PROVIDER_ID:
+            return False
+        if result.status != "success":
+            return False
+        selected_handle_id = result.metadata.get("selected_handle_id") or result.metadata.get("control_flow_handle_id")
+        if selected_handle_id is None and isinstance(result.output, dict):
+            output_metadata = result.output.get("metadata")
+            if isinstance(output_metadata, dict):
+                selected_handle_id = output_metadata.get("selected_handle_id") or output_metadata.get("control_flow_handle_id")
+        return selected_handle_id == CONTROL_FLOW_ELSE_HANDLE_ID
 
     def _frame_iteration_context(self, frame: dict[str, Any]) -> dict[str, Any]:
         context: dict[str, Any] = {}
@@ -276,6 +323,17 @@ class GraphRuntime:
                 {"node_id": edge.target_id, "incoming_edge_id": edge.id, **inherited_context},
             )
 
+    def _complete_run(self, state: RunState, *, terminal_node_id: str | None) -> RunState:
+        state.status = "completed"
+        completion_event = self.emit(
+            state,
+            "run.completed",
+            "Run completed successfully.",
+            {"final_output": state.final_output, "terminal_node_id": terminal_node_id},
+        )
+        state.ended_at = completion_event.timestamp
+        return state
+
     def _run_spreadsheet_row_iterator(
         self,
         graph: GraphDefinition,
@@ -354,6 +412,18 @@ class GraphRuntime:
                 scoped_visit_counts=scoped_visit_counts,
                 complete_run_on_output=False,
             )
+            if terminal_state is not None and terminal_state.status == "completed":
+                self._emit_iterator_update(
+                    state,
+                    node.id,
+                    {
+                        **iterator_state,
+                        "status": "terminated",
+                        "current_row_index": row_index,
+                        "total_rows": total_rows,
+                    },
+                )
+                return terminal_state
             if terminal_state is not None and terminal_state.status in {"failed", "cancelled"}:
                 return terminal_state
 
@@ -488,16 +558,10 @@ class GraphRuntime:
             if node.kind == "output":
                 if self._should_promote_output_result(graph, state, node.id, result):
                     state.final_output = result.output
+                if result.metadata.get("terminate_run") is True:
+                    return self._complete_run(state, terminal_node_id=node.id)
                 if complete_run_on_output and not pending_nodes:
-                    state.status = "completed"
-                    completion_event = self.emit(
-                        state,
-                        "run.completed",
-                        "Run completed successfully.",
-                        {"final_output": state.final_output, "terminal_node_id": node.id},
-                    )
-                    state.ended_at = completion_event.timestamp
-                    return state
+                    return self._complete_run(state, terminal_node_id=node.id)
                 step_state["count"] += 1
                 continue
 
@@ -509,6 +573,11 @@ class GraphRuntime:
                 binding_edges = []
             if not next_edges and not binding_edges:
                 if hold_outgoing:
+                    state.current_node_id = None
+                    state.current_edge_id = None
+                    step_state["count"] += 1
+                    continue
+                if self._allows_missing_edge_fallthrough(graph, node.id, result):
                     state.current_node_id = None
                     state.current_edge_id = None
                     step_state["count"] += 1
@@ -543,15 +612,7 @@ class GraphRuntime:
                 error={"type": "max_steps_exceeded", "max_steps": self.max_steps},
             )
         if complete_run_on_output and not pending_nodes and state.status == "running":
-            state.status = "completed"
-            completion_event = self.emit(
-                state,
-                "run.completed",
-                "Run completed successfully.",
-                {"final_output": state.final_output, "terminal_node_id": state.current_node_id},
-            )
-            state.ended_at = completion_event.timestamp
-            return state
+            return self._complete_run(state, terminal_node_id=state.current_node_id)
         return None
 
     def run(

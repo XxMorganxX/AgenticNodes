@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 from graph_agent.api.graph_store import GraphStore
 from graph_agent.api.manager import GraphRunManager
 from graph_agent.examples.tool_schema_repair import build_example_services
+from graph_agent.runtime.core import GraphValidationError
 from graph_agent.runtime.documents import load_graph_document
 
 
@@ -161,6 +162,173 @@ class MultiAgentEnvironmentTests(unittest.TestCase):
         self.assertEqual(serialized["supabase_connections"][0]["connection_id"], "analytics-db")
         self.assertEqual(runtime_graph.default_supabase_connection_id, "analytics-db")
         self.assertEqual(runtime_graph.supabase_connections[0].connection_id, "analytics-db")
+
+    def test_multi_agent_document_allows_supabase_node_connection_from_document_registry(self) -> None:
+        payload = {
+            "graph_id": "supabase-environment-with-node",
+            "name": "Supabase Environment With Node",
+            "graph_type": "test_environment",
+            "env_vars": {
+                "GRAPH_AGENT_SUPABASE_ANALYTICS_URL": "https://analytics.example.supabase.co",
+                "GRAPH_AGENT_SUPABASE_ANALYTICS_SECRET_KEY": "analytics-secret",
+            },
+            "supabase_connections": [
+                {
+                    "connection_id": "analytics-db",
+                    "name": "Analytics DB",
+                    "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_URL",
+                    "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_SECRET_KEY",
+                    "project_ref_env_var": "SUPABASE_ANALYTICS_PROJECT_REF",
+                    "access_token_env_var": "SUPABASE_ANALYTICS_ACCESS_TOKEN",
+                }
+            ],
+            "default_supabase_connection_id": "analytics-db",
+            "agents": [
+                {
+                    "agent_id": "agent-one",
+                    "name": "Agent One",
+                    "start_node_id": "start",
+                    "nodes": [
+                        {
+                            "id": "start",
+                            "kind": "input",
+                            "category": "start",
+                            "label": "Start",
+                            "provider_id": "start.manual_run",
+                            "provider_label": "Run Button Start",
+                            "config": {"input_binding": {"type": "input_payload"}},
+                            "position": {"x": 0, "y": 0},
+                        },
+                        {
+                            "id": "supabase",
+                            "kind": "data",
+                            "category": "data",
+                            "label": "Supabase Data Source",
+                            "provider_id": "core.supabase_data",
+                            "provider_label": "Supabase Data Source",
+                            "config": {
+                                "mode": "supabase_data",
+                                "schema": "public",
+                                "source_kind": "table",
+                                "source_name": "projects",
+                                "select": "id,name",
+                                "filters_text": "",
+                                "order_by": "id",
+                                "order_desc": False,
+                                "limit": 10,
+                                "single_row": False,
+                                "output_mode": "records",
+                                "rpc_params_json": "{}",
+                                "supabase_connection_id": "analytics-db",
+                            },
+                            "position": {"x": 220, "y": 0},
+                        },
+                        {
+                            "id": "finish",
+                            "kind": "output",
+                            "category": "end",
+                            "label": "Finish",
+                            "provider_id": "core.output",
+                            "provider_label": "Core Output Node",
+                            "config": {"source_binding": {"type": "latest_payload", "source": "supabase"}},
+                            "position": {"x": 460, "y": 0},
+                        },
+                    ],
+                    "edges": [
+                        {
+                            "id": "edge-start-supabase",
+                            "source_id": "start",
+                            "target_id": "supabase",
+                            "label": "",
+                            "kind": "standard",
+                            "priority": 100,
+                        },
+                        {
+                            "id": "edge-supabase-finish",
+                            "source_id": "supabase",
+                            "target_id": "finish",
+                            "label": "",
+                            "kind": "standard",
+                            "priority": 100,
+                        },
+                    ],
+                }
+            ],
+        }
+
+        document = load_graph_document(payload)
+        runtime_graph = document.as_graph("agent-one")
+        stored_graph = self.store.create_graph(payload)
+
+        self.assertEqual(runtime_graph.supabase_connections[0].connection_id, "analytics-db")
+        self.assertEqual(runtime_graph.nodes["supabase"].config["supabase_connection_id"], "analytics-db")
+        self.assertEqual(stored_graph["supabase_connections"][0]["connection_id"], "analytics-db")
+
+        run_id = self.manager.start_run("supabase-environment-with-node", "load rows")
+        state = self.manager.get_run(run_id)
+
+        self.assertEqual(state["graph_id"], "supabase-environment-with-node")
+        self.assertIn("agent-one", state["agent_runs"])
+
+    def test_multi_agent_document_rejects_unknown_default_supabase_connection(self) -> None:
+        payload = {
+            "graph_id": "supabase-environment-invalid-default",
+            "name": "Supabase Environment Invalid Default",
+            "graph_type": "test_environment",
+            "supabase_connections": [
+                {
+                    "connection_id": "analytics-db",
+                    "name": "Analytics DB",
+                    "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_URL",
+                    "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_SECRET_KEY",
+                    "project_ref_env_var": "SUPABASE_ANALYTICS_PROJECT_REF",
+                    "access_token_env_var": "SUPABASE_ANALYTICS_ACCESS_TOKEN",
+                }
+            ],
+            "default_supabase_connection_id": "missing-db",
+            "agents": [
+                {
+                    "agent_id": "agent-one",
+                    "name": "Agent One",
+                    "start_node_id": "start",
+                    "nodes": [
+                        {
+                            "id": "start",
+                            "kind": "input",
+                            "category": "start",
+                            "label": "Start",
+                            "provider_id": "start.manual_run",
+                            "provider_label": "Run Button Start",
+                            "config": {"input_binding": {"type": "input_payload"}},
+                            "position": {"x": 0, "y": 0},
+                        },
+                        {
+                            "id": "finish",
+                            "kind": "output",
+                            "category": "end",
+                            "label": "Finish",
+                            "provider_id": "core.output",
+                            "provider_label": "Core Output Node",
+                            "config": {"response_mode": "message"},
+                            "position": {"x": 200, "y": 0},
+                        },
+                    ],
+                    "edges": [
+                        {
+                            "id": "edge-start-finish",
+                            "source_id": "start",
+                            "target_id": "finish",
+                            "label": "next",
+                            "kind": "standard",
+                            "priority": 100,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(GraphValidationError, "Unknown default Supabase connection 'missing-db'"):
+            load_graph_document(payload)
 
     def test_manager_tracks_isolated_agent_runs_for_environment_execution(self) -> None:
         run_id = self.manager.start_run("test-environment", "Find tools that can help plan and execute this task.")

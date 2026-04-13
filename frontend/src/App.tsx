@@ -25,6 +25,7 @@ import {
   resetRuntime,
   setMcpToolEnabled,
   startRun,
+  stopRuntime,
   stopMcpServer,
   testMcpServer,
   uploadProjectFiles,
@@ -55,6 +56,7 @@ import {
   loadPersistedSupabaseConnectionState,
   savePersistedSupabaseConnectionState,
 } from "./lib/persistedSupabaseConnections";
+import { getExplicitSupabaseConnections } from "./lib/supabaseConnections";
 import { clearSessionSupabaseSchema } from "./lib/sessionSupabaseSchema";
 import { clearAllPersistedRunSnapshots, clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
 import type { PersistedRunSnapshot } from "./lib/runSnapshots";
@@ -72,6 +74,7 @@ import type {
   RunFilesystemListing,
   RunState,
   RuntimeEvent,
+  SupabaseConnectionDefinition,
   ToolDefinition,
 } from "./lib/types";
 import { getUserPreferences, resetUserPreferences, saveUserPreferences } from "./lib/userPreferences";
@@ -82,6 +85,69 @@ const DEFAULT_INPUT = "Find graph-agent references for a schema repair workflow.
 const DEFAULT_TEST_ENVIRONMENT_ID = "test-environment";
 const ENVIRONMENT_AGENT_SELECTION_STORAGE_KEY = "agentic-nodes-environment-agent-selection";
 const SELECTED_AGENT_ID_STORAGE_KEY = "agentic-nodes-selected-agent-id";
+
+function collectReferencedSupabaseConnectionIds(graph: GraphDocument): Set<string> {
+  const nodes = isTestEnvironment(graph) ? graph.agents.flatMap((agent) => agent.nodes) : graph.nodes;
+  return new Set(
+    nodes
+      .map((node) => String(node.config.supabase_connection_id ?? "").trim())
+      .filter((connectionId) => connectionId.length > 0),
+  );
+}
+
+function reconcileSupabaseConnections(graph: GraphDocument, ...fallbackGraphs: Array<GraphDocument | null | undefined>): GraphDocument {
+  const referencedConnectionIds = collectReferencedSupabaseConnectionIds(graph);
+  const currentConnections = getExplicitSupabaseConnections(graph);
+  const resolvedConnectionIds = new Set(
+    currentConnections.map((connection) => String(connection.connection_id ?? "").trim()).filter(Boolean),
+  );
+  const rescuedConnections: SupabaseConnectionDefinition[] = [];
+  for (const fallbackGraph of fallbackGraphs) {
+    if (!fallbackGraph) {
+      continue;
+    }
+    const fallbackConnections = getExplicitSupabaseConnections(fallbackGraph);
+    for (const connection of fallbackConnections) {
+      const connectionId = String(connection.connection_id ?? "").trim();
+      if (connectionId && referencedConnectionIds.has(connectionId) && !resolvedConnectionIds.has(connectionId)) {
+        rescuedConnections.push(connection);
+        resolvedConnectionIds.add(connectionId);
+      }
+    }
+  }
+  const mergedConnections = rescuedConnections.length > 0 ? [...currentConnections, ...rescuedConnections] : currentConnections;
+  const currentDefaultConnectionId = String(graph.default_supabase_connection_id ?? "").trim();
+  const fallbackDefaultConnectionId = fallbackGraphs.reduce<string>((found, fallback) => {
+    if (found) return found;
+    const candidate = String(fallback?.default_supabase_connection_id ?? "").trim();
+    return candidate && resolvedConnectionIds.has(candidate) ? candidate : "";
+  }, "");
+  const resolvedDefaultConnectionId =
+    currentDefaultConnectionId && resolvedConnectionIds.has(currentDefaultConnectionId)
+      ? currentDefaultConnectionId
+      : fallbackDefaultConnectionId || "";
+  if (
+    rescuedConnections.length === 0 &&
+    resolvedDefaultConnectionId === currentDefaultConnectionId
+  ) {
+    return graph;
+  }
+  return {
+    ...graph,
+    supabase_connections: mergedConnections,
+    default_supabase_connection_id: resolvedDefaultConnectionId,
+  };
+}
+
+function findMissingSupabaseConnectionIds(graph: GraphDocument): string[] {
+  const referencedIds = collectReferencedSupabaseConnectionIds(graph);
+  const definedIds = new Set(
+    getExplicitSupabaseConnections(graph)
+      .map((c) => String(c.connection_id ?? "").trim())
+      .filter(Boolean),
+  );
+  return [...referencedIds].filter((id) => !definedIds.has(id));
+}
 
 function isTerminalRunStatus(status: string | null | undefined): boolean {
   return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
@@ -629,10 +695,43 @@ function applyPersistedSupabaseConnectionState(graph: GraphDocument, storageKey:
   if (!persistedState) {
     return graph;
   }
+  const referencedConnectionIds = collectReferencedSupabaseConnectionIds(graph);
+  const savedConnections = Array.isArray(graph.supabase_connections) ? graph.supabase_connections : [];
+  const savedConnectionIds = new Set(
+    savedConnections.map((connection) => String(connection.connection_id ?? "").trim()).filter(Boolean),
+  );
+  const savedDefaultConnectionId = String(graph.default_supabase_connection_id ?? "").trim();
+  const persistedDefaultConnectionId = String(persistedState.default_supabase_connection_id ?? "").trim();
+  const supplementalPersistedConnections = persistedState.supabase_connections.filter((connection) => {
+    const connectionId = String(connection.connection_id ?? "").trim();
+    if (!connectionId || savedConnectionIds.has(connectionId)) {
+      return false;
+    }
+    if (savedConnections.length === 0) {
+      return true;
+    }
+    return referencedConnectionIds.has(connectionId) || connectionId === persistedDefaultConnectionId;
+  });
+  const mergedConnections = [...savedConnections, ...supplementalPersistedConnections];
+  const mergedConnectionIds = new Set(
+    mergedConnections.map((connection) => String(connection.connection_id ?? "").trim()).filter(Boolean),
+  );
+  const resolvedDefaultConnectionId =
+    savedDefaultConnectionId && mergedConnectionIds.has(savedDefaultConnectionId)
+      ? savedDefaultConnectionId
+      : persistedDefaultConnectionId && mergedConnectionIds.has(persistedDefaultConnectionId)
+        ? persistedDefaultConnectionId
+        : "";
+  if (
+    supplementalPersistedConnections.length === 0
+    && resolvedDefaultConnectionId === savedDefaultConnectionId
+  ) {
+    return graph;
+  }
   return {
     ...graph,
-    supabase_connections: persistedState.supabase_connections,
-    default_supabase_connection_id: persistedState.default_supabase_connection_id,
+    supabase_connections: mergedConnections,
+    default_supabase_connection_id: resolvedDefaultConnectionId,
   };
 }
 
@@ -689,6 +788,7 @@ export default function App() {
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isStoppingRuntime, setIsStoppingRuntime] = useState(false);
   const [isResettingRuntime, setIsResettingRuntime] = useState(false);
   const [mcpPendingKey, setMcpPendingKey] = useState<string | null>(null);
   const [mcpPanelOpen, setMcpPanelOpen] = useState(false);
@@ -759,6 +859,12 @@ export default function App() {
   useEffect(() => {
     inputRef.current = input;
   }, [input]);
+
+  useEffect(() => {
+    if (!isRunning) {
+      setIsStoppingRuntime(false);
+    }
+  }, [isRunning]);
 
   const refreshRunFiles = useCallback(async (runId: string, agentId: string | null = null) => {
     setRunFilesError(null);
@@ -843,9 +949,13 @@ export default function App() {
   }, []);
 
   const hydrateSelectedGraph = useCallback((graph: GraphDocument) => {
-    const nextGraph = applyPersistedSupabaseConnectionState(
-      applyPersistedEnvVars(normalizeGraphDocument(graph), graph.graph_id),
-      graph.graph_id,
+    const storageKey = persistedGraphEnvStorageKey(graph.graph_id, graph.graph_id);
+    const nextGraph = reconcileSupabaseConnections(
+      applyPersistedSupabaseConnectionState(
+        applyPersistedEnvVars(normalizeGraphDocument(graph), storageKey),
+        storageKey,
+      ),
+      graph,
     );
     resetHistory(nextGraph);
     setSavedGraphSnapshot(serializeGraphSnapshot(nextGraph));
@@ -1330,8 +1440,29 @@ export default function App() {
     setIsSaving(true);
     setError(null);
     try {
+      const savedGraphFallback =
+        selectedGraphId && persistedGraphIds.has(selectedGraphId)
+          ? graphs.find((graph) => graph.graph_id === selectedGraphId) ?? null
+          : null;
+      const storageKey = persistedGraphEnvStorageKey(draftGraph.graph_id, selectedGraphId);
+      const hydratedDraftGraph = reconcileSupabaseConnections(
+        applyPersistedSupabaseConnectionState(draftGraph, storageKey),
+        savedGraphFallback,
+        ...graphs.filter((g) => g.graph_id !== draftGraph.graph_id),
+      );
+      const missingConnectionIds = findMissingSupabaseConnectionIds(hydratedDraftGraph);
+      if (missingConnectionIds.length > 0) {
+        const label = missingConnectionIds.length === 1
+          ? `Supabase connection "${missingConnectionIds[0]}" is`
+          : `Supabase connections ${missingConnectionIds.map((id) => `"${id}"`).join(", ")} are`;
+        throw new Error(
+          `${label} referenced by nodes but not defined on this graph. `
+          + "Open the Supabase Connections panel in the Environment section to add the missing connection, "
+          + "or switch affected nodes to a different connection.",
+        );
+      }
       const normalized = {
-        ...normalizeGraphDocument(draftGraph),
+        ...normalizeGraphDocument(hydratedDraftGraph),
         default_input: input,
       } satisfies GraphDocument;
       const savedGraph =
@@ -1458,6 +1589,7 @@ export default function App() {
     setEvents([]);
     setRunState(null);
     setVisualizerResetVersion((current) => current + 1);
+    setIsStoppingRuntime(false);
     setIsRunning(true);
     if (isTestEnvironment(savedGraph) && agentIdsToRun && agentIdsToRun.length > 0 && !agentIdsToRun.includes(selectedAgentId ?? "")) {
       setSelectedAgentId(agentIdsToRun[0] ?? null);
@@ -1475,11 +1607,27 @@ export default function App() {
     }
   }
 
+  async function handleStopRuntime() {
+    if (!window.confirm("Stop active execution? The current run state will stay visible, but active runs will be cancelled.")) {
+      return;
+    }
+    setIsStoppingRuntime(true);
+    setError(null);
+    try {
+      await stopRuntime();
+    } catch (stopError) {
+      const message = stopError instanceof Error ? stopError.message : "Unable to stop runtime.";
+      setError(message);
+      setIsStoppingRuntime(false);
+    }
+  }
+
   async function handleResetRuntime() {
     if (!window.confirm("Reset runtime? This will stop active runs, disconnect runtime services, and clear live run state.")) {
       return;
     }
     setIsResettingRuntime(true);
+    setIsStoppingRuntime(false);
     setError(null);
     try {
       await resetRuntime();
@@ -1557,9 +1705,17 @@ export default function App() {
                     type="button"
                     className="primary-button"
                     onClick={() => void handleRun()}
-                    disabled={!draftGraph || isRunning || isSaving || isResettingRuntime}
+                    disabled={!draftGraph || isRunning || isSaving || isStoppingRuntime || isResettingRuntime}
                   >
                     {isRunning ? "Running..." : isEnvironment ? "Run Environment" : "Run Graph"}
+                  </button>
+                  <button
+                    type="button"
+                    className="danger-button"
+                    onClick={() => void handleStopRuntime()}
+                    disabled={!isRunning || isStoppingRuntime || isResettingRuntime}
+                  >
+                    {isStoppingRuntime ? "Stopping..." : "Stop Runtime"}
                   </button>
                   <button type="button" className="secondary-button" onClick={handleCreateGraph}>
                     New Agent
@@ -1573,7 +1729,7 @@ export default function App() {
                   <button type="button" className="secondary-button" onClick={history.redo} disabled={!history.canRedo} title="Redo (⌘⇧Z)">
                     Redo
                   </button>
-                  <button type="button" className="danger-button" onClick={() => void handleResetRuntime()} disabled={isResettingRuntime}>
+                  <button type="button" className="danger-button" onClick={() => void handleResetRuntime()} disabled={isStoppingRuntime || isResettingRuntime}>
                     {isResettingRuntime ? "Resetting..." : "Reset Runtime"}
                   </button>
                   <button type="button" className="danger-button" onClick={() => void handleDeleteGraph()} disabled={!draftGraph}>

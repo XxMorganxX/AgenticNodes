@@ -5,6 +5,7 @@ import { DEFAULT_GRAPH_ENV_VARS, getGraphEnvVars } from "./graphEnv";
 import { isTestEnvironment } from "./graphDocuments";
 import { createLogicConditionBranch, normalizeLogicConditionConfig } from "./logicConditions";
 import type { SavedNode } from "./savedNodes";
+import { getExplicitSupabaseConnections } from "./supabaseConnections";
 import type { AgentDefinition, EditorCatalog, GraphDefinition, GraphDocument, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition } from "./types";
 
 export type GraphLayoutNodeDimensions = {
@@ -325,8 +326,12 @@ export function createNodeFromProvider(
   if (provider.node_kind === "data") {
     const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
     const defaultSupabaseConnectionId = String(graph.default_supabase_connection_id ?? "").trim();
+    const validDefaultSupabaseConnectionIds = new Set(
+      getExplicitSupabaseConnections(graph).map((connection) => connection.connection_id),
+    );
     const maybeSupabaseConnectionConfig =
       defaultSupabaseConnectionId &&
+      validDefaultSupabaseConnectionIds.has(defaultSupabaseConnectionId) &&
       ["core.supabase_data", "core.supabase_row_write", "core.outbound_email_logger"].includes(provider.provider_id)
         ? { supabase_connection_id: defaultSupabaseConnectionId }
         : {};
@@ -1011,17 +1016,31 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
     const logicHandleRemap = logicConditionHandleRemaps.get(edge.source_id);
     const remappedSourceHandleId =
       logicHandleRemap?.get(inferredSourceHandleId ?? "")?.shift() ?? inferredSourceHandleId;
+    const logicConditionConfig =
+      sourceNode?.provider_id === "core.logic_conditions" ? normalizeLogicConditionConfig(sourceNode.config).normalized : null;
+    const logicConditionHandleIds = logicConditionConfig
+      ? new Set([
+          ...logicConditionConfig.branches.map((branch) => String(branch.output_handle_id)),
+          String(logicConditionConfig.else_output_handle_id),
+        ])
+      : null;
+    const isLogicConditionRoute =
+      !!logicConditionHandleIds && typeof remappedSourceHandleId === "string" && logicConditionHandleIds.has(remappedSourceHandleId);
     return {
       ...edge,
       source_handle_id: remappedSourceHandleId,
       target_handle_id: edge.target_handle_id ?? null,
       waypoints: edge.waypoints?.map((waypoint) => ({ ...waypoint })),
       kind:
-        remappedSourceHandleId === API_TOOL_CALL_HANDLE_ID || remappedSourceHandleId === API_FINAL_MESSAGE_HANDLE_ID
+        isLogicConditionRoute
+          ? "standard"
+          : remappedSourceHandleId === API_TOOL_CALL_HANDLE_ID || remappedSourceHandleId === API_FINAL_MESSAGE_HANDLE_ID
           ? "conditional"
           : edge.kind,
       condition:
-        remappedSourceHandleId === API_TOOL_CALL_HANDLE_ID
+        isLogicConditionRoute
+          ? null
+          : remappedSourceHandleId === API_TOOL_CALL_HANDLE_ID
           ? edge.condition ?? defaultApiToolCallCondition(edge.id)
           : remappedSourceHandleId === API_FINAL_MESSAGE_HANDLE_ID
             ? edge.condition ?? defaultApiMessageCondition(edge.id)

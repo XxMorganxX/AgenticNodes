@@ -10,6 +10,12 @@ export type DerivedSupabaseConnection = SupabaseConnectionDefinition & {
   isImplicit?: boolean;
 };
 
+export type SupabaseConnectionSelectOption = {
+  value: string;
+  label: string;
+  missing?: boolean;
+};
+
 export type ResolvedSupabaseBinding = {
   connectionId: string;
   connectionName: string;
@@ -130,6 +136,29 @@ export function getSupabaseConnectionById(
     return null;
   }
   return getSupabaseConnections(graph).find((connection) => connection.connection_id === normalizedConnectionId) ?? null;
+}
+
+export function getSupabaseConnectionSelectOptions(
+  graph: GraphDocument | GraphDefinition | null | undefined,
+  config: Record<string, unknown>,
+): SupabaseConnectionSelectOption[] {
+  const options: SupabaseConnectionSelectOption[] = getSupabaseConnections(graph).map((connection) => ({
+    value: connection.connection_id,
+    label: `${connection.name}${connection.isImplicit ? " (legacy)" : ""}`,
+  }));
+  const resolvedBinding = resolveSupabaseBinding(graph, config);
+  if (
+    resolvedBinding.missingConnection &&
+    resolvedBinding.connectionId &&
+    !options.some((option) => option.value === resolvedBinding.connectionId)
+  ) {
+    options.push({
+      value: resolvedBinding.connectionId,
+      label: `Missing: ${resolvedBinding.connectionName}`,
+      missing: true,
+    });
+  }
+  return options;
 }
 
 export function resolveSupabaseBinding(

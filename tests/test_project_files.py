@@ -4,6 +4,7 @@ import importlib
 import json
 import sys
 import tempfile
+from threading import Event, Thread
 import unittest
 from pathlib import Path
 
@@ -15,7 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from graph_agent.api.graph_store import GraphStore
-from graph_agent.api.manager import GraphRunManager
+from graph_agent.api.manager import GraphRunManager, RunControl
 from graph_agent.api.project_files import ProjectFileStore
 from graph_agent.api.run_log_store import RunLogStore
 from graph_agent.examples.tool_schema_repair import build_example_services
@@ -176,6 +177,45 @@ class ProjectFileTests(unittest.TestCase):
                     self.assertEqual(final_list_response.json()["files"], [])
             finally:
                 app_module.manager = original_manager
+                manager.stop_background_services()
+
+    def test_stop_runtime_endpoint_requests_cancellation_without_resetting_state(self) -> None:
+        app_module = importlib.import_module("graph_agent.api.app")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            bundled_path = temp_path / "bundled_graphs.json"
+            bundled_path.write_text(json.dumps({"graphs": []}), encoding="utf-8")
+            services = build_example_services()
+            manager = GraphRunManager(
+                services=services,
+                store=GraphStore(services, path=temp_path / "graphs.json", bundled_path=bundled_path),
+                run_log_store=RunLogStore(temp_path / ".logs" / "runs"),
+                project_file_store=ProjectFileStore(temp_path / ".graph-agent" / "project-files"),
+            )
+            stop_event = Event()
+            worker = Thread(target=stop_event.wait, daemon=True)
+            worker.start()
+            with manager._lock:
+                manager._run_controls["active-run"] = RunControl(
+                    run_id="active-run",
+                    cancel_event=Event(),
+                    thread=worker,
+                )
+            original_manager = app_module.manager
+            app_module.manager = manager
+            try:
+                with TestClient(app_module.app) as client:
+                    response = client.post("/api/runtime/stop")
+                    self.assertEqual(response.status_code, 200, msg=response.text)
+                    payload = response.json()
+                    self.assertEqual(payload["stopping_run_ids"], ["active-run"])
+                    self.assertEqual(payload["stopping_run_count"], 1)
+                    with manager._lock:
+                        self.assertTrue(manager._run_controls["active-run"].cancel_event.is_set())
+            finally:
+                app_module.manager = original_manager
+                stop_event.set()
+                worker.join(timeout=1.0)
                 manager.stop_background_services()
 
     def test_manager_moves_project_files_when_graph_id_changes(self) -> None:

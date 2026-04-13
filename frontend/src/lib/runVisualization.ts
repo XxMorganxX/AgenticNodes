@@ -557,6 +557,13 @@ function incomingSourceNodeLabels(nodeId: string | null, graph: GraphDefinition 
   });
 }
 
+function hasNoOutgoingExecutionEdges(nodeId: string | null, graph: GraphDefinition | null): boolean {
+  if (!nodeId || !graph) {
+    return false;
+  }
+  return !graph.edges.some((edge) => edge.source_id === nodeId && edge.kind !== "binding");
+}
+
 function eventTone(eventType: string): AgentRunMilestone["tone"] {
   if (eventType === "run.completed" || eventType === "node.completed") {
     return "success";
@@ -705,6 +712,7 @@ function buildMilestoneDetails(
   const payload = event.payload;
   const nodeId = nodeIdFromEvent(event);
   const details: AgentRunMilestoneDetail[] = [{ label: "State", value: formatEventTypeLabel(event.event_type) }];
+  const node = nodeId ? (graph?.nodes.find((candidate) => candidate.id === nodeId) ?? null) : null;
   if (nodeId) {
     details.push({ label: "Node", value: labels.get(nodeId) ?? nodeId });
   }
@@ -744,6 +752,13 @@ function buildMilestoneDetails(
   }
   if (typeof payload.agent_name === "string") {
     details.push({ label: "Agent", value: payload.agent_name });
+  }
+  if (
+    event.event_type === "node.completed" &&
+    node?.provider_id === "core.data_display" &&
+    hasNoOutgoingExecutionEdges(nodeId, graph)
+  ) {
+    details.push({ label: "Routing", value: "No outgoing execution edge (display only)" });
   }
   return details;
 }

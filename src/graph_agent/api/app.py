@@ -507,6 +507,11 @@ def reset_runtime() -> dict[str, Any]:
     return manager.reset_runtime()
 
 
+@app.post("/api/runtime/stop")
+def stop_runtime() -> dict[str, Any]:
+    return manager.stop_runtime()
+
+
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str) -> dict[str, Any]:
     try:

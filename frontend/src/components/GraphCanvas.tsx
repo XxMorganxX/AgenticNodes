@@ -68,6 +68,7 @@ import { deleteSavedNode, getSavedNodes, saveNodeToLibrary } from "../lib/savedN
 import type { SavedNode } from "../lib/savedNodes";
 import { buildContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
 import { resolveSupabaseBinding } from "../lib/supabaseConnections";
+import { normalizeLogicConditionConfig } from "../lib/logicConditions";
 import {
   formatRunStatusLabel,
   type AgentRunLane,
@@ -2839,11 +2840,28 @@ export function GraphCanvas({
           condition: defaultApiMessageCondition(nextEdgeId),
         };
       }
+      if (sourceNode?.provider_id === "core.logic_conditions" && effectiveSourceHandleId) {
+        const logicConfig = normalizeLogicConditionConfig(sourceNode.config).normalized;
+        const matchedBranch = logicConfig.branches.find((branch) => branch.output_handle_id === effectiveSourceHandleId) ?? null;
+        const isElseHandle = effectiveSourceHandleId === logicConfig.else_output_handle_id;
+        return {
+          id: nextEdgeId,
+          source_id: sourceId,
+          target_id: targetId,
+          source_handle_id: effectiveSourceHandleId,
+          target_handle_id: effectiveTargetHandleId,
+          label: isElseHandle ? "else" : matchedBranch?.label?.trim() || "branch",
+          kind: "standard",
+          priority: 100,
+          waypoints,
+          condition: null,
+        };
+      }
       return {
         id: nextEdgeId,
         source_id: sourceId,
         target_id: targetId,
-          source_handle_id: effectiveSourceHandleId,
+        source_handle_id: effectiveSourceHandleId,
         target_handle_id: effectiveTargetHandleId,
         label: sourceNode?.provider_id === "core.parallel_splitter" ? "parallel branch" : hasStandardOutgoing ? "conditional route" : "next",
         kind: sourceNode?.provider_id === "core.parallel_splitter" ? "standard" : hasStandardOutgoing ? "conditional" : "standard",

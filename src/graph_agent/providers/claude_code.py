@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import selectors
 import subprocess
 import time
@@ -39,6 +40,12 @@ def _strict_json_schema(schema: Any) -> Any:
         for key, value in schema.items():
             normalized[key] = _strict_json_schema(value)
         type_value = normalized.get("type")
+        if type_value == "object" or (
+            isinstance(type_value, Sequence)
+            and not isinstance(type_value, (str, bytes))
+            and "object" in {str(entry).strip() for entry in type_value}
+        ) or "properties" in normalized:
+            normalized.setdefault("additionalProperties", False)
         if isinstance(type_value, Sequence) and not isinstance(type_value, (str, bytes)):
             union_types = [entry for entry in type_value if isinstance(entry, str) and entry.strip()]
             if len(union_types) == 1:
@@ -79,6 +86,122 @@ def _friendly_cli_error_detail(detail: str) -> str:
     if parsed.get("is_error") is True:
         return f"Claude Code request failed. {message_text}"
     return detail
+
+
+def _schema_type_includes(schema: Mapping[str, Any], expected_type: str) -> bool:
+    type_value = schema.get("type")
+    if type_value == expected_type:
+        return True
+    if isinstance(type_value, Sequence) and not isinstance(type_value, (str, bytes)):
+        return expected_type in {str(entry).strip() for entry in type_value}
+    return False
+
+
+def _string_like_schema(schema: Any) -> bool:
+    return isinstance(schema, Mapping) and _schema_type_includes(schema, "string")
+
+
+def _decision_message_object_schema(response_schema: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    if not _is_mapping(response_schema):
+        return None
+    properties = response_schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return None
+    message_schema = properties.get("message")
+    if not isinstance(message_schema, Mapping):
+        return None
+    if not (_schema_type_includes(message_schema, "object") or isinstance(message_schema.get("properties"), Mapping)):
+        return None
+    return message_schema
+
+
+def _normalized_label_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _candidate_field_labels(field_name: str) -> set[str]:
+    normalized = _normalized_label_key(field_name)
+    labels = {
+        normalized,
+        normalized.replace("_", " "),
+    }
+    if normalized == "recipient":
+        labels.update({"to", "recipient", "email recipient", "recipient email"})
+    elif normalized == "body":
+        labels.update({"body", "message", "email body", "content", "text"})
+    elif normalized == "subject":
+        labels.update({"subject", "title", "email subject"})
+    return {label for label in labels if label}
+
+
+def _clean_labeled_value(value: str) -> str:
+    cleaned = value.strip()
+    cleaned = re.sub(r"^\*+\s*", "", cleaned)
+    cleaned = re.sub(r"\s*\*+$", "", cleaned)
+    return cleaned.strip()
+
+
+def _coerce_labeled_message_object(
+    content_text: str,
+    message_schema: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not content_text.strip() or not isinstance(message_schema, Mapping):
+        return None
+    properties = message_schema.get("properties")
+    if not isinstance(properties, Mapping) or not properties:
+        return None
+
+    field_aliases: dict[str, set[str]] = {}
+    for field_name, field_schema in properties.items():
+        normalized_name = str(field_name).strip()
+        if not normalized_name or not _string_like_schema(field_schema):
+            continue
+        field_aliases[normalized_name] = _candidate_field_labels(normalized_name)
+    if not field_aliases:
+        return None
+
+    required_fields = [
+        str(field_name).strip()
+        for field_name in message_schema.get("required", [])
+        if str(field_name).strip()
+    ]
+    if any(field_name not in field_aliases for field_name in required_fields):
+        return None
+
+    normalized_text = content_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    heading_pattern = re.compile(r"(?im)^\s*(?:\*\*)?\s*([A-Za-z][A-Za-z0-9 _/\-]{0,60})\s*(?:\*\*)?\s*:\s*")
+    matches: list[tuple[int, int, str]] = []
+    for match in heading_pattern.finditer(normalized_text):
+        normalized_label = _normalized_label_key(match.group(1))
+        for field_name, aliases in field_aliases.items():
+            if normalized_label in aliases:
+                matches.append((match.start(), match.end(), field_name))
+                break
+
+    extracted_values: dict[str, str] = {}
+    if matches:
+        matches.sort(key=lambda entry: entry[0])
+        for index, (_start, value_start, field_name) in enumerate(matches):
+            if field_name in extracted_values:
+                continue
+            next_start = matches[index + 1][0] if index + 1 < len(matches) else len(normalized_text)
+            extracted_values[field_name] = _clean_labeled_value(normalized_text[value_start:next_start])
+    elif len(field_aliases) == 1:
+        only_field = next(iter(field_aliases))
+        extracted_values[only_field] = _clean_labeled_value(normalized_text)
+
+    if not extracted_values:
+        return None
+
+    coerced: dict[str, Any] = {}
+    for field_name in field_aliases:
+        if field_name in extracted_values and extracted_values[field_name]:
+            coerced[field_name] = extracted_values[field_name]
+        elif field_name in required_fields:
+            coerced[field_name] = ""
+    if not all(field_name in coerced for field_name in required_fields):
+        return None
+    return coerced
 
 
 def _string_config(config: Mapping[str, Any], key: str, default: str) -> str:
@@ -595,7 +718,19 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
         content_text = content if isinstance(content, str) else ""
         structured_output = payload.get("structured_output") if response_schema is not None else None
         if structured_output is None and response_schema is not None and content_text.strip():
-            structured_output = json.loads(content_text)
+            try:
+                structured_output = json.loads(content_text)
+            except json.JSONDecodeError:
+                structured_output = None
+        if structured_output is None and response_schema is not None and content_text.strip() and not tools:
+            message_schema = _decision_message_object_schema(response_schema)
+            coerced_message = _coerce_labeled_message_object(content_text, message_schema)
+            if coerced_message is not None:
+                structured_output = {
+                    "message": coerced_message,
+                    "need_tool": False,
+                    "tool_calls": [],
+                }
 
         normalized_tool_calls: list[ModelToolCall] = []
         if _is_mapping(structured_output):

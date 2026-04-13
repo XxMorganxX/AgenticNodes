@@ -33,6 +33,7 @@ import { insertTokenAtEnd, listPromptBlockAvailableVariables, PROMPT_BLOCK_START
 import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "../lib/spreadsheetMatrixPrompt";
 import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
 import { useRenderDiagnostics } from "../lib/dragDiagnostics";
+import { StructuredPayloadBuilderLearnMoreModal } from "./StructuredPayloadBuilderLearnMoreModal";
 import type {
   EditorCatalog,
   GraphDefinition,
@@ -108,12 +109,75 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
 }
 
+type StructuredPayloadTemplateEntry = {
+  id: string;
+  key: string;
+  value: string;
+};
+
+function parseStructuredPayloadTemplateEntries(value: unknown): StructuredPayloadTemplateEntry[] {
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return [];
+    }
+    return Object.entries(parsed).map(([key, entryValue], index) => ({
+      id: `template-entry-${index + 1}-${key}`,
+      key,
+      value:
+        typeof entryValue === "string"
+          ? entryValue
+          : entryValue == null
+            ? ""
+            : JSON.stringify(entryValue),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function serializeStructuredPayloadTemplateEntries(entries: StructuredPayloadTemplateEntry[]): string {
+  const payload: Record<string, unknown> = {};
+  for (const entry of entries) {
+    const key = entry.key.trim();
+    if (!key) {
+      continue;
+    }
+    const rawValue = entry.value;
+    const trimmedValue = rawValue.trim();
+    if (!trimmedValue) {
+      payload[key] = "";
+      continue;
+    }
+    if (trimmedValue === "null") {
+      payload[key] = null;
+      continue;
+    }
+    if (trimmedValue === "{}") {
+      payload[key] = {};
+      continue;
+    }
+    if (trimmedValue === "[]") {
+      payload[key] = [];
+      continue;
+    }
+    payload[key] = rawValue;
+  }
+  return JSON.stringify(payload, null, 2);
+}
+
 const CONTEXT_BUILDER_PROVIDER_ID = "core.context_builder";
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
 const SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision";
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
 const WRITE_TEXT_FILE_PROVIDER_ID = "core.write_text_file";
+const STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID = "core.structured_payload_builder";
+const APOLLO_EMAIL_LOOKUP_PROVIDER_ID = "core.apollo_email_lookup";
 const LINKEDIN_PROFILE_FETCH_PROVIDER_ID = "core.linkedin_profile_fetch";
 const RUNTIME_NORMALIZER_PROVIDER_ID = "core.runtime_normalizer";
 const CONTEXT_BUILDER_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -433,6 +497,8 @@ export function GraphInspector({
   const [spreadsheetPreviewError, setSpreadsheetPreviewError] = useState<string | null>(null);
   const [isSpreadsheetPreviewLoading, setIsSpreadsheetPreviewLoading] = useState(false);
   const [contextBuilderPreviewFormatted, setContextBuilderPreviewFormatted] = useState(true);
+  const [isStructuredPayloadBuilderLearnMoreOpen, setIsStructuredPayloadBuilderLearnMoreOpen] = useState(false);
+  const [structuredPayloadTemplateDraftEntries, setStructuredPayloadTemplateDraftEntries] = useState<StructuredPayloadTemplateEntry[]>([]);
 
   if (!graph) {
     return (
@@ -466,6 +532,18 @@ export function GraphInspector({
     setSpreadsheetPreviewError(null);
     setIsSpreadsheetPreviewLoading(false);
   }, [spreadsheetPreviewKey]);
+  useEffect(() => {
+    if (selectedNode?.provider_id !== STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID) {
+      setIsStructuredPayloadBuilderLearnMoreOpen(false);
+    }
+  }, [selectedNode]);
+  useEffect(() => {
+    if (selectedNode?.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID) {
+      setStructuredPayloadTemplateDraftEntries(parseStructuredPayloadTemplateEntries(selectedNode.config.template_json));
+      return;
+    }
+    setStructuredPayloadTemplateDraftEntries([]);
+  }, [selectedNode?.id, selectedNode?.provider_id]);
   const formatNodeLabel = (node: GraphNode) => getNodeInstanceLabel(graph, node);
   const executorFollowUpEnabled =
     selectedNode?.kind === "mcp_tool_executor" && Boolean(selectedNode.config.enable_follow_up_decision);
@@ -934,6 +1012,10 @@ export function GraphInspector({
     const isContextBuilderNode = selectedNode.kind === "data" && selectedNode.provider_id === CONTEXT_BUILDER_PROVIDER_ID;
     const isPromptBlockDataNode = selectedNode.kind === "data" && selectedNode.provider_id === PROMPT_BLOCK_PROVIDER_ID;
     const isWriteTextFileNode = selectedNode.kind === "data" && selectedNode.provider_id === WRITE_TEXT_FILE_PROVIDER_ID;
+    const isStructuredPayloadBuilderNode =
+      selectedNode.kind === "data" && selectedNode.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID;
+    const isApolloEmailLookupNode =
+      selectedNode.kind === "data" && selectedNode.provider_id === APOLLO_EMAIL_LOOKUP_PROVIDER_ID;
     const isLinkedInProfileFetchNode =
       selectedNode.kind === "data" && selectedNode.provider_id === LINKEDIN_PROFILE_FETCH_PROVIDER_ID;
     const isRuntimeNormalizerNode =
@@ -1075,6 +1157,22 @@ export function GraphInspector({
       : false;
     const promptBlockAvailableVariables = isPromptBlockDataNode ? listPromptBlockAvailableVariables(graph) : [];
     const promptBlockRenderedPreview = isPromptBlockDataNode ? renderPromptBlockPreview(selectedNode, graph, runState) : "";
+    const structuredPayloadTemplateEntries = isStructuredPayloadBuilderNode
+      ? structuredPayloadTemplateDraftEntries
+      : [];
+    const updateStructuredPayloadTemplateEntries = (entries: StructuredPayloadTemplateEntry[]) => {
+      setStructuredPayloadTemplateDraftEntries(entries);
+      onGraphChange(
+        updateNode(graph, selectedNode.id, (node) => ({
+          ...node,
+          config: {
+            ...node.config,
+            mode: "structured_payload_builder",
+            template_json: serializeStructuredPayloadTemplateEntries(entries),
+          },
+        })),
+      );
+    };
     const updateContextBuilderBindings = (bindings: ContextBuilderBindingRow[]) =>
       onGraphChange(
         updateNode(graph, selectedNode.id, (node) => ({
@@ -1102,12 +1200,13 @@ export function GraphInspector({
       );
 
     return (
-      <section className="panel inspector-panel">
-        <div className="panel-header">
-          <h2>Node Inspector</h2>
-          <p>Edit the selected node and its runtime contract.</p>
-        </div>
-        <div className="inspector-body">
+      <>
+        <section className="panel inspector-panel">
+          <div className="panel-header">
+            <h2>Node Inspector</h2>
+            <p>Edit the selected node and its runtime contract.</p>
+          </div>
+          <div className="inspector-body">
           <label>
             Node ID
             <input value={selectedNode.id} readOnly />
@@ -1168,6 +1267,15 @@ export function GraphInspector({
             <span>Kind: {selectedNode.kind}</span>
             <span>Provider: {selectedNode.provider_label}</span>
           </div>
+          {isStructuredPayloadBuilderNode ? (
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setIsStructuredPayloadBuilderLearnMoreOpen(true)}
+            >
+              Learn More About This Node
+            </button>
+          ) : null}
           {onOpenProviderDetails &&
           selectedNode.provider_id !== "core.data_display" &&
           selectedNode.provider_id !== "core.logic_conditions" ? (
@@ -2954,6 +3062,447 @@ export function GraphInspector({
                     <span>Auto mode: overwrites outside loops and appends inside iterator executions</span>
                   </div>
                 </>
+              ) : isStructuredPayloadBuilderNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Structured Payload Builder</strong>
+                    <span>Starts from a JSON object template and auto-fills only the missing fields from the incoming payload.</span>
+                    <span>Use it when you want to hand-write a few values and let the node recursively discover the rest by field name.</span>
+                  </div>
+                  <div className="context-builder-binding-actions">
+                    <button
+                      type="button"
+                      className="secondary-button context-builder-inline-button"
+                      onClick={() => setIsStructuredPayloadBuilderLearnMoreOpen(true)}
+                    >
+                      Learn More
+                    </button>
+                  </div>
+                  <div className="contract-card">
+                    <strong>Dictionary Entries</strong>
+                    <span>Add one key per row. Leave the value blank to auto-fill it from the incoming payload.</span>
+                    <span>Special values: use <code>null</code>, <code>{`{}`}</code>, or <code>[]</code> if you want those missing shapes to be auto-filled.</span>
+                  </div>
+                  <div className="context-builder-binding-actions">
+                    <button
+                      type="button"
+                      className="secondary-button context-builder-inline-button"
+                      onClick={() =>
+                        updateStructuredPayloadTemplateEntries([
+                          ...structuredPayloadTemplateEntries,
+                          {
+                            id: `template-entry-new-${structuredPayloadTemplateEntries.length + 1}`,
+                            key: "",
+                            value: "",
+                          },
+                        ])
+                      }
+                    >
+                      Add Entry
+                    </button>
+                  </div>
+                  {structuredPayloadTemplateEntries.length > 0 ? (
+                    <div className="checkbox-grid">
+                      {structuredPayloadTemplateEntries.map((entry, index) => (
+                        <div key={entry.id} className="context-builder-binding-card">
+                          <div className="context-builder-binding-header">
+                            <div>
+                              <strong>Entry {index + 1}</strong>
+                              <small>Blank value means auto-fill</small>
+                            </div>
+                            <div className="context-builder-binding-actions">
+                              <button
+                                type="button"
+                                className="secondary-button context-builder-inline-button"
+                                onClick={() =>
+                                  updateStructuredPayloadTemplateEntries(
+                                    structuredPayloadTemplateEntries.filter((candidate) => candidate.id !== entry.id),
+                                  )
+                                }
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          </div>
+                          <label>
+                            Key
+                            <input
+                              value={entry.key}
+                              placeholder="email"
+                              onChange={(event) =>
+                                updateStructuredPayloadTemplateEntries(
+                                  structuredPayloadTemplateEntries.map((candidate) =>
+                                    candidate.id === entry.id
+                                      ? { ...candidate, key: event.target.value }
+                                      : candidate,
+                                  ),
+                                )
+                              }
+                            />
+                          </label>
+                          <label>
+                            Value
+                            <input
+                              value={entry.value}
+                              placeholder="Leave blank to auto-fill"
+                              onChange={(event) =>
+                                updateStructuredPayloadTemplateEntries(
+                                  structuredPayloadTemplateEntries.map((candidate) =>
+                                    candidate.id === entry.id
+                                      ? { ...candidate, value: event.target.value }
+                                      : candidate,
+                                  ),
+                                )
+                              }
+                            />
+                          </label>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="tool-details-modal-help">
+                      No entries yet. Add a dictionary entry to start defining the payload shape.
+                    </div>
+                  )}
+                  <label className="checkbox-option">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(selectedNode.config.case_sensitive ?? false)}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "structured_payload_builder",
+                              case_sensitive: event.target.checked,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                    <span>
+                      Case Sensitive
+                      <small>Match field names using exact case instead of lowercase-insensitive matching.</small>
+                    </span>
+                  </label>
+                  <label>
+                    Max Matches Per Field
+                    <input
+                      type="number"
+                      value={String(selectedNode.config.max_matches_per_field ?? 25)}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "structured_payload_builder",
+                              max_matches_per_field: event.target.value ? Number(event.target.value) : 25,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="inspector-meta">
+                    <span>Write the output shape you want as JSON, then leave any field blank, null, an empty object, or an empty array to let this node auto-fill it from upstream data.</span>
+                    <span>Filled fields preserve any explicit values you wrote in the template.</span>
+                    <span>Nested objects are searched recursively, with parent keys used as context when possible.</span>
+                  </div>
+                </>
+              ) : isApolloEmailLookupNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Apollo Email Lookup</strong>
+                    <span>Performs one Apollo `people/match` lookup, returns the full Apollo response payload, and reuses a shared cache across runs.</span>
+                    <span>Use direct identifiers when possible to minimize credits and improve cache hit quality.</span>
+                  </div>
+                  <label>
+                    Apollo API Key Env Var
+                    <input
+                      value={String(selectedNode.config.api_key_env_var ?? "APOLLO_API_KEY")}
+                      placeholder="APOLLO_API_KEY"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "apollo_email_lookup",
+                              api_key_env_var: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Name
+                    <input
+                      value={String(selectedNode.config.name ?? "")}
+                      placeholder="Taylor Doe"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "apollo_email_lookup",
+                              name: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Domain
+                    <input
+                      value={String(selectedNode.config.domain ?? "")}
+                      placeholder="example.com"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "apollo_email_lookup",
+                              domain: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Organization Name
+                    <input
+                      value={String(selectedNode.config.organization_name ?? "")}
+                      placeholder="Example Co"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "apollo_email_lookup",
+                              organization_name: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    First Name
+                    <input
+                      value={String(selectedNode.config.first_name ?? "")}
+                      placeholder="Taylor"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "apollo_email_lookup",
+                              first_name: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Last Name
+                    <input
+                      value={String(selectedNode.config.last_name ?? "")}
+                      placeholder="Doe"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "apollo_email_lookup",
+                              last_name: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    LinkedIn URL
+                    <input
+                      value={String(selectedNode.config.linkedin_url ?? "")}
+                      placeholder="https://www.linkedin.com/in/example/"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "apollo_email_lookup",
+                              linkedin_url: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Email
+                    <input
+                      value={String(selectedNode.config.email ?? "")}
+                      placeholder="person@example.com"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "apollo_email_lookup",
+                              email: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Twitter URL
+                    <input
+                      value={String(selectedNode.config.twitter_url ?? "")}
+                      placeholder="https://x.com/example"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "apollo_email_lookup",
+                              twitter_url: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Optional Conversation
+                    <textarea
+                      rows={4}
+                      value={String(selectedNode.config.conversation ?? "")}
+                      placeholder="Optional context or operator notes for this lookup"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "apollo_email_lookup",
+                              conversation: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="checkbox-grid">
+                    <label className="checkbox-option">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(selectedNode.config.reveal_personal_emails ?? false)}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                mode: "apollo_email_lookup",
+                                reveal_personal_emails: event.target.checked,
+                              },
+                            })),
+                          )
+                        }
+                      />
+                      <span>
+                        Reveal Personal Emails
+                        <small>Leave off by default to minimize credit usage and keep lookups work-email focused.</small>
+                      </span>
+                    </label>
+                    <label className="checkbox-option">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(selectedNode.config.use_cache ?? true)}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                mode: "apollo_email_lookup",
+                                use_cache: event.target.checked,
+                              },
+                            })),
+                          )
+                        }
+                      />
+                      <span>
+                        Use Shared Cache
+                        <small>Read and write the reusable `.graph-agent/cache/apollo-email/` entry for this normalized lookup.</small>
+                      </span>
+                    </label>
+                    <label className="checkbox-option">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(selectedNode.config.force_refresh ?? false)}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                mode: "apollo_email_lookup",
+                                force_refresh: event.target.checked,
+                              },
+                            })),
+                          )
+                        }
+                      />
+                      <span>
+                        Force Refresh
+                        <small>Bypass any existing shared cache entry and run one fresh Apollo lookup.</small>
+                      </span>
+                    </label>
+                  </div>
+                  <label>
+                    Workspace Cache Path Template
+                    <input
+                      value={String(selectedNode.config.workspace_cache_path_template ?? "cache/apollo-email/{cache_key}.json")}
+                      placeholder="cache/apollo-email/{cache_key}.json"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "apollo_email_lookup",
+                              workspace_cache_path_template: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <div className="inspector-meta">
+                    <span>Parameters: configure direct identifiers or person-plus-organization fields on the node, or supply them from upstream payloads.</span>
+                    <span>Optional conversation: stored on the node for operator context and visible in the details UI.</span>
+                    <span>Workspace mirror: {String(selectedNode.config.workspace_cache_path_template ?? "cache/apollo-email/{cache_key}.json")}</span>
+                    <span>Shared cache: sibling of the configured `.graph-agent/runs` root under `.graph-agent/cache/apollo-email/`</span>
+                  </div>
+                </>
               ) : isLinkedInProfileFetchNode ? (
                 <>
                   <div className="contract-card">
@@ -3283,6 +3832,7 @@ export function GraphInspector({
                   <span>Display mode: visualizer envelope inspection</span>
                   <span>Behavior: passes the original payload through unchanged</span>
                   <span>Visualizer: shows the full incoming envelope under node output details</span>
+                  <span>Outgoing edge: optional when you only want to inspect data here</span>
                 </div>
               ) : isPromptBlockDataNode ? (
                 <>
@@ -3661,8 +4211,16 @@ export function GraphInspector({
               <span className="inspector-save-hint">Save this node's configuration for reuse in the Add menu.</span>
             </div>
           ) : null}
-        </div>
-      </section>
+          </div>
+        </section>
+        {isStructuredPayloadBuilderLearnMoreOpen && isStructuredPayloadBuilderNode ? (
+          <StructuredPayloadBuilderLearnMoreModal
+            graph={graph}
+            node={selectedNode}
+            onClose={() => setIsStructuredPayloadBuilderLearnMoreOpen(false)}
+          />
+        ) : null}
+      </>
     );
   }
 

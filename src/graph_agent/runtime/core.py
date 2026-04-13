@@ -32,6 +32,22 @@ from graph_agent.runtime.agent_filesystem import (
     resolve_agent_workspace_path,
     write_agent_workspace_text_file,
 )
+from graph_agent.runtime.apollo_email_lookup import (
+    ApolloEmailLookupRequest,
+    ApolloLookupError,
+    build_apollo_email_cache_entry,
+    build_apollo_email_lookup_cache_info,
+    determine_apollo_lookup_status,
+    extract_apollo_email,
+    extract_apollo_lookup_fields,
+    fetch_apollo_person_match_live,
+    is_cacheable_apollo_response,
+    read_cached_apollo_email_lookup,
+    validate_apollo_lookup_request,
+    workspace_cache_relative_path as apollo_workspace_cache_relative_path,
+    write_apollo_email_lookup_workspace_copy,
+    write_cached_apollo_email_lookup,
+)
 from graph_agent.runtime.linkedin_profile_fetch import (
     LinkedInFetchError,
     build_linkedin_profile_cache_info,
@@ -49,6 +65,11 @@ from graph_agent.runtime.runtime_normalizer import (
     RuntimeFieldExtractorConfig,
     extract_field_candidates,
     parse_field_name_list,
+)
+from graph_agent.runtime.structured_payload_builder import (
+    StructuredPayloadBuilderConfig,
+    build_structured_payload,
+    parse_structured_payload_template,
 )
 from graph_agent.runtime.supabase_data import (
     SupabaseDataError,
@@ -94,13 +115,18 @@ PROMPT_BLOCK_ROLES = {"system", "user", "assistant"}
 DISCORD_END_PROVIDER_ID = "end.discord_message"
 DEFAULT_DISCORD_BOT_TOKEN_ENV_VAR = "{DISCORD_BOT_TOKEN}"
 OUTLOOK_DRAFT_PROVIDER_ID = "end.outlook_draft"
+END_AGENT_RUN_PROVIDER_ID = "end.agent_run"
 SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows"
 SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision"
 LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions"
 PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter"
 WRITE_TEXT_FILE_PROVIDER_ID = "core.write_text_file"
+APOLLO_EMAIL_LOOKUP_PROVIDER_ID = "core.apollo_email_lookup"
+APOLLO_EMAIL_LOOKUP_MODE = "apollo_email_lookup"
 LINKEDIN_PROFILE_FETCH_PROVIDER_ID = "core.linkedin_profile_fetch"
 LINKEDIN_PROFILE_FETCH_MODE = "linkedin_profile_fetch"
+STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID = "core.structured_payload_builder"
+STRUCTURED_PAYLOAD_BUILDER_MODE = "structured_payload_builder"
 RUNTIME_NORMALIZER_PROVIDER_ID = "core.runtime_normalizer"
 RUNTIME_NORMALIZER_MODE = "runtime_normalizer"
 SUPABASE_DATA_PROVIDER_ID = "core.supabase_data"
@@ -2174,6 +2200,232 @@ class DataNode(BaseNode):
             summary=f"{action_label} {file_record['path']} in the agent workspace.",
         )
 
+    def _apollo_email_lookup_config(self, context: NodeContext) -> dict[str, Any]:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        return {
+            "api_key_env_var": str(resolved.get("api_key_env_var", "APOLLO_API_KEY") or "APOLLO_API_KEY").strip()
+            or "APOLLO_API_KEY",
+            "name": str(resolved.get("name", "") or "").strip(),
+            "domain": str(resolved.get("domain", "") or "").strip(),
+            "organization_name": str(resolved.get("organization_name", "") or "").strip(),
+            "first_name": str(resolved.get("first_name", "") or "").strip(),
+            "last_name": str(resolved.get("last_name", "") or "").strip(),
+            "linkedin_url": str(resolved.get("linkedin_url", "") or "").strip(),
+            "email": str(resolved.get("email", "") or "").strip(),
+            "twitter_url": str(resolved.get("twitter_url", "") or "").strip(),
+            "conversation": str(resolved.get("conversation", "") or "").strip(),
+            "reveal_personal_emails": _coerce_bool(resolved.get("reveal_personal_emails"), default=False),
+            "use_cache": _coerce_bool(resolved.get("use_cache"), default=True),
+            "force_refresh": _coerce_bool(resolved.get("force_refresh"), default=False),
+            "workspace_cache_path_template": str(
+                resolved.get("workspace_cache_path_template", "cache/apollo-email/{cache_key}.json")
+                or "cache/apollo-email/{cache_key}.json"
+            ).strip()
+            or "cache/apollo-email/{cache_key}.json",
+        }
+
+    def _apollo_email_lookup_source_value(self, context: NodeContext) -> Any:
+        source_value = context.resolve_binding(None)
+        if source_value is None:
+            source_value = context.resolve_binding(self.config.get("input_binding"))
+        if isinstance(source_value, Mapping) and "payload" in source_value:
+            source_value = source_value.get("payload")
+        return source_value
+
+    def _apollo_email_lookup_request(
+        self,
+        context: NodeContext,
+        *,
+        resolved_config: Mapping[str, Any] | None = None,
+        source_value: Any = None,
+    ) -> ApolloEmailLookupRequest:
+        config = dict(resolved_config or self._apollo_email_lookup_config(context))
+        resolved_source_value = source_value if source_value is not None else self._apollo_email_lookup_source_value(context)
+        merged = extract_apollo_lookup_fields(resolved_source_value)
+        for key in (
+            "name",
+            "domain",
+            "organization_name",
+            "first_name",
+            "last_name",
+            "linkedin_url",
+            "email",
+            "twitter_url",
+        ):
+            value = str(config.get(key, "") or "").strip()
+            if value:
+                merged[key] = value
+        merged["reveal_personal_emails"] = bool(config.get("reveal_personal_emails", False))
+        return ApolloEmailLookupRequest.from_mapping(merged)
+
+    def _build_apollo_email_lookup_envelope(
+        self,
+        apollo_payload: Mapping[str, Any],
+        *,
+        cache_status: str,
+        cache_key: str,
+        lookup_status: str,
+        resolved_email: str | None,
+        workspace_relative_path: str,
+        workspace_file: Mapping[str, Any],
+        shared_cache_file: Mapping[str, Any] | None = None,
+    ) -> MessageEnvelope:
+        artifacts: dict[str, Any] = {
+            "workspace_file": dict(workspace_file),
+        }
+        if shared_cache_file is not None:
+            artifacts["shared_cache_file"] = dict(shared_cache_file)
+        return MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=dict(apollo_payload),
+            artifacts=artifacts,
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "data_mode": APOLLO_EMAIL_LOOKUP_MODE,
+                "provider_id": self.provider_id,
+                "cache_status": cache_status,
+                "cache_key": cache_key,
+                "lookup_status": lookup_status,
+                "resolved_email": resolved_email,
+                "workspace_cache_path": workspace_relative_path,
+                **({"shared_cache_path": str(shared_cache_file.get("path", ""))} if shared_cache_file is not None else {}),
+            },
+        )
+
+    def _execute_apollo_email_lookup(self, context: NodeContext) -> NodeExecutionResult:
+        resolved_config = self._apollo_email_lookup_config(context)
+        source_value = self._apollo_email_lookup_source_value(context)
+        request = self._apollo_email_lookup_request(
+            context,
+            resolved_config=resolved_config,
+            source_value=source_value,
+        )
+        request_error = validate_apollo_lookup_request(request)
+        if request_error:
+            return NodeExecutionResult(
+                status="failed",
+                error={
+                    "type": "invalid_apollo_lookup_input",
+                    "message": request_error,
+                    "lookup": request.to_lookup_fields(),
+                },
+                summary="Apollo email lookup did not receive enough identifying information.",
+            )
+
+        cache_info = build_apollo_email_lookup_cache_info(request)
+        workspace_template = resolved_config["workspace_cache_path_template"]
+        use_cache = resolved_config["use_cache"]
+        force_refresh = resolved_config["force_refresh"]
+
+        if use_cache and not force_refresh:
+            cached_entry, shared_cache_file = read_cached_apollo_email_lookup(cache_info)
+            if cached_entry is not None:
+                try:
+                    workspace_relative_path, workspace_file = write_apollo_email_lookup_workspace_copy(
+                        context.state.run_id,
+                        context.state.agent_id,
+                        workspace_template,
+                        cache_key=cache_info.cache_key,
+                        cache_entry=cached_entry,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    return NodeExecutionResult(
+                        status="failed",
+                        error={
+                            "type": "apollo_workspace_cache_write_failed",
+                            "message": str(exc),
+                            "cache_key": cache_info.cache_key,
+                        },
+                        summary="Apollo cache hit could not be mirrored into the agent workspace.",
+                    )
+                envelope = self._build_apollo_email_lookup_envelope(
+                    cached_entry["payload"],
+                    cache_status="hit",
+                    cache_key=cache_info.cache_key,
+                    lookup_status=str(cached_entry.get("lookup_status", "no_match") or "no_match"),
+                    resolved_email=str(cached_entry.get("resolved_email", "") or "") or None,
+                    workspace_relative_path=workspace_relative_path,
+                    workspace_file=workspace_file,
+                    shared_cache_file=shared_cache_file,
+                )
+                return NodeExecutionResult(
+                    status="success",
+                    output=envelope.to_dict(),
+                    summary="Loaded Apollo lookup from shared cache.",
+                    metadata=envelope.metadata,
+                )
+
+        api_key = resolve_graph_process_env(resolved_config["api_key_env_var"], context.graph_env_vars())
+        cache_status = "refresh" if force_refresh else "miss"
+        try:
+            apollo_payload = fetch_apollo_person_match_live(request=request, api_key=api_key)
+        except ApolloLookupError as exc:
+            return NodeExecutionResult(status="failed", error=exc.to_error_dict(), summary=str(exc))
+
+        lookup_status = determine_apollo_lookup_status(apollo_payload)
+        resolved_email = extract_apollo_email(apollo_payload)
+        cache_entry = build_apollo_email_cache_entry(request, apollo_payload)
+
+        try:
+            workspace_relative_path, workspace_file = write_apollo_email_lookup_workspace_copy(
+                context.state.run_id,
+                context.state.agent_id,
+                workspace_template,
+                cache_key=cache_info.cache_key,
+                cache_entry=cache_entry,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return NodeExecutionResult(
+                status="failed",
+                error={
+                    "type": "apollo_workspace_cache_write_failed",
+                    "message": str(exc),
+                    "cache_key": cache_info.cache_key,
+                },
+                summary="Apollo lookup completed but the workspace mirror could not be written.",
+            )
+
+        shared_cache_file: dict[str, Any] | None = None
+        if use_cache and is_cacheable_apollo_response(apollo_payload):
+            try:
+                shared_cache_file = write_cached_apollo_email_lookup(cache_info, cache_entry)
+            except Exception as exc:  # noqa: BLE001
+                return NodeExecutionResult(
+                    status="failed",
+                    error={
+                        "type": "apollo_shared_cache_write_failed",
+                        "message": str(exc),
+                        "cache_key": cache_info.cache_key,
+                    },
+                    summary="Apollo lookup completed but the shared cache entry could not be written.",
+                )
+
+        envelope = self._build_apollo_email_lookup_envelope(
+            apollo_payload,
+            cache_status=cache_status,
+            cache_key=cache_info.cache_key,
+            lookup_status=lookup_status,
+            resolved_email=resolved_email,
+            workspace_relative_path=workspace_relative_path,
+            workspace_file=workspace_file,
+            shared_cache_file=shared_cache_file,
+        )
+        summary_prefix = "Refreshed" if cache_status == "refresh" else "Fetched"
+        summary = (
+            f"{summary_prefix} Apollo match and updated shared cache."
+            if shared_cache_file is not None
+            else f"{summary_prefix} Apollo lookup."
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary=summary,
+            metadata=envelope.metadata,
+        )
+
     def _linkedin_profile_fetch_config(self, context: NodeContext) -> dict[str, Any]:
         resolved = context.resolve_graph_env_value(dict(self.config))
         return {
@@ -2386,6 +2638,86 @@ class DataNode(BaseNode):
             status="success",
             output=envelope.to_dict(),
             summary=f"{summary_prefix} LinkedIn profile '{cache_info.normalized_url}'{summary_suffix}",
+            metadata=envelope.metadata,
+        )
+
+    def _structured_payload_builder_config(self, context: NodeContext) -> StructuredPayloadBuilderConfig:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        return StructuredPayloadBuilderConfig(
+            template_json=str(resolved.get("template_json", "{}") or "{}").strip() or "{}",
+            case_sensitive=_coerce_bool(resolved.get("case_sensitive"), default=False),
+            max_matches_per_field=_coerce_int(resolved.get("max_matches_per_field"), default=25, minimum=1),
+        )
+
+    def _structured_payload_builder_source_value(self, context: NodeContext) -> Any:
+        source_value = context.resolve_binding(None)
+        if source_value is None:
+            source_value = context.resolve_binding(self.config.get("input_binding"))
+        source_value = _parse_json_object_or_array(source_value)
+        if isinstance(source_value, Mapping) and "payload" in source_value:
+            payload = _parse_json_object_or_array(source_value.get("payload"))
+            if payload is not source_value.get("payload"):
+                source_value = {**dict(source_value), "payload": payload}
+        return source_value
+
+    def _structured_payload_builder_source_roots(self, context: NodeContext) -> tuple[Any, ...]:
+        source_value = self._structured_payload_builder_source_value(context)
+        roots: list[Any] = [source_value]
+        if _is_message_envelope_like(source_value):
+            roots.append(source_value.get("payload"))
+        return tuple(roots)
+
+    def _execute_structured_payload_builder(self, context: NodeContext) -> NodeExecutionResult:
+        resolved_config = self._structured_payload_builder_config(context)
+        source_roots = self._structured_payload_builder_source_roots(context)
+        try:
+            template = parse_structured_payload_template(resolved_config.template_json)
+        except ValueError as exc:
+            error = {
+                "type": "invalid_template_json",
+                "message": str(exc),
+            }
+            return NodeExecutionResult(status="failed", error=error, summary=error["message"])
+
+        result = build_structured_payload(
+            template,
+            source_roots,
+            case_sensitive=resolved_config.case_sensitive,
+            max_matches_per_field=resolved_config.max_matches_per_field,
+        )
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=result.payload,
+            artifacts={
+                "field_matches": list(result.field_matches),
+                "filled_paths": list(result.filled_paths),
+                "preserved_paths": list(result.preserved_paths),
+                "unresolved_paths": list(result.unresolved_paths),
+                "template": template,
+            },
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "data_mode": STRUCTURED_PAYLOAD_BUILDER_MODE,
+                "provider_id": self.provider_id,
+                "filled_field_count": len(result.filled_paths),
+                "preserved_field_count": len(result.preserved_paths),
+                "unresolved_field_count": len(result.unresolved_paths),
+                "case_sensitive": resolved_config.case_sensitive,
+                "max_matches_per_field": resolved_config.max_matches_per_field,
+            },
+        )
+        summary = (
+            f"Built structured payload with {len(result.filled_paths)} auto-filled field(s)."
+            if result.filled_paths
+            else "Built structured payload without any auto-filled fields."
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary=summary,
             metadata=envelope.metadata,
         )
 
@@ -2777,6 +3109,75 @@ class DataNode(BaseNode):
                 "append_newline": bool(self.config.get("append_newline", True)),
                 "loop_execution": is_loop_execution,
             }
+        if self.provider_id == STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID or mode == STRUCTURED_PAYLOAD_BUILDER_MODE:
+            resolved_config = self._structured_payload_builder_config(context)
+            source_roots = self._structured_payload_builder_source_roots(context)
+            preview: dict[str, Any] = {
+                "case_sensitive": resolved_config.case_sensitive,
+                "max_matches_per_field": resolved_config.max_matches_per_field,
+            }
+            try:
+                template = parse_structured_payload_template(resolved_config.template_json)
+            except ValueError as exc:
+                preview["error"] = str(exc)
+                preview["template_json"] = resolved_config.template_json
+                return preview
+            result = build_structured_payload(
+                template,
+                source_roots,
+                case_sensitive=resolved_config.case_sensitive,
+                max_matches_per_field=resolved_config.max_matches_per_field,
+            )
+            preview["template"] = template
+            preview["payload_preview"] = result.payload
+            preview["filled_paths"] = list(result.filled_paths)
+            preview["unresolved_paths"] = list(result.unresolved_paths)
+            return preview
+        if self.provider_id == APOLLO_EMAIL_LOOKUP_PROVIDER_ID or mode == APOLLO_EMAIL_LOOKUP_MODE:
+            resolved_config = self._apollo_email_lookup_config(context)
+            source_value = self._apollo_email_lookup_source_value(context)
+            request = self._apollo_email_lookup_request(
+                context,
+                resolved_config=resolved_config,
+                source_value=source_value,
+            )
+            preview: dict[str, Any] = {
+                "api_key_env_var": resolved_config["api_key_env_var"],
+                "api_key_configured": bool(
+                    resolve_graph_process_env(resolved_config["api_key_env_var"], context.graph_env_vars())
+                ),
+                "use_cache": resolved_config["use_cache"],
+                "force_refresh": resolved_config["force_refresh"],
+                "lookup": request.to_lookup_fields(),
+                "conversation": resolved_config["conversation"],
+            }
+            request_error = validate_apollo_lookup_request(request)
+            if request_error:
+                preview["error"] = request_error
+                return preview
+            cache_info = build_apollo_email_lookup_cache_info(request)
+            preview["cache_key"] = cache_info.cache_key
+            preview["shared_cache_path"] = str(cache_info.shared_cache_path)
+            cached_entry, shared_cache_file = (
+                read_cached_apollo_email_lookup(cache_info) if resolved_config["use_cache"] else (None, None)
+            )
+            preview["cache_hit"] = cached_entry is not None and not resolved_config["force_refresh"]
+            if shared_cache_file is not None:
+                preview["shared_cache_file"] = shared_cache_file
+            if isinstance(cached_entry, Mapping):
+                preview["lookup_status"] = cached_entry.get("lookup_status")
+                preview["resolved_email"] = cached_entry.get("resolved_email")
+            workspace_relative_path = apollo_workspace_cache_relative_path(
+                resolved_config["workspace_cache_path_template"],
+                cache_key=cache_info.cache_key,
+            )
+            preview["workspace_cache_path"] = workspace_relative_path
+            try:
+                workspace_absolute_path, _ = context.resolve_workspace_path(workspace_relative_path)
+                preview["workspace_cache_absolute_path"] = workspace_absolute_path
+            except Exception as exc:  # noqa: BLE001
+                preview["workspace_path_error"] = str(exc)
+            return preview
         if self.provider_id == LINKEDIN_PROFILE_FETCH_PROVIDER_ID or mode == LINKEDIN_PROFILE_FETCH_MODE:
             resolved_config = self._linkedin_profile_fetch_config(context)
             source_value = self._linkedin_profile_fetch_source_value(context)
@@ -2918,6 +3319,10 @@ class DataNode(BaseNode):
             return self._execute_spreadsheet_rows(context)
         if self.provider_id == WRITE_TEXT_FILE_PROVIDER_ID or mode == "write_text_file":
             return self._execute_write_text_file(context)
+        if self.provider_id == STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID or mode == STRUCTURED_PAYLOAD_BUILDER_MODE:
+            return self._execute_structured_payload_builder(context)
+        if self.provider_id == APOLLO_EMAIL_LOOKUP_PROVIDER_ID or mode == APOLLO_EMAIL_LOOKUP_MODE:
+            return self._execute_apollo_email_lookup(context)
         if self.provider_id == LINKEDIN_PROFILE_FETCH_PROVIDER_ID or mode == LINKEDIN_PROFILE_FETCH_MODE:
             return self._execute_linkedin_profile_fetch(context)
         if self.provider_id == RUNTIME_NORMALIZER_PROVIDER_ID or mode == RUNTIME_NORMALIZER_MODE:
@@ -4158,10 +4563,14 @@ class SpreadsheetMatrixDecisionNode(ModelNode):
         matrix: SpreadsheetMatrixParseResult,
     ) -> dict[str, str]:
         candidate = response.structured_output
-        # Claude Code providers normalize structured outputs into the
+        # Providers may normalize structured outputs into the
         # {message, need_tool, tool_calls} decision envelope. For spreadsheet
         # matrix nodes, only the wrapped message payload is relevant.
-        if isinstance(candidate, Mapping) and isinstance(candidate.get("message"), Mapping):
+        if isinstance(candidate, Mapping) and (
+            "need_tool" in candidate
+            or "tool_calls" in candidate
+            or "message" in candidate
+        ):
             candidate = candidate.get("message")
         if not isinstance(candidate, Mapping) and response.content.strip():
             try:
@@ -5554,6 +5963,37 @@ class OutputNode(BaseNode):
         return _resolve_output_payload(context, self.config.get("source_binding"))
 
 
+class EndAgentRunNode(OutputNode):
+    def __init__(
+        self,
+        node_id: str,
+        label: str,
+        provider_id: str = END_AGENT_RUN_PROVIDER_ID,
+        provider_label: str = "End Agent Run",
+        description: str = "",
+        config: Mapping[str, Any] | None = None,
+        position: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            node_id=node_id,
+            label=label,
+            provider_id=provider_id,
+            provider_label=provider_label,
+            description=description,
+            config=config,
+            position=position,
+        )
+
+    def execute(self, context: NodeContext) -> NodeExecutionResult:
+        output = _resolve_output_payload(context, self.config.get("source_binding"))
+        return NodeExecutionResult(
+            status="success",
+            output=output,
+            summary="Run termination prepared.",
+            metadata={"terminate_run": True},
+        )
+
+
 class DiscordOutputNode(OutputNode):
     def __init__(
         self,
@@ -5991,15 +6431,26 @@ class OutlookDraftOutputNode(OutputNode):
                     validation=logger_validation,
                 )
             except SupabaseDataError as exc:
-                error_payload = exc.to_error_payload()
-                error_payload["draft_id"] = draft.draft_id
-                error_payload["provider_draft_saved"] = True
-                return NodeExecutionResult(
-                    status="failed",
-                    error=error_payload,
-                    summary=str(exc),
-                    metadata={"outlook_draft_saved": True, "outbound_email_log_failed": True},
-                )
+                if exc.error_type == "missing_outbound_email_log_recipient":
+                    logged_outbound_email = {
+                        "skipped": True,
+                        "reason": "missing_recipient_email",
+                        "message": str(exc),
+                        "node_id": logger_binding.node_id,
+                        "table_name": logger_binding.table_name,
+                        "schema": logger_binding.schema,
+                    }
+                else:
+                    error_payload = exc.to_error_payload()
+                    error_payload["draft_id"] = draft.draft_id
+                    error_payload["provider_draft_saved"] = True
+                    return NodeExecutionResult(
+                        status="failed",
+                        error=error_payload,
+                        summary=str(exc),
+                        metadata={"outlook_draft_saved": True, "outbound_email_log_failed": True},
+                    )
+        summary = f"Saved Outlook draft for {', '.join(draft.to_recipients)}." if draft.to_recipients else "Saved Outlook draft."
         return NodeExecutionResult(
             status="success",
             output={
@@ -6019,10 +6470,11 @@ class OutlookDraftOutputNode(OutputNode):
                 "outbound_email_log": logged_outbound_email,
                 "source_payload": payload,
             },
-            summary=f"Saved Outlook draft for {', '.join(draft.to_recipients)}.",
+            summary=summary,
             metadata={
                 "outlook_draft_saved": True,
-                "outbound_email_logged": logged_outbound_email is not None,
+                "outbound_email_logged": bool(logged_outbound_email and not logged_outbound_email.get("skipped")),
+                "outbound_email_log_skipped": bool(logged_outbound_email and logged_outbound_email.get("skipped")),
             },
         )
 
@@ -6132,6 +6584,12 @@ def _node_from_dict(payload: Mapping[str, Any]) -> BaseNode:
     if kind == "output":
         provider_id = str(payload.get("provider_id", "core.output"))
         provider_label = str(payload.get("provider_label", "Core Output Node"))
+        if provider_id == END_AGENT_RUN_PROVIDER_ID:
+            return EndAgentRunNode(
+                provider_id=provider_id,
+                provider_label=provider_label,
+                **common,
+            )
         if provider_id == DISCORD_END_PROVIDER_ID:
             return DiscordOutputNode(
                 provider_id=provider_id,
@@ -6711,9 +7169,7 @@ class GraphDefinition:
                         )
                     source_node_id = str(raw_binding.get("source_node_id") or raw_binding.get("source") or "").strip()
                     if source_node_id and source_node_id not in incoming_source_ids:
-                        raise GraphValidationError(
-                            f"Context builder '{node.id}' references '{source_node_id}', but it is not currently connected."
-                        )
+                        continue
                     placeholder = _slugify_context_builder_placeholder(
                         raw_binding.get("placeholder"),
                         fallback=f"source_{index + 1}",
@@ -6745,6 +7201,41 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Outlook draft node '{node.id}' can only have one outbound email logger binding."
                     )
+            if node.kind == "data" and node.provider_id == APOLLO_EMAIL_LOOKUP_PROVIDER_ID:
+                api_key_env_var = str(node.config.get("api_key_env_var", "APOLLO_API_KEY") or "").strip()
+                if not api_key_env_var:
+                    raise GraphValidationError(
+                        f"Apollo email lookup node '{node.id}' must declare api_key_env_var."
+                    )
+                workspace_template = str(
+                    node.config.get("workspace_cache_path_template", "cache/apollo-email/{cache_key}.json")
+                    or "cache/apollo-email/{cache_key}.json"
+                ).strip()
+                if not workspace_template:
+                    raise GraphValidationError(
+                        f"Apollo email lookup node '{node.id}' must declare workspace_cache_path_template."
+                    )
+                try:
+                    preview_path = apollo_workspace_cache_relative_path(workspace_template, cache_key="preview")
+                    resolve_agent_workspace_path("preview-run", "preview-agent", preview_path)
+                except Exception as exc:  # noqa: BLE001
+                    raise GraphValidationError(
+                        f"Apollo email lookup node '{node.id}' uses an invalid workspace cache path template."
+                    ) from exc
+            if node.kind == "data" and node.provider_id == STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID:
+                try:
+                    parse_structured_payload_template(node.config.get("template_json", "{}"))
+                except ValueError as exc:
+                    raise GraphValidationError(
+                        f"Structured payload builder node '{node.id}' has invalid template_json."
+                    ) from exc
+                try:
+                    if int(node.config.get("max_matches_per_field", 25)) < 1:
+                        raise ValueError("max_matches_per_field")
+                except (TypeError, ValueError) as exc:
+                    raise GraphValidationError(
+                        f"Structured payload builder node '{node.id}' must declare a positive max_matches_per_field value."
+                    ) from exc
             if node.kind == "data" and node.provider_id == LINKEDIN_PROFILE_FETCH_PROVIDER_ID:
                 url_field = str(node.config.get("url_field", "url") or "").strip()
                 if not url_field:

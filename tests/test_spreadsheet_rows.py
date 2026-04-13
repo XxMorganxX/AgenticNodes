@@ -370,6 +370,110 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertIsInstance(state.final_output, str)
         self.assertIn("Portland", state.final_output)
 
+    def test_end_agent_run_node_halts_spreadsheet_iteration_immediately(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "rows.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["city", "temperature"])
+                writer.writerow(["Seattle", "58"])
+                writer.writerow(["Portland", "62"])
+
+            services = build_example_services()
+            provider = SpreadsheetEchoProvider()
+            services.model_providers["spreadsheet_echo"] = provider
+            runtime = GraphRuntime(
+                services=services,
+                max_steps=services.config["max_steps"],
+                max_visits_per_node=services.config["max_visits_per_node"],
+            )
+            graph_payload = {
+                "graph_id": "spreadsheet-row-end-agent-run-graph",
+                "name": "Spreadsheet Row End Agent Run Graph",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "sheet",
+                        "kind": "control_flow_unit",
+                        "category": "control_flow_unit",
+                        "label": "Spreadsheet Rows",
+                        "provider_id": "core.spreadsheet_rows",
+                        "provider_label": "Spreadsheet Rows",
+                        "config": {
+                            "mode": "spreadsheet_rows",
+                            "file_format": "csv",
+                            "file_path": str(csv_path),
+                            "sheet_name": "",
+                            "header_row_index": 1,
+                            "start_row_index": 2,
+                            "empty_row_policy": "skip",
+                        },
+                        "position": {"x": 100, "y": 0},
+                    },
+                    {
+                        "id": "model",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "spreadsheet_echo",
+                        "prompt_name": "spreadsheet_prompt",
+                        "config": {
+                            "provider_name": "spreadsheet_echo",
+                            "prompt_name": "spreadsheet_prompt",
+                            "system_prompt": "Process the current spreadsheet row.",
+                            "user_message_template": "{input_payload}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 220, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "End Agent Run",
+                        "provider_id": "end.agent_run",
+                        "provider_label": "End Agent Run",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "model"}},
+                        "position": {"x": 340, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "e1", "source_id": "start", "target_id": "sheet", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e2", "source_id": "sheet", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e3", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+            graph = GraphDefinition.from_dict(graph_payload)
+            graph.validate_against_services(services)
+
+            state = runtime.run(graph, {"request": "Process spreadsheet rows"}, run_id="spreadsheet-row-end-agent-run")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(len(provider.user_messages), 1)
+        self.assertIn('"city": "Seattle"', provider.user_messages[0])
+        self.assertEqual(state.visit_counts.get("model"), 1)
+        self.assertEqual(state.iterator_states["sheet"]["status"], "terminated")
+        self.assertEqual(state.iterator_states["sheet"]["current_row_index"], 1)
+        self.assertEqual(state.iterator_states["sheet"]["total_rows"], 2)
+        self.assertEqual(state.final_output, provider.user_messages[0])
+        completed_events = [event for event in state.event_history if event.event_type == "run.completed"]
+        self.assertEqual(len(completed_events), 1)
+        self.assertEqual(completed_events[0].payload.get("terminal_node_id"), "finish")
+
     def test_context_builder_renders_spreadsheet_rows_as_llm_friendly_text_sections(self) -> None:
         with TemporaryDirectory() as temp_dir:
             csv_path = Path(temp_dir) / "jobs.csv"
@@ -730,6 +834,91 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertEqual(else_branch_output["metadata"]["condition_evaluations"][0]["actual_value"], False)
         self.assertEqual(else_branch_output["metadata"]["branch_evaluations"][0]["matched"], False)
 
+    def test_logic_conditions_allows_unwired_else_fallthrough(self) -> None:
+        services = build_example_services()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "logic-conditions-unwired-else-graph",
+            "name": "Logic Conditions Unwired Else Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "branch",
+                    "kind": "control_flow_unit",
+                    "category": "control_flow_unit",
+                    "label": "Branch",
+                    "provider_id": "core.logic_conditions",
+                    "provider_label": "Logic Conditions",
+                    "config": {
+                        "mode": "logic_conditions",
+                        "clauses": [
+                            {
+                                "id": "if",
+                                "label": "If Approved",
+                                "path": "approved",
+                                "operator": "equals",
+                                "value": True,
+                                "source_contracts": ["message_envelope"],
+                                "output_handle_id": "control-flow-if",
+                            }
+                        ],
+                        "else_output_handle_id": "control-flow-else",
+                    },
+                    "position": {"x": 120, "y": 0},
+                },
+                {
+                    "id": "if_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "If Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {},
+                    "position": {"x": 260, "y": -60},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "branch", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "e2",
+                    "source_id": "branch",
+                    "source_handle_id": "control-flow-if",
+                    "target_id": "if_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                },
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(services)
+
+        else_state = runtime.run(graph, {"approved": False}, run_id="logic-conditions-unwired-else")
+
+        self.assertEqual(else_state.status, "completed")
+        self.assertIsNone(else_state.terminal_error)
+        self.assertIsNone(else_state.final_output)
+        branch_output = else_state.node_outputs["branch"]
+        self.assertEqual(branch_output["metadata"]["matched_branch_label"], "Else")
+        self.assertEqual(branch_output["metadata"]["selected_handle_id"], "control-flow-else")
+        self.assertFalse(any(transition.target_id == "if_finish" for transition in else_state.transition_history))
+
     def test_logic_conditions_support_nested_branch_groups(self) -> None:
         services = build_example_services()
         runtime = GraphRuntime(
@@ -1046,6 +1235,128 @@ class SpreadsheetRowTests(unittest.TestCase):
         else_output = else_state.node_outputs["branch"]
         self.assertEqual(else_output["metadata"]["matched_branch_label"], "Else")
         self.assertEqual(else_output["metadata"]["condition_evaluations"][0]["matched"], False)
+
+    def test_logic_conditions_no_matching_edge_error_reports_selected_handle(self) -> None:
+        services = build_example_services()
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "logic-handle-debug-graph",
+            "name": "Logic Handle Debug Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "branch",
+                    "kind": "control_flow_unit",
+                    "category": "control_flow_unit",
+                    "label": "Branch",
+                    "provider_id": "core.logic_conditions",
+                    "provider_label": "Logic Conditions",
+                    "config": {
+                        "mode": "logic_conditions",
+                        "branches": [
+                            {
+                                "id": "company-exists",
+                                "label": "Company Exists",
+                                "output_handle_id": "control-flow-company-exists",
+                                "root_group": {
+                                    "id": "company-group",
+                                    "type": "group",
+                                    "combinator": "all",
+                                    "children": [
+                                        {
+                                            "id": "company-rule",
+                                            "type": "rule",
+                                            "path": "company_exists",
+                                            "operator": "equals",
+                                            "value": True,
+                                            "source_contracts": ["message_envelope"],
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                        "else_output_handle_id": "control-flow-else",
+                    },
+                    "position": {"x": 120, "y": 0},
+                },
+                {
+                    "id": "validation_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Validation Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {},
+                    "position": {"x": 260, "y": -60},
+                },
+                {
+                    "id": "else_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Else Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {},
+                    "position": {"x": 260, "y": 60},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "branch", "label": "", "kind": "standard", "priority": 100},
+                {
+                    "id": "e2",
+                    "source_id": "branch",
+                    "source_handle_id": "control-flow-company-exists",
+                    "target_id": "validation_finish",
+                    "label": "validation only",
+                    "kind": "conditional",
+                    "priority": 100,
+                    "condition": {
+                        "id": "validation-error",
+                        "label": "Validation error",
+                        "type": "result_status_equals",
+                        "value": "validation_error",
+                    },
+                },
+                {
+                    "id": "e3",
+                    "source_id": "branch",
+                    "source_handle_id": "control-flow-else",
+                    "target_id": "else_finish",
+                    "label": "skip row",
+                    "kind": "standard",
+                    "priority": 100,
+                },
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, {"company_exists": True}, run_id="logic-handle-debug")
+
+        self.assertEqual(state.status, "failed")
+        assert state.terminal_error is not None
+        self.assertEqual(state.terminal_error["type"], "no_matching_edge")
+        self.assertEqual(state.terminal_error["selected_handle_id"], "control-flow-company-exists")
+        self.assertEqual(state.terminal_error["matched_branch_label"], "Company Exists")
+        self.assertEqual(state.terminal_error["emitted_route_handles"], ["control-flow-company-exists"])
+        self.assertIn("Selected output handle was 'control-flow-company-exists'.", state.terminal_error["message"])
+        self.assertIn("Matched branch was 'Company Exists'.", state.terminal_error["message"])
 
     def test_run_state_reducer_tracks_iterator_updates(self) -> None:
         state = build_run_state("run-iterator", "graph-1", None, execution_node_ids=["sheet"])

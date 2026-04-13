@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { fetchMicrosoftAuthStatus, verifySupabaseAuth } from "../lib/api";
 import { getGraphEnvVars, NON_PERSISTED_GRAPH_ENV_KEYS, STANDARD_GRAPH_ENV_FIELDS, sanitizeGraphEnvVars } from "../lib/graphEnv";
@@ -115,6 +115,7 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
   const [supabaseBatchVerificationError, setSupabaseBatchVerificationError] = useState<string | null>(null);
   const [microsoftAuthStatus, setMicrosoftAuthStatus] = useState<MicrosoftAuthStatus>(disconnectedMicrosoftAuthStatus());
   const [microsoftAuthError, setMicrosoftAuthError] = useState<string | null>(null);
+  const autoVerifiedGraphKeysRef = useRef<Set<string>>(new Set());
 
   const envVars = useMemo(() => getGraphEnvVars(graph), [graph]);
   const managedConnectionEnvKeys = useMemo(() => managedSupabaseEnvKeys(graph), [graph]);
@@ -180,7 +181,7 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
     };
   }, []);
 
-  async function handleVerifyAllSupabaseConnections(): Promise<void> {
+  async function handleVerifyAllSupabaseConnections(options?: { autoTriggered?: boolean }): Promise<void> {
     if (!graph || verifiableSupabaseConnections.length === 0) {
       return;
     }
@@ -229,12 +230,33 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
       if (failures.length > 0) {
         summaryParts.push(`${failures.length} failed.`);
       }
+      if (options?.autoTriggered) {
+        summaryParts.push("Auto-verified on load.");
+      }
       setSupabaseBatchVerificationSummary(summaryParts.join(" "));
       setSupabaseBatchVerificationError(failures.length > 0 ? failures.join(" ") : null);
     } finally {
       setIsVerifyingAllSupabaseConnections(false);
     }
   }
+
+  useEffect(() => {
+    if (!graph || supabaseConnections.length === 0 || isVerifyingAllSupabaseConnections) {
+      return;
+    }
+    if (verifiableSupabaseConnections.length !== supabaseConnections.length) {
+      return;
+    }
+    const autoVerifyKey = [
+      String(graph.graph_id ?? "").trim() || "__draft__",
+      ...supabaseConnections.map((connection) => connection.connection_id).sort(),
+    ].join("::");
+    if (autoVerifiedGraphKeysRef.current.has(autoVerifyKey)) {
+      return;
+    }
+    autoVerifiedGraphKeysRef.current.add(autoVerifyKey);
+    void handleVerifyAllSupabaseConnections({ autoTriggered: true });
+  }, [graph, isVerifyingAllSupabaseConnections, supabaseConnections, verifiableSupabaseConnections]);
 
   if (!graph) {
     return null;

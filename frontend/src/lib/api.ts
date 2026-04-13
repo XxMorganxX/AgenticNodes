@@ -510,6 +510,22 @@ export async function resetRuntime(): Promise<{
   };
 }
 
+export async function stopRuntime(): Promise<{
+  stopping_run_ids: string[];
+  stopping_run_count: number;
+}> {
+  const response = await fetch(`${API_BASE_URL}/api/runtime/stop`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error("Failed to stop runtime.");
+  }
+  return (await response.json()) as {
+    stopping_run_ids: string[];
+    stopping_run_count: number;
+  };
+}
+
 export async function fetchRun(runId: string): Promise<RunState> {
   const response = await fetch(`${API_BASE_URL}/api/runs/${runId}`);
   if (!response.ok) {

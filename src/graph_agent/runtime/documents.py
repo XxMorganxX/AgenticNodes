@@ -112,21 +112,27 @@ class AgentDefinition:
     env_vars: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_GRAPH_ENV_VARS))
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> AgentDefinition:
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        supabase_connections: list[SupabaseConnectionDefinition] | None = None,
+        default_supabase_connection_id: str = "",
+    ) -> AgentDefinition:
         normalized_nodes = _normalize_legacy_graph_nodes(
             [dict(node) for node in payload.get("nodes", []) if isinstance(node, Mapping)]
         )
-        graph = GraphDefinition.from_dict(
-            {
-                "graph_id": str(payload.get("agent_id", payload.get("graph_id", "agent"))),
-                "name": str(payload.get("name", payload.get("agent_id", "Agent"))),
-                "description": str(payload.get("description", "")),
-                "version": str(payload.get("version", "1.0")),
-                "start_node_id": str(payload["start_node_id"]),
-                "env_vars": payload.get("env_vars"),
-                "nodes": normalized_nodes,
-                "edges": payload.get("edges", []),
-            }
+        graph = GraphDefinition(
+            graph_id=str(payload.get("agent_id", payload.get("graph_id", "agent"))),
+            name=str(payload.get("name", payload.get("agent_id", "Agent"))),
+            description=str(payload.get("description", "")),
+            version=str(payload.get("version", "1.0")),
+            start_node_id=str(payload["start_node_id"]),
+            env_vars=payload.get("env_vars"),
+            nodes=[_node_from_dict(node) for node in normalized_nodes],
+            edges=[Edge.from_dict(edge) for edge in payload.get("edges", [])],
+            supabase_connections=list(supabase_connections or []),
+            default_supabase_connection_id=default_supabase_connection_id,
         )
         return cls.from_graph(graph, agent_id=str(payload.get("agent_id", graph.graph_id)))
 
@@ -143,7 +149,14 @@ class AgentDefinition:
             edges=[edge.to_dict() for edge in graph.edges],
         )
 
-    def to_graph(self, *, graph_id: str, shared_env_vars: Mapping[str, Any] | None = None) -> GraphDefinition:
+    def to_graph(
+        self,
+        *,
+        graph_id: str,
+        shared_env_vars: Mapping[str, Any] | None = None,
+        supabase_connections: list[SupabaseConnectionDefinition] | None = None,
+        default_supabase_connection_id: str = "",
+    ) -> GraphDefinition:
         merged_env_vars = _normalize_env_vars(shared_env_vars)
         merged_env_vars.update(_normalize_env_vars(self.env_vars))
         nodes = [_node_from_dict(node) for node in self.nodes]
@@ -157,6 +170,8 @@ class AgentDefinition:
             env_vars=merged_env_vars,
             nodes=nodes,
             edges=edges,
+            supabase_connections=list(supabase_connections or []),
+            default_supabase_connection_id=default_supabase_connection_id,
         )
 
     def validate(self, *, graph_id: str, shared_env_vars: Mapping[str, Any] | None = None) -> None:
@@ -202,8 +217,19 @@ class TestEnvironmentDefinition:
             legacy_agent_id = str(payload.get("agent_id", f"{legacy_graph.graph_id}-agent"))
             graph_type = "graph"
             agents = [AgentDefinition.from_graph(legacy_graph, agent_id=legacy_agent_id)]
+            supabase_connections = list(legacy_graph.supabase_connections)
+            default_supabase_connection_id = legacy_graph.default_supabase_connection_id
         else:
-            agents = [AgentDefinition.from_dict(agent) for agent in payload.get("agents", [])]
+            supabase_connections = _normalize_supabase_connections(payload.get("supabase_connections"))
+            default_supabase_connection_id = str(payload.get("default_supabase_connection_id", "") or "").strip()
+            agents = [
+                AgentDefinition.from_dict(
+                    agent,
+                    supabase_connections=supabase_connections,
+                    default_supabase_connection_id=default_supabase_connection_id,
+                )
+                for agent in payload.get("agents", [])
+            ]
             graph_type = str(payload.get("graph_type", "test_environment"))
         document = cls(
             graph_id=str(payload["graph_id"]),
@@ -214,8 +240,8 @@ class TestEnvironmentDefinition:
             default_input=str(payload.get("default_input", "")),
             env_vars=_normalize_env_vars(payload.get("env_vars")),
             agents=agents,
-            supabase_connections=_normalize_supabase_connections(payload.get("supabase_connections")),
-            default_supabase_connection_id=str(payload.get("default_supabase_connection_id", "") or "").strip(),
+            supabase_connections=supabase_connections,
+            default_supabase_connection_id=default_supabase_connection_id,
         )
         document.validate()
         return document
@@ -228,17 +254,22 @@ class TestEnvironmentDefinition:
             if agent.agent_id in seen_agent_ids:
                 raise GraphValidationError(f"Duplicate agent identifier '{agent.agent_id}'.")
             seen_agent_ids.add(agent.agent_id)
-            agent_graph = agent.to_graph(graph_id=self.graph_id, shared_env_vars=self.env_vars)
-            agent_graph.supabase_connections = list(self.supabase_connections)
-            agent_graph.default_supabase_connection_id = self.default_supabase_connection_id
-            agent_graph.validate()
+            agent.to_graph(
+                graph_id=self.graph_id,
+                shared_env_vars=self.env_vars,
+                supabase_connections=self.supabase_connections,
+                default_supabase_connection_id=self.default_supabase_connection_id,
+            )
 
     def validate_against_services(self, services: RuntimeServices) -> None:
         self.validate()
         for agent in self.agents:
-            agent_graph = agent.to_graph(graph_id=self.graph_id, shared_env_vars=self.env_vars)
-            agent_graph.supabase_connections = list(self.supabase_connections)
-            agent_graph.default_supabase_connection_id = self.default_supabase_connection_id
+            agent_graph = agent.to_graph(
+                graph_id=self.graph_id,
+                shared_env_vars=self.env_vars,
+                supabase_connections=self.supabase_connections,
+                default_supabase_connection_id=self.default_supabase_connection_id,
+            )
             agent_graph.validate_against_services(services)
 
     def get_agent(self, agent_id: str) -> AgentDefinition:
@@ -274,11 +305,12 @@ class TestEnvironmentDefinition:
 
     def as_graph(self, agent_id: str | None = None) -> GraphDefinition:
         selected_agent = self.get_agent(agent_id or self.default_agent_id)
-        graph = selected_agent.to_graph(graph_id=self.graph_id, shared_env_vars=self.env_vars)
-        graph.supabase_connections = list(self.supabase_connections)
-        graph.default_supabase_connection_id = self.default_supabase_connection_id
-        graph.validate()
-        return graph
+        return selected_agent.to_graph(
+            graph_id=self.graph_id,
+            shared_env_vars=self.env_vars,
+            supabase_connections=self.supabase_connections,
+            default_supabase_connection_id=self.default_supabase_connection_id,
+        )
 
 
 def load_graph_document(payload: Mapping[str, Any]) -> TestEnvironmentDefinition:

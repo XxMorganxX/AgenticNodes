@@ -649,6 +649,86 @@ class SupabaseDataNodeTests(unittest.TestCase):
         self.assertIn("internet_message_id", result.missing_required_columns)
         self.assertIn("conversation_id", result.missing_required_columns)
 
+    def test_outbound_email_log_schema_validation_accepts_postgres_type_aliases(self) -> None:
+        result = validate_outbound_email_log_schema(
+            sources=[
+                SupabaseSchemaSource(
+                    name="outbound_email_messages",
+                    source_kind="table",
+                    description="Outbound drafts",
+                    columns=[
+                        SupabaseSchemaColumn(name="provider", data_type="text", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="mailbox_account", data_type="text", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="recipient_email", data_type="text", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="subject", data_type="text", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="body_text", data_type="text", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="message_type", data_type="text", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="outreach_step", data_type="integer", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="sales_approach", data_type="text", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="provider_draft_id", data_type="text", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="provider_message_id", data_type="text", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="internet_message_id", data_type="text", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="conversation_id", data_type="text", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="drafted_at", data_type="timestamp with time zone", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="metadata", data_type="jsonb", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="raw_provider_payload", data_type="jsonb", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="source_run_id", data_type="text", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="sales_approach_version", data_type="text", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="parent_outbound_email_id", data_type="uuid", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="root_outbound_email_id", data_type="uuid", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="observed_sent_at", data_type="timestamp with time zone", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="created_at", data_type="timestamp with time zone", nullable=True, description=""),
+                    ],
+                )
+            ],
+            schema="public",
+            table_name="outbound_email_messages",
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.type_mismatches, [])
+        self.assertEqual(result.missing_required_columns, [])
+
+    def test_outbound_email_log_schema_validation_accepts_openapi_decorated_type_labels(self) -> None:
+        result = validate_outbound_email_log_schema(
+            sources=[
+                SupabaseSchemaSource(
+                    name="outbound_email_messages",
+                    source_kind="table",
+                    description="Outbound drafts",
+                    columns=[
+                        SupabaseSchemaColumn(name="provider", data_type="string (text)", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="mailbox_account", data_type="string (text)", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="recipient_email", data_type="string (text)", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="subject", data_type="string (text)", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="body_text", data_type="string (text)", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="message_type", data_type="string (text)", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="outreach_step", data_type="integer (integer)", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="sales_approach", data_type="string (text)", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="provider_draft_id", data_type="string (text)", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="provider_message_id", data_type="string (text)", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="internet_message_id", data_type="string (text)", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="conversation_id", data_type="string (text)", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="drafted_at", data_type="string (timestamp with time zone)", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="metadata", data_type="unknown (jsonb)", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="raw_provider_payload", data_type="unknown (jsonb)", nullable=False, description=""),
+                        SupabaseSchemaColumn(name="source_run_id", data_type="string (text)", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="sales_approach_version", data_type="string (text)", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="parent_outbound_email_id", data_type="string (uuid)", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="root_outbound_email_id", data_type="string (uuid)", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="observed_sent_at", data_type="string (timestamp with time zone)", nullable=True, description=""),
+                        SupabaseSchemaColumn(name="created_at", data_type="string (timestamp with time zone)", nullable=True, description=""),
+                    ],
+                )
+            ],
+            schema="public",
+            table_name="outbound_email_messages",
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.type_mismatches, [])
+        self.assertEqual(result.missing_required_columns, [])
+
     def test_supabase_connection_id_uses_named_graph_connection(self) -> None:
         with SupabaseStubServer() as base_url:
             graph = GraphDefinition.from_dict(
@@ -694,6 +774,46 @@ class SupabaseDataNodeTests(unittest.TestCase):
                     "supabase-data-missing-connection",
                     node_config={"supabase_connection_id": "missing-db"},
                 )
+            )
+
+    def test_supabase_connection_id_rejects_registry_rows_dropped_by_normalization(self) -> None:
+        with self.assertRaisesRegex(GraphValidationError, "unknown Supabase connection 'analytics-db'"):
+            GraphDefinition.from_dict(
+                supabase_graph_payload(
+                    "supabase-data-invalid-connection-row",
+                    node_config={"supabase_connection_id": "analytics-db"},
+                )
+                | {
+                    "supabase_connections": [
+                        {
+                            "connection_id": "analytics-db",
+                            "name": "",
+                            "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_URL",
+                            "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_SECRET_KEY",
+                            "project_ref_env_var": "SUPABASE_ANALYTICS_PROJECT_REF",
+                            "access_token_env_var": "SUPABASE_ANALYTICS_ACCESS_TOKEN",
+                        }
+                    ],
+                }
+            )
+
+    def test_default_supabase_connection_id_validation_rejects_stale_default(self) -> None:
+        with self.assertRaisesRegex(GraphValidationError, "Unknown default Supabase connection 'missing-db'"):
+            GraphDefinition.from_dict(
+                supabase_graph_payload("supabase-data-stale-default")
+                | {
+                    "supabase_connections": [
+                        {
+                            "connection_id": "analytics-db",
+                            "name": "Analytics DB",
+                            "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_URL",
+                            "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_SECRET_KEY",
+                            "project_ref_env_var": "SUPABASE_ANALYTICS_PROJECT_REF",
+                            "access_token_env_var": "SUPABASE_ANALYTICS_ACCESS_TOKEN",
+                        }
+                    ],
+                    "default_supabase_connection_id": "missing-db",
+                }
             )
 
     def test_supabase_secret_key_omits_authorization_header(self) -> None:

@@ -5,7 +5,7 @@ import os
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from graph_agent.providers.base import (
@@ -22,6 +22,31 @@ from graph_agent.providers.base import (
 
 def _is_mapping(value: Any) -> bool:
     return isinstance(value, Mapping)
+
+
+def _strict_json_schema(schema: Any) -> Any:
+    if isinstance(schema, Mapping):
+        normalized: dict[str, Any] = {}
+        for key, value in schema.items():
+            normalized[key] = _strict_json_schema(value)
+        type_value = normalized.get("type")
+        if type_value == "object" or (
+            isinstance(type_value, Sequence)
+            and not isinstance(type_value, (str, bytes))
+            and "object" in {str(entry).strip() for entry in type_value}
+        ) or "properties" in normalized:
+            normalized.setdefault("additionalProperties", False)
+        if isinstance(type_value, Sequence) and not isinstance(type_value, (str, bytes)):
+            union_types = [entry for entry in type_value if isinstance(entry, str) and entry.strip()]
+            if len(union_types) == 1:
+                normalized["type"] = union_types[0]
+            elif len(union_types) > 1:
+                normalized.pop("type", None)
+                normalized["anyOf"] = [{"type": union_type} for union_type in union_types]
+        return normalized
+    if isinstance(schema, Sequence) and not isinstance(schema, (str, bytes)):
+        return [_strict_json_schema(entry) for entry in schema]
+    return schema
 
 
 def _string_config(config: Mapping[str, Any], key: str, default: str) -> str:
@@ -232,6 +257,16 @@ class OpenAIChatModelProvider(VendorAPIModelProvider):
                 }
             elif request.response_mode == "tool_call":
                 payload["tool_choice"] = "required"
+        elif response_schema is not None:
+            # Ask OpenAI to enforce the JSON schema upstream for plain message responses.
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "graph_agent_response",
+                    "strict": True,
+                    "schema": _strict_json_schema(response_schema),
+                },
+            }
         return payload
 
     def _parse_response(
@@ -276,7 +311,10 @@ class OpenAIChatModelProvider(VendorAPIModelProvider):
                 arguments: Any = {}
                 raw_arguments = function_call.get("arguments", "{}")
                 if isinstance(raw_arguments, str):
-                    arguments = json.loads(raw_arguments)
+                    try:
+                        arguments = json.loads(raw_arguments)
+                    except json.JSONDecodeError:
+                        arguments = raw_arguments
                 elif _is_mapping(raw_arguments):
                     arguments = dict(raw_arguments)
                 normalized_tool_calls.append(
@@ -290,7 +328,10 @@ class OpenAIChatModelProvider(VendorAPIModelProvider):
 
         structured_output = None
         if structured_output is None and response_schema is not None and content_text.strip():
-            structured_output = json.loads(content_text)
+            try:
+                structured_output = json.loads(content_text)
+            except json.JSONDecodeError:
+                structured_output = None
         decision_output = normalize_api_decision_output(
             structured_output,
             content=content_text,
@@ -409,7 +450,10 @@ class ClaudeMessagesModelProvider(VendorAPIModelProvider):
         content_text = "\n".join(part for part in text_parts if part)
         structured_output = None
         if structured_output is None and response_schema is not None and content_text.strip():
-            structured_output = json.loads(content_text)
+            try:
+                structured_output = json.loads(content_text)
+            except json.JSONDecodeError:
+                structured_output = None
         decision_output = normalize_api_decision_output(
             structured_output,
             content=content_text,

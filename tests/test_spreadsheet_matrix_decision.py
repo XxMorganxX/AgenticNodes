@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
 
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.providers.base import ModelRequest, ModelResponse, ProviderPreflightResult
+from graph_agent.providers.vendor_api import OpenAIChatModelProvider
 from graph_agent.runtime.core import GraphDefinition
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.spreadsheets import SpreadsheetParseError, parse_spreadsheet_matrix
@@ -77,6 +78,34 @@ class WrappedMatrixDecisionProvider:
             message="Wrapped matrix decision test provider is available.",
             details={"backend_type": "test"},
         )
+
+
+class PlainTextMatrixOpenAIProvider(OpenAIChatModelProvider):
+    name = "plain_text_matrix_openai"
+
+    def _post_json(
+        self,
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        timeout_seconds: float,
+    ) -> dict[str, object]:
+        return {
+            "model": payload.get("model"),
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": "I would escalate this, but I did not return JSON.",
+                        "tool_calls": [],
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 7},
+        }
+
+    def _headers(self, provider_config=None) -> dict[str, str]:
+        return {"Authorization": "Bearer test"}
 
 
 class SpreadsheetMatrixDecisionTests(unittest.TestCase):
@@ -324,6 +353,93 @@ class SpreadsheetMatrixDecisionTests(unittest.TestCase):
         matrix_output = state.node_outputs["matrix"]
         self.assertEqual(matrix_output["metadata"]["row_label"], "High urgency")
         self.assertEqual(matrix_output["metadata"]["column_label"], "Enterprise")
+
+    def test_runtime_reports_selection_error_when_provider_returns_plain_text(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "decision-matrix.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["Audience", "SMB", "Enterprise"])
+                writer.writerow(["Low urgency", "Send help article", "Queue for success team"])
+                writer.writerow(["High urgency", "Page support", "Escalate to dedicated team"])
+
+            services = build_example_services()
+            provider = PlainTextMatrixOpenAIProvider()
+            services.model_providers[provider.name] = provider
+            runtime = GraphRuntime(
+                services=services,
+                max_steps=services.config["max_steps"],
+                max_visits_per_node=services.config["max_visits_per_node"],
+            )
+            graph = GraphDefinition.from_dict(
+                {
+                    "graph_id": "spreadsheet-matrix-plain-text-runtime-graph",
+                    "name": "Spreadsheet Matrix Plain Text Runtime Graph",
+                    "description": "",
+                    "version": "1.0",
+                    "start_node_id": "start",
+                    "nodes": [
+                        {
+                            "id": "start",
+                            "kind": "input",
+                            "category": "start",
+                            "label": "Start",
+                            "provider_id": "start.manual_run",
+                            "provider_label": "Run Button Start",
+                            "config": {"input_binding": {"type": "input_payload"}},
+                            "position": {"x": 0, "y": 0},
+                        },
+                        {
+                            "id": "matrix",
+                            "kind": "model",
+                            "category": "api",
+                            "label": "Matrix Decision",
+                            "provider_id": "core.spreadsheet_matrix_decision",
+                            "provider_label": "Spreadsheet Matrix Decision",
+                            "model_provider_name": provider.name,
+                            "prompt_name": "spreadsheet_matrix_prompt",
+                            "config": {
+                                "provider_name": provider.name,
+                                "model": "gpt-4.1-mini",
+                                "prompt_name": "spreadsheet_matrix_prompt",
+                                "mode": "spreadsheet_matrix_decision",
+                                "system_prompt": "Use the matrix to decide the next action.",
+                                "user_message_template": "{input_payload}",
+                                "file_format": "csv",
+                                "file_path": str(csv_path),
+                                "sheet_name": "",
+                            },
+                            "position": {"x": 240, "y": 0},
+                        },
+                        {
+                            "id": "finish",
+                            "kind": "output",
+                            "category": "end",
+                            "label": "Finish",
+                            "provider_id": "core.output",
+                            "provider_label": "Core Output Node",
+                            "config": {},
+                            "position": {"x": 520, "y": 0},
+                        },
+                    ],
+                    "edges": [
+                        {"id": "e1", "source_id": "start", "target_id": "matrix", "label": "", "kind": "standard", "priority": 100},
+                        {"id": "e2", "source_id": "matrix", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                    ],
+                }
+            )
+
+            state = runtime.run(
+                graph,
+                "An enterprise customer has a high urgency issue.",
+                run_id="spreadsheet-matrix-plain-text-runtime",
+            )
+
+        self.assertEqual(state.status, "failed")
+        self.assertIsInstance(state.terminal_error, dict)
+        assert isinstance(state.terminal_error, dict)
+        self.assertEqual(state.terminal_error["type"], "spreadsheet_matrix_selection_error")
+        self.assertIn("structured JSON object response", state.terminal_error["message"])
 
 
 if __name__ == "__main__":
