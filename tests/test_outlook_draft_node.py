@@ -132,6 +132,9 @@ class _SupabaseEmailLogStubHandler(BaseHTTPRequestHandler):
     last_headers: dict[str, str] = {}
     last_path: str = ""
     last_json_body: object | None = None
+    request_bodies: list[object] = []
+    fail_source_run_id_fk_once: bool = False
+    source_run_id_fk_failures: int = 0
 
     def do_GET(self) -> None:  # noqa: N802
         type(self).last_headers = {str(key).lower(): str(value) for key, value in self.headers.items()}
@@ -204,7 +207,29 @@ class _SupabaseEmailLogStubHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0") or "0")
         raw_body = self.rfile.read(content_length).decode("utf-8")
         type(self).last_json_body = json.loads(raw_body or "{}")
+        type(self).request_bodies.append(type(self).last_json_body)
         if self.path == "/rest/v1/outbound_email_messages":
+            if (
+                type(self).fail_source_run_id_fk_once
+                and type(self).source_run_id_fk_failures == 0
+                and isinstance(type(self).last_json_body, dict)
+                and "source_run_id" in type(self).last_json_body
+            ):
+                type(self).source_run_id_fk_failures += 1
+                body = json.dumps(
+                    {
+                        "code": "23503",
+                        "details": 'Key (source_run_id)=(run-outlook-log-fk-retry) is not present in table "runs".',
+                        "hint": None,
+                        "message": 'insert or update on table "outbound_email_messages" violates foreign key constraint "outbound_email_messages_source_run_id_fkey"',
+                    }
+                ).encode("utf-8")
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             body = json.dumps(type(self).last_json_body).encode("utf-8")
             self.send_response(201)
             self.send_header("Content-Type", "application/json")
@@ -224,6 +249,9 @@ class SupabaseEmailLogStubServer:
         _SupabaseEmailLogStubHandler.last_headers = {}
         _SupabaseEmailLogStubHandler.last_path = ""
         _SupabaseEmailLogStubHandler.last_json_body = None
+        _SupabaseEmailLogStubHandler.request_bodies = []
+        _SupabaseEmailLogStubHandler.fail_source_run_id_fk_once = False
+        _SupabaseEmailLogStubHandler.source_run_id_fk_failures = 0
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _SupabaseEmailLogStubHandler)
         self._thread = Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
@@ -652,6 +680,45 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertNotIn("sales_approach", row)
         self.assertEqual(row["source_run_id"], "run-outlook-log-no-sales-approach")
         self.assertEqual(row["metadata"]["run_id"], "run-outlook-log-no-sales-approach")
+        self.assertEqual(state.final_output["outbound_email_log"]["table_name"], "outbound_email_messages")
+        self.assertTrue(state.node_outputs["draft"]["outbound_email_log"])
+
+    def test_outlook_draft_node_retries_without_source_run_id_when_run_fk_is_missing(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph = GraphDefinition.from_dict(build_outlook_draft_graph_with_logger_payload())
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        with SupabaseEmailLogStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_SUPABASE_URL": base_url,
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+            },
+            clear=False,
+        ):
+            _SupabaseEmailLogStubHandler.fail_source_run_id_fk_once = True
+            state = runtime.run(graph, "Draft this exact email body.", run_id="run-outlook-log-fk-retry")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(_SupabaseEmailLogStubHandler.source_run_id_fk_failures, 1)
+        self.assertEqual(len(_SupabaseEmailLogStubHandler.request_bodies), 2)
+        first_row = _SupabaseEmailLogStubHandler.request_bodies[0]
+        second_row = _SupabaseEmailLogStubHandler.request_bodies[1]
+        assert isinstance(first_row, dict)
+        assert isinstance(second_row, dict)
+        self.assertEqual(first_row["source_run_id"], "run-outlook-log-fk-retry")
+        self.assertNotIn("source_run_id", second_row)
+        self.assertEqual(second_row["metadata"]["run_id"], "run-outlook-log-fk-retry")
+        self.assertNotIn("source_run_id", state.final_output["outbound_email_log"]["inserted_row"])
         self.assertEqual(state.final_output["outbound_email_log"]["table_name"], "outbound_email_messages")
         self.assertTrue(state.node_outputs["draft"]["outbound_email_log"])
 

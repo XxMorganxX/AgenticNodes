@@ -1,3 +1,5 @@
+import { useEffect, useId, useRef, useState } from "react";
+
 import type { AgentRunErrorSummary } from "../lib/runVisualization";
 
 type RunErrorHoverProps = {
@@ -8,6 +10,7 @@ type RunErrorHoverProps = {
 };
 
 const MAX_VISIBLE_ERRORS = 6;
+const CLOSE_DELAY_MS = 140;
 
 function formatTooltipTitle(summaries: AgentRunErrorSummary[]): string {
   return summaries
@@ -23,6 +26,32 @@ export function RunErrorHover({
   className = "",
   emptyLabel = "0 errors",
 }: RunErrorHoverProps) {
+  const [isOpen, setIsOpen] = useState(false);
+  const closeTimeoutRef = useRef<number | null>(null);
+  const tooltipId = useId();
+
+  const clearCloseTimeout = () => {
+    if (closeTimeoutRef.current !== null) {
+      window.clearTimeout(closeTimeoutRef.current);
+      closeTimeoutRef.current = null;
+    }
+  };
+
+  const openTooltip = () => {
+    clearCloseTimeout();
+    setIsOpen(true);
+  };
+
+  const scheduleTooltipClose = () => {
+    clearCloseTimeout();
+    closeTimeoutRef.current = window.setTimeout(() => {
+      setIsOpen(false);
+      closeTimeoutRef.current = null;
+    }, CLOSE_DELAY_MS);
+  };
+
+  useEffect(() => () => clearCloseTimeout(), []);
+
   if (count <= 0 || summaries.length === 0) {
     return <span className={`run-error-hover run-error-hover--empty ${className}`.trim()}>{emptyLabel}</span>;
   }
@@ -31,11 +60,25 @@ export function RunErrorHover({
   const remainingCount = Math.max(0, summaries.length - visibleSummaries.length);
 
   return (
-    <span className={`run-error-hover ${className}`.trim()} title={formatTooltipTitle(summaries)}>
-      <span className="run-error-hover-trigger">
+    <span className={`run-error-hover ${isOpen ? "is-open" : ""} ${className}`.trim()} title={formatTooltipTitle(summaries)}>
+      <span
+        className="run-error-hover-trigger"
+        aria-describedby={isOpen ? tooltipId : undefined}
+        tabIndex={0}
+        onMouseEnter={openTooltip}
+        onMouseLeave={scheduleTooltipClose}
+        onFocus={openTooltip}
+        onBlur={scheduleTooltipClose}
+      >
         {count} error{count === 1 ? "" : "s"}
       </span>
-      <span className="run-error-hover-popup" role="tooltip">
+      <span
+        id={tooltipId}
+        className="run-error-hover-popup"
+        role="tooltip"
+        onMouseEnter={openTooltip}
+        onMouseLeave={scheduleTooltipClose}
+      >
         <strong>Run Errors</strong>
         {visibleSummaries.map((summary) => (
           <span key={summary.id} className="run-error-hover-item">

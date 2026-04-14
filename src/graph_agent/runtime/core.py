@@ -77,6 +77,7 @@ from graph_agent.runtime.supabase_data import (
     fetch_supabase_schema_catalog,
     fetch_supabase_data,
     SupabaseRowWriteRequest,
+    SupabaseRowWriteResult,
     validate_outbound_email_log_schema,
     write_supabase_row,
 )
@@ -6503,16 +6504,9 @@ class OutlookDraftOutputNode(OutputNode):
         if root_outbound_email_id:
             include("root_outbound_email_id", root_outbound_email_id)
 
-        result = write_supabase_row(
-            SupabaseRowWriteRequest(
-                supabase_url=binding.supabase_url,
-                supabase_key=binding.supabase_key,
-                schema=binding.schema,
-                table_name=binding.table_name,
-                row=row,
-                write_mode="insert",
-                returning="representation",
-            )
+        result = self._write_outbound_email_log_row(
+            binding=binding,
+            row=row,
         )
         return {
             "schema": result.schema,
@@ -6521,6 +6515,56 @@ class OutlookDraftOutputNode(OutputNode):
             "inserted_row": result.inserted_row,
             "written_columns": sorted(result.inserted_row.keys()),
         }
+
+    def _write_outbound_email_log_row(
+        self,
+        *,
+        binding: OutboundEmailLoggerBinding,
+        row: Mapping[str, Any],
+    ) -> SupabaseRowWriteResult:
+        try:
+            return write_supabase_row(
+                SupabaseRowWriteRequest(
+                    supabase_url=binding.supabase_url,
+                    supabase_key=binding.supabase_key,
+                    schema=binding.schema,
+                    table_name=binding.table_name,
+                    row=dict(row),
+                    write_mode="insert",
+                    returning="representation",
+                )
+            )
+        except SupabaseDataError as exc:
+            if not self._should_retry_outbound_email_log_without_source_run_id(exc, row):
+                raise
+            fallback_row = dict(row)
+            fallback_row.pop("source_run_id", None)
+            return write_supabase_row(
+                SupabaseRowWriteRequest(
+                    supabase_url=binding.supabase_url,
+                    supabase_key=binding.supabase_key,
+                    schema=binding.schema,
+                    table_name=binding.table_name,
+                    row=fallback_row,
+                    write_mode="insert",
+                    returning="representation",
+                )
+            )
+
+    def _should_retry_outbound_email_log_without_source_run_id(
+        self,
+        error: SupabaseDataError,
+        row: Mapping[str, Any],
+    ) -> bool:
+        if "source_run_id" not in row:
+            return False
+        if error.error_type != "supabase_write_request_failed":
+            return False
+        message = str(error)
+        return (
+            ("23503" in message or "foreign key constraint" in message)
+            and "source_run_id" in message
+        )
 
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         payload = _resolve_output_payload(context, self.config.get("source_binding"))

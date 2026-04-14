@@ -1806,6 +1806,12 @@ pre {
   text-decoration: underline;
   text-decoration-style: dotted;
   text-underline-offset: 0.16rem;
+  border-radius: 0.35rem;
+  outline: none;
+}
+
+.run-error-hover-trigger:focus-visible {
+  box-shadow: 0 0 0 2px rgba(248, 113, 113, 0.3);
 }
 
 .run-error-hover-popup {
@@ -1830,9 +1836,9 @@ pre {
   z-index: 30;
 }
 
-.run-error-hover:hover .run-error-hover-popup,
-.run-error-hover:focus-within .run-error-hover-popup {
+.run-error-hover.is-open .run-error-hover-popup {
   opacity: 1;
+  pointer-events: auto;
   transform: translate(-50%, 0);
 }
 
