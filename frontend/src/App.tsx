@@ -51,6 +51,7 @@ import {
   persistedGraphEnvStorageKey,
   savePersistedGraphEnvVars,
 } from "./lib/persistedGraphEnv";
+import { getGraphEnvVars } from "./lib/graphEnv";
 import {
   clearPersistedSupabaseConnectionState,
   loadPersistedSupabaseConnectionState,
@@ -1446,7 +1447,10 @@ export default function App() {
           : null;
       const storageKey = persistedGraphEnvStorageKey(draftGraph.graph_id, selectedGraphId);
       const hydratedDraftGraph = reconcileSupabaseConnections(
-        applyPersistedSupabaseConnectionState(draftGraph, storageKey),
+        applyPersistedSupabaseConnectionState(
+          applyPersistedEnvVars(draftGraph, storageKey),
+          storageKey,
+        ),
         savedGraphFallback,
         ...graphs.filter((g) => g.graph_id !== draftGraph.graph_id),
       );
@@ -1578,6 +1582,8 @@ export default function App() {
     if (!savedGraph) {
       return;
     }
+    const storageKey = persistedGraphEnvStorageKey(savedGraph.graph_id, selectedGraphId);
+    const runGraphEnvVars = getGraphEnvVars(applyPersistedEnvVars(savedGraph, storageKey));
 
     clearRunPolling();
     sourceRef.current?.close();
@@ -1596,7 +1602,10 @@ export default function App() {
     }
 
     try {
-      const runId = await startRun(savedGraph.graph_id, input, { agent_ids: agentIdsToRun });
+      const runId = await startRun(savedGraph.graph_id, input, {
+        agent_ids: agentIdsToRun,
+        graph_env_vars: runGraphEnvVars,
+      });
       setActiveRunId(runId);
       setRunState(createPendingRunState(savedGraph, runId, input, agentIdsToRun));
       connectToRunStream(runId, savedGraph.graph_id, input);

@@ -638,9 +638,18 @@ class GraphRunManager:
         input_payload: Any,
         agent_ids: list[str] | None = None,
         documents: list[dict[str, Any]] | None = None,
+        graph_env_vars: dict[str, str] | None = None,
     ) -> str:
         self._start_heartbeat_loop()
         document = load_graph_document(self._store.get_graph(graph_id))
+        if isinstance(graph_env_vars, dict):
+            document.env_vars.update(
+                {
+                    str(key).strip(): str(value if value is not None else "")
+                    for key, value in graph_env_vars.items()
+                    if str(key).strip()
+                }
+            )
         document.validate_against_services(self._services)
         run_id = str(uuid4())
         selected_agents = self._resolve_environment_agents(document, agent_ids) if document.is_multi_agent else None

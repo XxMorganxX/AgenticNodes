@@ -1,7 +1,29 @@
 import type { AgentDefinition, GraphDefinition, GraphDocument, RunState, RuntimeEvent, TestEnvironmentDefinition } from "./types";
 
+function isDefaultEnvPlaceholder(key: string, value: string): boolean {
+  const normalizedKey = String(key ?? "").trim();
+  const normalizedValue = String(value ?? "").trim();
+  return normalizedKey.length > 0 && normalizedValue === normalizedKey;
+}
+
 function mergeEnvVars(...envGroups: Array<Record<string, string> | undefined>): Record<string, string> {
-  return Object.assign({}, ...envGroups.filter(Boolean));
+  const merged: Record<string, string> = {};
+  for (const envGroup of envGroups) {
+    if (!envGroup) {
+      continue;
+    }
+    for (const [key, rawValue] of Object.entries(envGroup)) {
+      const value = String(rawValue ?? "");
+      if (isDefaultEnvPlaceholder(key, value)) {
+        const parentValue = String(merged[key] ?? "").trim();
+        if (parentValue && !isDefaultEnvPlaceholder(key, parentValue)) {
+          continue;
+        }
+      }
+      merged[key] = value;
+    }
+  }
+  return merged;
 }
 
 export function isTestEnvironment(graph: GraphDocument | null | undefined): graph is TestEnvironmentDefinition {

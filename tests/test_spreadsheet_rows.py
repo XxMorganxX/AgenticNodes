@@ -474,7 +474,7 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertEqual(len(completed_events), 1)
         self.assertEqual(completed_events[0].payload.get("terminal_node_id"), "finish")
 
-    def test_context_builder_renders_spreadsheet_rows_as_llm_friendly_text_sections(self) -> None:
+    def test_context_builder_preserves_spreadsheet_rows_as_structured_sections(self) -> None:
         with TemporaryDirectory() as temp_dir:
             csv_path = Path(temp_dir) / "jobs.csv"
             with csv_path.open("w", encoding="utf-8", newline="") as handle:
@@ -565,12 +565,24 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertIsInstance(state.final_output, list)
         assert isinstance(state.final_output, list)
         self.assertEqual(len(state.final_output), 1)
-        self.assertEqual(state.final_output[0]["header"], "Spreadsheet Rows")
-        self.assertIn("Spreadsheet record 1", state.final_output[0]["body"])
-        self.assertIn("Company: Scale AI", state.final_output[0]["body"])
-        self.assertIn("CEO: Alexandr Wang", state.final_output[0]["body"])
-        self.assertIn("Summer_2026_Internships?: YES", state.final_output[0]["body"])
-        self.assertNotIn('"row_data"', state.final_output[0]["body"])
+        self.assertEqual(
+            state.final_output,
+            [
+                {
+                    "Spreadsheet Rows": {
+                        "row_index": 1,
+                        "row_number": 2,
+                        "sheet_name": "Sheet1",
+                        "source_file": str(csv_path),
+                        "row_data": {
+                            "Company": "Scale AI",
+                            "CEO": "Alexandr Wang",
+                            "Summer_2026_Internships?": "YES",
+                        },
+                    }
+                }
+            ],
+        )
 
     def test_failed_spreadsheet_rows_do_not_traverse_standard_edges(self) -> None:
         services = build_example_services()

@@ -333,7 +333,11 @@ def fetch_apollo_person_match_live(
 ) -> dict[str, Any]:
     resolved_api_key = _normalize_optional_text(api_key)
     if not resolved_api_key:
-        raise ApolloLookupError("apollo_api_key_missing", "Missing Apollo API key.")
+        raise ApolloLookupError(
+            "apollo_api_key_missing",
+            "Missing Apollo API key.",
+            details={"attempted_api_key": api_key},
+        )
 
     http_request = urllib.request.Request(
         f"{APOLLO_MATCH_URL}?{urllib.parse.urlencode(request.to_query_params())}",

@@ -477,6 +477,7 @@ export async function startRun(graphId: string, input: string, options?: StartRu
       input,
       agent_ids: options?.agent_ids,
       documents: options?.documents,
+      graph_env_vars: options?.graph_env_vars,
     }),
   });
 

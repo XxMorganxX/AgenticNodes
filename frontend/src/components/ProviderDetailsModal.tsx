@@ -2222,7 +2222,7 @@ export function ProviderDetailsModal({
                   <div className="tool-details-modal-help">
                     <strong>Outbound email logger notes</strong>
                     <div>Connect this node with a binding edge into an Outlook Draft End node to validate the target table and log each created draft.</div>
-                    <div>Choose the destination table from the schema browser above, then set <code>message_type</code>, <code>outreach_step</code>, and <code>sales_approach</code>.</div>
+                    <div>Choose the destination table from the schema browser above, then set <code>message_type</code> and <code>outreach_step</code>. Add <code>sales_approach</code> when you want that extra context stored.</div>
                     <div>Use <code>metadata_json</code> for any extra campaign or sequencing fields you want merged into the stored metadata object.</div>
                   </div>
                 ) : null}

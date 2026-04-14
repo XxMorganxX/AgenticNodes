@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import json
 import re
@@ -12,13 +13,30 @@ OUTLOOK_DRAFT_USER_AGENT = "graph-agent-outlook-draft/1.0"
 RECIPIENT_SPLIT_PATTERN = re.compile(r"[\n,;]+")
 
 
-def parse_outlook_recipient_addresses(value: Any, *, required: bool = True) -> list[str]:
+def _flatten_outlook_recipient_candidates(value: Any) -> list[str]:
+    if value is None:
+        return []
     if isinstance(value, str):
-        candidates = [candidate.strip() for candidate in RECIPIENT_SPLIT_PATTERN.split(value)]
-    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
-        candidates = [str(candidate).strip() for candidate in value]
-    else:
-        candidates = [str(value).strip()] if value is not None else []
+        return [candidate.strip() for candidate in RECIPIENT_SPLIT_PATTERN.split(value)]
+    if isinstance(value, Mapping):
+        email_address = value.get("emailAddress")
+        if email_address is not None:
+            return _flatten_outlook_recipient_candidates(email_address)
+        for key in ("address", "email", "recipient_email"):
+            candidate = value.get(key)
+            if candidate is not None:
+                return _flatten_outlook_recipient_candidates(candidate)
+        return []
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
+        candidates: list[str] = []
+        for candidate in value:
+            candidates.extend(_flatten_outlook_recipient_candidates(candidate))
+        return candidates
+    return [str(value).strip()]
+
+
+def parse_outlook_recipient_addresses(value: Any, *, required: bool = True) -> list[str]:
+    candidates = _flatten_outlook_recipient_candidates(value)
     recipients = [candidate for candidate in candidates if candidate]
     if not recipients:
         if not required:

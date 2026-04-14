@@ -22,15 +22,15 @@ create table if not exists public.outbound_email_messages (
   source_run_id text references public.runs(run_id) on delete set null,
 
   provider text not null default 'outlook',
-  mailbox_account text not null,
+  mailbox_account text,
 
   recipient_email text not null,
   subject text not null default '',
   body_text text not null default '',
 
-  message_type text not null check (message_type in ('initial', 'follow_up')),
+  message_type text not null default 'initial' check (message_type in ('initial', 'follow_up')),
   outreach_step integer not null default 0,
-  sales_approach text not null,
+  sales_approach text,
   sales_approach_version text,
 
   parent_outbound_email_id uuid references public.outbound_email_messages(id) on delete set null,
@@ -41,7 +41,7 @@ create table if not exists public.outbound_email_messages (
   internet_message_id text,
   conversation_id text,
 
-  drafted_at timestamptz not null,
+  drafted_at timestamptz not null default now(),
   observed_sent_at timestamptz,
 
   metadata jsonb not null default '{}'::jsonb,
@@ -83,6 +83,7 @@ create table if not exists public.inbound_email_messages (
 
 ## Agent Guidance
 
+- The bare minimum compatible logger table only needs `recipient_email`; the remaining columns can be added as optional/default-backed fields and will be populated when available.
 - Use `message_type` and `outreach_step` to distinguish initial outreach from later follow-ups.
 - Use `parent_outbound_email_id` to link a follow-up to the specific prior outreach message it extends.
 - Use `root_outbound_email_id` to group a full outreach chain when needed.

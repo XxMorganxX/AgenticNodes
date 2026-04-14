@@ -1675,7 +1675,9 @@ export function GraphInspector({
                   <div className="contract-card">
                     <strong>Draft Behavior</strong>
                     <span>The body comes from the selected Body Source and is stored as plain text in Outlook.</span>
+                    <span>Leave To blank to auto-use a payload email when the resolved data includes fields like <code>email</code>.</span>
                     <span>Use <code>{"{input_payload}"}</code>, <code>{"{message_payload}"}</code>, or <code>{"{message_json}"}</code> in the subject if you want it templated.</span>
+                    <span>The To field also supports top-level payload placeholders like <code>{"{email}"}</code>.</span>
                     <span>Authentication is handled globally through Microsoft device-code sign-in, not graph env vars.</span>
                     <span>Only the toggled fields are required before saving the draft.</span>
                   </div>
@@ -3307,25 +3309,9 @@ export function GraphInspector({
                     <span>Performs one Apollo `people/match` lookup, returns the full Apollo response payload, and reuses a shared cache across runs.</span>
                     <span>Use direct identifiers when possible to minimize credits and improve cache hit quality.</span>
                   </div>
-                  <label>
-                    Apollo API Key Env Var
-                    <input
-                      value={String(selectedNode.config.api_key_env_var ?? "APOLLO_API_KEY")}
-                      placeholder="APOLLO_API_KEY"
-                      onChange={(event) =>
-                        onGraphChange(
-                          updateNode(graph, selectedNode.id, (node) => ({
-                            ...node,
-                            config: {
-                              ...node.config,
-                              mode: "apollo_email_lookup",
-                              api_key_env_var: event.target.value,
-                            },
-                          })),
-                        )
-                      }
-                    />
-                  </label>
+                  <div className="tool-details-modal-help">
+                    Apollo credentials come from the Environment section's <code>APOLLO_API_KEY</code> field automatically.
+                  </div>
                   <label>
                     Name
                     <input

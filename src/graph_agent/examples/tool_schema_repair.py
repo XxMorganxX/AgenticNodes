@@ -501,7 +501,6 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             default_config={
                 "mode": "apollo_email_lookup",
                 "input_binding": {"type": "input_payload"},
-                "api_key_env_var": "APOLLO_API_KEY",
                 "name": "",
                 "domain": "",
                 "organization_name": "",
@@ -517,7 +516,6 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 "workspace_cache_path_template": "cache/apollo-email/{cache_key}.json",
             },
             config_fields=[
-                ProviderConfigFieldDefinition(key="api_key_env_var", label="Apollo API Key Env Var"),
                 ProviderConfigFieldDefinition(key="name", label="Name"),
                 ProviderConfigFieldDefinition(key="domain", label="Domain"),
                 ProviderConfigFieldDefinition(key="organization_name", label="Organization Name"),
@@ -801,7 +799,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 ProviderConfigFieldDefinition(
                     key="sales_approach",
                     label="Sales Approach",
-                    help_text="Supports graph env refs and runtime template variables like {run_id} and {graph_id}.",
+                    help_text="Optional. Supports graph env refs and runtime template variables like {run_id} and {graph_id}.",
                     placeholder="value-led personalization",
                 ),
                 ProviderConfigFieldDefinition(

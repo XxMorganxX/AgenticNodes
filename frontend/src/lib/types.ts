@@ -223,6 +223,7 @@ export type McpServerTestResult = {
 export type StartRunOptions = {
   agent_ids?: string[];
   documents?: RunDocument[];
+  graph_env_vars?: Record<string, string>;
 };
 
 export type ConnectionRule = {

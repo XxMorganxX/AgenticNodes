@@ -626,7 +626,6 @@ class SupabaseDataNodeTests(unittest.TestCase):
                     columns=[
                         SupabaseSchemaColumn(name="provider", data_type="string", nullable=False, description=""),
                         SupabaseSchemaColumn(name="mailbox_account", data_type="string", nullable=False, description=""),
-                        SupabaseSchemaColumn(name="recipient_email", data_type="string", nullable=False, description=""),
                         SupabaseSchemaColumn(name="subject", data_type="string", nullable=False, description=""),
                         SupabaseSchemaColumn(name="body_text", data_type="string", nullable=False, description=""),
                         SupabaseSchemaColumn(name="message_type", data_type="string", nullable=False, description=""),
@@ -646,8 +645,28 @@ class SupabaseDataNodeTests(unittest.TestCase):
 
         self.assertFalse(result.valid)
         self.assertEqual(result.table_name, "outbound_email_messages")
-        self.assertIn("internet_message_id", result.missing_required_columns)
-        self.assertIn("conversation_id", result.missing_required_columns)
+        self.assertEqual(result.missing_required_columns, ["recipient_email"])
+
+    def test_outbound_email_log_schema_validation_accepts_minimal_logger_table(self) -> None:
+        result = validate_outbound_email_log_schema(
+            sources=[
+                SupabaseSchemaSource(
+                    name="outbound_email_messages",
+                    source_kind="table",
+                    description="Outbound drafts",
+                    columns=[
+                        SupabaseSchemaColumn(name="recipient_email", data_type="text", nullable=False, description=""),
+                    ],
+                )
+            ],
+            schema="public",
+            table_name="outbound_email_messages",
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.missing_required_columns, [])
+        self.assertIn("provider", result.missing_optional_columns)
+        self.assertIn("drafted_at", result.missing_optional_columns)
 
     def test_outbound_email_log_schema_validation_accepts_postgres_type_aliases(self) -> None:
         result = validate_outbound_email_log_schema(

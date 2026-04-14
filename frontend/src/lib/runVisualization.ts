@@ -31,6 +31,7 @@ export type AgentRunMilestone = {
   id: string;
   label: string;
   eventType: string;
+  nodeTypeLabel: string | null;
   timestamp: string;
   timestampLabel: string;
   timestampDetail: string;
@@ -433,6 +434,20 @@ function buildFocusedLoopRegions(
 }
 
 function graphByAgent(environment: TestEnvironmentDefinition): Map<string, GraphDefinition> {
+  const mergeEnvVars = (parentEnvVars: Record<string, string> | undefined, childEnvVars: Record<string, string> | undefined): Record<string, string> => {
+    const merged: Record<string, string> = { ...(parentEnvVars ?? {}) };
+    for (const [key, rawValue] of Object.entries(childEnvVars ?? {})) {
+      const value = String(rawValue ?? "");
+      const normalizedKey = String(key ?? "").trim();
+      const isPlaceholder = normalizedKey.length > 0 && value.trim() === normalizedKey;
+      const parentValue = String(merged[key] ?? "").trim();
+      if (isPlaceholder && parentValue && parentValue !== normalizedKey) {
+        continue;
+      }
+      merged[key] = value;
+    }
+    return merged;
+  };
   return new Map(
     environment.agents.map((agent) => [
       agent.agent_id,
@@ -443,7 +458,7 @@ function graphByAgent(environment: TestEnvironmentDefinition): Map<string, Graph
         version: agent.version,
         graph_type: "graph",
         start_node_id: agent.start_node_id,
-        env_vars: { ...environment.env_vars, ...agent.env_vars },
+        env_vars: mergeEnvVars(environment.env_vars, agent.env_vars),
         nodes: agent.nodes,
         edges: agent.edges,
         node_providers: environment.node_providers,
@@ -542,6 +557,36 @@ function formatDeltaLabel(timestamp: string, previousTimestamp: string | null): 
 function nodeIdFromEvent(event: RuntimeEvent): string | null {
   const payloadNodeId = event.payload.node_id;
   return typeof payloadNodeId === "string" && payloadNodeId.length > 0 ? payloadNodeId : null;
+}
+
+function nodeFromEvent(event: RuntimeEvent, graph: GraphDefinition | null): GraphNode | null {
+  const nodeId = nodeIdFromEvent(event);
+  if (nodeId) {
+    return nodeById(graph, nodeId);
+  }
+  if (event.event_type === "edge.selected") {
+    const targetId = typeof event.payload.target_id === "string" && event.payload.target_id.length > 0 ? event.payload.target_id : null;
+    if (targetId) {
+      return nodeById(graph, targetId);
+    }
+    const sourceId = typeof event.payload.source_id === "string" && event.payload.source_id.length > 0 ? event.payload.source_id : null;
+    if (sourceId) {
+      return nodeById(graph, sourceId);
+    }
+  }
+  return null;
+}
+
+function milestoneNodeTypeLabel(event: RuntimeEvent, graph: GraphDefinition | null): string | null {
+  if (typeof event.payload.node_provider_label === "string" && event.payload.node_provider_label.trim().length > 0) {
+    return event.payload.node_provider_label.trim();
+  }
+  const node = nodeFromEvent(event, graph);
+  const providerLabel = typeof node?.provider_label === "string" ? node.provider_label.trim() : "";
+  if (providerLabel.length > 0) {
+    return providerLabel;
+  }
+  return null;
 }
 
 function incomingSourceNodeLabels(nodeId: string | null, graph: GraphDefinition | null, labels: Map<string, string>): string[] {
@@ -929,6 +974,7 @@ export function buildAgentRunLanes(
           id: `${agent.agent_id}-${event.timestamp}-${index}`,
           label: milestoneLabel(event, currentGraph),
           eventType: event.event_type,
+          nodeTypeLabel: milestoneNodeTypeLabel(event, currentGraph),
           timestamp: event.timestamp,
           timestampLabel: formatTimestamp(event.timestamp),
           timestampDetail: formatTimestamp(event.timestamp, true),

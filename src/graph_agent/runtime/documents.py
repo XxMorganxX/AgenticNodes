@@ -27,6 +27,24 @@ def _normalize_env_vars(payload: Mapping[str, Any] | None) -> dict[str, str]:
     return env_vars
 
 
+def _is_default_env_placeholder(key: str, value: str) -> bool:
+    normalized_key = str(key).strip()
+    normalized_value = str(value).strip()
+    return bool(normalized_key) and normalized_value == normalized_key
+
+
+def _merge_env_vars(shared_env_vars: Mapping[str, Any] | None, agent_env_vars: Mapping[str, Any] | None) -> dict[str, str]:
+    merged_env_vars = _normalize_env_vars(shared_env_vars)
+    agent_values = _normalize_env_vars(agent_env_vars)
+    for key, value in agent_values.items():
+        if _is_default_env_placeholder(key, value):
+            parent_value = str(merged_env_vars.get(key, "") or "").strip()
+            if parent_value and not _is_default_env_placeholder(key, parent_value):
+                continue
+        merged_env_vars[key] = value
+    return merged_env_vars
+
+
 def _normalize_legacy_mcp_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized_nodes = [dict(node) for node in nodes]
     node_lookup = {str(node.get("id", "")): node for node in normalized_nodes}
@@ -157,8 +175,7 @@ class AgentDefinition:
         supabase_connections: list[SupabaseConnectionDefinition] | None = None,
         default_supabase_connection_id: str = "",
     ) -> GraphDefinition:
-        merged_env_vars = _normalize_env_vars(shared_env_vars)
-        merged_env_vars.update(_normalize_env_vars(self.env_vars))
+        merged_env_vars = _merge_env_vars(shared_env_vars, self.env_vars)
         nodes = [_node_from_dict(node) for node in self.nodes]
         edges = [Edge.from_dict(edge) for edge in self.edges]
         return GraphDefinition(

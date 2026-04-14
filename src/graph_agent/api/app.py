@@ -41,6 +41,7 @@ class RunRequest(BaseModel):
     input: Any
     agent_ids: Optional[list[str]] = None
     documents: Optional[list[RunDocumentPayload]] = None
+    graph_env_vars: Optional[dict[str, str]] = None
 
 
 class ProviderPreflightRequest(BaseModel):
@@ -494,6 +495,7 @@ def start_run(graph_id: str, request: RunRequest) -> dict[str, str]:
             request.input,
             agent_ids=request.agent_ids,
             documents=[document.model_dump() for document in request.documents or []],
+            graph_env_vars=request.graph_env_vars,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Unknown graph '{graph_id}'.") from exc

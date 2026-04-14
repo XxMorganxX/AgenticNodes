@@ -182,6 +182,7 @@ class _SupabaseEmailLogStubHandler(BaseHTTPRequestHandler):
                                 "observed_sent_at": {"type": "string", "nullable": True},
                                 "metadata": {"type": "object"},
                                 "raw_provider_payload": {"type": "object"},
+                                "source_run_id": {"type": "string", "nullable": True},
                             },
                         }
                     }
@@ -458,6 +459,81 @@ class OutlookDraftNodeTests(unittest.TestCase):
             "Would love to grab 15 minutes to learn what you're hiring for.",
         )
 
+    def test_outlook_draft_node_uses_payload_email_when_to_field_is_blank(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph_payload = build_outlook_draft_graph_payload()
+        draft_node = graph_payload["nodes"][1]
+        assert isinstance(draft_node, dict)
+        draft_node["config"] = {
+            "to": "",
+            "subject": "Hello {name}",
+            "require_to": True,
+            "require_subject": True,
+            "require_body": True,
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        state = runtime.run(
+            graph,
+            {
+                "name": "Taylor",
+                "email": "taylor@example.com",
+                "body": "Checking in on next steps.",
+            },
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(fake_client.calls[0]["to_recipients"], ["taylor@example.com"])
+        self.assertEqual(fake_client.calls[0]["subject"], "Hello Taylor")
+        self.assertEqual(fake_client.calls[0]["body"], "Checking in on next steps.")
+        self.assertEqual(state.final_output["to_recipients"], ["taylor@example.com"])
+
+    def test_outlook_draft_node_templates_to_field_from_payload_email(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph_payload = build_outlook_draft_graph_payload()
+        draft_node = graph_payload["nodes"][1]
+        assert isinstance(draft_node, dict)
+        draft_node["config"] = {
+            "to": "{email}",
+            "subject": "Follow-up",
+            "require_to": True,
+            "require_subject": True,
+            "require_body": True,
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        state = runtime.run(
+            graph,
+            {
+                "email": "sam@example.com",
+                "body": "Wanted to share a quick update.",
+            },
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(fake_client.calls[0]["to_recipients"], ["sam@example.com"])
+        self.assertEqual(state.final_output["to_recipients"], ["sam@example.com"])
+
     def test_outlook_client_uses_draft_endpoint_only(self) -> None:
         with OutlookHttpStubServer() as server_url:
             client = OutlookDraftClient(api_base_url=server_url)
@@ -531,10 +607,51 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertEqual(row["internet_message_id"], "internet-message-123")
         self.assertEqual(row["conversation_id"], "conversation-123")
         self.assertEqual(row["drafted_at"], "2026-04-10T12:00:00Z")
+        self.assertEqual(row["source_run_id"], "run-outlook-log")
         self.assertEqual(row["metadata"]["campaign"], "spring-launch")
         self.assertEqual(row["metadata"]["run_id"], "run-outlook-log")
         self.assertEqual(row["metadata"]["logger_node_id"], "logger")
         self.assertEqual(row["raw_provider_payload"]["conversationId"], "conversation-123")
+        self.assertEqual(state.final_output["outbound_email_log"]["table_name"], "outbound_email_messages")
+        self.assertTrue(state.node_outputs["draft"]["outbound_email_log"])
+
+    def test_outlook_draft_node_logs_outbound_email_row_when_sales_approach_is_blank(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph_payload = build_outlook_draft_graph_with_logger_payload()
+        logger_node = graph_payload["nodes"][2]
+        assert isinstance(logger_node, dict)
+        logger_config = dict(logger_node.get("config", {}))
+        logger_config["sales_approach"] = ""
+        logger_node["config"] = logger_config
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        with SupabaseEmailLogStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_SUPABASE_URL": base_url,
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+            },
+            clear=False,
+        ):
+            state = runtime.run(graph, "Draft this exact email body.", run_id="run-outlook-log-no-sales-approach")
+
+        self.assertEqual(state.status, "completed")
+        self.assertIsInstance(_SupabaseEmailLogStubHandler.last_json_body, dict)
+        row = _SupabaseEmailLogStubHandler.last_json_body
+        assert isinstance(row, dict)
+        self.assertNotIn("sales_approach", row)
+        self.assertEqual(row["source_run_id"], "run-outlook-log-no-sales-approach")
+        self.assertEqual(row["metadata"]["run_id"], "run-outlook-log-no-sales-approach")
         self.assertEqual(state.final_output["outbound_email_log"]["table_name"], "outbound_email_messages")
         self.assertTrue(state.node_outputs["draft"]["outbound_email_log"])
 

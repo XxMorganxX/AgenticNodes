@@ -78,6 +78,16 @@ function formatStructuredValue(value: unknown): string {
   }
 }
 
+const RUN_LEVEL_NODE_TYPE_KEY = "__run_level__";
+
+function nodeTypeFilterKey(nodeTypeLabel: string | null): string {
+  return nodeTypeLabel?.trim().length ? nodeTypeLabel.trim() : RUN_LEVEL_NODE_TYPE_KEY;
+}
+
+function nodeTypeFilterLabel(nodeTypeLabel: string | null): string {
+  return nodeTypeLabel?.trim().length ? nodeTypeLabel.trim() : "Run-level";
+}
+
 export function AgentRunSwimlanes({
   lanes,
   selectedAgentId,
@@ -97,6 +107,7 @@ export function AgentRunSwimlanes({
       .map(([eventType, count]) => ({ eventType, count }));
   }, [lanes]);
   const [visibleEventTypes, setVisibleEventTypes] = useState<Record<string, boolean>>({});
+  const [visibleNodeTypesByLane, setVisibleNodeTypesByLane] = useState<Record<string, Record<string, boolean>>>({});
 
   useEffect(() => {
     setVisibleEventTypes((previous) => {
@@ -108,16 +119,36 @@ export function AgentRunSwimlanes({
     });
   }, [eventTypeSummaries]);
 
+  useEffect(() => {
+    setVisibleNodeTypesByLane((previous) =>
+      Object.fromEntries(
+        lanes.map((lane) => {
+          const lanePrevious = previous[lane.agentId] ?? {};
+          const laneNext: Record<string, boolean> = {};
+          lane.milestones.forEach((milestone) => {
+            const key = nodeTypeFilterKey(milestone.nodeTypeLabel);
+            laneNext[key] = lanePrevious[key] ?? true;
+          });
+          return [lane.agentId, laneNext];
+        }),
+      ),
+    );
+  }, [lanes]);
+
   const allEventTypesVisible =
     eventTypeSummaries.length === 0 || eventTypeSummaries.every(({ eventType }) => visibleEventTypes[eventType] !== false);
+  const isMilestoneVisible = (laneAgentId: string, eventType: string, nodeTypeLabel: string | null): boolean =>
+    visibleEventTypes[eventType] !== false &&
+    visibleNodeTypesByLane[laneAgentId]?.[nodeTypeFilterKey(nodeTypeLabel)] !== false;
   const visibleMilestoneCount = useMemo(
     () =>
       lanes.reduce(
         (total, lane) =>
-          total + lane.milestones.filter((milestone) => visibleEventTypes[milestone.eventType] !== false).length,
+          total +
+          lane.milestones.filter((milestone) => isMilestoneVisible(lane.agentId, milestone.eventType, milestone.nodeTypeLabel)).length,
         0,
       ),
-    [lanes, visibleEventTypes],
+    [lanes, visibleEventTypes, visibleNodeTypesByLane],
   );
 
   return (
@@ -187,7 +218,41 @@ export function AgentRunSwimlanes({
       ) : null}
       <div className="agent-swimlanes">
         {lanes.map((lane) => {
-          const visibleMilestones = lane.milestones.filter((milestone) => visibleEventTypes[milestone.eventType] !== false);
+          const nodeTypeSummaries = (() => {
+            const counts = new Map<string, { label: string; count: number }>();
+            lane.milestones.forEach((milestone) => {
+              const key = nodeTypeFilterKey(milestone.nodeTypeLabel);
+              const existing = counts.get(key);
+              if (existing) {
+                existing.count += 1;
+                return;
+              }
+              counts.set(key, {
+                label: nodeTypeFilterLabel(milestone.nodeTypeLabel),
+                count: 1,
+              });
+            });
+            return [...counts.entries()]
+              .sort(([leftKey, left], [rightKey, right]) => {
+                if (leftKey === RUN_LEVEL_NODE_TYPE_KEY) {
+                  return -1;
+                }
+                if (rightKey === RUN_LEVEL_NODE_TYPE_KEY) {
+                  return 1;
+                }
+                return left.label.localeCompare(right.label);
+              })
+              .map(([nodeTypeKey, summary]) => ({ nodeTypeKey, ...summary }));
+          })();
+          const allNodeTypesVisible =
+            nodeTypeSummaries.length === 0 ||
+            nodeTypeSummaries.every(({ nodeTypeKey }) => visibleNodeTypesByLane[lane.agentId]?.[nodeTypeKey] !== false);
+          const visibleNodeTypeCount = nodeTypeSummaries.filter(
+            ({ nodeTypeKey }) => visibleNodeTypesByLane[lane.agentId]?.[nodeTypeKey] !== false,
+          ).length;
+          const visibleMilestones = lane.milestones.filter((milestone) =>
+            isMilestoneVisible(lane.agentId, milestone.eventType, milestone.nodeTypeLabel),
+          );
           return (
             <section
               key={lane.agentId}
@@ -226,11 +291,63 @@ export function AgentRunSwimlanes({
                 </div>
                 <div className="agent-swimlane-current">Current: {lane.currentNodeLabel}</div>
               </div>
+              {nodeTypeSummaries.length > 0 ? (
+                <div className="agent-swimlane-filters" aria-label={`${lane.agentName} node type filters`}>
+                  <div className="agent-swimlane-filter-header">
+                    <strong>Node types</strong>
+                    <span>Show only specific node types in this lane.</span>
+                  </div>
+                  <div className="agent-swimlane-filter-actions">
+                    <button
+                      type="button"
+                      className={`agent-swimlane-filter-chip agent-swimlane-filter-chip--all ${allNodeTypesVisible ? "is-active" : ""}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setVisibleNodeTypesByLane((previous) => ({
+                          ...previous,
+                          [lane.agentId]: Object.fromEntries(nodeTypeSummaries.map(({ nodeTypeKey }) => [nodeTypeKey, true])),
+                        }));
+                      }}
+                    >
+                      Show all
+                    </button>
+                    {nodeTypeSummaries.map(({ nodeTypeKey, label, count }) => {
+                      const isVisible = visibleNodeTypesByLane[lane.agentId]?.[nodeTypeKey] !== false;
+                      return (
+                        <button
+                          key={nodeTypeKey}
+                          type="button"
+                          aria-pressed={isVisible}
+                          className={`agent-swimlane-filter-chip ${isVisible ? "is-active" : ""}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            const nextLaneState = allNodeTypesVisible
+                              ? Object.fromEntries(nodeTypeSummaries.map(({ nodeTypeKey: candidateKey }) => [candidateKey, candidateKey === nodeTypeKey]))
+                              : isVisible && visibleNodeTypeCount === 1
+                                ? Object.fromEntries(nodeTypeSummaries.map(({ nodeTypeKey: candidateKey }) => [candidateKey, true]))
+                                : {
+                                    ...(visibleNodeTypesByLane[lane.agentId] ?? {}),
+                                    [nodeTypeKey]: !isVisible,
+                                  };
+                            setVisibleNodeTypesByLane((previous) => ({
+                              ...previous,
+                              [lane.agentId]: nextLaneState,
+                            }));
+                          }}
+                        >
+                          <span>{label}</span>
+                          <strong>{count}</strong>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
               <div className="agent-swimlane-track" role="list" aria-label={`${lane.agentName} milestones`}>
                 {lane.milestones.length === 0 ? (
                   <div className="agent-swimlane-empty">No runtime milestones yet.</div>
                 ) : visibleMilestones.length === 0 ? (
-                  <div className="agent-swimlane-empty">All milestone card types are hidden by the current filters.</div>
+                  <div className="agent-swimlane-empty">All milestone cards are hidden by the current filters.</div>
                 ) : (
                   visibleMilestones.map((milestone) => (
                     <div
@@ -266,7 +383,9 @@ export function AgentRunSwimlanes({
                         <div className="agent-swimlane-milestone-header">
                           <span className="agent-swimlane-milestone-copy">
                             <strong>{milestone.label}</strong>
-                            <span>{formatEventTypeLabel(milestone.eventType)}</span>
+                            <span>
+                              {[formatEventTypeLabel(milestone.eventType), milestone.nodeTypeLabel].filter(Boolean).join(" · ")}
+                            </span>
                           </span>
                           <span className="agent-swimlane-milestone-time">
                             <strong>{milestone.timestampLabel}</strong>

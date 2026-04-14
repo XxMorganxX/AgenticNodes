@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from graph_agent.api.graph_store import GraphStore
+from graph_agent.api.manager import GraphRunManager
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.runtime.apollo_email_lookup import (
     ApolloEmailLookupRequest,
@@ -21,6 +23,45 @@ from graph_agent.runtime.apollo_email_lookup import (
 )
 from graph_agent.runtime.core import GraphDefinition
 from graph_agent.runtime.engine import GraphRuntime
+
+
+class InMemoryRunStore:
+    def __init__(self) -> None:
+        self._manifests: dict[str, dict[str, object]] = {}
+        self._events: dict[str, list[dict[str, object]]] = {}
+        self._states: dict[str, dict[str, object]] = {}
+
+    def initialize_run(self, state: dict[str, object]) -> None:
+        run_id = str(state["run_id"])
+        self._manifests[run_id] = dict(state)
+        self._states[run_id] = dict(state)
+        self._events.setdefault(run_id, [])
+
+    def append_event(self, run_id: str, event: dict[str, object]) -> None:
+        self._events.setdefault(run_id, []).append(dict(event))
+
+    def write_state(self, run_id: str, state: dict[str, object]) -> None:
+        self._states[run_id] = dict(state)
+
+    def load_manifest(self, run_id: str) -> dict[str, object] | None:
+        manifest = self._manifests.get(run_id)
+        return dict(manifest) if manifest is not None else None
+
+    def load_events(self, run_id: str) -> list[dict[str, object]]:
+        return [dict(event) for event in self._events.get(run_id, [])]
+
+    def load_state(self, run_id: str) -> dict[str, object] | None:
+        state = self._states.get(run_id)
+        return dict(state) if state is not None else None
+
+    def recover_run_state(self, run_id: str) -> dict[str, object] | None:
+        return self.load_state(run_id)
+
+    def list_runs(self, *, graph_id: str | None = None, limit: int = 50) -> list[dict[str, object]]:
+        rows = [dict(state) for state in self._states.values()]
+        if graph_id is not None:
+            rows = [row for row in rows if row.get("graph_id") == graph_id]
+        return rows[:limit]
 
 
 def apollo_graph_payload(
@@ -32,7 +73,6 @@ def apollo_graph_payload(
     resolved_node_config: dict[str, object] = {
         "mode": "apollo_email_lookup",
         "input_binding": {"type": "input_payload"},
-        "api_key_env_var": "APOLLO_API_KEY",
         "name": "",
         "domain": "",
         "organization_name": "",
@@ -141,21 +181,19 @@ class ApolloEmailLookupTests(unittest.TestCase):
             candidate for candidate in catalog["node_providers"] if candidate["provider_id"] == "core.apollo_email_lookup"
         )
         self.assertEqual(provider["default_config"]["mode"], "apollo_email_lookup")
-        self.assertEqual(provider["default_config"]["api_key_env_var"], "APOLLO_API_KEY")
+        self.assertNotIn("api_key_env_var", provider["default_config"])
         self.assertEqual(provider["default_config"]["conversation"], "")
         self.assertTrue(provider["default_config"]["use_cache"])
 
-    def test_runtime_resolves_lookup_from_payload_config_and_graph_env(self) -> None:
+    def test_runtime_uses_default_apollo_api_key_env_var_without_node_override(self) -> None:
         graph = GraphDefinition.from_dict(
             apollo_graph_payload(
                 "apollo-env-graph",
                 node_config={
-                    "api_key_env_var": "{APOLLO_KEY_ALIAS}",
                     "first_name": "Taylor",
                     "organization_name": "{COMPANY_NAME}",
                 },
                 env_vars={
-                    "APOLLO_KEY_ALIAS": "APOLLO_API_KEY",
                     "COMPANY_NAME": "Example Co",
                 },
             )
@@ -192,6 +230,117 @@ class ApolloEmailLookupTests(unittest.TestCase):
         self.assertEqual(request.last_name, "Doe")
         self.assertEqual(request.linkedin_url, "https://www.linkedin.com/in/taylor-doe/")
         self.assertEqual(request.organization_name, "Example Co")
+
+    def test_runtime_resolves_braced_apollo_api_key_reference_as_env_var_name(self) -> None:
+        graph = GraphDefinition.from_dict(
+            apollo_graph_payload(
+                "apollo-braced-env-graph",
+                node_config={
+                    "api_key_env_var": "{APOLLO_API_KEY}",
+                    "first_name": "Taylor",
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+        workspace_root = Path(tempfile.mkdtemp()) / ".graph-agent" / "runs"
+
+        with patch.dict(
+            "os.environ",
+            {"GRAPH_AGENT_WORKSPACE_DIR": str(workspace_root), "APOLLO_API_KEY": "live-key"},
+            clear=False,
+        ):
+            with patch(
+                "graph_agent.runtime.core.fetch_apollo_person_match_live",
+                return_value=sample_apollo_response("Taylor Doe", email="taylor@example.com"),
+            ) as fetch_mock:
+                state = runtime.run(
+                    graph,
+                    {
+                        "last_name": "Doe",
+                        "domain": "example.com",
+                    },
+                    run_id="run-apollo-braced-env",
+                    agent_id="agent-alpha",
+                )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(fetch_mock.call_args.kwargs["api_key"], "live-key")
+
+    def test_runtime_resolves_braced_apollo_api_key_reference_from_graph_env_literal(self) -> None:
+        graph = GraphDefinition.from_dict(
+            apollo_graph_payload(
+                "apollo-braced-literal-graph",
+                node_config={
+                    "api_key_env_var": "{APOLLO_API_KEY}",
+                    "first_name": "Taylor",
+                },
+                env_vars={
+                    "APOLLO_API_KEY": "live-key",
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+        workspace_root = Path(tempfile.mkdtemp()) / ".graph-agent" / "runs"
+
+        with patch.dict(
+            "os.environ",
+            {"GRAPH_AGENT_WORKSPACE_DIR": str(workspace_root)},
+            clear=False,
+        ):
+            with patch(
+                "graph_agent.runtime.core.fetch_apollo_person_match_live",
+                return_value=sample_apollo_response("Taylor Doe", email="taylor@example.com"),
+            ) as fetch_mock:
+                state = runtime.run(
+                    graph,
+                    {
+                        "last_name": "Doe",
+                        "domain": "example.com",
+                    },
+                    run_id="run-apollo-braced-literal",
+                    agent_id="agent-alpha",
+                )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(fetch_mock.call_args.kwargs["api_key"], "live-key")
+
+    def test_manager_start_run_uses_graph_env_vars_overlay_for_apollo_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = GraphStore(self.services, path=Path(directory) / "graphs.json")
+            graph_payload = apollo_graph_payload(
+                "apollo-manager-graph",
+                node_config={"force_refresh": True},
+                env_vars={"APOLLO_API_KEY": "APOLLO_API_KEY"},
+            )
+            store.create_graph(graph_payload)
+            manager = GraphRunManager(
+                services=self.services,
+                store=store,
+                run_store=InMemoryRunStore(),
+            )
+
+            with patch(
+                "graph_agent.runtime.core.fetch_apollo_person_match_live",
+                return_value=sample_apollo_response("Taylor Doe", email="taylor@example.com"),
+            ) as fetch_mock:
+                run_id = manager.start_run(
+                    "apollo-manager-graph",
+                    {"name": "Taylor Doe", "domain": "example.com"},
+                    graph_env_vars={"APOLLO_API_KEY": "live-key"},
+                )
+                deadline = time.time() + 5
+                snapshot: dict[str, object] | None = None
+                while time.time() < deadline:
+                    snapshot = manager.get_run(run_id)
+                    if str(snapshot.get("status", "")).strip() in {"completed", "failed", "cancelled"}:
+                        break
+                    time.sleep(0.05)
+
+        assert snapshot is not None
+        self.assertEqual(snapshot.get("status"), "completed")
+        self.assertEqual(fetch_mock.call_args.kwargs["api_key"], "live-key")
 
     def test_runtime_reuses_shared_cache_across_runs(self) -> None:
         graph = GraphDefinition.from_dict(apollo_graph_payload())
@@ -397,6 +546,34 @@ class ApolloEmailLookupTests(unittest.TestCase):
         self.assertEqual(state.terminal_error["type"], "apollo_http_error")
         shared_cache_path = workspace_root.parent / "cache" / "apollo-email" / f"{cache_info.cache_key}.json"
         self.assertFalse(shared_cache_path.exists())
+
+    def test_missing_apollo_api_key_error_includes_attempted_key_and_env_var(self) -> None:
+        graph = GraphDefinition.from_dict(
+            apollo_graph_payload(
+                "apollo-missing-key",
+                env_vars={"APOLLO_API_KEY": "APOLLO_API_KEY"},
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+        workspace_root = Path(tempfile.mkdtemp()) / ".graph-agent" / "runs"
+
+        with patch.dict(
+            "os.environ",
+            {"GRAPH_AGENT_WORKSPACE_DIR": str(workspace_root)},
+            clear=False,
+        ):
+            state = runtime.run(
+                graph,
+                {"name": "Error Person", "domain": "example.com"},
+                run_id="run-apollo-missing-key",
+                agent_id="agent-alpha",
+            )
+
+        self.assertEqual(state.status, "failed")
+        self.assertEqual(state.terminal_error["type"], "apollo_api_key_missing")
+        self.assertEqual(state.terminal_error["api_key_env_var"], "APOLLO_API_KEY")
+        self.assertEqual(state.terminal_error["attempted_api_key"], "")
 
 
 if __name__ == "__main__":

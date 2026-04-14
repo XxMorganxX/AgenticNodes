@@ -13,6 +13,7 @@ export const DEFAULT_GRAPH_ENV_VARS: Record<string, string> = {
   OPENAI_API_KEY: "OPENAI_API_KEY",
   ANTHROPIC_API_KEY: "ANTHROPIC_API_KEY",
   DISCORD_BOT_TOKEN: "DISCORD_BOT_TOKEN",
+  APOLLO_API_KEY: "APOLLO_API_KEY",
   GRAPH_AGENT_SUPABASE_URL: "",
   GRAPH_AGENT_SUPABASE_SECRET_KEY: "",
   SUPABASE_PROJECT_REF: "",
@@ -34,6 +35,12 @@ export const STANDARD_GRAPH_ENV_FIELDS: readonly StandardGraphEnvField[] = [
     key: "DISCORD_BOT_TOKEN",
     label: "Discord Bot Token Reference",
     placeholder: "DISCORD_BOT_TOKEN",
+  },
+  {
+    key: "APOLLO_API_KEY",
+    label: "Apollo API Key Reference",
+    placeholder: "APOLLO_API_KEY",
+    tooltipText: "Used automatically by Apollo Email Lookup nodes. Set this once in Environment instead of per node.",
   },
   {
     key: "GRAPH_AGENT_SUPABASE_URL",

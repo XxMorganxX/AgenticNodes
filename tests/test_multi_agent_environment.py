@@ -163,6 +163,63 @@ class MultiAgentEnvironmentTests(unittest.TestCase):
         self.assertEqual(runtime_graph.default_supabase_connection_id, "analytics-db")
         self.assertEqual(runtime_graph.supabase_connections[0].connection_id, "analytics-db")
 
+    def test_agent_placeholder_env_vars_do_not_override_real_environment_values(self) -> None:
+        payload = {
+            "graph_id": "apollo-environment",
+            "name": "Apollo Environment",
+            "graph_type": "test_environment",
+            "env_vars": {
+                "APOLLO_API_KEY": "real-apollo-secret",
+            },
+            "agents": [
+                {
+                    "agent_id": "agent-one",
+                    "name": "Agent One",
+                    "start_node_id": "start",
+                    "env_vars": {
+                        "APOLLO_API_KEY": "APOLLO_API_KEY",
+                    },
+                    "nodes": [
+                        {
+                            "id": "start",
+                            "kind": "input",
+                            "category": "start",
+                            "label": "Start",
+                            "provider_id": "start.manual_run",
+                            "provider_label": "Run Button Start",
+                            "config": {"input_binding": {"type": "input_payload"}},
+                            "position": {"x": 0, "y": 0},
+                        },
+                        {
+                            "id": "finish",
+                            "kind": "output",
+                            "category": "end",
+                            "label": "Finish",
+                            "provider_id": "core.output",
+                            "provider_label": "Core Output Node",
+                            "config": {"response_mode": "message"},
+                            "position": {"x": 200, "y": 0},
+                        },
+                    ],
+                    "edges": [
+                        {
+                            "id": "edge-start-finish",
+                            "source_id": "start",
+                            "target_id": "finish",
+                            "label": "next",
+                            "kind": "standard",
+                            "priority": 100,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        document = load_graph_document(payload)
+        runtime_graph = document.as_graph("agent-one")
+
+        self.assertEqual(runtime_graph.env_vars["APOLLO_API_KEY"], "real-apollo-secret")
+
     def test_multi_agent_document_allows_supabase_node_connection_from_document_registry(self) -> None:
         payload = {
             "graph_id": "supabase-environment-with-node",

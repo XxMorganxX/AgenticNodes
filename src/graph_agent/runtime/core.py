@@ -119,11 +119,14 @@ END_AGENT_RUN_PROVIDER_ID = "end.agent_run"
 SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows"
 SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision"
 JSON_CODE_FENCE_PATTERN = re.compile(r"^```(?:[A-Za-z0-9_-]+)?[ \t]*\n(?P<body>.*)\n```$", re.DOTALL)
+GRAPH_ENV_REFERENCE_EXACT_PATTERN = re.compile(r"^\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+ENV_VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions"
 PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter"
 WRITE_TEXT_FILE_PROVIDER_ID = "core.write_text_file"
 APOLLO_EMAIL_LOOKUP_PROVIDER_ID = "core.apollo_email_lookup"
 APOLLO_EMAIL_LOOKUP_MODE = "apollo_email_lookup"
+DEFAULT_APOLLO_API_KEY_ENV_VAR = "APOLLO_API_KEY"
 LINKEDIN_PROFILE_FETCH_PROVIDER_ID = "core.linkedin_profile_fetch"
 LINKEDIN_PROFILE_FETCH_MODE = "linkedin_profile_fetch"
 STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID = "core.structured_payload_builder"
@@ -329,8 +332,6 @@ def _spreadsheet_matrix_selection_response_schema(matrix: SpreadsheetMatrixParse
 
 
 def _render_context_builder_value(value: Any) -> Any:
-    if _is_spreadsheet_row_payload(value):
-        return _render_spreadsheet_row_text(value)
     return value
 
 
@@ -498,7 +499,7 @@ def _is_message_envelope_like(value: Any) -> bool:
     return isinstance(value, Mapping) and "schema_version" in value and "payload" in value
 
 
-def _normalize_runtime_normalizer_source(value: Any) -> Any:
+def _normalize_json_like_source_value(value: Any) -> Any:
     normalized = _parse_json_object_or_array(value)
     if not _is_message_envelope_like(normalized):
         return normalized
@@ -517,6 +518,7 @@ DEFAULT_GRAPH_ENV_VARS = {
     "OPENAI_API_KEY": "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
     "DISCORD_BOT_TOKEN": "DISCORD_BOT_TOKEN",
+    "APOLLO_API_KEY": "APOLLO_API_KEY",
 }
 DEFAULT_SUPABASE_URL_ENV_VAR = "GRAPH_AGENT_SUPABASE_URL"
 DEFAULT_SUPABASE_KEY_ENV_VAR = "GRAPH_AGENT_SUPABASE_SECRET_KEY"
@@ -644,6 +646,24 @@ def resolve_graph_env_value(value: Any, env_vars: Mapping[str, str]) -> Any:
 
 def resolve_graph_env_var_name(value: str, env_vars: Mapping[str, str]) -> str:
     return str(resolve_graph_env_value(value, env_vars)).strip()
+
+
+def resolve_graph_env_reference_name(value: Any, env_vars: Mapping[str, str], *, default: str = "") -> str:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return default
+    exact_reference = GRAPH_ENV_REFERENCE_EXACT_PATTERN.match(raw_value)
+    if exact_reference is not None:
+        reference_name = str(exact_reference.group(1) or "").strip()
+        aliased_name = str(env_vars.get(reference_name, "") or "").strip()
+        if aliased_name and ENV_VAR_NAME_PATTERN.fullmatch(aliased_name):
+            return aliased_name
+        return reference_name or default
+    if ENV_VAR_NAME_PATTERN.fullmatch(raw_value):
+        aliased_name = str(env_vars.get(raw_value, "") or "").strip()
+        if aliased_name and ENV_VAR_NAME_PATTERN.fullmatch(aliased_name):
+            return aliased_name
+    return raw_value or default
 
 
 def resolve_graph_process_env(value: str, env_vars: Mapping[str, str]) -> str:
@@ -2209,8 +2229,11 @@ class DataNode(BaseNode):
     def _apollo_email_lookup_config(self, context: NodeContext) -> dict[str, Any]:
         resolved = context.resolve_graph_env_value(dict(self.config))
         return {
-            "api_key_env_var": str(resolved.get("api_key_env_var", "APOLLO_API_KEY") or "APOLLO_API_KEY").strip()
-            or "APOLLO_API_KEY",
+            "api_key_env_var": resolve_graph_env_reference_name(
+                self.raw_config.get("api_key_env_var", DEFAULT_APOLLO_API_KEY_ENV_VAR),
+                context.graph_env_vars(),
+                default=DEFAULT_APOLLO_API_KEY_ENV_VAR,
+            ),
             "name": str(resolved.get("name", "") or "").strip(),
             "domain": str(resolved.get("domain", "") or "").strip(),
             "organization_name": str(resolved.get("organization_name", "") or "").strip(),
@@ -2369,7 +2392,11 @@ class DataNode(BaseNode):
         try:
             apollo_payload = fetch_apollo_person_match_live(request=request, api_key=api_key)
         except ApolloLookupError as exc:
-            return NodeExecutionResult(status="failed", error=exc.to_error_dict(), summary=str(exc))
+            error = exc.to_error_dict()
+            if exc.error_type == "apollo_api_key_missing":
+                error["api_key_env_var"] = resolved_config["api_key_env_var"]
+                error.setdefault("attempted_api_key", api_key)
+            return NodeExecutionResult(status="failed", error=error, summary=str(exc))
 
         lookup_status = determine_apollo_lookup_status(apollo_payload)
         resolved_email = extract_apollo_email(apollo_payload)
@@ -2740,7 +2767,7 @@ class DataNode(BaseNode):
 
     def _runtime_normalizer_source_roots(self, context: NodeContext) -> tuple[Any, ...]:
         source_value = self._runtime_normalizer_source_value(context)
-        source_value = _normalize_runtime_normalizer_source(source_value)
+        source_value = _normalize_json_like_source_value(source_value)
         roots: list[Any] = [source_value]
         if _is_message_envelope_like(source_value):
             roots.append(source_value.get("payload"))
@@ -2751,6 +2778,13 @@ class DataNode(BaseNode):
         if source_value is None:
             source_value = context.resolve_binding(self.config.get("input_binding"))
         return source_value
+
+    def _display_source_value(self, context: NodeContext) -> tuple[Any, Any]:
+        source_value = context.resolve_binding(self.config.get("input_binding"))
+        display_value = _normalize_json_like_source_value(source_value)
+        if isinstance(display_value, Mapping) and "payload" in display_value:
+            return display_value.get("payload"), display_value
+        return display_value, display_value
 
     def _execute_runtime_normalizer(self, context: NodeContext) -> NodeExecutionResult:
         resolved_config = self._runtime_normalizer_config(context)
@@ -3357,11 +3391,9 @@ class DataNode(BaseNode):
                     }
                 )
             return preview_bindings
-        source_value = context.resolve_binding(self.config.get("input_binding"))
+        source_value, display_value = self._display_source_value(context)
         if bool(self.config.get("show_input_envelope", False)):
-            return source_value
-        if isinstance(source_value, Mapping) and "payload" in source_value:
-            return source_value.get("payload")
+            return display_value
         return source_value
 
     def is_ready(self, context: NodeContext) -> bool:
@@ -3402,16 +3434,13 @@ class DataNode(BaseNode):
             )
         if self.provider_id == PROMPT_BLOCK_PROVIDER_ID or mode == PROMPT_BLOCK_MODE:
             return self._execute_prompt_block(context)
-        source_value = context.resolve_binding(self.config.get("input_binding"))
-        display_value = source_value
+        source_value, display_value = self._display_source_value(context)
         source_envelope: MessageEnvelope | None = None
         if isinstance(display_value, Mapping) and "metadata" in display_value:
             try:
                 source_envelope = MessageEnvelope.from_dict(display_value)
             except Exception:  # noqa: BLE001
                 source_envelope = None
-        if isinstance(source_value, Mapping) and "payload" in source_value:
-            source_value = source_value.get("payload")
         display_only = bool(self.config.get("show_input_envelope", False))
         if mode == "context_builder":
             return self._execute_context_builder(context)
@@ -5988,6 +6017,36 @@ def _parse_outlook_message_content(value: Any) -> tuple[str, str]:
     return subject, body
 
 
+def _outlook_template_variables(payload: Any) -> dict[str, Any]:
+    variables: dict[str, Any] = {
+        "message_payload": payload,
+        "message_json": _json_safe(payload),
+    }
+    if isinstance(payload, Mapping):
+        for key, value in payload.items():
+            normalized_key = str(key).strip()
+            if normalized_key and normalized_key not in variables:
+                variables[normalized_key] = value
+    return variables
+
+
+def _extract_outlook_recipient_value(payload: Any) -> Any | None:
+    if isinstance(payload, Mapping):
+        nested_payload = payload.get("payload")
+        nested_candidate = _extract_outlook_recipient_value(nested_payload)
+        if nested_candidate is not None:
+            return nested_candidate
+        for key in ("to_recipients", "toRecipients", "to", "email", "recipient_email"):
+            candidate = payload.get(key)
+            if candidate is not None:
+                return candidate
+        for key in ("recipient", "contact"):
+            nested_candidate = _extract_outlook_recipient_value(payload.get(key))
+            if nested_candidate is not None:
+                return nested_candidate
+    return None
+
+
 class OutputNode(BaseNode):
     kind = "output"
 
@@ -6161,9 +6220,18 @@ class OutlookDraftOutputNode(OutputNode):
     def _require_body(self) -> bool:
         return bool(self.config.get("require_body", True))
 
-    def _resolved_to_recipients(self, context: NodeContext) -> list[str]:
+    def _resolved_to_recipients(self, context: NodeContext, payload: Any) -> list[str]:
+        configured_to = str(self.config.get("to", "") or "").strip()
+        candidate_value: Any
+        if configured_to:
+            candidate_value = context.render_template(
+                configured_to,
+                _outlook_template_variables(payload),
+            ).strip()
+        else:
+            candidate_value = _extract_outlook_recipient_value(payload)
         return parse_outlook_recipient_addresses(
-            context.resolve_graph_env_value(self.config.get("to", "")),
+            candidate_value,
             required=self._require_to(),
         )
 
@@ -6173,10 +6241,7 @@ class OutlookDraftOutputNode(OutputNode):
         if subject_template:
             subject = context.render_template(
                 subject_template,
-                {
-                    "message_payload": payload,
-                    "message_json": _json_safe(payload),
-                },
+                _outlook_template_variables(payload),
             ).strip()
         else:
             subject = derived_subject
@@ -6369,12 +6434,6 @@ class OutlookDraftOutputNode(OutputNode):
             "graph_id": context.state.graph_id,
         }
         sales_approach = self._render_outbound_email_logger_value(context, binding.sales_approach_template, metadata_extra)
-        if not sales_approach:
-            raise SupabaseDataError(
-                "Outbound email logger requires a non-empty sales_approach value.",
-                error_type="missing_outbound_email_log_sales_approach",
-                details={"node_id": binding.node_id},
-            )
         if binding.message_type not in {"initial", "follow_up"}:
             raise SupabaseDataError(
                 f"Outbound email logger uses unsupported message_type '{binding.message_type}'.",
@@ -6413,18 +6472,27 @@ class OutlookDraftOutputNode(OutputNode):
             if column_name in available_columns:
                 row[column_name] = value
 
+        def include_if_present(column_name: str, value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, str) and not value.strip():
+                return
+            include(column_name, value)
+
         include("provider", "outlook")
-        include("mailbox_account", auth_status.account_username)
+        include_if_present("source_run_id", context.state.run_id)
+        include_if_present("mailbox_account", auth_status.account_username)
         include("recipient_email", primary_recipient)
         include("subject", draft.subject)
         include("body_text", draft.body)
         include("message_type", binding.message_type)
         include("outreach_step", binding.outreach_step)
-        include("sales_approach", sales_approach)
-        include("provider_draft_id", draft.draft_id or None)
-        include("provider_message_id", provider_message_id or None)
-        include("internet_message_id", internet_message_id or None)
-        include("conversation_id", conversation_id or None)
+        if sales_approach:
+            include("sales_approach", sales_approach)
+        include_if_present("provider_draft_id", draft.draft_id)
+        include_if_present("provider_message_id", provider_message_id)
+        include_if_present("internet_message_id", internet_message_id)
+        include_if_present("conversation_id", conversation_id)
         include("drafted_at", draft.created_at or utc_now_iso())
         include("metadata", metadata)
         include("raw_provider_payload", raw_provider_payload)
@@ -6456,7 +6524,7 @@ class OutlookDraftOutputNode(OutputNode):
 
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         payload = _resolve_output_payload(context, self.config.get("source_binding"))
-        recipients = self._resolved_to_recipients(context)
+        recipients = self._resolved_to_recipients(context, payload)
         subject = self._render_subject(context, payload)
         body = self._render_body(payload)
         logger_binding = self._outbound_email_logger_binding(context)
@@ -6541,7 +6609,7 @@ class OutlookDraftOutputNode(OutputNode):
         logger_binding = self._outbound_email_logger_binding(context)
         return {
             "microsoft_auth": auth_status.to_dict(),
-            "to_recipients": self._resolved_to_recipients(context),
+            "to_recipients": self._resolved_to_recipients(context, payload),
             "subject": self._render_subject(context, payload),
             "body": self._render_body(payload),
             "outbound_email_logger": {
@@ -7259,11 +7327,6 @@ class GraphDefinition:
                         f"Outlook draft node '{node.id}' can only have one outbound email logger binding."
                     )
             if node.kind == "data" and node.provider_id == APOLLO_EMAIL_LOOKUP_PROVIDER_ID:
-                api_key_env_var = str(node.config.get("api_key_env_var", "APOLLO_API_KEY") or "").strip()
-                if not api_key_env_var:
-                    raise GraphValidationError(
-                        f"Apollo email lookup node '{node.id}' must declare api_key_env_var."
-                    )
                 workspace_template = str(
                     node.config.get("workspace_cache_path_template", "cache/apollo-email/{cache_key}.json")
                     or "cache/apollo-email/{cache_key}.json"
