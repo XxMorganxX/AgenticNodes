@@ -30,6 +30,7 @@ import {
   slugifyContextBuilderPlaceholder,
   type ContextBuilderBindingRow,
 } from "../lib/contextBuilderBindings";
+import { getModelContextBuilderPromptVariables } from "../lib/contextBuilderPromptVariables";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import { insertTokenAtEnd, listPromptBlockAvailableVariables, PROMPT_BLOCK_STARTERS, renderPromptBlockPreview } from "../lib/promptBlockEditor";
 import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "../lib/spreadsheetMatrixPrompt";
@@ -758,6 +759,8 @@ export function GraphInspector({
         ? uniqueStrings(selectedNode.config.tool_target_node_ids.map((nodeId) => String(nodeId)))
         : [];
     const modelPromptBlockNodes = selectedNode.kind === "model" ? getModelPromptBlockNodes(graph, selectedNode) : [];
+    const contextBuilderPromptVariables =
+      selectedNode.kind === "model" ? getModelContextBuilderPromptVariables(graph, selectedNode) : [];
     const modelMetadataBindingKeys =
       selectedNode.kind === "model" && isRecord(selectedNode.config.metadata_bindings)
         ? uniqueStrings(Object.keys(selectedNode.config.metadata_bindings).map((key) => String(key)))
@@ -923,6 +926,7 @@ export function GraphInspector({
             "preferred_tool_name",
             "response_mode",
             "prompt_blocks",
+            ...contextBuilderPromptVariables.map((variable) => variable.token),
             ...modelPromptContextToolSummaries.map((tool) => tool.placeholderToken),
             ...modelMetadataBindingKeys,
           ]).sort()
@@ -985,6 +989,12 @@ export function GraphInspector({
               2,
             ),
             ...Object.fromEntries(modelPromptContextToolSummaries.map((tool) => [tool.placeholderToken, tool.renderedPromptText])),
+            ...Object.fromEntries(
+              contextBuilderPromptVariables.map((variable) => [
+                variable.token,
+                `[Context Builder section: ${variable.header}]`,
+              ]),
+            ),
             ...Object.fromEntries(modelMetadataBindingKeys.map((key) => [key, `[bound at runtime: ${key}]`])),
           }
         : {};
@@ -1208,6 +1218,7 @@ export function GraphInspector({
         ? renderContextBuilderPreview(contextBuilderTemplate, {
             ...Object.fromEntries(Object.entries(graph.env_vars ?? {}).map(([key, value]) => [key, String(value)])),
             current_node_id: selectedNode.id,
+            documents: stringifyPreviewValue(runState?.documents ?? []),
             graph_id: graph.graph_id,
             input_payload: "",
             run_id: runState?.run_id ?? "",
@@ -2052,6 +2063,11 @@ export function GraphInspector({
                     resolve inline at runtime.
                   </small>
                 ) : null}
+                {selectedNode.kind === "model" ? (
+                  <small>
+                    Markdown formatting is supported in prompt templates. Use <code>{"{placeholder}"}</code> tokens for runtime values.
+                  </small>
+                ) : null}
               </label>
               <label>
                 User Message Template
@@ -2067,6 +2083,62 @@ export function GraphInspector({
                     )
                   }
                 />
+                {selectedNode.kind === "model" && contextBuilderPromptVariables.length > 0 ? (
+                  <div className="context-builder-placeholder-bar">
+                    <button
+                      type="button"
+                      className="secondary-button context-builder-token-button"
+                      onClick={() =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              user_message_template: insertTokenAtEnd(displayedUserMessageTemplate, "{input_payload}"),
+                            },
+                          })),
+                        )
+                      }
+                    >
+                      {"{input_payload}"}
+                    </button>
+                    {contextBuilderPromptVariables.map((variable) => (
+                      <button
+                        key={`${variable.contextBuilderNodeId}-${variable.token}`}
+                        type="button"
+                        className="secondary-button context-builder-token-button"
+                        title={`${variable.header} from ${variable.contextBuilderLabel}`}
+                        onClick={() =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                user_message_template: insertTokenAtEnd(displayedUserMessageTemplate, `{${variable.token}}`),
+                              },
+                            })),
+                          )
+                        }
+                      >
+                        {`{${variable.token}}`}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {selectedNode.kind === "model" && contextBuilderPromptVariables.length > 0 ? (
+                  <small>
+                    Context Builder section tags:{" "}
+                    {contextBuilderPromptVariables.map((variable) => (
+                      <code key={`${variable.contextBuilderNodeId}-${variable.token}-label`}>{`{${variable.token}}`}</code>
+                    ))}{" "}
+                    resolve from the connected Context Builder input at runtime.
+                  </small>
+                ) : null}
+                {selectedNode.kind === "model" ? (
+                  <small>
+                    Markdown is preserved, including headings, bullets, and fenced code blocks.
+                  </small>
+                ) : null}
               </label>
               <label>
                 Response Mode
@@ -4205,6 +4277,19 @@ export function GraphInspector({
                         {`{${binding.placeholder}}`}
                       </button>
                     ))}
+                    <button
+                      type="button"
+                      className="secondary-button context-builder-token-button"
+                      onClick={() =>
+                        updateContextBuilderTemplate(
+                          contextBuilderTemplate.trim().length > 0
+                            ? `${contextBuilderTemplate}${contextBuilderTemplate.endsWith("\n") ? "" : "\n"}{documents}`
+                            : "{documents}",
+                        )
+                      }
+                    >
+                      {"{documents}"}
+                    </button>
                     {contextBuilderBindings.length > 0 ? (
                       <button
                         type="button"

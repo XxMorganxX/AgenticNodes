@@ -763,6 +763,11 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
             )
             for tool_call in decision_output["tool_calls"]
         ]
+        requested_model = _string_config(provider_config, "model", self.default_model)
+        reported_model_value = payload.get("model")
+        reported_model = str(reported_model_value).strip() if reported_model_value is not None else ""
+        resolved_reported_model = reported_model or None
+        resolved_vendor_model = resolved_reported_model or requested_model
 
         return ModelResponse(
             content=content_text,
@@ -770,7 +775,9 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
             tool_calls=normalized_decision_tool_calls,
             metadata={
                 "latency_ms": latency_ms,
-                "vendor_model": payload.get("model") or _string_config(provider_config, "model", self.default_model),
+                "requested_model": requested_model,
+                "reported_model": resolved_reported_model,
+                "vendor_model": resolved_vendor_model,
                 "session_id": payload.get("session_id"),
                 "total_cost_usd": payload.get("total_cost_usd"),
                 "duration_ms": payload.get("duration_ms"),

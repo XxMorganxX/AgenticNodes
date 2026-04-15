@@ -4222,6 +4222,84 @@ pre {
   gap: 0.42rem;
 }
 
+.provider-details-prompt-chunk-groups {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.provider-details-prompt-chunk-group {
+  display: grid;
+  gap: 0.42rem;
+  padding: 0.68rem 0.72rem;
+  border: 1px solid rgba(74, 78, 116, 0.72);
+  border-radius: 8px;
+  background: rgba(24, 26, 42, 0.9);
+}
+
+.provider-details-prompt-chunk-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+.provider-details-prompt-chunk-header strong {
+  color: #eff0ff;
+  font-size: 0.86rem;
+}
+
+.provider-details-prompt-chunk-header span {
+  color: #9fa3c8;
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.provider-details-placeholder-accordion {
+  border-top: 1px solid rgba(74, 78, 116, 0.62);
+  padding-top: 0.58rem;
+}
+
+.provider-details-placeholder-accordion summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  cursor: pointer;
+  color: #dfe1ef;
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  list-style: none;
+  text-transform: uppercase;
+}
+
+.provider-details-placeholder-accordion summary::-webkit-details-marker {
+  display: none;
+}
+
+.provider-details-placeholder-accordion summary::after {
+  content: "Show";
+  color: #9fa3c8;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.provider-details-placeholder-accordion[open] summary::after {
+  content: "Hide";
+}
+
+.provider-details-placeholder-accordion summary small {
+  color: #9fa3c8;
+  font-size: 0.72rem;
+  letter-spacing: 0;
+}
+
+.provider-details-placeholder-accordion .graph-env-reference-list {
+  margin-top: 0.55rem;
+}
+
 .provider-schema-boilerplate-list {
   display: grid;
   gap: 0.55rem;
@@ -4821,13 +4899,88 @@ pre {
 }
 
 .provider-details-prompt-layout {
-  grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.95fr);
+  grid-template-columns: minmax(0, 1.72fr) minmax(280px, 0.78fr);
+  gap: 1.15rem;
   align-items: start;
 }
 
 .provider-details-prompt-main {
   display: grid;
   gap: 1rem;
+  padding: 1rem;
+  border-radius: 18px;
+  border: 1px solid rgba(88, 98, 166, 0.46);
+  background:
+    linear-gradient(170deg, rgba(28, 33, 57, 0.82), rgba(15, 18, 30, 0.88)),
+    rgba(14, 17, 30, 0.9);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 10px 28px rgba(0, 0, 0, 0.2);
+}
+
+.provider-details-prompt-hero {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.provider-details-prompt-hero strong {
+  color: #f5f7ff;
+  font-size: 1.02rem;
+}
+
+.provider-details-prompt-hero span {
+  color: #aeb6df;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.provider-details-prompt-field {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.95rem;
+  border-radius: 14px;
+  border: 1px solid rgba(83, 90, 142, 0.62);
+  background: rgba(14, 16, 29, 0.82);
+}
+
+.provider-details-prompt-field--system {
+  border-color: rgba(121, 126, 206, 0.68);
+  background:
+    linear-gradient(180deg, rgba(29, 35, 62, 0.62), rgba(15, 18, 31, 0.84)),
+    rgba(14, 16, 29, 0.82);
+}
+
+.provider-details-prompt-field--user {
+  border-color: rgba(73, 146, 224, 0.46);
+  background:
+    linear-gradient(180deg, rgba(21, 39, 63, 0.55), rgba(15, 18, 31, 0.84)),
+    rgba(14, 16, 29, 0.82);
+}
+
+.provider-details-prompt-field small {
+  color: #a4aace;
+  line-height: 1.45;
+}
+
+.provider-details-prompt-textarea {
+  resize: vertical;
+  min-height: 13.5rem;
+  line-height: 1.6;
+  border-color: rgba(94, 103, 166, 0.78);
+  background: rgba(9, 11, 20, 0.95);
+}
+
+.provider-details-prompt-textarea:focus {
+  border-color: rgba(128, 147, 255, 0.95);
+  box-shadow: 0 0 0 3px rgba(116, 132, 236, 0.24);
+}
+
+.provider-details-prompt-textarea--system {
+  min-height: 20rem;
+}
+
+.provider-details-prompt-textarea--user {
+  min-height: 14.5rem;
 }
 
 .provider-details-placeholder-panel--prompt {
@@ -5050,6 +5203,11 @@ pre {
 
 .provider-details-preview-card {
   min-height: 100%;
+}
+
+.provider-details-preview-card--resolved-prompt {
+  grid-column: 1 / -1;
+  border-color: rgba(45, 212, 191, 0.32);
 }
 
 .provider-details-preview-card--prompt {
@@ -5727,6 +5885,18 @@ pre {
     grid-template-columns: 1fr;
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .provider-details-prompt-main {
+    padding: 0.8rem;
+  }
+
+  .provider-details-prompt-textarea--system {
+    min-height: 15rem;
+  }
+
+  .provider-details-prompt-textarea--user {
+    min-height: 11.5rem;
   }
 }
 

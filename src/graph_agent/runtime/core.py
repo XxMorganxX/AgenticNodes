@@ -145,6 +145,7 @@ CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body"
 CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if"
 CONTROL_FLOW_ELSE_HANDLE_ID = "control-flow-else"
 WORKSPACE_PATH_SUFFIX_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+TEMPLATE_PLACEHOLDER_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _json_safe(value: Any) -> str:
@@ -510,9 +511,27 @@ def _normalize_json_like_source_value(value: Any) -> Any:
     return {**dict(normalized), "payload": payload_value}
 
 
-class SafeFormatDict(dict[str, Any]):
-    def __missing__(self, key: str) -> str:
-        return "{" + key + "}"
+def _render_variable_template(template: str, variables: Mapping[str, Any]) -> str:
+    """Render {placeholder} tokens while keeping Markdown literal braces intact."""
+    rendered_template = str(template or "")
+    if not rendered_template:
+        return rendered_template
+
+    escaped_open = "\x00GRAPH_AGENT_ESCAPED_OPEN\x00"
+    escaped_close = "\x00GRAPH_AGENT_ESCAPED_CLOSE\x00"
+    rendered_template = rendered_template.replace("{{", escaped_open).replace("}}", escaped_close)
+
+    def _replace_placeholder(match: re.Match[str]) -> str:
+        key = str(match.group(1) or "")
+        if key not in variables:
+            return match.group(0)
+        value = variables.get(key)
+        if value is None:
+            return ""
+        return str(value)
+
+    rendered_template = TEMPLATE_PLACEHOLDER_PATTERN.sub(_replace_placeholder, rendered_template)
+    return rendered_template.replace(escaped_open, "{").replace(escaped_close, "}")
 
 
 DEFAULT_GRAPH_ENV_VARS = {
@@ -610,6 +629,32 @@ def _slugify_context_builder_placeholder(value: Any, *, fallback: str = "source"
     return normalized
 
 
+def _base_node_instance_label(node: Any) -> str:
+    explicit_label = str(getattr(node, "label", "") or "").strip()
+    if explicit_label:
+        return explicit_label
+    provider_label = str(getattr(node, "provider_label", "") or "").strip()
+    if provider_label:
+        return provider_label
+    return str(getattr(node, "id", "") or "").strip()
+
+
+def _node_instance_label_map(nodes: Sequence[Any]) -> dict[str, str]:
+    nodes_by_base_label: dict[str, list[Any]] = {}
+    for node in nodes:
+        base_label = _base_node_instance_label(node)
+        nodes_by_base_label.setdefault(base_label, []).append(node)
+
+    labels: dict[str, str] = {}
+    for base_label, matching_nodes in nodes_by_base_label.items():
+        if len(matching_nodes) <= 1:
+            labels[str(getattr(matching_nodes[0], "id", "") or "")] = base_label
+            continue
+        for index, node in enumerate(matching_nodes, start=1):
+            labels[str(getattr(node, "id", "") or "")] = f"{base_label} {index}"
+    return labels
+
+
 def _normalize_context_builder_header(value: Any, *, fallback: str = "Context") -> str:
     header = str(value or "").strip()
     if header:
@@ -633,6 +678,12 @@ def _is_context_builder_section_list(value: Any) -> bool:
             for item in value
         )
     )
+
+
+def _context_builder_section_body(section: Any) -> Any:
+    if not isinstance(section, Mapping) or len(section) != 1:
+        return None
+    return next(iter(section.values()))
 
 
 def resolve_graph_env_value(value: Any, env_vars: Mapping[str, str]) -> Any:
@@ -1331,18 +1382,17 @@ class NodeContext:
 
         return {
             **resolved_definition,
-            "description": template.format_map(
-                SafeFormatDict(
-                    self.template_variables(
-                        {
-                            "tool_name": resolved_name,
-                            "tool_user_description": user_description_text,
-                            "tool_agent_description": agent_description_text,
-                            "tool_description": agent_description_text,
-                            "tool_schema": schema_text,
-                        }
-                    )
-                )
+            "description": _render_variable_template(
+                template,
+                self.template_variables(
+                    {
+                        "tool_name": resolved_name,
+                        "tool_user_description": user_description_text,
+                        "tool_agent_description": agent_description_text,
+                        "tool_description": agent_description_text,
+                        "tool_schema": schema_text,
+                    }
+                ),
             ),
             "input_schema": resolved_schema,
         }
@@ -1497,13 +1547,69 @@ class NodeContext:
             "graph_id": self.state.graph_id,
             "current_node_id": self.state.current_node_id,
         }
+        variables.update(self.current_input_source_template_variables(input_payload))
         if extra:
             variables.update(extra)
         return {key: _json_safe(value) for key, value in variables.items()}
 
     def render_template(self, template: str, extra: Mapping[str, Any] | None = None) -> str:
         resolved_template = self.resolve_graph_env_value(template)
-        return resolved_template.format_map(SafeFormatDict(self.template_variables(extra)))
+        return _render_variable_template(resolved_template, self.template_variables(extra))
+
+    def current_input_source_template_variables(self, input_payload: Any) -> dict[str, Any]:
+        current_edge = self.current_input_edge()
+        if current_edge is None:
+            return {}
+        source_node = self.graph.nodes.get(current_edge.source_id)
+        if source_node is None:
+            return {}
+
+        labels = _node_instance_label_map(list(self.graph.nodes.values()))
+        aliases = [
+            current_edge.source_id,
+            _base_node_instance_label(source_node),
+            labels.get(source_node.id, ""),
+        ]
+        variables: dict[str, Any] = {}
+        for alias in aliases:
+            token = _slugify_context_builder_placeholder(alias, fallback=current_edge.source_id)
+            if not CONTEXT_BUILDER_IDENTIFIER_PATTERN.match(token):
+                continue
+            variables.setdefault(token, input_payload)
+        return variables
+
+    def context_builder_section_variables_for_current_input(self) -> dict[str, Any]:
+        source_value = self.resolve_binding(None)
+        if not _is_message_envelope_like(source_value):
+            return {}
+        try:
+            envelope = MessageEnvelope.from_dict(source_value)
+        except Exception:  # noqa: BLE001
+            return {}
+        if str(envelope.metadata.get("data_mode", "") or "").strip() != "context_builder":
+            return {}
+
+        raw_placeholders = envelope.metadata.get("placeholders", [])
+        if not isinstance(raw_placeholders, Sequence) or isinstance(raw_placeholders, (str, bytes, bytearray)):
+            return {}
+        placeholders = [str(placeholder).strip() for placeholder in raw_placeholders if str(placeholder).strip()]
+        if not placeholders:
+            return {}
+
+        raw_sections = envelope.metadata.get("structured_sections")
+        sections = raw_sections if _is_context_builder_section_list(raw_sections) else envelope.payload
+        if not _is_context_builder_section_list(sections):
+            return {}
+
+        variables: dict[str, Any] = {}
+        for placeholder, section in zip(placeholders, sections):
+            if not CONTEXT_BUILDER_IDENTIFIER_PATTERN.match(placeholder):
+                continue
+            body = _context_builder_section_body(section)
+            if body is None:
+                continue
+            variables.setdefault(placeholder, body)
+        return variables
 
     def bound_provider_node(self, node_id: str | None = None) -> ProviderNode | None:
         target_node_id = node_id or self.node_id
@@ -1774,6 +1880,7 @@ class DataNode(BaseNode):
     def _context_builder_bindings(self, context: NodeContext) -> list[dict[str, Any]]:
         incoming_edges = context.graph.get_incoming_edges(self.id)
         binding_source_ids = [edge.source_id for edge in incoming_edges if edge.kind == "binding"]
+        node_instance_labels = _node_instance_label_map(list(context.graph.nodes.values()))
         preferred_source_ids: list[str] = []
         current_edge = context.current_input_edge()
         if current_edge is not None:
@@ -1797,13 +1904,18 @@ class DataNode(BaseNode):
                 if not source_node_id or source_node_id not in incoming_source_set:
                     continue
                 source_node = context.graph.nodes.get(source_node_id)
+                source_label = (
+                    node_instance_labels.get(source_node_id)
+                    if source_node is not None
+                    else source_node_id
+                )
                 placeholder = _slugify_context_builder_placeholder(
                     raw_binding.get("placeholder"),
-                    fallback=(source_node.label if source_node is not None else f"source_{index + 1}"),
+                    fallback=(source_label or f"source_{index + 1}"),
                 )
                 header = _normalize_context_builder_header(
                     raw_binding.get("header"),
-                    fallback=(source_node.label if source_node is not None else f"Source {index + 1}"),
+                    fallback=(source_label or f"Source {index + 1}"),
                 )
                 binding = raw_binding.get("binding")
                 if not isinstance(binding, Mapping):
@@ -1829,14 +1941,15 @@ class DataNode(BaseNode):
                 source_node = context.graph.nodes.get(sid)
                 if source_node is None or source_node.provider_id != "core.data_display":
                     continue
+                source_label = node_instance_labels.get(sid, source_node.label)
                 placeholder = _slugify_context_builder_placeholder(
-                    source_node.label,
+                    source_label,
                     fallback=sid,
                 )
                 bindings.append(
                     {
                         "source_node_id": sid,
-                        "header": _normalize_context_builder_header(source_node.label, fallback=sid),
+                        "header": _normalize_context_builder_header(source_label, fallback=sid),
                         "placeholder": placeholder,
                         "binding": {"type": "latest_payload", "source": sid},
                     }
@@ -1846,15 +1959,20 @@ class DataNode(BaseNode):
         if not has_explicit_input_bindings:
             for index, source_node_id in enumerate(incoming_source_ids):
                 source_node = context.graph.nodes.get(source_node_id)
+                source_label = (
+                    node_instance_labels.get(source_node_id)
+                    if source_node is not None
+                    else source_node_id
+                )
                 placeholder = _slugify_context_builder_placeholder(
-                    source_node.label if source_node is not None else source_node_id,
+                    source_label,
                     fallback=f"source_{index + 1}",
                 )
                 bindings.append(
                     {
                         "source_node_id": source_node_id,
                         "header": _normalize_context_builder_header(
-                            source_node.label if source_node is not None else source_node_id,
+                            source_label,
                             fallback=f"Source {index + 1}",
                         ),
                         "placeholder": placeholder,
@@ -4162,6 +4280,8 @@ class ModelNode(BaseNode):
                 metadata[key] = context.resolve_binding(binding)
             else:
                 metadata[key] = binding
+        for key, value in context.context_builder_section_variables_for_current_input().items():
+            metadata.setdefault(key, value)
         mcp_tool_context = context.mcp_tool_context_for_model(self.id)
         if mcp_tool_context is not None and "mcp_tool_context" not in metadata:
             metadata["mcp_tool_context"] = mcp_tool_context
@@ -4488,14 +4608,28 @@ class ModelNode(BaseNode):
     def _provider_config(self, context: NodeContext, bound_provider_node: ProviderNode | None = None) -> dict[str, Any]:
         raw_provider_config = self.config.get("provider_config", {})
         provider_config = dict(raw_provider_config) if isinstance(raw_provider_config, Mapping) else {}
-        if bound_provider_node is not None:
-            for key, value in bound_provider_node.config.items():
-                if key != "provider_binding_node_id":
-                    provider_config[key] = value
         for key, value in self.config.items():
             if key not in self._RUNTIME_CONFIG_KEYS:
                 provider_config[key] = value
-        return context.resolve_graph_env_value(provider_config)
+        if bound_provider_node is not None:
+            for key, value in bound_provider_node.config.items():
+                if key != "provider_binding_node_id":
+                    # Bound provider-node configuration is authoritative when present.
+                    provider_config[key] = value
+        resolved_provider_config = context.resolve_graph_env_value(provider_config)
+        api_key_env_var = str(resolved_provider_config.get("api_key_env_var", "") or "").strip()
+        if api_key_env_var and not str(resolved_provider_config.get("api_key", "") or "").strip():
+            graph_env_vars = context.graph_env_vars()
+            graph_env_api_key = str(graph_env_vars.get(api_key_env_var, "") or "").strip()
+            if graph_env_api_key and graph_env_api_key != api_key_env_var:
+                api_key = graph_env_api_key
+            elif ENV_VAR_NAME_PATTERN.fullmatch(api_key_env_var):
+                api_key = resolve_graph_process_env(api_key_env_var, graph_env_vars)
+            else:
+                api_key = api_key_env_var
+            if api_key:
+                resolved_provider_config["api_key"] = api_key
+        return resolved_provider_config
 
 
 class SpreadsheetMatrixDecisionNode(ModelNode):

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 import sys
 from typing import Any
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -176,6 +177,99 @@ class DataDrivenGraphTests(unittest.TestCase):
         self.assertEqual(recording_provider.last_request.messages[1].content, "Input: repair the broken schema")
         self.assertEqual(recording_provider.last_request.provider_config["model"], "gpt-4.1-mini")
         self.assertEqual(recording_provider.last_request.provider_config["api_key_env_var"], "OPENAI_API_KEY")
+
+    def test_openai_provider_config_uses_graph_env_api_key_literal(self) -> None:
+        recording_provider = RecordingModelProvider()
+        self.services.model_providers["openai"] = recording_provider
+
+        payload: dict[str, Any] = {
+            "graph_id": "openai-key-env-agent",
+            "name": "OpenAI Key Env Agent",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "env_vars": {"OPENAI_API_KEY": "sk-graph-env-key"},
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "core.input",
+                    "provider_label": "Core Input Node",
+                    "description": "",
+                    "position": {"x": 0, "y": 0},
+                    "config": {"input_binding": {"type": "input_payload"}},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Call OpenAI",
+                    "provider_id": "core.api",
+                    "provider_label": "Core API Node",
+                    "description": "",
+                    "position": {"x": 240, "y": 0},
+                    "model_provider_name": "openai",
+                    "prompt_name": "openai_prompt",
+                    "config": {
+                        "provider_name": "openai",
+                        "prompt_name": "openai_prompt",
+                        "model": "gpt-4.1-mini",
+                        "api_key_env_var": "OPENAI_API_KEY",
+                        "system_prompt": "You are helpful.",
+                        "user_message_template": "{input_payload}",
+                    },
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "description": "",
+                    "position": {"x": 480, "y": 0},
+                    "config": {},
+                },
+            ],
+            "edges": [
+                {
+                    "id": "edge-start-model",
+                    "source_id": "start",
+                    "target_id": "model",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                    "condition": None,
+                },
+                {
+                    "id": "edge-model-finish",
+                    "source_id": "model",
+                    "target_id": "finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                    "condition": None,
+                },
+            ],
+        }
+        graph = GraphDefinition.from_dict(payload)
+        graph.validate_against_services(self.services)
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-process-env-key"}, clear=False):
+            state = runtime.run(graph, "hello")
+
+        self.assertEqual(state.status, "completed")
+        self.assertIsNotNone(recording_provider.last_request)
+        assert recording_provider.last_request is not None
+        self.assertEqual(recording_provider.last_request.provider_config["api_key_env_var"], "OPENAI_API_KEY")
+        self.assertEqual(recording_provider.last_request.provider_config["api_key"], "sk-graph-env-key")
 
     def test_logic_conditions_resolve_graph_env_references_in_branch_values_and_handles(self) -> None:
         payload: dict[str, Any] = {

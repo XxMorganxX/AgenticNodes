@@ -39,7 +39,11 @@ from graph_agent.providers.base import (
 )
 from graph_agent.providers.claude_code import ClaudeCodeCLIModelProvider
 from graph_agent.providers.mock import MockModelProvider
-from graph_agent.providers.vendor_api import ClaudeMessagesModelProvider, OpenAIChatModelProvider
+from graph_agent.providers.vendor_api import (
+    ClaudeMessagesModelProvider,
+    OpenAIChatModelProvider,
+    _strict_json_schema as openai_strict_json_schema,
+)
 from graph_agent.runtime.core import API_MESSAGE_HANDLE_ID, NO_TOOL_CALL_MESSAGE, GraphDefinition, GraphValidationError, NodeContext, RunState
 from graph_agent.runtime.documents import load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
@@ -306,6 +310,30 @@ class StubOpenAIProvider(OpenAIChatModelProvider):
         return {"Authorization": "Bearer test"}
 
 
+class HeaderCapturingOpenAIProvider(OpenAIChatModelProvider):
+    def __init__(self) -> None:
+        self.last_headers: Mapping[str, str] | None = None
+
+    def _post_json(
+        self,
+        url: str,
+        payload: Mapping[str, Any],
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        self.last_headers = dict(headers)
+        return {
+            "model": payload.get("model"),
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": "ok"},
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+
 class StubClaudeProvider(ClaudeMessagesModelProvider):
     def __init__(self) -> None:
         self.last_payload: Mapping[str, Any] | None = None
@@ -357,6 +385,24 @@ class StubClaudeCodeProvider(ClaudeCodeCLIModelProvider):
             "usage": {"input_tokens": 10, "output_tokens": 6},
         }
         return self.last_payload
+
+
+class RequestCaptureProvider(ModelProvider):
+    name = "request_capture"
+
+    def __init__(self) -> None:
+        self.last_request: ModelRequest | None = None
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        self.last_request = request
+        return ModelResponse(
+            content="ok",
+            structured_output=_decision(final_message="ok"),
+            metadata={"provider": self.name},
+        )
+
+    def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
 
 
 class ContextEchoProvider(ModelProvider):
@@ -966,6 +1012,73 @@ class ModelProviderTests(unittest.TestCase):
             ],
         }
 
+    def test_openai_provider_prefers_exact_api_key_in_provider_config(self) -> None:
+        provider = HeaderCapturingOpenAIProvider()
+        request = ModelRequest(
+            prompt_name="openai_auth",
+            messages=[ModelMessage(role="user", content="Hello")],
+            provider_config={
+                "model": "gpt-4.1-mini",
+                "api_key_env_var": "OPENAI_API_KEY",
+                "api_key": "sk-exact-provider-key",
+            },
+        )
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-process-env-key"}, clear=False):
+            provider.generate(request)
+
+        self.assertIsNotNone(provider.last_headers)
+        assert provider.last_headers is not None
+        self.assertEqual(provider.last_headers["Authorization"], "Bearer sk-exact-provider-key")
+
+    def test_openai_preflight_accepts_exact_api_key_in_provider_config(self) -> None:
+        provider = HeaderCapturingOpenAIProvider()
+
+        with patch.dict("os.environ", {}, clear=True):
+            result = provider.preflight(
+                {
+                    "api_key_env_var": "OPENAI_API_KEY",
+                    "api_key": "sk-exact-provider-key",
+                }
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "available")
+
+    def test_openai_strict_schema_adds_types_for_const_only_properties(self) -> None:
+        schema = openai_strict_json_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "need_tool": {"const": False},
+                    "tool_name": {"const": "search_catalog"},
+                },
+            }
+        )
+
+        self.assertEqual(schema["properties"]["need_tool"], {"const": False, "type": "boolean"})
+        self.assertEqual(schema["properties"]["tool_name"], {"const": "search_catalog", "type": "string"})
+
+    def test_openai_strict_schema_forces_nested_objects_to_disallow_extra_properties(self) -> None:
+        schema = openai_strict_json_schema(
+            api_decision_response_schema(
+                allow_tool_calls=False,
+                response_mode="message",
+            )
+        )
+
+        tool_call_item_schema = schema["properties"]["tool_calls"]["items"]
+        self.assertIs(tool_call_item_schema["properties"]["arguments"]["additionalProperties"], False)
+        self.assertEqual(tool_call_item_schema["properties"]["arguments"]["properties"], {})
+        self.assertEqual(tool_call_item_schema["properties"]["arguments"]["required"], [])
+        self.assertIs(tool_call_item_schema["properties"]["metadata"]["additionalProperties"], False)
+        self.assertEqual(tool_call_item_schema["properties"]["metadata"]["properties"], {})
+        self.assertEqual(tool_call_item_schema["properties"]["metadata"]["required"], [])
+        self.assertEqual(
+            tool_call_item_schema["required"],
+            ["tool_name", "arguments", "provider_tool_id", "metadata"],
+        )
+
     def test_openai_provider_normalizes_tool_calls_for_tool_call_nodes(self) -> None:
         provider = StubOpenAIProvider()
         request = ModelRequest(
@@ -1079,6 +1192,17 @@ class ModelProviderTests(unittest.TestCase):
         self.assertIs(
             response_format["json_schema"]["schema"]["properties"]["message"]["additionalProperties"],
             False,
+        )
+        self.assertEqual(
+            response_format["json_schema"]["schema"]["properties"]["need_tool"],
+            {"type": "boolean", "const": False},
+        )
+        tool_call_item_schema = response_format["json_schema"]["schema"]["properties"]["tool_calls"]["items"]
+        self.assertIs(tool_call_item_schema["properties"]["arguments"]["additionalProperties"], False)
+        self.assertIs(tool_call_item_schema["properties"]["metadata"]["additionalProperties"], False)
+        self.assertEqual(
+            tool_call_item_schema["required"],
+            ["tool_name", "arguments", "provider_tool_id", "metadata"],
         )
         self.assertEqual(
             response.structured_output,
@@ -1214,6 +1338,40 @@ class ModelProviderTests(unittest.TestCase):
         assert provider.last_command is not None
         model_index = provider.last_command.index("--model")
         self.assertEqual(provider.last_command[model_index + 1], "haiku")
+
+    def test_claude_code_provider_records_requested_and_reported_models(self) -> None:
+        class ModelReportingClaudeCodeProvider(StubClaudeCodeProvider):
+            def _run_command(self, command: list[str], cwd: str | None, timeout_seconds: float) -> Mapping[str, Any]:
+                self.last_command = command
+                self.last_cwd = cwd
+                self.last_timeout_seconds = timeout_seconds
+                self.last_payload = {
+                    "result": "ok",
+                    "structured_output": {"message": "ok", "need_tool": False, "tool_calls": []},
+                    "model": "opus",
+                    "session_id": "session-model-report",
+                    "duration_ms": 19,
+                    "usage": {"input_tokens": 3, "output_tokens": 1},
+                }
+                return self.last_payload
+
+        provider = ModelReportingClaudeCodeProvider()
+        request = ModelRequest(
+            prompt_name="schema_proposal",
+            messages=[ModelMessage(role="user", content="Build the tool payload.")],
+            provider_config={
+                "model": "sonnet",
+                "cli_path": "claude",
+                "working_directory": str(ROOT),
+            },
+            response_mode="message",
+        )
+
+        response = provider.generate(request)
+
+        self.assertEqual(response.metadata.get("requested_model"), "sonnet")
+        self.assertEqual(response.metadata.get("reported_model"), "opus")
+        self.assertEqual(response.metadata.get("vendor_model"), "opus")
 
     def test_claude_code_provider_coerces_labeled_email_text_into_required_message_object(self) -> None:
         class LabeledEmailClaudeCodeProvider(StubClaudeCodeProvider):
@@ -1442,8 +1600,10 @@ class ModelProviderTests(unittest.TestCase):
         item_schemas = schema["properties"]["tool_calls"]["items"]["oneOf"]
         self.assertEqual(len(item_schemas), 2)
         self.assertEqual(item_schemas[0]["properties"]["tool_name"]["const"], "weather_current")
+        self.assertEqual(item_schemas[0]["properties"]["tool_name"]["type"], "string")
         self.assertEqual(item_schemas[0]["properties"]["arguments"]["required"], ["location"])
         self.assertEqual(item_schemas[1]["properties"]["tool_name"]["const"], "time_current_minute")
+        self.assertEqual(item_schemas[1]["properties"]["tool_name"]["type"], "string")
         self.assertEqual(item_schemas[1]["properties"]["arguments"]["type"], "object")
         self.assertEqual(schema["required"], ["message", "need_tool", "tool_calls"])
 
@@ -2046,6 +2206,194 @@ class ModelProviderTests(unittest.TestCase):
                     self.assertEqual(payload["available_tool_names"], [WEATHER_TOOL_ID])
             finally:
                 manager.stop_background_services()
+
+    def test_bound_provider_node_config_is_authoritative_for_model_request(self) -> None:
+        services = build_example_services()
+        capture_provider = RequestCaptureProvider()
+        services.model_providers["request_capture"] = capture_provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "provider-binding-authoritative",
+            "name": "Provider Binding Authoritative",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "provider",
+                    "kind": "provider",
+                    "category": "provider",
+                    "label": "Provider",
+                    "provider_id": "provider.mock",
+                    "provider_label": "Mock Provider",
+                    "model_provider_name": "request_capture",
+                    "config": {
+                        "provider_name": "request_capture",
+                        "model": "haiku",
+                        "temperature": 0.7,
+                    },
+                    "position": {"x": 100, "y": -100},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "request_capture",
+                    "prompt_name": "binding_prompt",
+                    "config": {
+                        "provider_name": "request_capture",
+                        "provider_binding_node_id": "provider",
+                        "prompt_name": "binding_prompt",
+                        "system_prompt": "Use bound provider settings.",
+                        "user_message_template": "{input_payload}",
+                        "response_mode": "message",
+                        "model": "sonnet",
+                        "temperature": 0.1,
+                        "max_tokens": 512,
+                    },
+                    "position": {"x": 200, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_envelope", "source": "model"}},
+                    "position": {"x": 300, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "start-model", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {"id": "provider-model", "source_id": "provider", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {"id": "model-finish", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, "hello", run_id="run-provider-binding-authoritative")
+        self.assertEqual(state.status, "completed")
+        self.assertIsNotNone(capture_provider.last_request)
+        assert capture_provider.last_request is not None
+        provider_config = dict(capture_provider.last_request.provider_config or {})
+        self.assertEqual(provider_config.get("model"), "haiku")
+        self.assertEqual(provider_config.get("temperature"), 0.7)
+        self.assertEqual(provider_config.get("max_tokens"), 512)
+
+    def test_api_call_node_templates_support_markdown_with_literal_json_blocks(self) -> None:
+        services = build_example_services()
+        capture_provider = RequestCaptureProvider()
+        services.model_providers["request_capture"] = capture_provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph_payload = {
+            "graph_id": "api-call-markdown-template",
+            "name": "API Call Markdown Template",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "config": {"input_binding": {"type": "input_payload"}},
+                    "position": {"x": 0, "y": 0},
+                },
+                {
+                    "id": "model",
+                    "kind": "model",
+                    "category": "api",
+                    "label": "Model",
+                    "provider_id": "core.api",
+                    "provider_label": "API Call Node",
+                    "model_provider_name": "request_capture",
+                    "prompt_name": "markdown_prompt",
+                    "config": {
+                        "provider_name": "request_capture",
+                        "prompt_name": "markdown_prompt",
+                        "system_prompt": (
+                            "Use markdown headings.\n\n"
+                            "### Output Rubric\n"
+                            "```json\n"
+                            "{\n"
+                            '  "tone": "direct",\n'
+                            '  "length": "short"\n'
+                            "}\n"
+                            "```"
+                        ),
+                        "user_message_template": (
+                            "## Request\n"
+                            "{input_payload}\n\n"
+                            "### Example JSON\n"
+                            "```json\n"
+                            "{\n"
+                            '  "key": "value"\n'
+                            "}\n"
+                            "```"
+                        ),
+                        "response_mode": "message",
+                    },
+                    "position": {"x": 200, "y": 0},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "config": {"source_binding": {"type": "latest_envelope", "source": "model"}},
+                    "position": {"x": 300, "y": 0},
+                },
+            ],
+            "edges": [
+                {"id": "start-model", "source_id": "start", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                {"id": "model-finish", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, {"goal": "test markdown"}, run_id="run-api-call-markdown-template")
+        self.assertEqual(state.status, "completed")
+        self.assertIsNotNone(capture_provider.last_request)
+
+        assert capture_provider.last_request is not None
+        system_prompt = capture_provider.last_request.messages[0].content
+        user_prompt = capture_provider.last_request.messages[-1].content
+
+        self.assertIn("### Output Rubric", system_prompt)
+        self.assertIn("```json", system_prompt)
+        self.assertIn('"tone": "direct"', system_prompt)
+        self.assertIn("### Example JSON", user_prompt)
+        self.assertIn('"key": "value"', user_prompt)
+        self.assertIn('"goal": "test markdown"', user_prompt)
 
     def test_model_nodes_can_place_mcp_tool_guidance_inline(self) -> None:
         services = build_example_services()
@@ -5089,6 +5437,336 @@ class ModelProviderTests(unittest.TestCase):
                 {"role": "user", "content": "Suggest the next debugging step."},
             ],
         )
+
+    def test_model_node_exposes_context_builder_sections_as_prompt_variables(self) -> None:
+        services = build_example_services()
+        provider = PromptBlockEchoProvider()
+        services.model_providers["prompt_block_echo"] = provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "context-builder-model-section-variables",
+                "name": "Context Builder Model Section Variables",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "linkedin",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "LinkedIn Source",
+                        "provider_id": "core.data",
+                        "provider_label": "Core Data Node",
+                        "config": {"mode": "template", "template": "LinkedIn profile for {input_payload}"},
+                        "position": {"x": 180, "y": -80},
+                    },
+                    {
+                        "id": "sales",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Sales Source",
+                        "provider_id": "core.data",
+                        "provider_label": "Core Data Node",
+                        "config": {"mode": "template", "template": "Sales values for Taylor"},
+                        "position": {"x": 180, "y": 80},
+                    },
+                    {
+                        "id": "compose",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Compose",
+                        "provider_id": "core.context_builder",
+                        "provider_label": "Context Builder",
+                        "config": {
+                            "mode": "context_builder",
+                            "template": "",
+                            "joiner": "\n\n",
+                            "input_bindings": [
+                                {
+                                    "source_node_id": "linkedin",
+                                    "header": "LinkedIn Data",
+                                    "placeholder": "linkedin_data",
+                                    "binding": {"type": "latest_payload", "source": "linkedin"},
+                                },
+                                {
+                                    "source_node_id": "sales",
+                                    "header": "Sales Values",
+                                    "placeholder": "sales_values",
+                                    "binding": {"type": "latest_payload", "source": "sales"},
+                                },
+                            ],
+                        },
+                        "position": {"x": 380, "y": 0},
+                    },
+                    {
+                        "id": "model",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "prompt_block_echo",
+                        "prompt_name": "prompt_block_echo",
+                        "config": {
+                            "provider_name": "prompt_block_echo",
+                            "prompt_name": "prompt_block_echo",
+                            "system_prompt": "Use the context.",
+                            "user_message_template": (
+                                "LinkedIn:\n{linkedin_data}\n\n"
+                                "Sales:\n{sales_values}\n\n"
+                                "Whole context:\n{input_payload}"
+                            ),
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 580, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "model"}},
+                        "position": {"x": 760, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-linkedin", "source_id": "start", "target_id": "linkedin", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "linkedin-sales", "source_id": "linkedin", "target_id": "sales", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "linkedin-compose", "source_id": "linkedin", "target_id": "compose", "label": "context input", "kind": "binding", "priority": 0},
+                    {"id": "sales-compose", "source_id": "sales", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "compose-model", "source_id": "compose", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "model-finish", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, "Taylor", run_id="run-context-builder-model-section-vars")
+
+        self.assertEqual(state.status, "completed")
+        self.assertIsNotNone(provider.last_request)
+        assert provider.last_request is not None
+        user_message = provider.last_request.messages[-1].content
+        self.assertIn("LinkedIn:\nLinkedIn profile for Taylor", user_message)
+        self.assertIn("Sales:\nSales values for Taylor", user_message)
+        self.assertIn('"LinkedIn Data": "LinkedIn profile for Taylor"', user_message)
+        self.assertIn('"Sales Values": "Sales values for Taylor"', user_message)
+
+    def test_model_node_exposes_current_source_node_instance_label_as_prompt_variable(self) -> None:
+        services = build_example_services()
+        provider = PromptBlockEchoProvider()
+        services.model_providers["prompt_block_echo"] = provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "model-current-source-placeholder",
+                "name": "Model Current Source Placeholder",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "split-1",
+                        "kind": "control_flow_unit",
+                        "category": "control_flow_unit",
+                        "label": "Parallel Splitter",
+                        "provider_id": "core.parallel_splitter",
+                        "provider_label": "Parallel Splitter",
+                        "config": {"mode": "parallel_splitter"},
+                        "position": {"x": 180, "y": 0},
+                    },
+                    {
+                        "id": "split-2",
+                        "kind": "control_flow_unit",
+                        "category": "control_flow_unit",
+                        "label": "Parallel Splitter",
+                        "provider_id": "core.parallel_splitter",
+                        "provider_label": "Parallel Splitter",
+                        "config": {"mode": "parallel_splitter"},
+                        "position": {"x": 360, "y": 0},
+                    },
+                    {
+                        "id": "model",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "prompt_block_echo",
+                        "prompt_name": "prompt_block_echo",
+                        "config": {
+                            "provider_name": "prompt_block_echo",
+                            "prompt_name": "prompt_block_echo",
+                            "system_prompt": "Use the current source.",
+                            "user_message_template": "Information:\n{parallel_splitter_2}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 540, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "model"}},
+                        "position": {"x": 720, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-split-1", "source_id": "start", "target_id": "split-1", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "split-1-split-2", "source_id": "split-1", "target_id": "split-2", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "split-2-model", "source_id": "split-2", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "model-finish", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, "Taylor profile data", run_id="run-current-source-placeholder")
+
+        self.assertEqual(state.status, "completed")
+        self.assertIsNotNone(provider.last_request)
+        assert provider.last_request is not None
+        self.assertEqual(provider.last_request.messages[-1].content, "Information:\nTaylor profile data")
+
+    def test_context_builder_uses_source_node_instance_label_for_auto_placeholder(self) -> None:
+        services = build_example_services()
+        provider = PromptBlockEchoProvider()
+        services.model_providers["prompt_block_echo"] = provider
+        runtime = GraphRuntime(
+            services=services,
+            max_steps=services.config["max_steps"],
+            max_visits_per_node=services.config["max_visits_per_node"],
+        )
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "context-builder-instance-placeholder",
+                "name": "Context Builder Instance Placeholder",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "split-1",
+                        "kind": "control_flow_unit",
+                        "category": "control_flow_unit",
+                        "label": "Parallel Splitter",
+                        "provider_id": "core.parallel_splitter",
+                        "provider_label": "Parallel Splitter",
+                        "config": {"mode": "parallel_splitter"},
+                        "position": {"x": 180, "y": 0},
+                    },
+                    {
+                        "id": "split-2",
+                        "kind": "control_flow_unit",
+                        "category": "control_flow_unit",
+                        "label": "Parallel Splitter",
+                        "provider_id": "core.parallel_splitter",
+                        "provider_label": "Parallel Splitter",
+                        "config": {"mode": "parallel_splitter"},
+                        "position": {"x": 360, "y": 0},
+                    },
+                    {
+                        "id": "compose",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Compose",
+                        "provider_id": "core.context_builder",
+                        "provider_label": "Context Builder",
+                        "config": {"mode": "context_builder", "template": "", "input_bindings": [], "joiner": "\n\n"},
+                        "position": {"x": 540, "y": 0},
+                    },
+                    {
+                        "id": "model",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "prompt_block_echo",
+                        "prompt_name": "prompt_block_echo",
+                        "config": {
+                            "provider_name": "prompt_block_echo",
+                            "prompt_name": "prompt_block_echo",
+                            "system_prompt": "Use the composed context.",
+                            "user_message_template": "Information:\n{parallel_splitter_2}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 720, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "model"}},
+                        "position": {"x": 900, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-split-1", "source_id": "start", "target_id": "split-1", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "split-1-split-2", "source_id": "split-1", "target_id": "split-2", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "split-2-compose", "source_id": "split-2", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "compose-model", "source_id": "compose", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "model-finish", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        state = runtime.run(graph, "Taylor profile data", run_id="run-context-builder-instance-placeholder")
+
+        self.assertEqual(state.status, "completed")
+        compose_output = state.node_outputs["compose"]
+        self.assertIn("parallel_splitter_2", compose_output.get("metadata", {}).get("placeholders", []))
+        self.assertIsNotNone(provider.last_request)
+        assert provider.last_request is not None
+        self.assertEqual(provider.last_request.messages[-1].content, "Information:\nTaylor profile data")
 
     def test_mcp_executor_packages_follow_up_context_for_model(self) -> None:
         services = build_example_services()

@@ -24,18 +24,44 @@ def _is_mapping(value: Any) -> bool:
     return isinstance(value, Mapping)
 
 
+def _json_type_for_const(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if value is None:
+        return "null"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return "array"
+    return "string"
+
+
 def _strict_json_schema(schema: Any) -> Any:
     if isinstance(schema, Mapping):
         normalized: dict[str, Any] = {}
         for key, value in schema.items():
             normalized[key] = _strict_json_schema(value)
+        if "const" in normalized and "type" not in normalized:
+            normalized["type"] = _json_type_for_const(normalized["const"])
         type_value = normalized.get("type")
         if type_value == "object" or (
             isinstance(type_value, Sequence)
             and not isinstance(type_value, (str, bytes))
             and "object" in {str(entry).strip() for entry in type_value}
         ) or "properties" in normalized:
-            normalized.setdefault("additionalProperties", False)
+            properties = normalized.get("properties")
+            if isinstance(properties, Mapping):
+                normalized["properties"] = dict(properties)
+            else:
+                normalized["properties"] = {}
+            normalized["required"] = list(normalized["properties"].keys())
+            normalized["additionalProperties"] = False
         if isinstance(type_value, Sequence) and not isinstance(type_value, (str, bytes)):
             union_types = [entry for entry in type_value if isinstance(entry, str) and entry.strip()]
             if len(union_types) == 1:
@@ -90,13 +116,13 @@ class VendorAPIModelProvider(ModelProvider):
     def preflight(self, provider_config: Mapping[str, Any] | None = None) -> ProviderPreflightResult:
         config = provider_config if _is_mapping(provider_config) else {}
         api_key_env_var = _string_config(config, "api_key_env_var", self.api_key_env_var)
+        api_key = self._api_key(config)
         if not api_key_env_var:
             return ProviderPreflightResult(
                 status="missing_config",
                 ok=False,
                 message=f"{self.name} provider is missing an API key env var setting.",
             )
-        api_key = os.environ.get(api_key_env_var, "").strip()
         if not api_key:
             return ProviderPreflightResult(
                 status="missing_credentials",
@@ -129,13 +155,20 @@ class VendorAPIModelProvider(ModelProvider):
         return []
 
     def _headers(self, provider_config: Mapping[str, Any]) -> dict[str, str]:
-        api_key_env_var = _string_config(provider_config, "api_key_env_var", self.api_key_env_var)
-        api_key = os.environ.get(api_key_env_var, "").strip()
+        api_key = self._api_key(provider_config)
         if not api_key:
+            api_key_env_var = _string_config(provider_config, "api_key_env_var", self.api_key_env_var)
             raise RuntimeError(
                 f"{self.name} provider requires the '{api_key_env_var}' environment variable to be set."
             )
         return self._build_headers(api_key)
+
+    def _api_key(self, provider_config: Mapping[str, Any]) -> str:
+        exact_api_key = provider_config.get("api_key")
+        if isinstance(exact_api_key, str) and exact_api_key.strip():
+            return exact_api_key.strip()
+        api_key_env_var = _string_config(provider_config, "api_key_env_var", self.api_key_env_var)
+        return os.environ.get(api_key_env_var, "").strip()
 
     def _tool_definitions(self, request: ModelRequest) -> list[ModelToolDefinition]:
         if request.available_tools:

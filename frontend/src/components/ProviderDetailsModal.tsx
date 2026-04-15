@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, MouseEvent } from "react";
 
 import { fetchProviderDiagnostics, inspectSupabaseRuntimeStatus, preflightProvider, previewSupabaseSchema } from "../lib/api";
+import { getModelContextBuilderPromptVariables } from "../lib/contextBuilderPromptVariables";
 import { findProviderDefinition, inferModelResponseMode, modelProviderDefinitions, providerDefaultConfig, providerModelName } from "../lib/editor";
 import { getGraphEnvVars, resolveGraphEnvReferences } from "../lib/graphEnv";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
@@ -23,6 +24,7 @@ import type {
   GraphNode,
   ProviderDiagnosticsResult,
   ProviderPreflightResult,
+  RunState,
   SupabaseRuntimeStatusResult,
   SupabaseSchemaPreviewResult,
   SupabaseSchemaSource,
@@ -34,6 +36,7 @@ const LIVE_PROVIDER_VERIFICATION_STORAGE_KEY = "agentic-nodes-live-provider-veri
 type ProviderDetailsModalProps = {
   graph: GraphDefinition;
   node: GraphNode;
+  runState?: RunState | null;
   catalog: EditorCatalog | null;
   onGraphChange: (graph: GraphDefinition) => void;
   onClose: () => void;
@@ -118,6 +121,36 @@ function serializeLegacyConfigStringList(values: string[]): string {
     .map((value) => value.trim())
     .filter((value) => value.length > 0)
     .join("\n");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+type ResolvedPromptMessage = {
+  role: string;
+  content: string;
+};
+
+function resolvedPromptMessagesFromRuntimeInput(input: unknown): ResolvedPromptMessage[] {
+  if (!isRecord(input) || !Array.isArray(input.messages)) {
+    return [];
+  }
+  return input.messages
+    .filter((message): message is Record<string, unknown> => isRecord(message))
+    .map((message) => ({
+      role: String(message.role ?? "message").trim() || "message",
+      content: String(message.content ?? ""),
+    }));
+}
+
+function formatResolvedPromptMessages(messages: ResolvedPromptMessage[]): string {
+  return messages
+    .map((message) => {
+      const roleLabel = message.role.toUpperCase();
+      return [`[${roleLabel}]`, message.content.trimEnd()].join("\n");
+    })
+    .join("\n\n");
 }
 
 type StructuredPayloadTemplateEntry = {
@@ -340,6 +373,7 @@ function buildProviderVerificationStorageKey(providerName: string, providerConfi
 export function ProviderDetailsModal({
   graph,
   node,
+  runState = null,
   catalog,
   onGraphChange,
   onClose,
@@ -353,6 +387,22 @@ export function ProviderDetailsModal({
     ? String(node.config.provider_name ?? node.model_provider_name ?? "not-set")
     : String(provider?.provider_id ?? node.provider_id ?? "not-set");
   const providerConfigFields = provider?.config_fields ?? [];
+  const contextBuilderPromptVariables = isModelNode ? getModelContextBuilderPromptVariables(graph, node) : [];
+  const contextBuilderPromptVariableGroups = contextBuilderPromptVariables.reduce<
+    Array<{ contextBuilderNodeId: string; contextBuilderLabel: string; variables: typeof contextBuilderPromptVariables }>
+  >((groups, variable) => {
+    const existingGroup = groups.find((group) => group.contextBuilderNodeId === variable.contextBuilderNodeId);
+    if (existingGroup) {
+      existingGroup.variables.push(variable);
+      return groups;
+    }
+    groups.push({
+      contextBuilderNodeId: variable.contextBuilderNodeId,
+      contextBuilderLabel: variable.contextBuilderLabel,
+      variables: [variable],
+    });
+    return groups;
+  }, []);
   const allModelOptions = useMemo(() => {
     const options = new Map<string, { value: string; label: string }>();
     availableProviders.forEach((candidate) => {
@@ -555,10 +605,11 @@ export function ProviderDetailsModal({
     "preferred_tool_name",
     "response_mode",
     "prompt_blocks",
+    ...contextBuilderPromptVariables.map((variable) => variable.token),
     ...promptContextToolSummaries.map((tool) => tool.placeholderToken),
   ]);
   const optionalSystemPromptPlaceholders = availableSystemPromptPlaceholders.filter(
-    (token) => !requiredMcpPlaceholders.includes(token),
+    (token) => !requiredMcpPlaceholders.includes(token) && !contextBuilderPromptVariables.some((variable) => variable.token === token),
   );
   const modelGeneratedMcpPlaceholderTemplate = buildMcpToolPlaceholderTemplate(promptContextToolSummaries);
   const systemPromptPreviewVariables: Record<string, string> = {
@@ -595,8 +646,21 @@ export function ProviderDetailsModal({
     response_mode: String(node.config.response_mode ?? "auto"),
     prompt_blocks: "[]",
     ...Object.fromEntries(promptContextToolSummaries.map((tool) => [tool.placeholderToken, tool.renderedPromptText])),
+    ...Object.fromEntries(
+      contextBuilderPromptVariables.map((variable) => [
+        variable.token,
+        `[Context Builder section: ${variable.header}]`,
+      ]),
+    ),
   };
   const systemPromptTemplatePreview = resolveGraphEnvReferences(systemPromptTemplate, graph, systemPromptPreviewVariables);
+  const lastRuntimeInput = isModelNode ? runState?.node_inputs?.[node.id] : null;
+  const lastResolvedPromptMessages = resolvedPromptMessagesFromRuntimeInput(lastRuntimeInput);
+  const lastResolvedPromptText = formatResolvedPromptMessages(lastResolvedPromptMessages);
+  const lastResolvedPromptResponseMode =
+    isRecord(lastRuntimeInput) && typeof lastRuntimeInput.response_mode === "string"
+      ? lastRuntimeInput.response_mode
+      : "";
   const promptAssemblySections = node.kind === "model"
     ? (() => {
         const sections: string[] = [];
@@ -627,6 +691,9 @@ export function ProviderDetailsModal({
           .filter(Boolean)
           .join("\n\n")
       : "";
+  const lastResolvedPromptEmptyText = runState
+    ? "This API node has not started in the latest run yet."
+    : "Run the graph to see the fully populated prompt from this API node.";
   const [activeTab, setActiveTab] = useState<ProviderDetailsModalTab>("node");
   const [preflightResult, setPreflightResult] = useState<ProviderPreflightResult | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProviderDiagnosticsResult | null>(null);
@@ -1399,28 +1466,75 @@ export function ProviderDetailsModal({
             {activeTab === "prompt" && isModelNode ? (
               <div className="modal-folder-section provider-details-prompt-layout">
                 <div className="provider-details-prompt-main">
-                <label>
-                  System Prompt
-                  <textarea
-                    rows={7}
-                    value={String(node.config.system_prompt ?? "")}
-                    placeholder="You are a helpful model node."
-                    onChange={handleTextInputChange("system_prompt")}
-                  />
-                  <small>
-                    Connected MCP edges already define which tools are in scope. MCP coverage is the only required part
-                    here; all other placeholders are optional runtime values.
-                  </small>
-                </label>
+                  <div className="provider-details-prompt-hero">
+                    <strong>Prompt Authoring</strong>
+                    <span>These two templates define the core model behavior and the primary runtime message payload.</span>
+                  </div>
 
-                <label>
-                  User Message Template
-                  <textarea
-                    rows={5}
-                    value={displayedUserMessageTemplate}
-                    onChange={handleTextInputChange("user_message_template")}
-                  />
-                </label>
+                  <label className="provider-details-prompt-field provider-details-prompt-field--system">
+                    System Prompt
+                    <textarea
+                      className="provider-details-prompt-textarea provider-details-prompt-textarea--system"
+                      rows={16}
+                      value={String(node.config.system_prompt ?? "")}
+                      placeholder="You are a helpful model node."
+                      onChange={handleTextInputChange("system_prompt")}
+                      spellCheck={false}
+                    />
+                    <small>
+                      Connected MCP edges already define which tools are in scope. MCP coverage is the only required part
+                      here; all other placeholders are optional runtime values.
+                    </small>
+                    <small>
+                      Markdown formatting is supported in prompt templates. Use <code>{"{placeholder}"}</code> tokens for runtime values.
+                    </small>
+                  </label>
+
+                  <label className="provider-details-prompt-field provider-details-prompt-field--user">
+                    User Message Template
+                    <textarea
+                      className="provider-details-prompt-textarea provider-details-prompt-textarea--user"
+                      rows={12}
+                      value={displayedUserMessageTemplate}
+                      placeholder="{input_payload}"
+                      onChange={handleTextInputChange("user_message_template")}
+                      spellCheck={false}
+                    />
+                    {contextBuilderPromptVariables.length > 0 ? (
+                      <div className="context-builder-placeholder-bar">
+                        <button
+                          type="button"
+                          className="secondary-button context-builder-token-button"
+                          onClick={() => updateProviderConfig("user_message_template", insertTokenAtEnd(displayedUserMessageTemplate, "{input_payload}"))}
+                        >
+                          {"{input_payload}"}
+                        </button>
+                        {contextBuilderPromptVariables.map((variable) => (
+                          <button
+                            key={`${variable.contextBuilderNodeId}-${variable.token}`}
+                            type="button"
+                            className="secondary-button context-builder-token-button"
+                            title={`${variable.header} from ${variable.contextBuilderLabel}`}
+                            onClick={() => updateProviderConfig("user_message_template", insertTokenAtEnd(displayedUserMessageTemplate, `{${variable.token}}`))}
+                          >
+                            {`{${variable.token}}`}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                    {contextBuilderPromptVariables.length > 0 ? (
+                      <small>
+                        Context Builder section tags:{" "}
+                        {contextBuilderPromptVariables.map((variable) => (
+                          <code key={`${variable.contextBuilderNodeId}-${variable.token}-label`}>{`{${variable.token}}`}</code>
+                        ))}{" "}
+                        resolve from the connected Context Builder input at runtime.
+                      </small>
+                    ) : null}
+                    <small>
+                      Markdown is preserved, including headings, bullets, and fenced code blocks.
+                    </small>
+                  </label>
                 </div>
 
                 <aside className="provider-details-prompt-sidebar">
@@ -1438,46 +1552,71 @@ export function ProviderDetailsModal({
 
                   {node.kind === "model" ? (
                     <div className="tool-details-modal-help provider-details-placeholder-panel provider-details-placeholder-panel--prompt">
-                    <div className="provider-details-placeholder-header">
-                      <strong>Required MCP placeholders</strong>
-                      <span>Only needed if you want full inline MCP prompt control.</span>
-                    </div>
-                    <div className="graph-env-reference-list">
-                      {requiredMcpPlaceholders.map((token) => (
-                        <code key={token} className="placeholder-chip placeholder-chip--required">{`{${token}}`}</code>
-                      ))}
-                      {requiredMcpPlaceholders.length === 0 ? <span>None required.</span> : null}
-                    </div>
-                    <div className="provider-details-placeholder-rule">
-                      <span className="provider-details-placeholder-rule-label">Rule</span>
-                      <p>
-                        Include <code>{"{mcp_tool_guidance_block}"}</code> plus either <code>{"{mcp_tool_context_block}"}</code> or
-                        every ordered MCP tool placeholder for full inline MCP control. Missing MCP sections are appended
-                        automatically.
-                      </p>
-                    </div>
-                    {promptContextToolSummaries.length > 0 ? (
-                      <div className="provider-details-placeholder-subsection">
-                        <div className="provider-details-placeholder-subtitle">Ordered MCP tool placeholders</div>
-                        <div className="provider-details-placeholder-list">
-                          {promptContextToolSummaries.map((tool) => (
-                            <span key={tool.placeholderToken}>
-                              <code className="placeholder-chip placeholder-chip--optional">{`{${tool.placeholderToken}}`}</code> {tool.displayName} ({tool.status})
-                            </span>
-                          ))}
-                        </div>
+                      <div className="provider-details-placeholder-header">
+                        <strong>Required MCP placeholders</strong>
+                        <span>Only needed if you want full inline MCP prompt control.</span>
                       </div>
-                    ) : null}
-                    {optionalSystemPromptPlaceholders.length > 0 ? (
-                      <div className="provider-details-placeholder-subsection">
-                        <div className="provider-details-placeholder-subtitle">Optional placeholders</div>
-                        <div className="graph-env-reference-list">
-                          {optionalSystemPromptPlaceholders.map((token) => (
-                            <code key={token} className="placeholder-chip placeholder-chip--optional">{`{${token}}`}</code>
-                          ))}
-                        </div>
+                      <div className="graph-env-reference-list">
+                        {requiredMcpPlaceholders.map((token) => (
+                          <code key={token} className="placeholder-chip placeholder-chip--required">{`{${token}}`}</code>
+                        ))}
+                        {requiredMcpPlaceholders.length === 0 ? <span>None required.</span> : null}
                       </div>
-                    ) : null}
+                      <div className="provider-details-placeholder-rule">
+                        <span className="provider-details-placeholder-rule-label">Rule</span>
+                        <p>
+                          Include <code>{"{mcp_tool_guidance_block}"}</code> plus either <code>{"{mcp_tool_context_block}"}</code> or
+                          every ordered MCP tool placeholder for full inline MCP control. Missing MCP sections are appended
+                          automatically.
+                        </p>
+                      </div>
+                      {promptContextToolSummaries.length > 0 ? (
+                        <div className="provider-details-placeholder-subsection">
+                          <div className="provider-details-placeholder-subtitle">Ordered MCP tool placeholders</div>
+                          <div className="provider-details-placeholder-list">
+                            {promptContextToolSummaries.map((tool) => (
+                              <span key={tool.placeholderToken}>
+                                <code className="placeholder-chip placeholder-chip--optional">{`{${tool.placeholderToken}}`}</code> {tool.displayName} ({tool.status})
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                      {contextBuilderPromptVariableGroups.length > 0 ? (
+                        <div className="provider-details-placeholder-subsection">
+                          <div className="provider-details-placeholder-subtitle">Context Builder sections</div>
+                          <div className="provider-details-prompt-chunk-groups">
+                            {contextBuilderPromptVariableGroups.map((group) => (
+                              <section key={group.contextBuilderNodeId} className="provider-details-prompt-chunk-group">
+                                <div className="provider-details-prompt-chunk-header">
+                                  <strong>{group.contextBuilderLabel}</strong>
+                                  <span>{group.variables.length} section{group.variables.length === 1 ? "" : "s"}</span>
+                                </div>
+                                <div className="provider-details-placeholder-list">
+                                  {group.variables.map((variable) => (
+                                    <span key={`${variable.contextBuilderNodeId}-${variable.token}`}>
+                                      <code className="placeholder-chip placeholder-chip--optional">{`{${variable.token}}`}</code> {variable.header}
+                                    </span>
+                                  ))}
+                                </div>
+                              </section>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                      {optionalSystemPromptPlaceholders.length > 0 ? (
+                        <details className="provider-details-placeholder-accordion">
+                          <summary>
+                            <span>Other optional placeholders</span>
+                            <small>{optionalSystemPromptPlaceholders.length}</small>
+                          </summary>
+                          <div className="graph-env-reference-list">
+                            {optionalSystemPromptPlaceholders.map((token) => (
+                              <code key={token} className="placeholder-chip placeholder-chip--optional">{`{${token}}`}</code>
+                            ))}
+                          </div>
+                        </details>
+                      ) : null}
                     </div>
                   ) : null}
 
@@ -2268,6 +2407,19 @@ export function ProviderDetailsModal({
                       output_mode: supabaseOutputMode,
                       rpc_params_json: String(node.config.rpc_params_json ?? "{}") || "{}",
                     }, null, 2)}</pre>
+                  </section>
+                ) : null}
+                {node.kind === "model" ? (
+                  <section className="tool-details-modal-preview provider-details-preview-card provider-details-preview-card--resolved-prompt">
+                    <div className="tool-details-modal-preview-header">
+                      <strong>Last Run Resolved Prompt</strong>
+                      <span>
+                        {lastResolvedPromptResponseMode
+                          ? `From run ${runState?.run_id ?? "unknown"} with response mode ${lastResolvedPromptResponseMode}.`
+                          : "Shows the populated prompt captured the last time this API node started."}
+                      </span>
+                    </div>
+                    <pre>{lastResolvedPromptText || lastResolvedPromptEmptyText}</pre>
                   </section>
                 ) : null}
                 {node.kind === "model" ? (

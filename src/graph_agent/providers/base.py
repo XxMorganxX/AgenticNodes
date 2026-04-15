@@ -124,7 +124,7 @@ def _tool_call_item_schema(tool_name: str, input_schema: Mapping[str, Any]) -> d
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "tool_name": {"const": tool_name},
+            "tool_name": {"type": "string", "const": tool_name},
             "arguments": normalized_arguments_schema,
             "provider_tool_id": {"type": ["string", "null"]},
             "metadata": {"type": "object", "additionalProperties": True},
@@ -207,21 +207,21 @@ def api_decision_response_schema(
         "required": ["message", "need_tool", "tool_calls"],
     }
     if not allow_tool_calls:
-        schema["properties"]["need_tool"] = {"const": False}
+        schema["properties"]["need_tool"] = {"type": "boolean", "const": False}
         schema["properties"]["tool_calls"] = {
             "type": "array",
             "items": tool_call_item_schema,
             "maxItems": 0,
         }
     elif response_mode == "tool_call":
-        schema["properties"]["need_tool"] = {"const": True}
+        schema["properties"]["need_tool"] = {"type": "boolean", "const": True}
         schema["properties"]["tool_calls"] = {
             "type": "array",
             "items": tool_call_item_schema,
             "minItems": 1,
         }
     elif response_mode == "message":
-        schema["properties"]["need_tool"] = {"const": False}
+        schema["properties"]["need_tool"] = {"type": "boolean", "const": False}
         schema["properties"]["tool_calls"] = {
             "type": "array",
             "items": tool_call_item_schema,

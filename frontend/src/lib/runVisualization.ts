@@ -757,6 +757,7 @@ function buildMilestoneDetails(
 ): AgentRunMilestoneDetail[] {
   const payload = event.payload;
   const nodeId = nodeIdFromEvent(event);
+  const executionMetadata = isRecord(payload.metadata) ? payload.metadata : null;
   const details: AgentRunMilestoneDetail[] = [{ label: "State", value: formatEventTypeLabel(event.event_type) }];
   const node = nodeId ? (graph?.nodes.find((candidate) => candidate.id === nodeId) ?? null) : null;
   if (nodeId) {
@@ -770,6 +771,14 @@ function buildMilestoneDetails(
   }
   if (typeof payload.node_provider_label === "string") {
     details.push({ label: "Provider", value: payload.node_provider_label });
+  }
+  if (typeof executionMetadata?.requested_model === "string" && executionMetadata.requested_model.trim().length > 0) {
+    details.push({ label: "Requested model", value: executionMetadata.requested_model.trim() });
+  }
+  if (typeof executionMetadata?.reported_model === "string" && executionMetadata.reported_model.trim().length > 0) {
+    details.push({ label: "Reported model", value: executionMetadata.reported_model.trim() });
+  } else if (typeof executionMetadata?.vendor_model === "string" && executionMetadata.vendor_model.trim().length > 0) {
+    details.push({ label: "Model", value: executionMetadata.vendor_model.trim() });
   }
   if (typeof payload.status === "string") {
     details.push({ label: "Status", value: payload.status });

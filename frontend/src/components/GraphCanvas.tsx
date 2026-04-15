@@ -5186,6 +5186,7 @@ export function GraphCanvas({
         <ProviderDetailsModal
           graph={graph}
           node={providerDetailsNode}
+          runState={runState}
           catalog={catalog}
           onGraphChange={onGraphChange}
           onClose={() => setProviderDetailsNodeId(null)}
