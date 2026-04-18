@@ -68,6 +68,7 @@ import type {
   EditorCatalog,
   GraphDefinition,
   GraphDocument,
+  LoopRegionState,
   McpServerDraft,
   McpServerStatus,
   ProjectFile,
@@ -260,6 +261,172 @@ function markTerminalNodeStatuses(
       return [nodeId, nextStatus];
     }),
   );
+}
+
+function buildIterationId(iteratorNodeId: unknown, iteratorRowIndex: unknown): string | null {
+  if (typeof iteratorNodeId !== "string" || !iteratorNodeId) {
+    return null;
+  }
+  if (typeof iteratorRowIndex !== "number" || !Number.isInteger(iteratorRowIndex) || iteratorRowIndex <= 0) {
+    return null;
+  }
+  return `${iteratorNodeId}:row:${iteratorRowIndex}`;
+}
+
+function appendUniqueString(values: string[], candidate: unknown): string[] {
+  if (typeof candidate !== "string" || !candidate || values.includes(candidate)) {
+    return values;
+  }
+  return [...values, candidate];
+}
+
+function resolveIteratorNodeId(payload: Record<string, unknown>): string | null {
+  const iteratorNodeId = typeof payload.iterator_node_id === "string" ? payload.iterator_node_id : null;
+  if (iteratorNodeId) {
+    return iteratorNodeId;
+  }
+  const nodeId = typeof payload.node_id === "string" ? payload.node_id : null;
+  const looksLikeIteratorUpdate =
+    payload.iterator_type != null || payload.current_row_index != null || payload.total_rows != null;
+  if (nodeId && looksLikeIteratorUpdate) {
+    return nodeId;
+  }
+  return null;
+}
+
+function updateLoopRegionState(
+  previousRegions: RunState["loop_regions"] | undefined,
+  payload: Record<string, unknown>,
+  includeStatus = false,
+): RunState["loop_regions"] | undefined {
+  const iteratorNodeId = resolveIteratorNodeId(payload);
+  if (!iteratorNodeId) {
+    return previousRegions;
+  }
+  const nextRegions = { ...(previousRegions ?? {}) };
+  const existingRegion = nextRegions[iteratorNodeId];
+  const currentRegion = (existingRegion ?? {}) as LoopRegionState;
+  let memberNodeIds = Array.isArray(currentRegion.member_node_ids)
+    ? currentRegion.member_node_ids.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+    : [];
+  let iterationIds = Array.isArray(currentRegion.iteration_ids)
+    ? currentRegion.iteration_ids.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+    : [];
+
+  const nodeId = typeof payload.node_id === "string" ? payload.node_id : null;
+  if (nodeId && nodeId !== iteratorNodeId) {
+    memberNodeIds = appendUniqueString(memberNodeIds, nodeId);
+  }
+
+  const iteratorRowIndex =
+    typeof payload.iterator_row_index === "number"
+      ? payload.iterator_row_index
+      : typeof payload.current_row_index === "number"
+        ? payload.current_row_index
+        : null;
+  const iterationId =
+    typeof payload.iteration_id === "string" && payload.iteration_id
+      ? payload.iteration_id
+      : buildIterationId(iteratorNodeId, iteratorRowIndex);
+  iterationIds = appendUniqueString(iterationIds, iterationId);
+
+  const currentRowIndex =
+    typeof payload.current_row_index === "number"
+      ? payload.current_row_index
+      : iteratorRowIndex ?? currentRegion.current_row_index ?? null;
+  const totalRows =
+    typeof payload.total_rows === "number"
+      ? payload.total_rows
+      : typeof payload.iterator_total_rows === "number"
+        ? payload.iterator_total_rows
+        : currentRegion.total_rows ?? null;
+  const status =
+    includeStatus && typeof payload.status === "string" && payload.status
+      ? payload.status
+      : currentRegion.status ?? null;
+
+  nextRegions[iteratorNodeId] = {
+    iterator_node_id: iteratorNodeId,
+    iterator_type:
+      typeof payload.iterator_type === "string"
+        ? payload.iterator_type
+        : currentRegion.iterator_type ?? null,
+    status,
+    current_row_index: currentRowIndex,
+    total_rows: totalRows,
+    active_iteration_id:
+      typeof iterationId === "string" && iterationId
+        ? iterationId
+        : currentRegion.active_iteration_id ?? null,
+    member_node_ids: memberNodeIds,
+    iteration_ids: iterationIds,
+    sheet_name: typeof payload.sheet_name === "string" ? payload.sheet_name : (currentRegion.sheet_name ?? null),
+    source_file: typeof payload.source_file === "string" ? payload.source_file : (currentRegion.source_file ?? null),
+    file_format: typeof payload.file_format === "string" ? payload.file_format : (currentRegion.file_format ?? null),
+  };
+  return nextRegions;
+}
+
+function resetLoopMemberNodeVisualizerState(
+  runState: RunState,
+  iteratorNodeId: string,
+  previousIterationId: string | null,
+  nextIterationId: string | null,
+): RunState {
+  if (!previousIterationId || !nextIterationId || previousIterationId === nextIterationId) {
+    return runState;
+  }
+  const loopRegion = runState.loop_regions?.[iteratorNodeId];
+  const memberNodeIds = Array.isArray(loopRegion?.member_node_ids)
+    ? loopRegion.member_node_ids.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+    : [];
+  if (memberNodeIds.length === 0) {
+    return runState;
+  }
+  let nodeInputs = runState.node_inputs ?? {};
+  let nodeOutputs = runState.node_outputs ?? {};
+  let nodeErrors = runState.node_errors ?? {};
+  let visitCounts = runState.visit_counts ?? {};
+  const nextNodeStatuses = { ...(runState.node_statuses ?? {}) };
+  let didMutate = false;
+
+  for (const nodeId of memberNodeIds) {
+    if (nodeId === iteratorNodeId) {
+      continue;
+    }
+    if (nextNodeStatuses[nodeId] !== "idle") {
+      nextNodeStatuses[nodeId] = "idle";
+      didMutate = true;
+    }
+    if (Object.prototype.hasOwnProperty.call(nodeInputs, nodeId)) {
+      nodeInputs = omitRunStateEntry(nodeInputs, nodeId);
+      didMutate = true;
+    }
+    if (Object.prototype.hasOwnProperty.call(nodeOutputs, nodeId)) {
+      nodeOutputs = omitRunStateEntry(nodeOutputs, nodeId);
+      didMutate = true;
+    }
+    if (Object.prototype.hasOwnProperty.call(nodeErrors, nodeId)) {
+      nodeErrors = omitRunStateEntry(nodeErrors, nodeId);
+      didMutate = true;
+    }
+    if (Object.prototype.hasOwnProperty.call(visitCounts, nodeId)) {
+      visitCounts = omitRunStateEntry(visitCounts, nodeId);
+      didMutate = true;
+    }
+  }
+
+  if (!didMutate) {
+    return runState;
+  }
+  return {
+    ...runState,
+    node_statuses: nextNodeStatuses,
+    node_inputs: nodeInputs,
+    node_outputs: nodeOutputs,
+    node_errors: nodeErrors,
+    visit_counts: visitCounts,
+  };
 }
 
 function getSavedInputPrompt(graph: GraphDocument | null | undefined): string {
@@ -496,12 +663,15 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
   }
 
   if (event.event_type === "node.started") {
-    const payload = event.payload as { node_id: string; visit_count: number; received_input?: unknown };
+    const payload = event.payload as { node_id: string; visit_count: number; received_input?: unknown } & Record<string, unknown>;
     next.current_node_id = payload.node_id;
     next.current_edge_id = null;
+    const previousNodeVisitCount = Number(next.visit_counts?.[payload.node_id] ?? 0);
+    const expectedVisitCount = previousNodeVisitCount + 1;
+    const resolvedVisitCount = payload.visit_count === expectedVisitCount ? payload.visit_count : expectedVisitCount;
     next.visit_counts = {
       ...next.visit_counts,
-      [payload.node_id]: payload.visit_count,
+      [payload.node_id]: resolvedVisitCount,
     };
     next.node_inputs = {
       ...(next.node_inputs ?? {}),
@@ -512,10 +682,14 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
       ...(next.node_statuses ?? {}),
       [payload.node_id]: "active",
     };
+    const nextLoopRegions = updateLoopRegionState(next.loop_regions, payload);
+    if (nextLoopRegions) {
+      next.loop_regions = nextLoopRegions;
+    }
   }
 
   if (event.event_type === "node.completed") {
-    const payload = event.payload as { node_id: string; output?: unknown; error?: unknown };
+    const payload = event.payload as { node_id: string; output?: unknown; error?: unknown } & Record<string, unknown>;
     if (next.current_node_id === payload.node_id) {
       next.current_node_id = null;
     }
@@ -537,11 +711,20 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
       ...(next.node_statuses ?? {}),
       [payload.node_id]: payload.error != null ? "failed" : "success",
     };
+    const nextLoopRegions = updateLoopRegionState(next.loop_regions, payload);
+    if (nextLoopRegions) {
+      next.loop_regions = nextLoopRegions;
+    }
   }
 
   if (event.event_type === "node.iterator.updated") {
     const payload = event.payload as Record<string, unknown>;
     const nodeId = typeof payload.node_id === "string" ? payload.node_id : null;
+    const iteratorNodeId = resolveIteratorNodeId(payload);
+    const previousIterationId =
+      iteratorNodeId && next.loop_regions?.[iteratorNodeId] && typeof next.loop_regions[iteratorNodeId]?.active_iteration_id === "string"
+        ? next.loop_regions[iteratorNodeId]?.active_iteration_id ?? null
+        : null;
     if (nodeId) {
       next.iterator_states = {
         ...(next.iterator_states ?? {}),
@@ -556,6 +739,17 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
           file_format: payload.file_format,
         },
       };
+    }
+    const nextLoopRegions = updateLoopRegionState(next.loop_regions, payload, true);
+    if (nextLoopRegions) {
+      next.loop_regions = nextLoopRegions;
+    }
+    const nextIterationId =
+      iteratorNodeId && next.loop_regions?.[iteratorNodeId] && typeof next.loop_regions[iteratorNodeId]?.active_iteration_id === "string"
+        ? next.loop_regions[iteratorNodeId]?.active_iteration_id ?? null
+        : null;
+    if (iteratorNodeId) {
+      Object.assign(next, resetLoopMemberNodeVisualizerState(next, iteratorNodeId, previousIterationId, nextIterationId));
     }
   }
 

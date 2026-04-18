@@ -271,6 +271,38 @@ class GraphRuntime:
             iterator_payload,
         )
 
+    def _collect_downstream_node_ids(self, graph: GraphDefinition, iterator_node_id: str) -> set[str]:
+        downstream: set[str] = set()
+        queue: deque[str] = deque([iterator_node_id])
+        visited: set[str] = {iterator_node_id}
+        while queue:
+            source_id = queue.popleft()
+            for edge in graph.get_outgoing_edges(source_id):
+                target_id = edge.target_id
+                if target_id in visited:
+                    continue
+                visited.add(target_id)
+                downstream.add(target_id)
+                queue.append(target_id)
+        return downstream
+
+    def _reset_downstream_runtime_state_for_iteration(
+        self,
+        graph: GraphDefinition,
+        state: RunState,
+        *,
+        iterator_node_id: str,
+        downstream_node_ids: set[str],
+    ) -> None:
+        if not downstream_node_ids:
+            return
+        for node_id in downstream_node_ids:
+            state.node_outputs.pop(node_id, None)
+            state.node_errors.pop(node_id, None)
+        for edge in graph.edges:
+            if edge.source_id == iterator_node_id or edge.source_id in downstream_node_ids:
+                state.edge_outputs.pop(edge.id, None)
+
     def _enqueue_selected_edges(
         self,
         graph: GraphDefinition,
@@ -305,7 +337,7 @@ class GraphRuntime:
                 state,
                 "edge.selected",
                 f"Transitioning from '{next_edge.source_id}' to '{next_edge.target_id}'.",
-                next_edge.to_dict(),
+                {**next_edge.to_dict(), **inherited_context},
             )
             frame = {"node_id": next_edge.target_id, "incoming_edge_id": next_edge.id, **inherited_context}
             target = graph.nodes.get(next_edge.target_id)
@@ -326,7 +358,7 @@ class GraphRuntime:
                 state,
                 "edge.selected",
                 f"Transitioning from '{edge.source_id}' to '{edge.target_id}'.",
-                edge.to_dict(),
+                {**edge.to_dict(), **inherited_context},
             )
             pending_nodes.appendleft(
                 {"node_id": edge.target_id, "incoming_edge_id": edge.id, **inherited_context},
@@ -365,9 +397,16 @@ class GraphRuntime:
         if total_rows == 0:
             return None
 
+        downstream_node_ids = self._collect_downstream_node_ids(graph, node.id)
         for row_index, row_envelope in enumerate(row_envelopes, start=1):
             if self.cancel_requested():
                 return self.cancel_run(state, summary=f"Run cancelled during spreadsheet iteration for node '{node.label}'.")
+            self._reset_downstream_runtime_state_for_iteration(
+                graph,
+                state,
+                iterator_node_id=node.id,
+                downstream_node_ids=downstream_node_ids,
+            )
             state.node_outputs[node.id] = row_envelope
             self._emit_iterator_update(
                 state,
@@ -529,23 +568,28 @@ class GraphRuntime:
             if result.output is not None:
                 state.node_outputs[node.id] = result.output
 
+            completed_payload = {
+                "node_id": node.id,
+                "node_kind": node.kind,
+                "node_category": node.category.value,
+                "node_provider_id": node.provider_id,
+                "node_provider_label": node.provider_label,
+                "status": result.status,
+                "output": result.output,
+                "route_outputs": result.route_outputs,
+                "error": result.error,
+                "metadata": result.metadata,
+                **self._frame_iteration_context(frame),
+            }
+            result_session_id = self._result_session_id(result)
+            if result_session_id is not None:
+                completed_payload["session_id"] = result_session_id
+
             self.emit(
                 state,
                 "node.completed",
                 result.summary or f"Completed node '{node.label}'.",
-                {
-                    "node_id": node.id,
-                    "node_kind": node.kind,
-                    "node_category": node.category.value,
-                    "node_provider_id": node.provider_id,
-                    "node_provider_label": node.provider_label,
-                    "status": result.status,
-                    "output": result.output,
-                    "route_outputs": result.route_outputs,
-                    "error": result.error,
-                    "metadata": result.metadata,
-                    **self._frame_iteration_context(frame),
-                },
+                completed_payload,
             )
 
             row_envelopes = internal_metadata.get("spreadsheet_row_envelopes")
@@ -886,6 +930,22 @@ class GraphRuntime:
             return None
         contract = metadata.get("contract")
         return contract if isinstance(contract, str) and contract else None
+
+    def _result_session_id(self, result: NodeExecutionResult) -> str | None:
+        metadata_candidates: list[dict[str, Any]] = []
+        if isinstance(result.metadata, dict):
+            metadata_candidates.append(result.metadata)
+        if isinstance(result.output, dict):
+            output_metadata = result.output.get("metadata")
+            if isinstance(output_metadata, dict):
+                metadata_candidates.append(output_metadata)
+        for metadata in metadata_candidates:
+            session_id = metadata.get("session_id")
+            if isinstance(session_id, str):
+                normalized = session_id.strip()
+                if normalized:
+                    return normalized
+        return None
 
     def fail_run(self, state: RunState, summary: str, error: dict[str, Any]) -> RunState:
         state.status = "failed"

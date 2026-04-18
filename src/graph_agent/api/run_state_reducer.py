@@ -127,23 +127,31 @@ def _append_unique_string(values: list[Any], candidate: Any) -> list[str]:
     return normalized_values
 
 
-def _update_loop_region_state(
-    previous_regions: dict[str, Any] | None,
-    payload: dict[str, Any],
-    *,
-    include_status: bool = False,
-) -> dict[str, Any] | None:
+def _resolve_iterator_node_id(payload: dict[str, Any]) -> str | None:
     iterator_node_id = payload.get("iterator_node_id")
+    if isinstance(iterator_node_id, str) and iterator_node_id:
+        return iterator_node_id
+    node_id = payload.get("node_id")
     if (
-        (not isinstance(iterator_node_id, str) or not iterator_node_id)
-        and isinstance(payload.get("node_id"), str)
+        isinstance(node_id, str)
+        and node_id
         and (
             payload.get("iterator_type") is not None
             or payload.get("current_row_index") is not None
             or payload.get("total_rows") is not None
         )
     ):
-        iterator_node_id = payload.get("node_id")
+        return node_id
+    return None
+
+
+def _update_loop_region_state(
+    previous_regions: dict[str, Any] | None,
+    payload: dict[str, Any],
+    *,
+    include_status: bool = False,
+) -> dict[str, Any] | None:
+    iterator_node_id = _resolve_iterator_node_id(payload)
     if not isinstance(iterator_node_id, str) or not iterator_node_id:
         return previous_regions
     next_regions = dict(previous_regions or {})
@@ -190,6 +198,62 @@ def _update_loop_region_state(
     return next_regions
 
 
+def _reset_loop_member_node_runtime_state(
+    next_state: dict[str, Any],
+    iterator_node_id: str,
+    previous_iteration_id: str | None,
+    next_iteration_id: str | None,
+) -> None:
+    if (
+        not isinstance(previous_iteration_id, str)
+        or not previous_iteration_id
+        or not isinstance(next_iteration_id, str)
+        or not next_iteration_id
+        or previous_iteration_id == next_iteration_id
+    ):
+        return
+    loop_regions = next_state.get("loop_regions")
+    if not isinstance(loop_regions, dict):
+        return
+    loop_region = loop_regions.get(iterator_node_id)
+    if not isinstance(loop_region, dict):
+        return
+    member_node_ids = [value for value in loop_region.get("member_node_ids", []) if isinstance(value, str) and value]
+    if not member_node_ids:
+        return
+    next_node_statuses = dict(next_state.get("node_statuses", {}))
+    next_node_inputs = dict(next_state.get("node_inputs", {}))
+    next_node_outputs = dict(next_state.get("node_outputs", {}))
+    next_node_errors = dict(next_state.get("node_errors", {}))
+    next_visit_counts = dict(next_state.get("visit_counts", {}))
+    did_mutate = False
+    for node_id in member_node_ids:
+        if node_id == iterator_node_id:
+            continue
+        if next_node_statuses.get(node_id) != "idle":
+            next_node_statuses[node_id] = "idle"
+            did_mutate = True
+        if node_id in next_node_inputs:
+            next_node_inputs.pop(node_id, None)
+            did_mutate = True
+        if node_id in next_node_outputs:
+            next_node_outputs.pop(node_id, None)
+            did_mutate = True
+        if node_id in next_node_errors:
+            next_node_errors.pop(node_id, None)
+            did_mutate = True
+        if node_id in next_visit_counts:
+            next_visit_counts.pop(node_id, None)
+            did_mutate = True
+    if not did_mutate:
+        return
+    next_state["node_statuses"] = next_node_statuses
+    next_state["node_inputs"] = next_node_inputs
+    next_state["node_outputs"] = next_node_outputs
+    next_state["node_errors"] = next_node_errors
+    next_state["visit_counts"] = next_visit_counts
+
+
 def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
     event = normalize_runtime_event_dict(event)
     next_state = {
@@ -212,9 +276,21 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
         next_state["current_node_id"] = node_id if isinstance(node_id, str) else None
         next_state["current_edge_id"] = None
         if isinstance(node_id, str):
+            previous_visit_counts = next_state.get("visit_counts", {})
+            previous_node_visit_count = (
+                int(previous_visit_counts.get(node_id, 0) or 0)
+                if isinstance(previous_visit_counts, dict)
+                else 0
+            )
+            expected_visit_count = previous_node_visit_count + 1
+            resolved_visit_count = (
+                int(visit_count)
+                if isinstance(visit_count, int) and int(visit_count) == expected_visit_count
+                else expected_visit_count
+            )
             next_state["visit_counts"] = {
-                **next_state.get("visit_counts", {}),
-                node_id: int(visit_count) if isinstance(visit_count, int) else 0,
+                **(previous_visit_counts if isinstance(previous_visit_counts, dict) else {}),
+                node_id: resolved_visit_count,
             }
             next_state["node_inputs"] = {
                 **next_state.get("node_inputs", {}),
@@ -255,6 +331,18 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
             next_state["loop_regions"] = next_loop_regions
 
     if event_type == "node.iterator.updated":
+        iterator_node_id = _resolve_iterator_node_id(payload)
+        previous_iteration_id: str | None = None
+        if isinstance(iterator_node_id, str) and iterator_node_id:
+            previous_loop_regions = next_state.get("loop_regions")
+            if isinstance(previous_loop_regions, dict):
+                previous_loop_region = previous_loop_regions.get(iterator_node_id)
+                if isinstance(previous_loop_region, dict):
+                    previous_iteration_id = (
+                        previous_loop_region.get("active_iteration_id")
+                        if isinstance(previous_loop_region.get("active_iteration_id"), str)
+                        else None
+                    )
         node_id = payload.get("node_id")
         if isinstance(node_id, str):
             next_state["iterator_states"] = {
@@ -273,6 +361,23 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
         next_loop_regions = _update_loop_region_state(next_state.get("loop_regions"), payload, include_status=True)
         if next_loop_regions is not None:
             next_state["loop_regions"] = next_loop_regions
+        if isinstance(iterator_node_id, str) and iterator_node_id:
+            next_iteration_id: str | None = None
+            next_loop_regions = next_state.get("loop_regions")
+            if isinstance(next_loop_regions, dict):
+                next_loop_region = next_loop_regions.get(iterator_node_id)
+                if isinstance(next_loop_region, dict):
+                    next_iteration_id = (
+                        next_loop_region.get("active_iteration_id")
+                        if isinstance(next_loop_region.get("active_iteration_id"), str)
+                        else None
+                    )
+            _reset_loop_member_node_runtime_state(
+                next_state,
+                iterator_node_id,
+                previous_iteration_id,
+                next_iteration_id,
+            )
 
     if event_type == "edge.selected":
         selected_edge_id = payload.get("id")

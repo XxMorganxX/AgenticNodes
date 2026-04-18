@@ -209,6 +209,115 @@ function stringifyCompactValue(value: unknown): string {
   }
 }
 
+function parseJsonRecord(candidate: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(candidate);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractProviderPayloadFromErrorMessage(message: unknown): Record<string, unknown> | null {
+  if (typeof message !== "string" || message.trim().length === 0) {
+    return null;
+  }
+  const direct = parseJsonRecord(message.trim());
+  if (direct) {
+    return direct;
+  }
+  const start = message.indexOf("{");
+  const end = message.lastIndexOf("}");
+  if (start === -1 || end <= start) {
+    return null;
+  }
+  return parseJsonRecord(message.slice(start, end + 1));
+}
+
+function normalizeProviderIterations(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((entry, index) => {
+    if (isRecord(entry)) {
+      return {
+        turn: index + 1,
+        ...entry,
+      };
+    }
+    return {
+      turn: index + 1,
+      value: entry,
+    };
+  });
+}
+
+function buildProviderTurnTranscript(providerPayload: Record<string, unknown>): Record<string, unknown> | null {
+  const usage = isRecord(providerPayload.usage) ? providerPayload.usage : null;
+  const iterations = normalizeProviderIterations(usage?.iterations);
+  const errors = Array.isArray(providerPayload.errors) ? providerPayload.errors : [];
+  const rawNumTurns = providerPayload.num_turns;
+  const numTurns =
+    typeof rawNumTurns === "number" && Number.isFinite(rawNumTurns)
+      ? rawNumTurns
+      : iterations.length > 0
+        ? iterations.length
+        : null;
+  if (iterations.length === 0 && errors.length === 0 && numTurns == null) {
+    return null;
+  }
+  const transcript: Record<string, unknown> = {};
+  if (typeof providerPayload.session_id === "string" && providerPayload.session_id.trim().length > 0) {
+    transcript.session_id = providerPayload.session_id.trim();
+  }
+  if (typeof providerPayload.stop_reason === "string" && providerPayload.stop_reason.trim().length > 0) {
+    transcript.stop_reason = providerPayload.stop_reason.trim();
+  }
+  if (typeof providerPayload.terminal_reason === "string" && providerPayload.terminal_reason.trim().length > 0) {
+    transcript.terminal_reason = providerPayload.terminal_reason.trim();
+  }
+  if (numTurns != null) {
+    transcript.num_turns = numTurns;
+  }
+  if (errors.length > 0) {
+    transcript.errors = errors;
+  }
+  if (iterations.length > 0) {
+    transcript.iterations = iterations;
+  }
+  return transcript;
+}
+
+function providerTurnTranscriptFromPayload(payload: Record<string, unknown>): Record<string, unknown> | null {
+  const metadata = isRecord(payload.metadata) ? payload.metadata : null;
+  if (metadata) {
+    const metadataTranscript = buildProviderTurnTranscript(metadata);
+    if (metadataTranscript) {
+      return metadataTranscript;
+    }
+  }
+
+  const output = isRecord(payload.output) ? payload.output : null;
+  const outputMetadata = output && isRecord(output.metadata) ? output.metadata : null;
+  if (outputMetadata) {
+    const outputTranscript = buildProviderTurnTranscript(outputMetadata);
+    if (outputTranscript) {
+      return outputTranscript;
+    }
+  }
+
+  const error = isRecord(payload.error) ? payload.error : null;
+  if (!error) {
+    return null;
+  }
+  const parsedErrorPayload =
+    extractProviderPayloadFromErrorMessage(error.message) ??
+    extractProviderPayloadFromErrorMessage(error.detail) ??
+    extractProviderPayloadFromErrorMessage(error.stderr) ??
+    extractProviderPayloadFromErrorMessage(error.stdout);
+  return parsedErrorPayload ? buildProviderTurnTranscript(parsedErrorPayload) : null;
+}
+
 function extractErrorMessage(value: unknown): string | null {
   if (typeof value === "string") {
     return firstNonEmptyString(value);
@@ -559,6 +668,22 @@ function nodeIdFromEvent(event: RuntimeEvent): string | null {
   return typeof payloadNodeId === "string" && payloadNodeId.length > 0 ? payloadNodeId : null;
 }
 
+function sessionIdFromEventPayload(payload: Record<string, unknown>): string | null {
+  if (typeof payload.session_id === "string" && payload.session_id.trim().length > 0) {
+    return payload.session_id.trim();
+  }
+  const metadata = isRecord(payload.metadata) ? payload.metadata : null;
+  if (metadata && typeof metadata.session_id === "string" && metadata.session_id.trim().length > 0) {
+    return metadata.session_id.trim();
+  }
+  const output = isRecord(payload.output) ? payload.output : null;
+  const outputMetadata = output && isRecord(output.metadata) ? output.metadata : null;
+  if (outputMetadata && typeof outputMetadata.session_id === "string" && outputMetadata.session_id.trim().length > 0) {
+    return outputMetadata.session_id.trim();
+  }
+  return null;
+}
+
 function nodeFromEvent(event: RuntimeEvent, graph: GraphDefinition | null): GraphNode | null {
   const nodeId = nodeIdFromEvent(event);
   if (nodeId) {
@@ -783,6 +908,20 @@ function buildMilestoneDetails(
   if (typeof payload.status === "string") {
     details.push({ label: "Status", value: payload.status });
   }
+  if (typeof payload.iteration_id === "string" && payload.iteration_id.trim().length > 0) {
+    details.push({ label: "Iteration", value: payload.iteration_id.trim() });
+  }
+  const sessionId = sessionIdFromEventPayload(payload);
+  if (sessionId) {
+    details.push({ label: "Session", value: sessionId });
+  }
+  const providerTranscript = providerTurnTranscriptFromPayload(payload);
+  if (providerTranscript && typeof providerTranscript.num_turns === "number") {
+    details.push({ label: "Turns", value: String(providerTranscript.num_turns) });
+  }
+  if (providerTranscript && typeof providerTranscript.stop_reason === "string") {
+    details.push({ label: "Stop reason", value: providerTranscript.stop_reason });
+  }
   if (typeof payload.visit_count === "number") {
     details.push({ label: "Visit", value: `#${payload.visit_count}` });
   }
@@ -855,6 +994,10 @@ function buildMilestoneDataSections(
     if ("metadata" in payload) {
       appendSection(sections, "Execution metadata", payload.metadata);
     }
+    const providerTranscript = providerTurnTranscriptFromPayload(payload);
+    if (providerTranscript) {
+      appendSection(sections, "Provider turn transcript", providerTranscript);
+    }
     return sections;
   }
   if (event.event_type === "run.completed") {
@@ -863,6 +1006,10 @@ function buildMilestoneDataSections(
   }
   if (event.event_type === "run.failed") {
     appendSection(sections, "Failure", payload.error, { allowNull: true });
+    const providerTranscript = providerTurnTranscriptFromPayload(payload);
+    if (providerTranscript) {
+      appendSection(sections, "Provider turn transcript", providerTranscript);
+    }
     if ("final_output" in payload) {
       appendSection(sections, "Final output", payload.final_output, { allowNull: true });
     }
@@ -870,6 +1017,10 @@ function buildMilestoneDataSections(
   }
   if (event.event_type === "run.cancelled") {
     appendSection(sections, "Cancellation", payload.error, { allowNull: true });
+    const providerTranscript = providerTurnTranscriptFromPayload(payload);
+    if (providerTranscript) {
+      appendSection(sections, "Provider turn transcript", providerTranscript);
+    }
     if ("final_output" in payload) {
       appendSection(sections, "Final output", payload.final_output, { allowNull: true });
     }
@@ -877,6 +1028,10 @@ function buildMilestoneDataSections(
   }
   if (event.event_type === "run.interrupted") {
     appendSection(sections, "Interruption", payload.error, { allowNull: true });
+    const providerTranscript = providerTurnTranscriptFromPayload(payload);
+    if (providerTranscript) {
+      appendSection(sections, "Provider turn transcript", providerTranscript);
+    }
     return sections;
   }
   if (event.event_type === "condition.evaluated") {
@@ -1178,6 +1333,18 @@ export function buildFocusedRunSummary(
 function buildSingleEventGroup(id: string, event: RuntimeEvent, graph: GraphDefinition | null): FocusedEventGroup {
   const eventType = normalizeEventType(event.event_type);
   const tone = eventTone(eventType);
+  const iterationId =
+    typeof event.payload.iteration_id === "string" && event.payload.iteration_id.trim().length > 0
+      ? event.payload.iteration_id.trim()
+      : null;
+  const sessionId = sessionIdFromEventPayload(event.payload);
+  const diagnosticsLine = iterationId && sessionId
+    ? `Iteration ${iterationId} | Session ${sessionId}`
+    : iterationId
+      ? `Iteration ${iterationId}`
+      : sessionId
+        ? `Session ${sessionId}`
+        : null;
   return {
     id,
     title: milestoneLabel(event, graph),
@@ -1187,7 +1354,7 @@ function buildSingleEventGroup(id: string, event: RuntimeEvent, graph: GraphDefi
     startedAt: event.timestamp,
     endedAt: null,
     nodeId: nodeIdFromEvent(event),
-    lines: [event.summary],
+    lines: diagnosticsLine ? [event.summary, diagnosticsLine] : [event.summary],
   };
 }
 

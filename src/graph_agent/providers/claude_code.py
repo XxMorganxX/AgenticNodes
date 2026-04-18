@@ -781,6 +781,10 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
                 "session_id": payload.get("session_id"),
                 "total_cost_usd": payload.get("total_cost_usd"),
                 "duration_ms": payload.get("duration_ms"),
+                "num_turns": payload.get("num_turns"),
+                "stop_reason": payload.get("stop_reason"),
+                "terminal_reason": payload.get("terminal_reason"),
+                "errors": payload.get("errors"),
                 "usage": payload.get("usage"),
             },
         )

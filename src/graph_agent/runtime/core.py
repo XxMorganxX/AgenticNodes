@@ -88,6 +88,10 @@ from graph_agent.runtime.node_providers import (
     is_valid_category_connection,
 )
 from graph_agent.runtime.microsoft_auth import MicrosoftAuthService, MicrosoftAuthStatus
+from graph_agent.runtime.outlook_dedupe import (
+    OutlookDraftDeduplicationScope,
+    OutlookDraftDedupeStore,
+)
 from graph_agent.runtime.run_documents import normalize_run_documents
 from graph_agent.runtime.spreadsheets import (
     SPREADSHEET_FIRST_DATA_ROW_INDEX,
@@ -6394,6 +6398,47 @@ class OutlookDraftOutputNode(OutputNode):
             raise ValueError("Outlook draft node could not derive body text from the resolved payload.")
         return body
 
+    def _resolve_iteration_source_file(self, context: NodeContext, payload: Any) -> str:
+        iteration_context = context.current_iteration_context()
+        iterator_node_id = str(iteration_context.get("iterator_node_id", "") or "").strip()
+        if iterator_node_id:
+            iterator_state = context.state.iterator_states.get(iterator_node_id)
+            if isinstance(iterator_state, Mapping):
+                source_file = str(iterator_state.get("source_file", "") or "").strip()
+                if source_file:
+                    return source_file
+        if isinstance(payload, Mapping):
+            source_file = str(payload.get("source_file", "") or "").strip()
+            if source_file:
+                return source_file
+        return ""
+
+    def _dedupe_scope(
+        self,
+        context: NodeContext,
+        *,
+        payload: Any,
+        recipients: list[str],
+        subject: str,
+        body: str,
+    ) -> OutlookDraftDeduplicationScope | None:
+        iteration_context = context.current_iteration_context()
+        iterator_node_id = str(iteration_context.get("iterator_node_id", "") or "").strip()
+        iteration_id = str(iteration_context.get("iteration_id", "") or "").strip()
+        if not iterator_node_id or not iteration_id:
+            return None
+        return OutlookDraftDeduplicationScope(
+            graph_id=context.state.graph_id,
+            node_id=self.id,
+            iterator_node_id=iterator_node_id,
+            iteration_id=iteration_id,
+            source_file=self._resolve_iteration_source_file(context, payload),
+            recipients=list(recipients),
+            agent_id=str(context.state.agent_id or ""),
+            subject=subject,
+            body=body,
+        )
+
     def _outbound_email_logger_binding(self, context: NodeContext) -> OutboundEmailLoggerBinding | None:
         for edge in context.graph.get_incoming_edges(self.id):
             if edge.kind != "binding":
@@ -6709,19 +6754,120 @@ class OutlookDraftOutputNode(OutputNode):
         logger_validation: dict[str, Any] | None = None
         if logger_binding is not None:
             logger_validation = self._validate_outbound_email_logger_binding(logger_binding)
-        auth_status = self._auth_service(context).connection_status()
-        access_token = self._auth_service(context).acquire_access_token()
-        draft_client = context.services.outlook_draft_client or OutlookDraftClient()
-        draft = draft_client.create_draft(
-            access_token=access_token,
-            to_recipients=recipients,
+        auth_service = self._auth_service(context)
+        auth_status = auth_service.connection_status()
+        dedupe_scope = self._dedupe_scope(
+            context,
+            payload=payload,
+            recipients=recipients,
             subject=subject,
             body=body,
         )
+        dedupe_store = OutlookDraftDedupeStore() if dedupe_scope is not None else None
+        if dedupe_store is not None and dedupe_scope is not None:
+            dedupe_action, dedupe_row = dedupe_store.begin_attempt(
+                scope=dedupe_scope,
+                run_id=context.state.run_id,
+                parent_run_id=context.state.parent_run_id,
+            )
+            if dedupe_action == "deduped_success":
+                cached_output = dedupe_store.decode_success_output(dedupe_row) or {}
+                output_payload = dict(cached_output)
+                output_payload["delivery_status"] = "draft_saved_deduped"
+                output_payload.setdefault("subject", subject)
+                output_payload.setdefault("body", body)
+                output_payload.setdefault("to_recipients", list(recipients))
+                output_payload.setdefault("account_username", auth_status.account_username)
+                output_payload.setdefault("source_payload", payload)
+                logged_outbound_email = output_payload.get("outbound_email_log")
+                logged_mapping = logged_outbound_email if isinstance(logged_outbound_email, Mapping) else {}
+                summary = (
+                    f"Skipped duplicate Outlook draft for {', '.join(recipients)}."
+                    if recipients
+                    else "Skipped duplicate Outlook draft."
+                )
+                return NodeExecutionResult(
+                    status="success",
+                    output=output_payload,
+                    summary=summary,
+                    metadata={
+                        "outlook_draft_saved": True,
+                        "outlook_draft_deduped": True,
+                        "outbound_email_logged": bool(logged_mapping and not logged_mapping.get("skipped")),
+                        "outbound_email_log_skipped": bool(logged_mapping and logged_mapping.get("skipped")),
+                    },
+                )
+            if dedupe_action == "deduped_in_progress":
+                summary = (
+                    f"Skipped duplicate Outlook draft for {', '.join(recipients)} while another attempt is in progress."
+                    if recipients
+                    else "Skipped duplicate Outlook draft while another attempt is in progress."
+                )
+                return NodeExecutionResult(
+                    status="success",
+                    output={
+                        "delivery_status": "draft_deduped_in_progress",
+                        "subject": subject,
+                        "body": body,
+                        "to_recipients": list(recipients),
+                        "account_username": auth_status.account_username,
+                        "source_payload": payload,
+                    },
+                    summary=summary,
+                    metadata={
+                        "outlook_draft_saved": False,
+                        "outlook_draft_deduped": True,
+                        "outlook_draft_pending": True,
+                        "outbound_email_logged": False,
+                        "outbound_email_log_skipped": False,
+                    },
+                )
+        access_token = auth_service.acquire_access_token()
+        draft_client = context.services.outlook_draft_client or OutlookDraftClient()
+        try:
+            draft = draft_client.create_draft(
+                access_token=access_token,
+                to_recipients=recipients,
+                subject=subject,
+                body=body,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if dedupe_store is not None and dedupe_scope is not None:
+                dedupe_store.mark_failure(
+                    scope=dedupe_scope,
+                    error_payload={
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "run_id": context.state.run_id,
+                    },
+                )
+            raise
         raw_provider_payload = dict(draft.raw_response) if isinstance(draft.raw_response, Mapping) else {}
         provider_message_id = str(raw_provider_payload.get("id", draft.draft_id) or draft.draft_id or "").strip()
         internet_message_id = str(raw_provider_payload.get("internetMessageId", "") or "").strip()
         conversation_id = str(raw_provider_payload.get("conversationId", "") or "").strip()
+        output_payload: dict[str, Any] = {
+            "delivery_status": "draft_saved",
+            "draft_id": draft.draft_id,
+            "provider_message_id": provider_message_id,
+            "internet_message_id": internet_message_id,
+            "conversation_id": conversation_id,
+            "web_link": draft.web_link,
+            "subject": draft.subject,
+            "body": draft.body,
+            "to_recipients": draft.to_recipients,
+            "created_at": draft.created_at,
+            "last_modified_at": draft.last_modified_at,
+            "account_username": auth_status.account_username,
+            "raw_provider_payload": raw_provider_payload,
+            "outbound_email_log": None,
+            "source_payload": payload,
+        }
+        if dedupe_store is not None and dedupe_scope is not None:
+            dedupe_store.mark_success(
+                scope=dedupe_scope,
+                output_payload=output_payload,
+            )
         logged_outbound_email: dict[str, Any] | None = None
         if logger_binding is not None and logger_validation is not None:
             try:
@@ -6753,29 +6899,20 @@ class OutlookDraftOutputNode(OutputNode):
                         summary=str(exc),
                         metadata={"outlook_draft_saved": True, "outbound_email_log_failed": True},
                     )
+        output_payload["outbound_email_log"] = logged_outbound_email
+        if dedupe_store is not None and dedupe_scope is not None:
+            dedupe_store.mark_success(
+                scope=dedupe_scope,
+                output_payload=output_payload,
+            )
         summary = f"Saved Outlook draft for {', '.join(draft.to_recipients)}." if draft.to_recipients else "Saved Outlook draft."
         return NodeExecutionResult(
             status="success",
-            output={
-                "delivery_status": "draft_saved",
-                "draft_id": draft.draft_id,
-                "provider_message_id": provider_message_id,
-                "internet_message_id": internet_message_id,
-                "conversation_id": conversation_id,
-                "web_link": draft.web_link,
-                "subject": draft.subject,
-                "body": draft.body,
-                "to_recipients": draft.to_recipients,
-                "created_at": draft.created_at,
-                "last_modified_at": draft.last_modified_at,
-                "account_username": auth_status.account_username,
-                "raw_provider_payload": raw_provider_payload,
-                "outbound_email_log": logged_outbound_email,
-                "source_payload": payload,
-            },
+            output=output_payload,
             summary=summary,
             metadata={
                 "outlook_draft_saved": True,
+                "outlook_draft_deduped": False,
                 "outbound_email_logged": bool(logged_outbound_email and not logged_outbound_email.get("skipped")),
                 "outbound_email_log_skipped": bool(logged_outbound_email and logged_outbound_email.get("skipped")),
             },

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 from pathlib import Path
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
 from unittest.mock import patch
@@ -357,6 +359,288 @@ def build_outlook_draft_graph_with_logger_payload() -> dict[str, object]:
     payload["nodes"] = nodes
     payload["edges"] = edges
     return payload
+
+
+def build_spreadsheet_outlook_draft_graph_payload(*, csv_path: str, duplicate_loop_edges: bool = False) -> dict[str, object]:
+    sheet_to_draft_edges: list[dict[str, object]] = [
+        {
+            "id": "edge-sheet-draft-1",
+            "source_id": "sheet",
+            "source_handle_id": "control-flow-loop-body",
+            "target_id": "draft",
+            "label": "row",
+            "kind": "standard",
+            "priority": 100,
+            "condition": None,
+        }
+    ]
+    if duplicate_loop_edges:
+        sheet_to_draft_edges.append(
+            {
+                "id": "edge-sheet-draft-2",
+                "source_id": "sheet",
+                "source_handle_id": "control-flow-loop-body",
+                "target_id": "draft",
+                "label": "row-duplicate",
+                "kind": "standard",
+                "priority": 90,
+                "condition": None,
+            }
+        )
+
+    return {
+        "graph_id": "outlook-draft-spreadsheet-agent",
+        "name": "Outlook Draft Spreadsheet Agent",
+        "description": "",
+        "version": "1.0",
+        "start_node_id": "start",
+        "nodes": [
+            {
+                "id": "start",
+                "kind": "input",
+                "category": "start",
+                "label": "Start",
+                "provider_id": "start.manual_run",
+                "provider_label": "Run Button Start",
+                "description": "",
+                "position": {"x": 0, "y": 0},
+                "config": {"input_binding": {"type": "input_payload"}},
+            },
+            {
+                "id": "sheet",
+                "kind": "control_flow_unit",
+                "category": "control_flow_unit",
+                "label": "Spreadsheet Rows",
+                "provider_id": "core.spreadsheet_rows",
+                "provider_label": "Spreadsheet Rows",
+                "description": "",
+                "position": {"x": 160, "y": 0},
+                "config": {
+                    "mode": "spreadsheet_rows",
+                    "file_format": "csv",
+                    "file_path": csv_path,
+                    "sheet_name": "",
+                    "empty_row_policy": "skip",
+                },
+            },
+            {
+                "id": "draft",
+                "kind": "output",
+                "category": "end",
+                "label": "Outlook Draft End",
+                "provider_id": "end.outlook_draft",
+                "provider_label": "Outlook Draft End",
+                "description": "",
+                "position": {"x": 360, "y": 0},
+                "config": {
+                    "to": "alex@example.com",
+                    "subject": "Follow-up row {row_index}",
+                    "require_to": True,
+                    "require_subject": True,
+                    "require_body": True,
+                },
+            },
+        ],
+        "edges": [
+            {
+                "id": "edge-start-sheet",
+                "source_id": "start",
+                "target_id": "sheet",
+                "label": "sheet",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            },
+            *sheet_to_draft_edges,
+        ],
+    }
+
+
+def build_spreadsheet_context_builder_outlook_graph_payload(*, csv_path: str) -> dict[str, object]:
+    return {
+        "graph_id": "outlook-draft-context-builder-agent",
+        "name": "Outlook Draft Context Builder Agent",
+        "description": "",
+        "version": "1.0",
+        "start_node_id": "start",
+        "nodes": [
+            {
+                "id": "start",
+                "kind": "input",
+                "category": "start",
+                "label": "Start",
+                "provider_id": "start.manual_run",
+                "provider_label": "Run Button Start",
+                "description": "",
+                "position": {"x": 0, "y": 0},
+                "config": {"input_binding": {"type": "input_payload"}},
+            },
+            {
+                "id": "sheet",
+                "kind": "control_flow_unit",
+                "category": "control_flow_unit",
+                "label": "Spreadsheet Rows",
+                "provider_id": "core.spreadsheet_rows",
+                "provider_label": "Spreadsheet Rows",
+                "description": "",
+                "position": {"x": 160, "y": 0},
+                "config": {
+                    "mode": "spreadsheet_rows",
+                    "file_format": "csv",
+                    "file_path": csv_path,
+                    "sheet_name": "",
+                    "empty_row_policy": "skip",
+                },
+            },
+            {
+                "id": "split",
+                "kind": "control_flow_unit",
+                "category": "control_flow_unit",
+                "label": "Parallel Split",
+                "provider_id": "core.parallel_splitter",
+                "provider_label": "Parallel Splitter",
+                "description": "",
+                "position": {"x": 320, "y": 0},
+                "config": {},
+            },
+            {
+                "id": "left",
+                "kind": "data",
+                "category": "data",
+                "label": "Left Branch",
+                "provider_id": "core.data",
+                "provider_label": "Core Data Node",
+                "description": "",
+                "position": {"x": 500, "y": -80},
+                "config": {"mode": "passthrough"},
+            },
+            {
+                "id": "right",
+                "kind": "data",
+                "category": "data",
+                "label": "Right Branch",
+                "provider_id": "core.data",
+                "provider_label": "Core Data Node",
+                "description": "",
+                "position": {"x": 500, "y": 80},
+                "config": {"mode": "passthrough"},
+            },
+            {
+                "id": "compose",
+                "kind": "data",
+                "category": "data",
+                "label": "Compose",
+                "provider_id": "core.context_builder",
+                "provider_label": "Context Builder",
+                "description": "",
+                "position": {"x": 700, "y": 0},
+                "config": {"mode": "context_builder", "template": "", "input_bindings": []},
+            },
+            {
+                "id": "display",
+                "kind": "data",
+                "category": "data",
+                "label": "Envelope Display Node 7",
+                "provider_id": "core.data_display",
+                "provider_label": "Envelope Display Node",
+                "description": "",
+                "position": {"x": 880, "y": 0},
+                "config": {"show_input_envelope": False},
+            },
+            {
+                "id": "draft",
+                "kind": "output",
+                "category": "end",
+                "label": "Outlook Draft End",
+                "provider_id": "end.outlook_draft",
+                "provider_label": "Outlook Draft End",
+                "description": "",
+                "position": {"x": 1080, "y": 0},
+                "config": {
+                    "to": "alex@example.com",
+                    "subject": "Follow-up",
+                    "require_to": True,
+                    "require_subject": True,
+                    "require_body": True,
+                },
+            },
+        ],
+        "edges": [
+            {
+                "id": "edge-start-sheet",
+                "source_id": "start",
+                "target_id": "sheet",
+                "label": "sheet",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            },
+            {
+                "id": "edge-sheet-split",
+                "source_id": "sheet",
+                "source_handle_id": "control-flow-loop-body",
+                "target_id": "split",
+                "label": "row",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            },
+            {
+                "id": "edge-split-left",
+                "source_id": "split",
+                "target_id": "left",
+                "label": "left",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            },
+            {
+                "id": "edge-split-right",
+                "source_id": "split",
+                "target_id": "right",
+                "label": "right",
+                "kind": "standard",
+                "priority": 110,
+                "condition": None,
+            },
+            {
+                "id": "edge-left-compose",
+                "source_id": "left",
+                "target_id": "compose",
+                "label": "left to compose",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            },
+            {
+                "id": "edge-right-compose",
+                "source_id": "right",
+                "target_id": "compose",
+                "label": "right to compose",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            },
+            {
+                "id": "edge-compose-display",
+                "source_id": "compose",
+                "target_id": "display",
+                "label": "next",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            },
+            {
+                "id": "edge-display-draft",
+                "source_id": "display",
+                "target_id": "draft",
+                "label": "next",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            },
+        ],
+    }
 
 
 class OutlookDraftNodeTests(unittest.TestCase):
@@ -765,6 +1049,134 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertEqual(state.final_output["outbound_email_log"]["table_name"], "outbound_email_messages")
         self.assertEqual(_SupabaseEmailLogStubHandler.last_path, "/rest/v1/")
         self.assertIsNone(_SupabaseEmailLogStubHandler.last_json_body)
+
+    def test_outlook_draft_node_dedupes_spreadsheet_rows_across_reruns(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "rows.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["email", "name"])
+                writer.writerow(["alex@example.com", "Alex"])
+                writer.writerow(["taylor@example.com", "Taylor"])
+            dedupe_db_path = Path(temp_dir) / "outlook-dedupe.sqlite3"
+            graph = GraphDefinition.from_dict(
+                build_spreadsheet_outlook_draft_graph_payload(csv_path=str(csv_path))
+            )
+            graph.validate_against_services(self.services)
+
+            with patch.dict(
+                os.environ,
+                {"GRAPH_AGENT_OUTLOOK_DEDUPE_DB": str(dedupe_db_path)},
+                clear=False,
+            ):
+                first_state = runtime.run(graph, {"request": "draft rows"}, run_id="run-outlook-dedupe-1")
+                second_state = runtime.run(graph, {"request": "draft rows"}, run_id="run-outlook-dedupe-2")
+
+        self.assertEqual(first_state.status, "completed")
+        self.assertEqual(second_state.status, "completed")
+        self.assertEqual(len(fake_client.calls), 2)
+        self.assertEqual(fake_auth.acquire_calls, 2)
+        self.assertEqual(first_state.final_output["delivery_status"], "draft_saved")
+        self.assertEqual(second_state.final_output["delivery_status"], "draft_saved_deduped")
+        self.assertEqual(second_state.final_output["draft_id"], "draft-123")
+        self.assertTrue(second_state.node_outputs["draft"]["delivery_status"].endswith("deduped"))
+
+    def test_outlook_draft_node_dedupes_duplicate_edges_in_same_iteration(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "rows.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["email", "name"])
+                writer.writerow(["alex@example.com", "Alex"])
+            dedupe_db_path = Path(temp_dir) / "outlook-dedupe.sqlite3"
+            graph = GraphDefinition.from_dict(
+                build_spreadsheet_outlook_draft_graph_payload(
+                    csv_path=str(csv_path),
+                    duplicate_loop_edges=True,
+                )
+            )
+            graph.validate_against_services(self.services)
+
+            with patch.dict(
+                os.environ,
+                {"GRAPH_AGENT_OUTLOOK_DEDUPE_DB": str(dedupe_db_path)},
+                clear=False,
+            ):
+                state = runtime.run(graph, {"request": "draft rows"}, run_id="run-outlook-dedupe-edge")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.visit_counts.get("draft"), 2)
+        self.assertEqual(len(fake_client.calls), 1)
+        self.assertEqual(fake_auth.acquire_calls, 1)
+        self.assertEqual(state.final_output["delivery_status"], "draft_saved_deduped")
+        self.assertEqual(state.final_output["draft_id"], "draft-123")
+
+    def test_spreadsheet_iteration_resets_downstream_runtime_state_to_prevent_repeated_transition(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "rows.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["email", "name"])
+                writer.writerow(["alex@example.com", "Alex"])
+                writer.writerow(["taylor@example.com", "Taylor"])
+            dedupe_db_path = Path(temp_dir) / "outlook-dedupe.sqlite3"
+            graph = GraphDefinition.from_dict(
+                build_spreadsheet_context_builder_outlook_graph_payload(csv_path=str(csv_path))
+            )
+            graph.validate_against_services(self.services)
+
+            with patch.dict(
+                os.environ,
+                {"GRAPH_AGENT_OUTLOOK_DEDUPE_DB": str(dedupe_db_path)},
+                clear=False,
+            ):
+                state = runtime.run(graph, {"request": "draft rows"}, run_id="run-outlook-context-reset")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(len(fake_client.calls), 2)
+        self.assertEqual(fake_auth.acquire_calls, 2)
+        display_to_draft_transitions = [
+            event
+            for event in state.event_history
+            if event.event_type == "edge.selected"
+            and isinstance(event.payload, dict)
+            and event.payload.get("id") == "edge-display-draft"
+        ]
+        self.assertEqual(len(display_to_draft_transitions), 2)
+        self.assertEqual(
+            [event.payload.get("iteration_id") for event in display_to_draft_transitions],
+            ["sheet:row:1", "sheet:row:2"],
+        )
 
 
 if __name__ == "__main__":

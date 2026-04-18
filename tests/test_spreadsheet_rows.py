@@ -50,6 +50,21 @@ class SpreadsheetEchoProvider:
         )
 
 
+class SpreadsheetSessionEchoProvider(SpreadsheetEchoProvider):
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        user_message = request.messages[-1].content if request.messages else ""
+        self.user_messages.append(user_message)
+        return ModelResponse(
+            content=user_message,
+            structured_output={
+                "message": user_message,
+                "need_tool": False,
+                "tool_calls": [],
+            },
+            metadata={"session_id": f"session-{len(self.user_messages)}"},
+        )
+
+
 class SpreadsheetRowTests(unittest.TestCase):
     def test_resolve_spreadsheet_path_from_run_documents(self) -> None:
         path = "/data/rows.csv"
@@ -369,6 +384,114 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertTrue(all(event.payload.get("iterator_node_id") == "sheet" for event in model_started_events))
         self.assertIsInstance(state.final_output, str)
         self.assertIn("Portland", state.final_output)
+
+    def test_model_completed_events_include_iteration_and_session_ids_per_row(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "rows.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["city", "temperature"])
+                writer.writerow(["Seattle", "58"])
+                writer.writerow(["Portland", "62"])
+
+            services = build_example_services()
+            provider = SpreadsheetSessionEchoProvider()
+            services.model_providers["spreadsheet_echo"] = provider
+            runtime = GraphRuntime(
+                services=services,
+                max_steps=services.config["max_steps"],
+                max_visits_per_node=services.config["max_visits_per_node"],
+            )
+            graph_payload = {
+                "graph_id": "spreadsheet-row-session-ids-graph",
+                "name": "Spreadsheet Row Session IDs Graph",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "sheet",
+                        "kind": "control_flow_unit",
+                        "category": "control_flow_unit",
+                        "label": "Spreadsheet Rows",
+                        "provider_id": "core.spreadsheet_rows",
+                        "provider_label": "Spreadsheet Rows",
+                        "config": {
+                            "mode": "spreadsheet_rows",
+                            "file_format": "csv",
+                            "file_path": str(csv_path),
+                            "sheet_name": "",
+                            "header_row_index": 1,
+                            "start_row_index": 2,
+                            "empty_row_policy": "skip",
+                        },
+                        "position": {"x": 100, "y": 0},
+                    },
+                    {
+                        "id": "model",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "spreadsheet_echo",
+                        "prompt_name": "spreadsheet_prompt",
+                        "config": {
+                            "provider_name": "spreadsheet_echo",
+                            "prompt_name": "spreadsheet_prompt",
+                            "system_prompt": "Process the current spreadsheet row.",
+                            "user_message_template": "{input_payload}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 220, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "model"}},
+                        "position": {"x": 340, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "e1", "source_id": "start", "target_id": "sheet", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e2", "source_id": "sheet", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e3", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+            graph = GraphDefinition.from_dict(graph_payload)
+            graph.validate_against_services(services)
+
+            state = runtime.run(graph, {"request": "Process spreadsheet rows"}, run_id="spreadsheet-row-session-ids")
+
+        self.assertEqual(state.status, "completed")
+        model_completed_events = [
+            event
+            for event in state.event_history
+            if event.event_type == "node.completed" and isinstance(event.payload, dict) and event.payload.get("node_id") == "model"
+        ]
+        self.assertEqual(len(model_completed_events), 2)
+        self.assertEqual(
+            [event.payload.get("iteration_id") for event in model_completed_events],
+            ["sheet:row:1", "sheet:row:2"],
+        )
+        self.assertEqual(
+            [event.payload.get("session_id") for event in model_completed_events],
+            ["session-1", "session-2"],
+        )
 
     def test_end_agent_run_node_halts_spreadsheet_iteration_immediately(self) -> None:
         with TemporaryDirectory() as temp_dir:

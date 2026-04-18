@@ -87,6 +87,36 @@ class RunStateReducerTests(unittest.TestCase):
         self.assertEqual(state["final_output"], {"answer": "done"})
         self.assertTrue(all(event["schema_version"] == RUNTIME_EVENT_SCHEMA_VERSION for event in state["event_history"]))
 
+    def test_single_run_reducer_derives_visit_counts_per_node(self) -> None:
+        state = build_run_state("run-visit-counts", "graph-1", None, execution_node_ids=["node-a", "node-b"])
+        state = apply_single_run_event(
+            state,
+            _event(
+                "node.started",
+                run_id="run-visit-counts",
+                payload={"node_id": "node-a", "visit_count": 1},
+            ),
+        )
+        state = apply_single_run_event(
+            state,
+            _event(
+                "node.started",
+                run_id="run-visit-counts",
+                payload={"node_id": "node-b", "visit_count": 2},
+            ),
+        )
+        state = apply_single_run_event(
+            state,
+            _event(
+                "node.started",
+                run_id="run-visit-counts",
+                payload={"node_id": "node-a", "visit_count": 3},
+            ),
+        )
+
+        self.assertEqual(state["visit_counts"]["node-a"], 2)
+        self.assertEqual(state["visit_counts"]["node-b"], 1)
+
     def test_single_run_reducer_tracks_failure_and_cancellation(self) -> None:
         failed_state = build_run_state("run-failed", "graph-1", None, execution_node_ids=["node-a", "node-b"])
         failed_state = apply_single_run_event(
@@ -153,6 +183,128 @@ class RunStateReducerTests(unittest.TestCase):
         self.assertEqual(state["status_reason"], "runtime_heartbeat_expired")
         self.assertEqual(state["node_statuses"]["node-a"], "success")
         self.assertEqual(state["terminal_error"], {"type": "runtime_interrupted", "message": "heartbeat expired"})
+
+    def test_iterator_iteration_change_resets_member_node_state(self) -> None:
+        state = build_run_state("run-loop", "graph-1", None, execution_node_ids=["sheet", "model", "finish"])
+        state = apply_single_run_event(
+            state,
+            _event(
+                "node.iterator.updated",
+                run_id="run-loop",
+                payload={
+                    "node_id": "sheet",
+                    "iterator_node_id": "sheet",
+                    "iterator_type": "spreadsheet_rows",
+                    "status": "running",
+                    "current_row_index": 1,
+                    "iterator_row_index": 1,
+                    "total_rows": 3,
+                    "iterator_total_rows": 3,
+                    "iteration_id": "sheet:row:1",
+                },
+            ),
+        )
+        state = apply_single_run_event(
+            state,
+            _event(
+                "node.started",
+                run_id="run-loop",
+                payload={
+                    "node_id": "model",
+                    "visit_count": 1,
+                    "received_input": {"row": 1},
+                    "iterator_node_id": "sheet",
+                    "iterator_row_index": 1,
+                    "iterator_total_rows": 3,
+                    "iteration_id": "sheet:row:1",
+                },
+            ),
+        )
+        state = apply_single_run_event(
+            state,
+            _event(
+                "node.completed",
+                run_id="run-loop",
+                payload={
+                    "node_id": "model",
+                    "output": {"result": "ok"},
+                    "error": None,
+                    "iterator_node_id": "sheet",
+                    "iterator_row_index": 1,
+                    "iterator_total_rows": 3,
+                    "iteration_id": "sheet:row:1",
+                },
+            ),
+        )
+        state = apply_single_run_event(
+            state,
+            _event(
+                "node.started",
+                run_id="run-loop",
+                payload={
+                    "node_id": "finish",
+                    "visit_count": 1,
+                    "received_input": {"row": 1},
+                    "iterator_node_id": "sheet",
+                    "iterator_row_index": 1,
+                    "iterator_total_rows": 3,
+                    "iteration_id": "sheet:row:1",
+                },
+            ),
+        )
+        state = apply_single_run_event(
+            state,
+            _event(
+                "node.completed",
+                run_id="run-loop",
+                payload={
+                    "node_id": "finish",
+                    "output": {"done": True},
+                    "error": None,
+                    "iterator_node_id": "sheet",
+                    "iterator_row_index": 1,
+                    "iterator_total_rows": 3,
+                    "iteration_id": "sheet:row:1",
+                },
+            ),
+        )
+
+        self.assertEqual(state["node_statuses"]["model"], "success")
+        self.assertEqual(state["node_statuses"]["finish"], "success")
+        self.assertIn("model", state["node_outputs"])
+        self.assertIn("finish", state["node_outputs"])
+        self.assertIn("model", state["visit_counts"])
+        self.assertIn("finish", state["visit_counts"])
+
+        state = apply_single_run_event(
+            state,
+            _event(
+                "node.iterator.updated",
+                run_id="run-loop",
+                payload={
+                    "node_id": "sheet",
+                    "iterator_node_id": "sheet",
+                    "iterator_type": "spreadsheet_rows",
+                    "status": "running",
+                    "current_row_index": 2,
+                    "iterator_row_index": 2,
+                    "total_rows": 3,
+                    "iterator_total_rows": 3,
+                    "iteration_id": "sheet:row:2",
+                },
+            ),
+        )
+
+        self.assertEqual(state["node_statuses"]["model"], "idle")
+        self.assertEqual(state["node_statuses"]["finish"], "idle")
+        self.assertNotIn("model", state["node_inputs"])
+        self.assertNotIn("finish", state["node_inputs"])
+        self.assertNotIn("model", state["node_outputs"])
+        self.assertNotIn("finish", state["node_outputs"])
+        self.assertNotIn("model", state["node_errors"])
+        self.assertNotIn("finish", state["node_errors"])
+        self.assertNotIn("model", state["visit_counts"])
+        self.assertNotIn("finish", state["visit_counts"])
 
     def test_agent_events_create_and_update_nested_child_state(self) -> None:
         state = build_run_state("parent-run", "graph-1", {"prompt": "hello"})
