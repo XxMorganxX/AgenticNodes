@@ -1095,6 +1095,17 @@ export function ProviderDetailsModal({
       return haystack.includes(query);
     });
   }, [supabaseSchemaPreview, supabaseSourceSearch, usesSupabaseTableSelection]);
+  const configuredSupabaseTableName = useMemo(
+    () => String(node.config.table_name ?? "").trim(),
+    [node.config.table_name],
+  );
+  const configuredSupabaseTableSource = useMemo<SupabaseSchemaSource | null>(() => {
+    if (!configuredSupabaseTableName) {
+      return null;
+    }
+    return (supabaseSchemaPreview?.sources ?? []).find((source) => source.name === configuredSupabaseTableName) ?? null;
+  }, [configuredSupabaseTableName, supabaseSchemaPreview]);
+  const configuredSupabaseTableColumns = configuredSupabaseTableSource?.columns ?? [];
   const selectedSupabaseSource = useMemo<SupabaseSchemaSource | null>(() => {
     const availableSources = supabaseSchemaPreview?.sources ?? [];
     if (availableSources.length === 0) {
@@ -1116,6 +1127,9 @@ export function ProviderDetailsModal({
     const availableColumns = selectedSupabaseSource?.columns.map((column) => column.name) ?? [];
     return parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns);
   }, [node.config.select, selectedSupabaseSource, usesSupabaseTableSelection]);
+  const isViewingConfiguredSupabaseTable = !usesSupabaseTableSelection || (
+    configuredSupabaseTableName.length > 0 && selectedSupabaseSource?.name === configuredSupabaseTableName
+  );
 
   useEffect(() => {
     if (!isSupabaseCatalogNode) {
@@ -2040,6 +2054,98 @@ export function ProviderDetailsModal({
                         ) : null}
                       </div>
                     </section>
+                    {isSupabaseTableRowsNode ? (() => {
+                      const configuredTableName = configuredSupabaseTableName;
+                      const tableColumns = configuredSupabaseTableColumns;
+                      const cursorValue = String(node.config.cursor_column ?? "").trim();
+                      const rowIdValue = String(node.config.row_id_column ?? "").trim();
+                      const pageSizeValue = String(node.config.page_size ?? "500");
+                      const hasColumns = tableColumns.length > 0;
+                      const renderColumnPicker = (
+                        fieldKey: "cursor_column" | "row_id_column",
+                        currentValue: string,
+                        placeholder: string,
+                      ) => {
+                        const datalistId = `${node.id}-${fieldKey}-iterator-options`;
+                        return (
+                          <>
+                            <input
+                              list={hasColumns ? datalistId : undefined}
+                              value={currentValue}
+                              placeholder={placeholder}
+                              onChange={(event) =>
+                                updateDraftNode((currentNode) => ({
+                                  ...currentNode,
+                                  config: { ...currentNode.config, [fieldKey]: event.target.value },
+                                }))
+                              }
+                            />
+                            {hasColumns ? (
+                              <datalist id={datalistId}>
+                                {tableColumns.map((column) => (
+                                  <option key={column.name} value={column.name}>
+                                    {column.data_type}
+                                    {column.nullable ? " · nullable" : ""}
+                                  </option>
+                                ))}
+                              </datalist>
+                            ) : null}
+                          </>
+                        );
+                      };
+                      return (
+                        <section className="provider-details-status-card">
+                          <div className="provider-details-status-card-header">
+                            <strong>Iterator Config</strong>
+                            <span>{configuredTableName ? `Table: ${configuredTableName}` : "Table not selected"}</span>
+                          </div>
+                          <div className="tool-details-modal-help">
+                            <label>
+                              Table name
+                              <input
+                                value={configuredTableName}
+                                placeholder="e.g. outreach_emails"
+                                onChange={(event) =>
+                                  updateDraftNode((currentNode) => ({
+                                    ...currentNode,
+                                    config: { ...currentNode.config, table_name: event.target.value },
+                                  }))
+                                }
+                              />
+                            </label>
+                            <label>
+                              Cursor column (rows pulled each iteration, ascending)
+                              {renderColumnPicker("cursor_column", cursorValue, "e.g. created_at")}
+                            </label>
+                            <label>
+                              Dedup row id column (stable tie-breaker, skips rows already processed)
+                              {renderColumnPicker("row_id_column", rowIdValue, "id")}
+                            </label>
+                            <label>
+                              Page size
+                              <input
+                                type="number"
+                                min={1}
+                                value={pageSizeValue}
+                                onChange={(event) =>
+                                  updateDraftNode((currentNode) => ({
+                                    ...currentNode,
+                                    config: { ...currentNode.config, page_size: event.target.value },
+                                  }))
+                                }
+                              />
+                            </label>
+                            <div>
+                              {hasColumns
+                                ? "Column suggestions come from the loaded schema. You can also type any column name directly."
+                                : configuredTableName
+                                  ? "Load the schema below to get column suggestions, or type the column name directly."
+                                  : "Pick a table below (or type one above) to enable column suggestions."}
+                            </div>
+                          </div>
+                        </section>
+                      );
+                    })() : null}
                     <section className="provider-details-schema-browser">
                     {isSupabaseBrowserLocked ? (
                       <div className="tool-details-modal-help provider-details-schema-lock-banner">
@@ -2157,6 +2263,11 @@ export function ProviderDetailsModal({
                             <div className="provider-details-schema-column-list">
                               {selectedSupabaseSource.columns.map((column) => {
                                 const checked = selectedSupabaseColumnNames.includes(column.name);
+                                const currentCursorColumn = String(node.config.cursor_column ?? "").trim();
+                                const currentRowIdColumn = String(node.config.row_id_column ?? "").trim();
+                                const isCursor = isSupabaseTableRowsNode && currentCursorColumn === column.name;
+                                const isRowId = isSupabaseTableRowsNode && currentRowIdColumn === column.name;
+                                const canSelectIteratorColumn = !isSupabaseTableRowsNode || isViewingConfiguredSupabaseTable;
                                 return (
                                   <label key={column.name} className="provider-details-schema-column-row">
                                     {!usesSupabaseTableSelection ? (
@@ -2174,10 +2285,62 @@ export function ProviderDetailsModal({
                                     {column.description ? (
                                       <span className="provider-details-schema-column-description">{column.description}</span>
                                     ) : null}
+                                    {isSupabaseTableRowsNode ? (
+                                      <span className="provider-details-schema-column-picker">
+                                        <button
+                                          type="button"
+                                          className={`chip-toggle${isCursor ? " is-active" : ""}`}
+                                          aria-pressed={isCursor}
+                                          disabled={isSupabaseBrowserLocked || !canSelectIteratorColumn}
+                                          onClick={(event) => {
+                                            event.preventDefault();
+                                            updateDraftNode((currentNode) => ({
+                                              ...currentNode,
+                                              config: { ...currentNode.config, cursor_column: column.name },
+                                            }));
+                                          }}
+                                        >
+                                          {isCursor ? "Cursor ✓" : "Use as cursor"}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className={`chip-toggle${isRowId ? " is-active" : ""}`}
+                                          aria-pressed={isRowId}
+                                          disabled={isSupabaseBrowserLocked || !canSelectIteratorColumn}
+                                          onClick={(event) => {
+                                            event.preventDefault();
+                                            updateDraftNode((currentNode) => ({
+                                              ...currentNode,
+                                              config: { ...currentNode.config, row_id_column: column.name },
+                                            }));
+                                          }}
+                                        >
+                                          {isRowId ? "Dedup row id ✓" : "Use as dedup row id"}
+                                        </button>
+                                      </span>
+                                    ) : null}
                                   </label>
                                 );
                               })}
                             </div>
+                            {isSupabaseTableRowsNode && selectedSupabaseSource && !isViewingConfiguredSupabaseTable ? (
+                              <div className="tool-details-modal-help">
+                                Cursor and dedup row id can only be selected from the node&apos;s current table,
+                                {" "}
+                                <code>{configuredSupabaseTableName || "not set"}</code>.
+                                Use Table on this source first, or switch back to the configured table to pick columns.
+                              </div>
+                            ) : null}
+                            {isSupabaseTableRowsNode ? (
+                              <div className="tool-details-modal-help">
+                                <div>
+                                  <strong>Cursor:</strong> {String(node.config.cursor_column ?? "") || "not set"} — iteration advances in ascending order of this column.
+                                </div>
+                                <div>
+                                  <strong>Dedup row id:</strong> {String(node.config.row_id_column ?? "") || "not set"} — stable tie-breaker when cursor values tie; also used to skip rows already processed in prior runs.
+                                </div>
+                              </div>
+                            ) : null}
                           </>
                         ) : (
                           <div className="tool-details-modal-help">Choose a source to inspect its columns.</div>

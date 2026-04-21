@@ -5210,6 +5210,39 @@ pre {
   grid-column: 2;
 }
 
+.provider-details-schema-column-picker {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.25rem;
+}
+
+.provider-details-schema-column-picker .chip-toggle {
+  font-size: 0.72rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid rgba(120, 130, 170, 0.55);
+  background: rgba(30, 36, 56, 0.65);
+  color: inherit;
+  cursor: pointer;
+}
+
+.provider-details-schema-column-picker .chip-toggle:hover:not(:disabled) {
+  border-color: rgba(148, 163, 184, 0.9);
+}
+
+.provider-details-schema-column-picker .chip-toggle.is-active {
+  background: rgba(45, 212, 191, 0.22);
+  border-color: rgba(45, 212, 191, 0.75);
+  color: #99f6e4;
+}
+
+.provider-details-schema-column-picker .chip-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .provider-details-preview-layout {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
