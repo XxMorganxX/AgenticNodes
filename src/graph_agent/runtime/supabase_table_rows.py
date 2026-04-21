@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 from collections.abc import Iterator
+from collections.abc import Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -73,6 +74,7 @@ class SupabaseTableRowsRequest:
     cursor_column: str
     row_id_column: str
     page_size: int
+    include_previously_processed_rows: bool = False
     last_cursor_value: str = ""
     last_row_id: str = ""
 
@@ -86,8 +88,10 @@ class SupabaseTableRowsResult:
     last_row_id: str
     schema: str
     table_name: str
+    select: str
     cursor_column: str
     row_id_column: str
+    include_previously_processed_rows: bool
 
 
 def _utc_now_iso() -> str:
@@ -105,7 +109,7 @@ def _row_to_dict(cursor: sqlite3.Cursor, row: tuple[Any, ...] | None) -> dict[st
     if row is None:
         return None
     keys = [column[0] for column in cursor.description or []]
-    return dict(zip(keys, row, strict=False))
+    return dict(zip(keys, row))
 
 
 def _normalize_filter_value(value: Any, *, field_name: str) -> str:
@@ -130,7 +134,11 @@ def _normalize_filter_value(value: Any, *, field_name: str) -> str:
 
 
 def _ensure_select_includes_columns(select: str, required_columns: list[str]) -> str:
-    normalized_select = str(select or "*").strip() or "*"
+    normalized_select = str(select or "").strip()
+    if not normalized_select:
+        existing: set[str] = set()
+        extras = [column for column in required_columns if column not in existing]
+        return ",".join(extras)
     if normalized_select == "*":
         return normalized_select
     existing = {part.strip() for part in normalized_select.split(",") if part.strip()}
@@ -138,6 +146,16 @@ def _ensure_select_includes_columns(select: str, required_columns: list[str]) ->
     if not extras:
         return normalized_select
     return ",".join([normalized_select, *extras])
+
+
+def filter_supabase_table_row_output(row: Mapping[str, Any], select: str) -> dict[str, Any]:
+    normalized_select = str(select or "").strip()
+    if not normalized_select:
+        return {}
+    if normalized_select == "*":
+        return dict(row)
+    selected_columns = [part.strip() for part in normalized_select.split(",") if part.strip()]
+    return {column: row[column] for column in selected_columns if column in row}
 
 
 def _build_iterator_or_filter(
@@ -288,8 +306,10 @@ def materialize_supabase_table_rows(request: SupabaseTableRowsRequest) -> Supaba
         last_row_id=last_row_id,
         schema=str(request.schema or "public").strip() or "public",
         table_name=str(request.table_name or "").strip(),
+        select="*" if request.select is None else str(request.select or "").strip(),
         cursor_column=str(request.cursor_column or "").strip(),
         row_id_column=str(request.row_id_column or "").strip(),
+        include_previously_processed_rows=bool(request.include_previously_processed_rows),
     )
 
 

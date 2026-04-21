@@ -334,6 +334,7 @@ export function createNodeFromProvider(
           cursor_column: "",
           row_id_column: "id",
           page_size: 500,
+          include_previously_processed_rows: false,
           ...maybeSupabaseConnectionConfig,
           ...defaultConfig,
         },

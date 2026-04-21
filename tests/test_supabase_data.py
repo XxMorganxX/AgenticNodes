@@ -417,6 +417,7 @@ def supabase_table_rows_graph_payload(
         "cursor_column": "created_at",
         "row_id_column": "id",
         "page_size": 500,
+        "include_previously_processed_rows": False,
     }
     if node_config:
         resolved_node_config.update(node_config)
@@ -558,6 +559,7 @@ class SupabaseDataNodeTests(unittest.TestCase):
         self.assertEqual(provider["default_config"]["mode"], "supabase_table_rows")
         self.assertEqual(provider["default_config"]["row_id_column"], "id")
         self.assertEqual(provider["default_config"]["page_size"], 500)
+        self.assertFalse(provider["default_config"]["include_previously_processed_rows"])
 
     def test_supabase_data_node_fetches_rows_and_emits_data_envelope(self) -> None:
         graph = GraphDefinition.from_dict(supabase_graph_payload())
@@ -1142,6 +1144,120 @@ class SupabaseDataNodeTests(unittest.TestCase):
         self.assertEqual(state.status, "failed")
         self.assertEqual(state.terminal_error["type"], "missing_supabase_iterator_field")
         self.assertEqual(state.terminal_error["field_name"], "processed_at")
+
+    def test_supabase_table_rows_can_replay_previously_processed_rows(self) -> None:
+        provider = SpreadsheetEchoProvider()
+        self.services.model_providers["spreadsheet_echo"] = provider
+        graph = GraphDefinition.from_dict(
+            supabase_table_rows_graph_payload(
+                "supabase-table-rows-include-processed",
+                node_config={
+                    "page_size": 1,
+                    "include_previously_processed_rows": True,
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cursor_db_path = Path(temp_dir) / "supabase-table-rows.sqlite3"
+            with SupabaseStubServer() as base_url, patch.dict(
+                os.environ,
+                {
+                    "GRAPH_AGENT_SUPABASE_URL": base_url,
+                    "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+                    "GRAPH_AGENT_SUPABASE_TABLE_ROWS_DB": str(cursor_db_path),
+                },
+                clear=False,
+            ):
+                _SupabaseStubHandler.table_rows["projects"] = [
+                    {"id": 1, "name": "Alpha", "status": "active", "created_at": "2026-04-10T12:00:00Z"},
+                    {"id": 2, "name": "Beta", "status": "active", "created_at": "2026-04-10T12:00:00Z"},
+                    {"id": 3, "name": "Gamma", "status": "active", "created_at": "2026-04-11T09:30:00Z"},
+                ]
+                first_state = runtime.run(graph, {"request": "process all rows"}, run_id="run-supabase-table-rows-all-1")
+                second_state = runtime.run(graph, {"request": "process all rows"}, run_id="run-supabase-table-rows-all-2")
+
+        self.assertEqual(first_state.status, "completed")
+        self.assertEqual(second_state.status, "completed")
+        self.assertEqual(len(provider.user_messages), 6)
+        self.assertEqual(second_state.visit_counts.get("model"), 3)
+        self.assertEqual(second_state.iterator_states["iterator"]["total_rows"], 3)
+        self.assertTrue(second_state.iterator_states["iterator"]["include_previously_processed_rows"])
+        self.assertEqual(second_state.iterator_states["iterator"]["last_cached_cursor_value"], "2026-04-11T09:30:00Z")
+        self.assertEqual(second_state.iterator_states["iterator"]["last_cached_row_id"], "3")
+
+    def test_supabase_table_rows_output_only_includes_selected_columns(self) -> None:
+        provider = SpreadsheetEchoProvider()
+        self.services.model_providers["spreadsheet_echo"] = provider
+        graph = GraphDefinition.from_dict(
+            supabase_table_rows_graph_payload(
+                "supabase-table-rows-selected-columns",
+                node_config={
+                    "select": "name",
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cursor_db_path = Path(temp_dir) / "supabase-table-rows.sqlite3"
+            with SupabaseStubServer() as base_url, patch.dict(
+                os.environ,
+                {
+                    "GRAPH_AGENT_SUPABASE_URL": base_url,
+                    "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+                    "GRAPH_AGENT_SUPABASE_TABLE_ROWS_DB": str(cursor_db_path),
+                },
+                clear=False,
+            ):
+                _SupabaseStubHandler.table_rows["projects"] = [
+                    {"id": 1, "name": "Alpha", "status": "active", "created_at": "2026-04-10T12:00:00Z"},
+                ]
+                state = runtime.run(graph, {"request": "process selected columns"}, run_id="run-supabase-table-rows-selected-columns")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(len(provider.user_messages), 1)
+        user_payload = json.loads(provider.user_messages[0])
+        self.assertEqual(user_payload["row_data"], {"name": "Alpha"})
+        self.assertEqual(sorted(user_payload.keys()), ["row_data"])
+
+    def test_supabase_table_rows_can_emit_empty_row_data_when_no_columns_are_selected(self) -> None:
+        provider = SpreadsheetEchoProvider()
+        self.services.model_providers["spreadsheet_echo"] = provider
+        graph = GraphDefinition.from_dict(
+            supabase_table_rows_graph_payload(
+                "supabase-table-rows-no-selected-columns",
+                node_config={
+                    "select": "",
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cursor_db_path = Path(temp_dir) / "supabase-table-rows.sqlite3"
+            with SupabaseStubServer() as base_url, patch.dict(
+                os.environ,
+                {
+                    "GRAPH_AGENT_SUPABASE_URL": base_url,
+                    "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+                    "GRAPH_AGENT_SUPABASE_TABLE_ROWS_DB": str(cursor_db_path),
+                },
+                clear=False,
+            ):
+                _SupabaseStubHandler.table_rows["projects"] = [
+                    {"id": 1, "name": "Alpha", "status": "active", "created_at": "2026-04-10T12:00:00Z"},
+                ]
+                state = runtime.run(graph, {"request": "process selected columns"}, run_id="run-supabase-table-rows-no-selected-columns")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(len(provider.user_messages), 1)
+        user_payload = json.loads(provider.user_messages[0])
+        self.assertEqual(user_payload, {"row_data": {}})
 
     def test_supabase_table_rows_failure_does_not_advance_watermark(self) -> None:
         provider = FailingEchoProvider()

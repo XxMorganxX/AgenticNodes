@@ -62,6 +62,7 @@ export type GraphCanvasNodeData = {
   onOpenToolDetails: (nodeId: string) => void;
   onOpenProviderDetails: (nodeId: string) => void;
   onToggleExecutorRetries: (nodeId: string) => void;
+  onToggleSupabaseIteratorIncludeProcessedRows: (nodeId: string) => void;
   onOpenPromptBlockDetails: (nodeId: string) => void;
   onOpenDisplayResponse: (nodeId: string) => void;
   onOpenContextBuilderPayload: (nodeId: string) => void;
@@ -226,6 +227,7 @@ function GraphCanvasNodeComponent({
     onOpenToolDetails,
     onOpenProviderDetails,
     onToggleExecutorRetries,
+    onToggleSupabaseIteratorIncludeProcessedRows,
     onOpenPromptBlockDetails,
     onOpenDisplayResponse,
     onOpenContextBuilderPayload,
@@ -422,6 +424,7 @@ function GraphCanvasNodeComponent({
   const displayStatus = status;
   const isActive = displayStatus === "active";
   const executorRetriesEnabled = node.kind === "mcp_tool_executor" ? node.config.allow_retries !== false : false;
+  const supabaseIteratorIncludesProcessedRows = isSupabaseTableRowsNode && node.config.include_previously_processed_rows === true;
   const modelConfiguredResponseMode = isModelNode ? configuredResponseMode(node) : null;
   const modelEffectiveResponseMode = isModelNode ? inferModelResponseMode(graph, node) : null;
   const executorConfiguredResponseMode = node.kind === "mcp_tool_executor" ? configuredResponseMode(node) : null;
@@ -701,6 +704,27 @@ function GraphCanvasNodeComponent({
                 <span className="graph-node-inline-toggle-thumb" />
               </span>
               <span className="graph-node-inline-toggle-text">{executorRetriesEnabled ? "On" : "Off"}</span>
+            </button>
+          </div>
+        ) : null}
+        {isSupabaseTableRowsNode ? (
+          <div className="graph-node-inline-toggle-row">
+            <span className="graph-node-inline-toggle-label">Include Cached</span>
+            <button
+              type="button"
+              className={`graph-node-inline-toggle ${supabaseIteratorIncludesProcessedRows ? "is-enabled" : "is-disabled"}`}
+              aria-pressed={supabaseIteratorIncludesProcessedRows}
+              aria-label={`${supabaseIteratorIncludesProcessedRows ? "Disable" : "Enable"} cached row replay for ${displayLabel}`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                onToggleSupabaseIteratorIncludeProcessedRows(node.id);
+              }}
+            >
+              <span className="graph-node-inline-toggle-track">
+                <span className="graph-node-inline-toggle-thumb" />
+              </span>
+              <span className="graph-node-inline-toggle-text">{supabaseIteratorIncludesProcessedRows ? "On" : "Off"}</span>
             </button>
           </div>
         ) : null}

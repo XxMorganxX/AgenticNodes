@@ -947,7 +947,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             display_name="Supabase Table Rows",
             category=NodeCategory.CONTROL_FLOW_UNIT,
             node_kind="control_flow_unit",
-            description="Reads unread rows from a Supabase table in ascending cursor order and iterates each row sequentially through downstream execution steps.",
+            description="Reads rows from a Supabase table in ascending cursor order and can either skip previously processed rows or replay the full table on each run.",
             capabilities=["supabase table reads", "persistent row watermark", "timestamp plus id cursoring", "sequential row iteration"],
             default_config={
                 "mode": "supabase_table_rows",
@@ -959,6 +959,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 "cursor_column": "",
                 "row_id_column": "id",
                 "page_size": 500,
+                "include_previously_processed_rows": False,
             },
             config_fields=[
                 ProviderConfigFieldDefinition(
@@ -995,6 +996,12 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                     label="Row ID Column",
                     placeholder="id",
                     help_text="Stable tie-breaker column used when multiple rows share the same cursor timestamp.",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="include_previously_processed_rows",
+                    label="Include Previously Processed Rows",
+                    input_type="checkbox",
+                    help_text="When enabled, each run replays all matching rows instead of skipping rows already covered by the cached watermark.",
                 ),
                 ProviderConfigFieldDefinition(
                     key="page_size",

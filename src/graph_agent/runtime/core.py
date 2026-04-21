@@ -82,6 +82,7 @@ from graph_agent.runtime.supabase_data import (
     write_supabase_row,
 )
 from graph_agent.runtime.supabase_table_rows import (
+    filter_supabase_table_row_output,
     SupabaseTableRowsCursorScope,
     SupabaseTableRowsCursorStore,
     SupabaseTableRowsRequest,
@@ -3896,11 +3897,19 @@ class ControlFlowNode(BaseNode):
             "supabase_connection_id": str(resolved.get("supabase_connection_id", "") or "").strip(),
             "schema": str(resolved.get("schema", "public") or "public").strip() or "public",
             "table_name": str(resolved.get("table_name", "") or "").strip(),
-            "select": str(resolved.get("select", "*") or "*").strip() or "*",
+            "select": (
+                "*"
+                if resolved.get("select") is None
+                else str(resolved.get("select", "") or "").strip()
+            ),
             "filters_text": str(resolved.get("filters_text", "") or "").strip(),
             "cursor_column": str(resolved.get("cursor_column", "") or "").strip(),
             "row_id_column": str(resolved.get("row_id_column", "id") or "id").strip() or "id",
             "page_size": _coerce_int(resolved.get("page_size"), default=500, minimum=1),
+            "include_previously_processed_rows": _coerce_bool(
+                resolved.get("include_previously_processed_rows"),
+                default=False,
+            ),
         }
 
     def _supabase_table_rows_scope(
@@ -3935,13 +3944,29 @@ class ControlFlowNode(BaseNode):
             supabase_key=str(resolved_config.get("supabase_key", "") or "").strip(),
             schema=str(resolved_config.get("schema", "public") or "public").strip() or "public",
             table_name=str(resolved_config.get("table_name", "") or "").strip(),
-            select=str(resolved_config.get("select", "*") or "*").strip() or "*",
+            select=(
+                "*"
+                if resolved_config.get("select") is None
+                else str(resolved_config.get("select", "") or "").strip()
+            ),
             filters_text=str(resolved_config.get("filters_text", "") or "").strip(),
             cursor_column=str(resolved_config.get("cursor_column", "") or "").strip(),
             row_id_column=str(resolved_config.get("row_id_column", "id") or "id").strip() or "id",
             page_size=_coerce_int(resolved_config.get("page_size"), default=500, minimum=1),
-            last_cursor_value=watermark.last_cursor_value if watermark is not None else "",
-            last_row_id=watermark.last_row_id if watermark is not None else "",
+            include_previously_processed_rows=_coerce_bool(
+                resolved_config.get("include_previously_processed_rows"),
+                default=False,
+            ),
+            last_cursor_value=(
+                ""
+                if _coerce_bool(resolved_config.get("include_previously_processed_rows"), default=False)
+                else watermark.last_cursor_value if watermark is not None else ""
+            ),
+            last_row_id=(
+                ""
+                if _coerce_bool(resolved_config.get("include_previously_processed_rows"), default=False)
+                else watermark.last_row_id if watermark is not None else ""
+            ),
         )
 
     def _supabase_table_rows_iterator_state(
@@ -3959,6 +3984,7 @@ class ControlFlowNode(BaseNode):
             "table_name": result.table_name,
             "cursor_column": result.cursor_column,
             "row_id_column": result.row_id_column,
+            "include_previously_processed_rows": result.include_previously_processed_rows,
             "last_cached_cursor_value": watermark.last_cursor_value if watermark is not None else None,
             "last_cached_row_id": watermark.last_row_id if watermark is not None else None,
         }
@@ -3969,18 +3995,13 @@ class ControlFlowNode(BaseNode):
         for position, row in enumerate(result.rows, start=1):
             row_id = row.get(result.row_id_column)
             cursor_value = row.get(result.cursor_column)
+            output_row_data = filter_supabase_table_row_output(row, result.select)
             envelope = MessageEnvelope(
                 schema_version="1.0",
                 from_node_id=self.id,
                 from_category=self.category.value,
                 payload={
-                    "row_index": position,
-                    "row_data": dict(row),
-                    "row_id": row_id,
-                    "cursor_column": result.cursor_column,
-                    "cursor_value": cursor_value,
-                    "schema": result.schema,
-                    "table_name": result.table_name,
+                    "row_data": output_row_data,
                 },
                 metadata={
                     "contract": "data_envelope",
@@ -4031,6 +4052,7 @@ class ControlFlowNode(BaseNode):
                 "row_count": result.row_count,
                 "cursor_column": result.cursor_column,
                 "row_id_column": result.row_id_column,
+                "include_previously_processed_rows": result.include_previously_processed_rows,
             },
             artifacts={
                 "supabase_request_urls": list(result.request_urls),
@@ -4045,6 +4067,7 @@ class ControlFlowNode(BaseNode):
                 "table_name": result.table_name,
                 "cursor_column": result.cursor_column,
                 "row_id_column": result.row_id_column,
+                "include_previously_processed_rows": result.include_previously_processed_rows,
                 "total_rows": result.row_count,
             },
         )
@@ -4449,6 +4472,7 @@ class ControlFlowNode(BaseNode):
                 "cursor_column": resolved_config["cursor_column"],
                 "row_id_column": resolved_config["row_id_column"],
                 "page_size": resolved_config["page_size"],
+                "include_previously_processed_rows": resolved_config["include_previously_processed_rows"],
                 "supabase_url_present": bool(resolved_config["supabase_url"]),
                 "supabase_key_present": bool(resolved_config["supabase_key"]),
                 "watermark": None

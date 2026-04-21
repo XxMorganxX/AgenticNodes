@@ -82,7 +82,7 @@ def _row_to_dict(cursor: sqlite3.Cursor, row: tuple[Any, ...] | None) -> dict[st
     if row is None:
         return None
     keys = [column[0] for column in cursor.description or []]
-    return dict(zip(keys, row, strict=False))
+    return dict(zip(keys, row))
 
 
 def _json_dumps_safe(value: Any) -> str:

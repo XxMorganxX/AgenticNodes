@@ -1530,6 +1530,24 @@ export function GraphCanvas({
     [graph, onGraphChange],
   );
 
+  const handleToggleSupabaseIteratorIncludeProcessedRows = useCallback(
+    (nodeId: string) => {
+      if (!graph) {
+        return;
+      }
+      onGraphChange(
+        updateNode(graph, nodeId, (node) => ({
+          ...node,
+          config: {
+            ...node.config,
+            include_previously_processed_rows: !(node.config.include_previously_processed_rows === true),
+          },
+        })),
+      );
+    },
+    [graph, onGraphChange],
+  );
+
   const handleSelectSpreadsheetFile = useCallback(
     (nodeId: string, fileId: string) => {
       if (!graph) {
@@ -3900,6 +3918,7 @@ export function GraphCanvas({
                 onOpenToolDetails: handleOpenToolDetails,
                 onOpenProviderDetails: handleOpenProviderDetails,
                 onToggleExecutorRetries: handleToggleExecutorRetries,
+                onToggleSupabaseIteratorIncludeProcessedRows: handleToggleSupabaseIteratorIncludeProcessedRows,
                 onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
                 onOpenDisplayResponse: handleOpenDisplayResponse,
                 onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
@@ -4006,6 +4025,7 @@ export function GraphCanvas({
         previousData.onOpenToolDetails === handleOpenToolDetails &&
         previousData.onOpenProviderDetails === handleOpenProviderDetails &&
         previousData.onToggleExecutorRetries === handleToggleExecutorRetries &&
+        previousData.onToggleSupabaseIteratorIncludeProcessedRows === handleToggleSupabaseIteratorIncludeProcessedRows &&
         previousData.onOpenPromptBlockDetails === handleOpenPromptBlockDetails &&
         previousData.onOpenDisplayResponse === handleOpenDisplayResponse &&
         previousData.onOpenContextBuilderPayload === handleOpenContextBuilderPayload &&
@@ -4036,6 +4056,7 @@ export function GraphCanvas({
               onOpenToolDetails: handleOpenToolDetails,
               onOpenProviderDetails: handleOpenProviderDetails,
               onToggleExecutorRetries: handleToggleExecutorRetries,
+              onToggleSupabaseIteratorIncludeProcessedRows: handleToggleSupabaseIteratorIncludeProcessedRows,
               onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
               onOpenDisplayResponse: handleOpenDisplayResponse,
               onOpenContextBuilderPayload: handleOpenContextBuilderPayload,

@@ -209,9 +209,16 @@ function serializeStructuredPayloadTemplateEntries(entries: StructuredPayloadTem
 const STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID = "core.structured_payload_builder";
 const RUNTIME_NORMALIZER_PROVIDER_ID = "core.runtime_normalizer";
 
-function parseSupabaseSelect(selectValue: string, availableColumns: string[]): string[] {
+function parseSupabaseSelect(
+  selectValue: string,
+  availableColumns: string[],
+  options: { defaultToAll?: boolean } = {},
+): string[] {
   const trimmed = selectValue.trim();
-  if (!trimmed || trimmed === "*") {
+  if (!trimmed) {
+    return options.defaultToAll === false ? [] : [...availableColumns];
+  }
+  if (trimmed === "*") {
     return [...availableColumns];
   }
   return uniqueStrings(
@@ -1042,6 +1049,7 @@ export function ProviderDetailsModal({
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
+  const supportsSupabaseColumnSelection = isSupabaseDataNode || isSupabaseTableRowsNode;
   const resolvedSupabaseBinding = useMemo(
     () => resolveSupabaseBinding(graph, node.config as Record<string, unknown>),
     [graph, node.config],
@@ -1121,12 +1129,14 @@ export function ProviderDetailsModal({
     return availableSources[0] ?? null;
   }, [node.config.source_name, node.config.table_name, selectedSupabaseSourceName, supabaseSchemaPreview, usesSupabaseTableSelection]);
   const selectedSupabaseColumnNames = useMemo(() => {
-    if (usesSupabaseTableSelection) {
+    if (!supportsSupabaseColumnSelection) {
       return [];
     }
     const availableColumns = selectedSupabaseSource?.columns.map((column) => column.name) ?? [];
-    return parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns);
-  }, [node.config.select, selectedSupabaseSource, usesSupabaseTableSelection]);
+    return parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns, {
+      defaultToAll: !isSupabaseTableRowsNode,
+    });
+  }, [isSupabaseTableRowsNode, node.config.select, selectedSupabaseSource, supportsSupabaseColumnSelection]);
   const isViewingConfiguredSupabaseTable = !usesSupabaseTableSelection || (
     configuredSupabaseTableName.length > 0 && selectedSupabaseSource?.name === configuredSupabaseTableName
   );
@@ -1260,33 +1270,49 @@ export function ProviderDetailsModal({
       ...currentNode,
       config: {
         ...currentNode.config,
-        ...(usesSupabaseTableSelection
-          ? {
+        ...(() => {
+          const availableColumns = source.columns.map((column) => column.name);
+          const resolvedColumns = nextColumns ?? parseSupabaseSelect(String(currentNode.config.select ?? "*"), availableColumns, {
+            defaultToAll: !isSupabaseTableRowsNode,
+          });
+          const resolvedSelect =
+            !supportsSupabaseColumnSelection
+              ? "*"
+              : isSupabaseTableRowsNode && resolvedColumns.length === 0
+                ? ""
+                : resolvedColumns.length === availableColumns.length
+                  ? "*"
+                  : resolvedColumns.join(",");
+          if (isSupabaseTableRowsNode) {
+            return {
               table_name: source.name,
-            }
-          : (() => {
-              const availableColumns = source.columns.map((column) => column.name);
-              const resolvedColumns = nextColumns ?? parseSupabaseSelect(String(currentNode.config.select ?? "*"), availableColumns);
-              return {
-                source_kind: source.source_kind,
-                source_name: source.name,
-                select:
-                  resolvedColumns.length === 0 || resolvedColumns.length === availableColumns.length
-                    ? "*"
-                    : resolvedColumns.join(","),
-              };
-            })()),
+              select: resolvedSelect,
+            };
+          }
+          if (usesSupabaseTableSelection) {
+            return {
+              table_name: source.name,
+            };
+          }
+          return {
+            source_kind: source.source_kind,
+            source_name: source.name,
+            select: resolvedSelect,
+          };
+        })(),
       },
     }));
     setSelectedSupabaseSourceName(source.name);
   }
 
   function toggleSupabaseColumn(columnName: string) {
-    if (!selectedSupabaseSource || usesSupabaseTableSelection) {
+    if (!selectedSupabaseSource || !supportsSupabaseColumnSelection) {
       return;
     }
     const availableColumns = selectedSupabaseSource.columns.map((column) => column.name);
-    const nextSet = new Set(parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns));
+    const nextSet = new Set(parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns, {
+      defaultToAll: !isSupabaseTableRowsNode,
+    }));
     if (nextSet.has(columnName)) {
       nextSet.delete(columnName);
     } else {
@@ -1448,13 +1474,17 @@ export function ProviderDetailsModal({
                       <span>Sequential table loop</span>
                     </div>
                     <p>
-                      This provider reads unread rows from a Supabase table in ascending cursor order, remembers the
-                      last completed watermark across runs, and emits one row at a time through the loop body handle.
+                      This provider reads rows from a Supabase table in ascending cursor order, can skip rows already
+                      covered by the cached watermark or replay the full result set, and emits one row at a time through
+                      the loop body handle.
                     </p>
                     <div className="provider-details-capabilities">
                       <span className="provider-capability-chip">table {String(node.config.table_name ?? "not set") || "not set"}</span>
                       <span className="provider-capability-chip">cursor {String(node.config.cursor_column ?? "not set") || "not set"}</span>
                       <span className="provider-capability-chip">page size {String(node.config.page_size ?? 500)}</span>
+                      <span className="provider-capability-chip">
+                        {node.config.include_previously_processed_rows === true ? "include cached" : "skip cached"}
+                      </span>
                     </div>
                   </section>
                 ) : null}
@@ -2060,6 +2090,7 @@ export function ProviderDetailsModal({
                       const cursorValue = String(node.config.cursor_column ?? "").trim();
                       const rowIdValue = String(node.config.row_id_column ?? "").trim();
                       const pageSizeValue = String(node.config.page_size ?? "500");
+                      const includePreviouslyProcessedRows = node.config.include_previously_processed_rows === true;
                       const hasColumns = tableColumns.length > 0;
                       const renderColumnPicker = (
                         fieldKey: "cursor_column" | "row_id_column",
@@ -2118,8 +2149,24 @@ export function ProviderDetailsModal({
                               {renderColumnPicker("cursor_column", cursorValue, "e.g. created_at")}
                             </label>
                             <label>
-                              Dedup row id column (stable tie-breaker, skips rows already processed)
+                              Dedup row id column (stable tie-breaker for ordering and cached progress)
                               {renderColumnPicker("row_id_column", rowIdValue, "id")}
+                            </label>
+                            <label>
+                              <span>Include previously processed rows</span>
+                              <input
+                                type="checkbox"
+                                checked={includePreviouslyProcessedRows}
+                                onChange={(event) =>
+                                  updateDraftNode((currentNode) => ({
+                                    ...currentNode,
+                                    config: {
+                                      ...currentNode.config,
+                                      include_previously_processed_rows: event.target.checked,
+                                    },
+                                  }))
+                                }
+                              />
                             </label>
                             <label>
                               Page size
@@ -2141,6 +2188,16 @@ export function ProviderDetailsModal({
                                 : configuredTableName
                                   ? "Load the schema below to get column suggestions, or type the column name directly."
                                   : "Pick a table below (or type one above) to enable column suggestions."}
+                            </div>
+                            <div>
+                              {supportsSupabaseColumnSelection
+                                ? "Only the selected columns are emitted in payload.row_data. Cursor fields are fetched internally for iteration but not forwarded in the row payload."
+                                : "This node uses the selected table schema for validation and writes, rather than emitting row payload columns."}
+                            </div>
+                            <div>
+                              {includePreviouslyProcessedRows
+                                ? "Cached watermark progress is ignored for reads, so every run replays all matching rows."
+                                : "Cached watermark progress is applied, so runs skip rows already processed in prior successful completions."}
                             </div>
                           </div>
                         </section>
@@ -2238,14 +2295,14 @@ export function ProviderDetailsModal({
                                   onClick={() =>
                                     applySupabaseSourceSelection(
                                       selectedSupabaseSource,
-                                      usesSupabaseTableSelection ? undefined : selectedSupabaseColumnNames,
+                                      supportsSupabaseColumnSelection ? selectedSupabaseColumnNames : undefined,
                                     )
                                   }
                                   disabled={isSupabaseBrowserLocked}
                                 >
-                                  {usesSupabaseTableSelection ? "Use Table" : "Apply Selection"}
+                                  {supportsSupabaseColumnSelection ? "Apply Selection" : "Use Table"}
                                 </button>
-                                {!usesSupabaseTableSelection ? (
+                                {supportsSupabaseColumnSelection ? (
                                   <button
                                     type="button"
                                     className="secondary-button"
@@ -2253,6 +2310,16 @@ export function ProviderDetailsModal({
                                     disabled={isSupabaseBrowserLocked}
                                   >
                                     Use All Columns
+                                  </button>
+                                ) : null}
+                                {supportsSupabaseColumnSelection ? (
+                                  <button
+                                    type="button"
+                                    className="secondary-button"
+                                    onClick={() => applySupabaseSourceSelection(selectedSupabaseSource, [])}
+                                    disabled={isSupabaseBrowserLocked}
+                                  >
+                                    Remove All Columns
                                   </button>
                                 ) : null}
                               </div>
@@ -2270,7 +2337,7 @@ export function ProviderDetailsModal({
                                 const canSelectIteratorColumn = !isSupabaseTableRowsNode || isViewingConfiguredSupabaseTable;
                                 return (
                                   <label key={column.name} className="provider-details-schema-column-row">
-                                    {!usesSupabaseTableSelection ? (
+                                    {supportsSupabaseColumnSelection ? (
                                       <input
                                         type="checkbox"
                                         checked={checked}
@@ -2337,7 +2404,10 @@ export function ProviderDetailsModal({
                                   <strong>Cursor:</strong> {String(node.config.cursor_column ?? "") || "not set"} — iteration advances in ascending order of this column.
                                 </div>
                                 <div>
-                                  <strong>Dedup row id:</strong> {String(node.config.row_id_column ?? "") || "not set"} — stable tie-breaker when cursor values tie; also used to skip rows already processed in prior runs.
+                                  <strong>Dedup row id:</strong> {String(node.config.row_id_column ?? "") || "not set"} — stable tie-breaker when cursor values tie; it also anchors cached progress when replay is turned off.
+                                </div>
+                                <div>
+                                  <strong>Cached rows:</strong> {node.config.include_previously_processed_rows === true ? "included on every run" : "skipped after successful runs"}
                                 </div>
                               </div>
                             ) : null}
@@ -2627,9 +2697,10 @@ export function ProviderDetailsModal({
                 ) : isSupabaseTableRowsNode ? (
                   <div className="tool-details-modal-help">
                     <strong>Supabase table rows node notes</strong>
-                    <div>Choose the destination table from the schema browser above, then set the timestamp-like <code>cursor_column</code> used for cross-run progress.</div>
+                    <div>Choose the destination table from the schema browser above, then set the timestamp-like <code>cursor_column</code> used for ordering and cached progress.</div>
                     <div>Use <code>row_id_column</code> as the stable tie-breaker when multiple rows share the same cursor value.</div>
-                    <div>Use <code>filters_text</code> as one PostgREST query parameter per line, like <code>status=eq.pending</code>. The unread-row cursor filter is added automatically at runtime.</div>
+                    <div>Use <code>filters_text</code> as one PostgREST query parameter per line, like <code>status=eq.pending</code>. The cached-row filter is added automatically unless replay mode is enabled.</div>
+                    <div>Turn on <code>include_previously_processed_rows</code> when you want every run to iterate over all matching rows again.</div>
                   </div>
                 ) : isSupabaseRowWriteNode ? (
                   <div className="tool-details-modal-help">

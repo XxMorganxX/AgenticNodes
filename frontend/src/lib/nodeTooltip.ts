@@ -561,6 +561,18 @@ export function buildNodeTooltip(
                   { label: "First Data Row", value: String(node.config.start_row_index ?? 2) },
                 ]
               : []),
+            ...(isSupabaseTableRowsNode
+              ? [
+                  { label: "Schema", value: asString(node.config.schema) ?? "public" },
+                  { label: "Table", value: asString(node.config.table_name) ?? "Not set" },
+                  { label: "Cursor", value: asString(node.config.cursor_column) ?? "Not set" },
+                  { label: "Row ID", value: asString(node.config.row_id_column) ?? "id" },
+                  {
+                    label: "Cached Rows",
+                    value: node.config.include_previously_processed_rows === true ? "Included on every run" : "Skipped after success",
+                  },
+                ]
+              : []),
             ...(isRuntimeFieldExtractorNode
               ? [
                   { label: "Field Names", value: formatList(runtimeFieldNames(node)) },

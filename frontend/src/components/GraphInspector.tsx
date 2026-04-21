@@ -2919,14 +2919,15 @@ export function GraphInspector({
                 <>
                   <div className="contract-card">
                     <strong>Supabase Table Rows</strong>
-                    <span>Reads unread rows from a Supabase table in ascending cursor order and runs downstream nodes once per row in strict sequence.</span>
-                    <span>Each row is emitted through the `loop-body` handle as `payload.row_data` plus `row_id`, `cursor_value`, `schema`, and `table_name`.</span>
+                    <span>Reads rows from a Supabase table in ascending cursor order and can either skip previously processed rows or replay the full result set.</span>
+                    <span>Each row is emitted through the `loop-body` handle as `payload.row_data`, containing only the selected columns.</span>
                   </div>
                   <div className="inspector-meta">
                     <span>Schema: {String(selectedNode.config.schema ?? "public") || "public"}</span>
                     <span>Table: {String(selectedNode.config.table_name ?? "not set") || "not set"}</span>
                     <span>Cursor: {String(selectedNode.config.cursor_column ?? "not set") || "not set"}</span>
                     <span>Row id: {String(selectedNode.config.row_id_column ?? "id") || "id"}</span>
+                    <span>Cached rows: {selectedNode.config.include_previously_processed_rows === true ? "included" : "skipped"}</span>
                     <span>Output handle: `loop-body`</span>
                   </div>
                   {spreadsheetIteratorState ? (
