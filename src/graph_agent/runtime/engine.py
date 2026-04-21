@@ -247,14 +247,9 @@ class GraphRuntime:
 
     def _update_iterator_state(self, state: RunState, node_id: str, payload: dict[str, Any]) -> None:
         state.iterator_states[node_id] = {
-            "iterator_type": payload.get("iterator_type"),
-            "status": payload.get("status"),
-            "current_row_index": payload.get("current_row_index"),
-            "total_rows": payload.get("total_rows"),
-            "headers": payload.get("headers"),
-            "sheet_name": payload.get("sheet_name"),
-            "source_file": payload.get("source_file"),
-            "file_format": payload.get("file_format"),
+            key: value
+            for key, value in payload.items()
+            if key not in {"node_id", "iterator_node_id", "iterator_row_index", "iterator_total_rows", "iteration_id"}
         }
 
     def _emit_iterator_update(self, state: RunState, node_id: str, payload: dict[str, Any]) -> None:
@@ -375,7 +370,7 @@ class GraphRuntime:
         state.ended_at = completion_event.timestamp
         return state
 
-    def _run_spreadsheet_row_iterator(
+    def _run_iterator_envelopes(
         self,
         graph: GraphDefinition,
         state: RunState,
@@ -384,6 +379,11 @@ class GraphRuntime:
         row_envelopes: list[dict[str, Any]],
         step_state: dict[str, int],
         scoped_visit_counts: dict[tuple[str, str | None, int | None], int],
+        *,
+        iterator_type: str,
+        handle_id: str,
+        iterator_item_label: str,
+        on_completed: Callable[[], None] | None = None,
     ) -> RunState | None:
         iterator_state = dict(result.metadata.get("iterator_state", {})) if isinstance(result.metadata.get("iterator_state"), dict) else {}
         total_rows = len(row_envelopes)
@@ -421,14 +421,14 @@ class GraphRuntime:
             row_result = NodeExecutionResult(
                 status="success",
                 output=row_envelope,
-                summary=f"Prepared spreadsheet row {row_index} of {total_rows}.",
+                summary=f"Prepared {iterator_item_label} {row_index} of {total_rows}.",
                 metadata={
-                    "control_flow_handle_id": CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
-                    "iterator_type": "spreadsheet_rows",
+                    "control_flow_handle_id": handle_id,
+                    "iterator_type": iterator_type,
                     "current_row_index": row_index,
                     "total_rows": total_rows,
                 },
-                route_outputs={CONTROL_FLOW_LOOP_BODY_HANDLE_ID: row_envelope},
+                route_outputs={handle_id: row_envelope},
             )
             next_edges = self.select_edges(graph, state, node.id, row_result)
             binding_edges = self._binding_edges_for_node(graph, node.id)
@@ -474,7 +474,19 @@ class GraphRuntime:
                 return terminal_state
             if terminal_state is not None and terminal_state.status in {"failed", "cancelled"}:
                 return terminal_state
-
+        if on_completed is not None:
+            try:
+                on_completed()
+            except Exception as exc:  # noqa: BLE001
+                return self.fail_run(
+                    state,
+                    summary=f"Iterator node '{node.label}' could not persist completion state.",
+                    error={
+                        "type": "iterator_completion_error",
+                        "node_id": node.id,
+                        "message": str(exc),
+                    },
+                )
         self._emit_iterator_update(
             state,
             node.id,
@@ -592,9 +604,9 @@ class GraphRuntime:
                 completed_payload,
             )
 
-            row_envelopes = internal_metadata.get("spreadsheet_row_envelopes")
+            row_envelopes = internal_metadata.get("iterator_envelopes")
             if isinstance(row_envelopes, list):
-                terminal_state = self._run_spreadsheet_row_iterator(
+                terminal_state = self._run_iterator_envelopes(
                     graph,
                     state,
                     node,
@@ -602,6 +614,10 @@ class GraphRuntime:
                     [row for row in row_envelopes if isinstance(row, dict)],
                     step_state,
                     scoped_visit_counts,
+                    iterator_type=str(internal_metadata.get("iterator_type", result.metadata.get("iterator_type", "spreadsheet_rows")) or "spreadsheet_rows"),
+                    handle_id=str(internal_metadata.get("iterator_handle_id", CONTROL_FLOW_LOOP_BODY_HANDLE_ID) or CONTROL_FLOW_LOOP_BODY_HANDLE_ID),
+                    iterator_item_label=str(internal_metadata.get("iterator_item_label", "row") or "row"),
+                    on_completed=internal_metadata.get("iterator_on_completed") if callable(internal_metadata.get("iterator_on_completed")) else None,
                 )
                 if terminal_state is not None:
                     return terminal_state

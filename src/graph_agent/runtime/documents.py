@@ -218,6 +218,7 @@ class TestEnvironmentDefinition:
     description: str = ""
     version: str = "1.0"
     graph_type: str = "test_environment"
+    email_routing_mode: str = ""
     default_input: str = ""
     env_vars: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_GRAPH_ENV_VARS))
     supabase_connections: list[SupabaseConnectionDefinition] = field(default_factory=list)
@@ -254,6 +255,7 @@ class TestEnvironmentDefinition:
             description=str(payload.get("description", "")),
             version=str(payload.get("version", "1.0")),
             graph_type=graph_type,
+            email_routing_mode=str(payload.get("email_routing_mode", "") or "").strip(),
             default_input=str(payload.get("default_input", "")),
             env_vars=_normalize_env_vars(payload.get("env_vars")),
             agents=agents,
@@ -314,6 +316,8 @@ class TestEnvironmentDefinition:
             "env_vars": dict(self.env_vars),
             "agents": [agent.to_dict() for agent in self.agents],
         }
+        if self.email_routing_mode:
+            payload["email_routing_mode"] = self.email_routing_mode
         if self.supabase_connections:
             payload["supabase_connections"] = [connection.to_dict() for connection in self.supabase_connections]
         if self.default_supabase_connection_id:

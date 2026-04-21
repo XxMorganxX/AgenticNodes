@@ -742,6 +742,20 @@ pre {
   margin-top: 0.85rem;
 }
 
+.mosaic-title-toggle-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.8rem;
+}
+
+.mosaic-title-toggle-label {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: #a8aed3;
+}
+
 .mosaic-title-actions > button {
   flex: 0 0 auto;
 }
@@ -6842,6 +6856,27 @@ pre {
   gap: 0.55rem;
 }
 
+.email-routing-mode-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.email-routing-mode-toggle .secondary-button {
+  flex: 1 1 10rem;
+  justify-content: center;
+}
+
+.email-routing-mode-toggle--compact {
+  gap: 0.35rem;
+}
+
+.email-routing-mode-toggle--compact .secondary-button {
+  flex: 0 0 auto;
+  min-width: 4.25rem;
+  padding: 0.38rem 0.7rem;
+}
+
 .env-supabase-launcher-button {
   justify-content: center;
 }
@@ -6887,6 +6922,14 @@ pre {
   font-size: 0.76rem;
   line-height: 1.45;
   color: #f0b1ba;
+}
+
+.production-run-confirm-modal {
+  max-width: 36rem;
+}
+
+.production-run-confirm-modal-body {
+  gap: 1rem;
 }
 
 .env-tiles {

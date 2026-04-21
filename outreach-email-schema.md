@@ -13,6 +13,18 @@ The outbound table is used for both initial outreach and follow-up drafts. The a
 - Store provider-specific or less frequently queried details in `jsonb`.
 - Do not infer "sent" from draft creation alone.
 - Allow later syncing of actual send activity with `observed_sent_at` if that becomes available.
+- Keep development writes isolated in mirror tables so test runs do not pollute the production-intended email history.
+
+## Development Mirror Tables
+
+When you want to exercise draft logging or inbound sync flows during development, use:
+
+- `public.outbound_email_messages_dev`
+- `public.inbound_email_messages_dev`
+
+These tables should match the production schema exactly, with their internal foreign keys pointing at the dev tables instead of the production tables. That keeps thread relationships intact inside development data while preserving the existing production-intended tables for real email activity.
+
+For draft logging in this app, point the outbound email logger node at `outbound_email_messages_dev` during development and keep `outbound_email_messages` for production-intended runs.
 
 ## Table 1: `public.outbound_email_messages`
 
@@ -88,5 +100,6 @@ create table if not exists public.inbound_email_messages (
 - Use `parent_outbound_email_id` to link a follow-up to the specific prior outreach message it extends.
 - Use `root_outbound_email_id` to group a full outreach chain when needed.
 - Treat `metadata` as the home for fields like `cc`, `bcc`, attachments, template context, and other sparse email metadata.
+- When a draft is generated from a model node, persist the rendered prompt trace in `metadata.generation_prompt` so evaluations can compare the exact `system_prompt`, `user_prompt`, and full request message list over time.
 - Treat `raw_provider_payload` as the full provider response for replay, debugging, and future extraction.
 - Do not build workflows that assume a drafted message was sent unless `observed_sent_at` or another verified sent signal is present.

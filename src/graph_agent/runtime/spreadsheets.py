@@ -279,18 +279,23 @@ def _read_xlsx_rows(path: Path, *, sheet_name: str | None) -> tuple[str, list[st
     if load_workbook is None:
         raise SpreadsheetParseError("XLSX support requires the 'openpyxl' package to be installed.")
     workbook = load_workbook(filename=str(path), read_only=True, data_only=True)
-    sheet_names = list(workbook.sheetnames)
-    selected_sheet_name = str(sheet_name or "").strip()
-    if selected_sheet_name:
-        if selected_sheet_name not in workbook.sheetnames:
-            raise SpreadsheetParseError(
-                f"Sheet '{selected_sheet_name}' was not found. Available sheets: {', '.join(sheet_names) or 'none'}."
-            )
-        worksheet = workbook[selected_sheet_name]
-    else:
-        worksheet = workbook[workbook.sheetnames[0]]
-        selected_sheet_name = worksheet.title
-    return selected_sheet_name, sheet_names, [list(row) for row in worksheet.iter_rows(values_only=True)]
+    try:
+        sheet_names = list(workbook.sheetnames)
+        selected_sheet_name = str(sheet_name or "").strip()
+        if selected_sheet_name:
+            if selected_sheet_name not in workbook.sheetnames:
+                raise SpreadsheetParseError(
+                    f"Sheet '{selected_sheet_name}' was not found. Available sheets: {', '.join(sheet_names) or 'none'}."
+                )
+            worksheet = workbook[selected_sheet_name]
+        else:
+            worksheet = workbook[workbook.sheetnames[0]]
+            selected_sheet_name = worksheet.title
+        return selected_sheet_name, sheet_names, [list(row) for row in worksheet.iter_rows(values_only=True)]
+    finally:
+        close = getattr(workbook, "close", None)
+        if callable(close):
+            close()
 
 
 def _build_parse_result(

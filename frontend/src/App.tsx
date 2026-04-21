@@ -4,6 +4,7 @@ import { AgentRunSwimlanes } from "./components/AgentRunSwimlanes";
 import { GraphCanvas } from "./components/GraphCanvas";
 import { GraphEnvEditor } from "./components/GraphEnvEditor";
 import { McpServerModal } from "./components/McpServerModal";
+import { ProductionRunConfirmModal } from "./components/ProductionRunConfirmModal";
 import { RunFilesExplorerModal } from "./components/RunFilesExplorerModal";
 import { UserPreferencesModal } from "./components/UserPreferencesModal";
 import {
@@ -35,6 +36,7 @@ import {
 } from "./lib/api";
 import { createBlankGraph, layoutGraphLR, normalizeGraphDocument } from "./lib/editor";
 import type { GraphLayoutNodeDimensions } from "./lib/editor";
+import { applyEmailRoutingMode, resolveEmailRoutingMode } from "./lib/emailTableRouting";
 import {
   filterEventsForAgent,
   getCanvasGraph,
@@ -434,6 +436,10 @@ function getSavedInputPrompt(graph: GraphDocument | null | undefined): string {
   return savedPrompt || DEFAULT_INPUT;
 }
 
+function serializePersistedGraphDocument(graph: GraphDocument): string {
+  return JSON.stringify(normalizeGraphDocument(graph));
+}
+
 function buildEnvironmentAgentSelection(
   graph: GraphDocument | null | undefined,
   previous: Record<string, boolean> = {},
@@ -728,16 +734,11 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
     if (nodeId) {
       next.iterator_states = {
         ...(next.iterator_states ?? {}),
-        [nodeId]: {
-          iterator_type: payload.iterator_type,
-          status: payload.status,
-          current_row_index: payload.current_row_index,
-          total_rows: payload.total_rows,
-          headers: payload.headers,
-          sheet_name: payload.sheet_name,
-          source_file: payload.source_file,
-          file_format: payload.file_format,
-        },
+        [nodeId]: Object.fromEntries(
+          Object.entries(payload).filter(
+            ([key]) => !["node_id", "iterator_node_id", "iterator_row_index", "iterator_total_rows", "iteration_id"].includes(key),
+          ),
+        ),
       };
     }
     const nextLoopRegions = updateLoopRegionState(next.loop_regions, payload, true);
@@ -868,10 +869,6 @@ function pickDefaultGraphId(graphs: GraphDocument[]): string {
   return graphs.find((graph) => graph.graph_id === DEFAULT_TEST_ENVIRONMENT_ID)?.graph_id ?? graphs[0]?.graph_id ?? "";
 }
 
-function serializeGraphSnapshot(graph: GraphDocument | null): string {
-  return graph ? JSON.stringify(normalizeGraphDocument(graph)) : "";
-}
-
 function applyPersistedEnvVars(graph: GraphDocument, storageKey: string | null | undefined): GraphDocument {
   const persistedEnvVars = loadPersistedGraphEnvVars(storageKey);
   if (!persistedEnvVars) {
@@ -958,8 +955,8 @@ export default function App() {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [environmentAgentSelection, setEnvironmentAgentSelection] = useState<Record<string, boolean>>({});
   const history = useGraphHistory();
-  const { graph: draftGraph, set: setDraftGraph, setQuiet: setDraftGraphQuiet, reset: resetHistory } = history;
-  const [savedGraphSnapshot, setSavedGraphSnapshot] = useState("");
+  const { graph: draftGraph, stateId: draftGraphStateId, set: setDraftGraph, setQuiet: setDraftGraphQuiet, reset: resetHistory } = history;
+  const [savedGraphStateId, setSavedGraphStateId] = useState(0);
   const [catalog, setCatalog] = useState<EditorCatalog | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
@@ -989,6 +986,7 @@ export default function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [isStoppingRuntime, setIsStoppingRuntime] = useState(false);
   const [isResettingRuntime, setIsResettingRuntime] = useState(false);
+  const [productionRunConfirmOpen, setProductionRunConfirmOpen] = useState(false);
   const [mcpPendingKey, setMcpPendingKey] = useState<string | null>(null);
   const [mcpPanelOpen, setMcpPanelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -997,9 +995,15 @@ export default function App() {
   const sourceRef = useRef<EventSource | null>(null);
   const runPollTimeoutRef = useRef<number | null>(null);
   const runStateRef = useRef<RunState | null>(null);
+  const draftGraphRef = useRef<GraphDocument | null>(draftGraph);
+  const graphsRef = useRef<GraphDocument[]>(graphs);
+  const selectedAgentIdRef = useRef<string | null>(selectedAgentId);
   const inputRef = useRef(input);
   const pendingRunSnapshotRef = useRef<PersistedRunSnapshot | null>(null);
   const persistRunSnapshotTimeoutRef = useRef<number | null>(null);
+  const pendingBackgroundPersistGraphRef = useRef<GraphDocument | null>(null);
+  const backgroundPersistInFlightRef = useRef(false);
+  const backgroundPersistedSnapshotRef = useRef("");
   const executionBoxRef = useRef<HTMLDivElement | null>(null);
 
   const canvasGraph = useMemo(() => getCanvasGraph(draftGraph, selectedAgentId), [draftGraph, selectedAgentId]);
@@ -1012,6 +1016,7 @@ export default function App() {
   const filteredEvents = useMemo(() => filterEventsForAgent(events, selectedAgentId), [events, selectedAgentId]);
   const persistedGraphIds = useMemo(() => new Set(graphs.map((graph) => graph.graph_id)), [graphs]);
   const isEnvironment = isTestEnvironment(draftGraph);
+  const emailRoutingMode = useMemo(() => resolveEmailRoutingMode(draftGraph), [draftGraph]);
   const selectedEnvironmentAgentIds = useMemo(
     () => getSelectedEnvironmentAgentIds(draftGraph, environmentAgentSelection),
     [draftGraph, environmentAgentSelection],
@@ -1027,8 +1032,7 @@ export default function App() {
   );
   const focusedRunSummary = focusedRunProjection.runSummary;
   const focusedEventGroups = focusedRunProjection.eventGroups;
-  const draftGraphSnapshot = useMemo(() => serializeGraphSnapshot(draftGraph), [draftGraph]);
-  const hasUnsavedChanges = (Boolean(draftGraph) && draftGraphSnapshot !== savedGraphSnapshot) || input !== savedInputPrompt;
+  const hasUnsavedChanges = (Boolean(draftGraph) && draftGraphStateId !== savedGraphStateId) || input !== savedInputPrompt;
   const projectFileGraphId = selectedGraphId || draftGraph?.graph_id || "";
   const readyProjectFiles = useMemo(() => projectFiles.filter((file) => file.status === "ready"), [projectFiles]);
   const readyRunDocuments = useMemo(() => runDocuments.filter((document) => document.status === "ready"), [runDocuments]);
@@ -1055,6 +1059,18 @@ export default function App() {
   useEffect(() => {
     runStateRef.current = runState;
   }, [runState]);
+
+  useEffect(() => {
+    draftGraphRef.current = draftGraph;
+  }, [draftGraph]);
+
+  useEffect(() => {
+    graphsRef.current = graphs;
+  }, [graphs]);
+
+  useEffect(() => {
+    selectedAgentIdRef.current = selectedAgentId;
+  }, [selectedAgentId]);
 
   useEffect(() => {
     inputRef.current = input;
@@ -1148,6 +1164,65 @@ export default function App() {
     return loadedCatalog;
   }, []);
 
+  const buildPersistableGraphDocument = useCallback((sourceGraph: GraphDocument): GraphDocument => {
+    const storageKey = persistedGraphEnvStorageKey(sourceGraph.graph_id, sourceGraph.graph_id);
+    const savedGraphFallback = graphsRef.current.find((graph) => graph.graph_id === sourceGraph.graph_id) ?? null;
+    const hydratedGraph = reconcileSupabaseConnections(
+      applyPersistedSupabaseConnectionState(
+        applyPersistedEnvVars(sourceGraph, storageKey),
+        storageKey,
+      ),
+      savedGraphFallback,
+      ...graphsRef.current.filter((graph) => graph.graph_id !== sourceGraph.graph_id),
+    );
+    const missingConnectionIds = findMissingSupabaseConnectionIds(hydratedGraph);
+    if (missingConnectionIds.length > 0) {
+      const label = missingConnectionIds.length === 1
+        ? `Supabase connection "${missingConnectionIds[0]}" is`
+        : `Supabase connections ${missingConnectionIds.map((id) => `"${id}"`).join(", ")} are`;
+      throw new Error(
+        `${label} referenced by nodes but not defined on this graph. `
+        + "Open the Supabase Connections panel in the Environment section to add the missing connection, "
+        + "or switch affected nodes to a different connection.",
+      );
+    }
+    return {
+      ...normalizeGraphDocument(hydratedGraph),
+      default_input: inputRef.current,
+    } satisfies GraphDocument;
+  }, []);
+
+  const persistPendingGraphInBackground = useCallback(async () => {
+    if (backgroundPersistInFlightRef.current) {
+      return;
+    }
+    const pendingGraph = pendingBackgroundPersistGraphRef.current;
+    if (!pendingGraph) {
+      return;
+    }
+    if (!pendingGraph.graph_id || !graphsRef.current.some((graph) => graph.graph_id === pendingGraph.graph_id)) {
+      pendingBackgroundPersistGraphRef.current = null;
+      return;
+    }
+
+    pendingBackgroundPersistGraphRef.current = null;
+    backgroundPersistInFlightRef.current = true;
+
+    try {
+      const normalized = buildPersistableGraphDocument(pendingGraph);
+      const savedGraph = await updateGraph(pendingGraph.graph_id, normalized);
+      backgroundPersistedSnapshotRef.current = serializePersistedGraphDocument(normalized);
+      setGraphs((current) => current.map((graph) => (graph.graph_id === savedGraph.graph_id ? savedGraph : graph)));
+    } catch (error) {
+      console.error("Background graph persistence failed.", error);
+    } finally {
+      backgroundPersistInFlightRef.current = false;
+      if (pendingBackgroundPersistGraphRef.current) {
+        void persistPendingGraphInBackground();
+      }
+    }
+  }, [buildPersistableGraphDocument]);
+
   const hydrateSelectedGraph = useCallback((graph: GraphDocument) => {
     const storageKey = persistedGraphEnvStorageKey(graph.graph_id, graph.graph_id);
     const nextGraph = reconcileSupabaseConnections(
@@ -1157,14 +1232,16 @@ export default function App() {
       ),
       graph,
     );
-    resetHistory(nextGraph);
-    setSavedGraphSnapshot(serializeGraphSnapshot(nextGraph));
+    const nextStateId = resetHistory(nextGraph);
+    setSavedGraphStateId(nextStateId);
     const nextInput = getSavedInputPrompt(nextGraph);
     setInput(nextInput);
     setSavedInputPrompt(nextInput);
     setSelectedAgentId(loadSelectedAgentId(nextGraph));
     setSelectedNodeId(null);
     setSelectedEdgeId(null);
+    pendingBackgroundPersistGraphRef.current = null;
+    backgroundPersistedSnapshotRef.current = serializePersistedGraphDocument(nextGraph);
     return nextGraph;
   }, [resetHistory]);
 
@@ -1486,8 +1563,8 @@ export default function App() {
             applyPersistedEnvVars(createBlankGraph(), draftGraphEnvStorageKey()),
             draftGraphEnvStorageKey(),
           );
-          resetHistory(blankGraph);
-          setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
+          const nextStateId = resetHistory(blankGraph);
+          setSavedGraphStateId(nextStateId);
           setInput(DEFAULT_INPUT);
           setSavedInputPrompt(DEFAULT_INPUT);
           setActiveRunId(null);
@@ -1626,8 +1703,8 @@ export default function App() {
     } else if (loadedGraphs.length === 0) {
       const blankGraph = createBlankGraph();
       setSelectedGraphId("");
-      resetHistory(blankGraph);
-      setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
+      const nextStateId = resetHistory(blankGraph);
+      setSavedGraphStateId(nextStateId);
       setInput(DEFAULT_INPUT);
       setSavedInputPrompt(DEFAULT_INPUT);
       setSelectedAgentId(null);
@@ -1662,38 +1739,14 @@ export default function App() {
     setIsSaving(true);
     setError(null);
     try {
-      const savedGraphFallback =
-        selectedGraphId && persistedGraphIds.has(selectedGraphId)
-          ? graphs.find((graph) => graph.graph_id === selectedGraphId) ?? null
-          : null;
-      const storageKey = persistedGraphEnvStorageKey(draftGraph.graph_id, selectedGraphId);
-      const hydratedDraftGraph = reconcileSupabaseConnections(
-        applyPersistedSupabaseConnectionState(
-          applyPersistedEnvVars(draftGraph, storageKey),
-          storageKey,
-        ),
-        savedGraphFallback,
-        ...graphs.filter((g) => g.graph_id !== draftGraph.graph_id),
-      );
-      const missingConnectionIds = findMissingSupabaseConnectionIds(hydratedDraftGraph);
-      if (missingConnectionIds.length > 0) {
-        const label = missingConnectionIds.length === 1
-          ? `Supabase connection "${missingConnectionIds[0]}" is`
-          : `Supabase connections ${missingConnectionIds.map((id) => `"${id}"`).join(", ")} are`;
-        throw new Error(
-          `${label} referenced by nodes but not defined on this graph. `
-          + "Open the Supabase Connections panel in the Environment section to add the missing connection, "
-          + "or switch affected nodes to a different connection.",
-        );
-      }
-      const normalized = {
-        ...normalizeGraphDocument(hydratedDraftGraph),
-        default_input: input,
-      } satisfies GraphDocument;
+      const graphToPersist = pendingBackgroundPersistGraphRef.current ?? draftGraph;
+      const normalized = buildPersistableGraphDocument(graphToPersist);
       const savedGraph =
         selectedGraphId && persistedGraphIds.has(selectedGraphId)
           ? await updateGraph(selectedGraphId, normalized)
           : await createGraph(normalized);
+      pendingBackgroundPersistGraphRef.current = null;
+      backgroundPersistedSnapshotRef.current = serializePersistedGraphDocument(normalized);
       if (!selectedGraphId) {
         const draftStorageKey = draftGraphEnvStorageKey();
         const draftEnvVars = loadPersistedGraphEnvVars(draftStorageKey);
@@ -1708,9 +1761,10 @@ export default function App() {
         }
       }
       await refreshGraphs(savedGraph.graph_id);
-      setSavedGraphSnapshot(serializeGraphSnapshot(savedGraph));
-      setSavedInputPrompt(getSavedInputPrompt(savedGraph));
-      setDraftGraph(savedGraph);
+      const nextSavedInput = getSavedInputPrompt(savedGraph);
+      const nextStateId = setDraftGraph(savedGraph);
+      setSavedGraphStateId(nextStateId);
+      setSavedInputPrompt(nextSavedInput);
       if (isTestEnvironment(savedGraph)) {
         setSelectedAgentId((current) => current ?? getDefaultAgentId(savedGraph));
       }
@@ -1745,8 +1799,8 @@ export default function App() {
     clearLiveRunState();
     setSelectedGraphId("");
     setSelectedAgentId(null);
-    resetHistory(blankGraph);
-    setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
+    const nextStateId = resetHistory(blankGraph);
+    setSavedGraphStateId(nextStateId);
     setInput(DEFAULT_INPUT);
     setSavedInputPrompt(DEFAULT_INPUT);
     setSelectedNodeId(null);
@@ -1774,8 +1828,8 @@ export default function App() {
         const blankGraph = createBlankGraph();
         setSelectedGraphId("");
         setSelectedAgentId(null);
-        resetHistory(blankGraph);
-        setSavedGraphSnapshot(serializeGraphSnapshot(blankGraph));
+        const nextStateId = resetHistory(blankGraph);
+        setSavedGraphStateId(nextStateId);
         setInput(DEFAULT_INPUT);
         setSavedInputPrompt(DEFAULT_INPUT);
         clearLiveRunState();
@@ -1789,7 +1843,7 @@ export default function App() {
     }
   }
 
-  async function handleRun() {
+  async function executeRun() {
     if (!draftGraph) {
       return;
     }
@@ -1839,6 +1893,22 @@ export default function App() {
     }
   }
 
+  async function handleRun() {
+    if (!draftGraph) {
+      return;
+    }
+    const agentIdsToRun = isTestEnvironment(draftGraph) ? getSelectedEnvironmentAgentIds(draftGraph, environmentAgentSelection) : undefined;
+    if (isTestEnvironment(draftGraph) && (!agentIdsToRun || agentIdsToRun.length === 0)) {
+      setError("Turn on at least one agent before running the environment.");
+      return;
+    }
+    if (emailRoutingMode === "production") {
+      setProductionRunConfirmOpen(true);
+      return;
+    }
+    await executeRun();
+  }
+
   async function handleStopRuntime() {
     if (!window.confirm("Stop active execution? The current run state will stay visible, but active runs will be cancelled.")) {
       return;
@@ -1882,15 +1952,47 @@ export default function App() {
     if (!canvasGraph || !draftGraph) {
       return;
     }
-    setDraftGraph(updateSelectedAgentGraph(draftGraph, selectedAgentId, nextGraph));
+    const nextDocument = updateSelectedAgentGraph(draftGraph, selectedAgentId, nextGraph);
+    const nextStateId = setDraftGraph(nextDocument);
+    try {
+      if (
+        backgroundPersistedSnapshotRef.current
+        && serializePersistedGraphDocument(buildPersistableGraphDocument(nextDocument)) === backgroundPersistedSnapshotRef.current
+      ) {
+        setSavedGraphStateId(nextStateId);
+      }
+    } catch {
+      // Preserve the in-memory commit even when background-persistence validation cannot be recomputed.
+    }
   }
 
-  function handleCanvasGraphDrag(nextGraph: GraphDefinition) {
+  function handleCanvasGraphQuietChange(nextGraph: GraphDefinition) {
     if (!canvasGraph || !draftGraph) {
       return;
     }
     setDraftGraphQuiet(updateSelectedAgentGraph(draftGraph, selectedAgentId, nextGraph));
   }
+
+  function handleCanvasGraphDrag(nextGraph: GraphDefinition) {
+    handleCanvasGraphQuietChange(nextGraph);
+  }
+
+  // Memoized so the modal receives a stable `onBackgroundPersistGraph` prop
+  // across renders. This reads draft graph and selected agent from refs so it
+  // can never drift, and it intentionally does NOT touch `draftGraph` state —
+  // background persist must stay off the rendered graph path.
+  const handleCanvasBackgroundPersist = useCallback((nextGraph: GraphDefinition) => {
+    const currentDraftGraph = draftGraphRef.current;
+    if (!currentDraftGraph) {
+      return;
+    }
+    pendingBackgroundPersistGraphRef.current = updateSelectedAgentGraph(
+      currentDraftGraph,
+      selectedAgentIdRef.current,
+      nextGraph,
+    );
+    void persistPendingGraphInBackground();
+  }, [persistPendingGraphInBackground]);
 
   function handleFormatGraph(nodeDimensions: Record<string, GraphLayoutNodeDimensions>) {
     if (!canvasGraph) {
@@ -1967,6 +2069,42 @@ export default function App() {
                   <button type="button" className="danger-button" onClick={() => void handleDeleteGraph()} disabled={!draftGraph}>
                     Delete
                   </button>
+                </div>
+                <div className="mosaic-title-toggle-row">
+                  <span className="mosaic-title-toggle-label">Email mode</span>
+                  <div className="email-routing-mode-toggle email-routing-mode-toggle--compact" role="group" aria-label="Email table mode">
+                    <button
+                      type="button"
+                      className={`secondary-button${emailRoutingMode === "development" ? " is-active" : ""}`}
+                      onClick={() => {
+                        if (!draftGraph) {
+                          return;
+                        }
+                        setDraftGraph(applyEmailRoutingMode(draftGraph, "development"));
+                      }}
+                      disabled={!draftGraph || isRunning || isSaving}
+                    >
+                      Dev
+                    </button>
+                    <button
+                      type="button"
+                      className={`secondary-button${emailRoutingMode === "production" ? " is-active" : ""}`}
+                      onClick={() => {
+                        if (!draftGraph) {
+                          return;
+                        }
+                        setDraftGraph(applyEmailRoutingMode(draftGraph, "production"));
+                      }}
+                      disabled={!draftGraph || isRunning || isSaving}
+                    >
+                      Prod
+                    </button>
+                  </div>
+                  {emailRoutingMode === "production" ? (
+                    <span className="env-integration-status">Confirmation required</span>
+                  ) : (
+                    <span className="env-integration-status is-ready">Using *_dev tables</span>
+                  )}
                 </div>
                 {selectedRunId ? (
                   <code className="mosaic-title-run-id">Run ID: {selectedRunId}</code>
@@ -2334,6 +2472,8 @@ export default function App() {
           selectedNodeId={selectedNodeId}
           selectedEdgeId={selectedEdgeId}
           onGraphChange={handleCanvasGraphChange}
+          onBackgroundPersistGraph={handleCanvasBackgroundPersist}
+          onGraphQuietChange={handleCanvasGraphQuietChange}
           onGraphDrag={handleCanvasGraphDrag}
           onFormatGraph={handleFormatGraph}
           onRunGraph={() => void handleRun()}
@@ -2392,6 +2532,15 @@ export default function App() {
           onSelectFile={(path) => {
             setFollowLatestRunFile(false);
             setSelectedRunFilePath(path);
+          }}
+        />
+      ) : null}
+      {productionRunConfirmOpen ? (
+        <ProductionRunConfirmModal
+          onClose={() => setProductionRunConfirmOpen(false)}
+          onConfirm={() => {
+            setProductionRunConfirmOpen(false);
+            void executeRun();
           }}
         />
       ) : null}

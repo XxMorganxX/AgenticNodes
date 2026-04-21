@@ -21,6 +21,7 @@ from graph_agent.api.manager import GraphRunManager
 from graph_agent.api.run_log_store import RunLogStore
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.runtime.core import GraphDefinition, NodeContext, RunState
+from graph_agent.runtime.documents import load_graph_document
 
 
 def wait_for_run_completion(manager: GraphRunManager, run_id: str, timeout_seconds: float = 5.0) -> dict[str, object]:
@@ -48,6 +49,54 @@ def sample_run_document() -> dict[str, object]:
 
 
 class RunDocumentTests(unittest.TestCase):
+    def test_graph_document_preserves_email_routing_mode(self) -> None:
+        document = load_graph_document(
+            {
+                "graph_id": "email-routing-graph",
+                "name": "Email Routing Graph",
+                "description": "",
+                "version": "1.0",
+                "graph_type": "graph",
+                "email_routing_mode": "development",
+                "start_node_id": "start",
+                "env_vars": {},
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "core.input",
+                        "provider_label": "Input",
+                        "config": {},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Output",
+                        "config": {"source_binding": {"type": "input_payload"}},
+                        "position": {"x": 240, "y": 0},
+                    }
+                ],
+                "edges": [
+                    {
+                        "id": "start-finish",
+                        "source_id": "start",
+                        "target_id": "finish",
+                        "label": "",
+                        "kind": "standard",
+                        "priority": 100,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(document.to_dict()["email_routing_mode"], "development")
+
     def test_upload_endpoint_saves_and_extracts_text_document(self) -> None:
         app_module = importlib.import_module("graph_agent.api.app")
         with tempfile.TemporaryDirectory() as temp_dir:

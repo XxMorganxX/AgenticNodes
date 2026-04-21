@@ -1,5 +1,6 @@
 import dagre from "dagre";
 
+import { DEFAULT_NEW_GRAPH_EMAIL_ROUTING_MODE, resolveEmailRoutingMode } from "./emailTableRouting";
 import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "./spreadsheetMatrixPrompt";
 import { DEFAULT_GRAPH_ENV_VARS, getGraphEnvVars } from "./graphEnv";
 import { isTestEnvironment } from "./graphDocuments";
@@ -7,6 +8,9 @@ import { createLogicConditionBranch, normalizeLogicConditionConfig } from "./log
 import type { SavedNode } from "./savedNodes";
 import { getExplicitSupabaseConnections } from "./supabaseConnections";
 import type { AgentDefinition, EditorCatalog, GraphDefinition, GraphDocument, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition } from "./types";
+
+const SPREADSHEET_ROWS_PROVIDER_ID = "core.spreadsheet_rows";
+const SUPABASE_TABLE_ROWS_PROVIDER_ID = "core.supabase_table_rows";
 
 export type GraphLayoutNodeDimensions = {
   width: number;
@@ -181,6 +185,7 @@ export function createBlankGraph(): GraphDefinition {
     name: "Untitled Agent",
     description: "",
     version: "1.0",
+    email_routing_mode: DEFAULT_NEW_GRAPH_EMAIL_ROUTING_MODE,
     default_input: "",
     start_node_id: "",
     env_vars: { ...DEFAULT_GRAPH_ENV_VARS },
@@ -210,6 +215,7 @@ export function createNodeFromProvider(
     position,
     config: {},
   };
+  const emailRoutingMode = resolveEmailRoutingMode(graph);
 
   if (provider.node_kind === "input") {
     return {
@@ -256,6 +262,17 @@ export function createNodeFromProvider(
     };
   }
 
+  if (provider.provider_id === "core.outbound_email_logger") {
+    const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
+    return {
+      ...baseNode,
+      config: {
+        ...defaultConfig,
+        table_name: emailRoutingMode === "production" ? "outbound_email_messages" : "outbound_email_messages_dev",
+      },
+    };
+  }
+
   if (provider.node_kind === "mcp_context_provider") {
     const mcpToolNames = catalog.tools.filter((tool) => tool.source_type === "mcp").map((tool) => tool.name);
     return {
@@ -280,7 +297,17 @@ export function createNodeFromProvider(
 
   if (provider.node_kind === "control_flow_unit") {
     const defaultConfig = provider.default_config && typeof provider.default_config === "object" ? provider.default_config : {};
-    if (provider.provider_id === "core.spreadsheet_rows") {
+    const defaultSupabaseConnectionId = String(graph.default_supabase_connection_id ?? "").trim();
+    const validDefaultSupabaseConnectionIds = new Set(
+      getExplicitSupabaseConnections(graph).map((connection) => connection.connection_id),
+    );
+    const maybeSupabaseConnectionConfig =
+      defaultSupabaseConnectionId &&
+      validDefaultSupabaseConnectionIds.has(defaultSupabaseConnectionId) &&
+      provider.provider_id === SUPABASE_TABLE_ROWS_PROVIDER_ID
+        ? { supabase_connection_id: defaultSupabaseConnectionId }
+        : {};
+    if (provider.provider_id === SPREADSHEET_ROWS_PROVIDER_ID) {
       return {
         ...baseNode,
         config: {
@@ -291,6 +318,23 @@ export function createNodeFromProvider(
           header_row_index: 1,
           start_row_index: 2,
           empty_row_policy: "skip",
+          ...defaultConfig,
+        },
+      };
+    }
+    if (provider.provider_id === SUPABASE_TABLE_ROWS_PROVIDER_ID) {
+      return {
+        ...baseNode,
+        config: {
+          mode: "supabase_table_rows",
+          schema: "public",
+          table_name: "",
+          select: "*",
+          filters_text: "",
+          cursor_column: "",
+          row_id_column: "id",
+          page_size: 500,
+          ...maybeSupabaseConnectionConfig,
           ...defaultConfig,
         },
       };
@@ -361,7 +405,7 @@ export function createNodeFromProvider(
         },
       };
     }
-    if (provider.provider_id === "core.spreadsheet_rows") {
+    if (provider.provider_id === SPREADSHEET_ROWS_PROVIDER_ID) {
       return {
         ...baseNode,
         config: {
@@ -936,7 +980,7 @@ export function inferToolEdgeSourceHandle(
     return TOOL_CONTEXT_HANDLE_ID;
   }
   if (isControlFlowNode(sourceNode)) {
-    if (sourceNode.provider_id === "core.spreadsheet_rows") {
+    if (sourceNode.provider_id === SPREADSHEET_ROWS_PROVIDER_ID || sourceNode.provider_id === SUPABASE_TABLE_ROWS_PROVIDER_ID) {
       return CONTROL_FLOW_LOOP_BODY_HANDLE_ID;
     }
     if (sourceNode.provider_id === "core.parallel_splitter") {
@@ -1053,7 +1097,7 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
       ...node,
       config: { ...node.config },
     };
-    if (node.provider_id === "core.spreadsheet_rows" && (node.kind === "data" || node.category === "data")) {
+    if (node.provider_id === SPREADSHEET_ROWS_PROVIDER_ID && (node.kind === "data" || node.category === "data")) {
       nextNode.kind = "control_flow_unit";
       nextNode.category = "control_flow_unit";
     }

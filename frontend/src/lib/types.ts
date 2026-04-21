@@ -47,6 +47,7 @@ export type GraphDefinition = {
   description: string;
   version: string;
   graph_type?: "graph" | "test_environment";
+  email_routing_mode?: "development" | "production";
   default_input?: string;
   start_node_id: string;
   env_vars?: Record<string, string>;
@@ -74,6 +75,7 @@ export type TestEnvironmentDefinition = {
   description: string;
   version: string;
   graph_type: "test_environment" | "graph";
+  email_routing_mode?: "development" | "production";
   default_input?: string;
   env_vars?: Record<string, string>;
   supabase_connections?: SupabaseConnectionDefinition[];
@@ -264,7 +266,9 @@ export type ProviderDiagnosticsResult = {
   provider_name: string;
   active_backend: string;
   claude_binary_exists: boolean;
+  claude_binary_status?: string;
   claude_binary_path?: string | null;
+  claude_binary_detail?: string | null;
   anthropic_api_key_present: boolean;
   warning?: string | null;
   child_env_sanitized: boolean;

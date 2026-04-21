@@ -67,6 +67,7 @@ export function getCanvasGraph(
     description: agent.description,
     version: agent.version,
     graph_type: "graph",
+    email_routing_mode: graph.email_routing_mode,
     start_node_id: agent.start_node_id,
     env_vars: mergeEnvVars(graph.env_vars, agent.env_vars),
     supabase_connections: graph.supabase_connections,

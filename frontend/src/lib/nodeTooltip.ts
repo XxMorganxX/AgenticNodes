@@ -468,6 +468,7 @@ export function buildNodeTooltip(
     const isContextBuilderNode = node.provider_id === "core.context_builder";
     const isPromptBlockNode = node.provider_id === "core.prompt_block";
     const isSpreadsheetNode = node.provider_id === "core.spreadsheet_rows";
+    const isSupabaseTableRowsNode = node.provider_id === "core.supabase_table_rows";
     const isLogicConditionsNode = node.provider_id === "core.logic_conditions";
     const isParallelSplitterNode = node.provider_id === "core.parallel_splitter";
     const isRuntimeFieldExtractorNode = node.provider_id === "core.runtime_normalizer";
@@ -507,6 +508,8 @@ export function buildNodeTooltip(
                     ? "logic conditions"
                   : isSpreadsheetNode
                     ? "spreadsheet rows"
+                  : isSupabaseTableRowsNode
+                    ? "supabase table rows"
                   : (asString(node.config.mode) ?? "passthrough"),
             },
             {

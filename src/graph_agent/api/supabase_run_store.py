@@ -10,7 +10,11 @@ from urllib.request import Request, urlopen
 
 from graph_agent.api.run_state_reducer import build_run_state, replay_events
 from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
-from graph_agent.runtime.core import utc_now_iso
+from graph_agent.runtime.core import (
+    generation_prompt_capture_from_value,
+    generation_prompt_captures_from_node_outputs,
+    utc_now_iso,
+)
 from graph_agent.runtime.supabase_data import build_supabase_rest_auth_headers
 
 
@@ -36,6 +40,76 @@ def _merge_snapshot_metadata(recovered: dict[str, Any], snapshot: dict[str, Any]
                 if key in snapshot_agent_state:
                     recovered_agent_state[key] = snapshot_agent_state.get(key)
     return recovered
+
+
+def _event_row_metadata(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return {}
+    metadata: dict[str, Any] = {}
+    for key in (
+        "node_id",
+        "node_kind",
+        "node_category",
+        "node_provider_id",
+        "node_provider_label",
+        "status",
+        "session_id",
+        "iterator_node_id",
+        "iterator_row_index",
+        "iterator_total_rows",
+        "iteration_id",
+    ):
+        value = payload.get(key)
+        if value is not None:
+            metadata[key] = value
+    payload_metadata = payload.get("metadata")
+    if isinstance(payload_metadata, dict):
+        for key in (
+            "contract",
+            "prompt_name",
+            "response_mode",
+            "provider",
+            "should_call_tools",
+            "tool_call_count",
+            "tool_name",
+            "tool_status",
+            "no_tool_call",
+        ):
+            value = payload_metadata.get(key)
+            if value is not None:
+                metadata[key] = value
+    generation_prompt = generation_prompt_capture_from_value(payload.get("output"))
+    if generation_prompt is None:
+        route_outputs = payload.get("route_outputs")
+        if isinstance(route_outputs, dict):
+            for route_output in route_outputs.values():
+                generation_prompt = generation_prompt_capture_from_value(route_output)
+                if generation_prompt is not None:
+                    break
+    if generation_prompt is not None:
+        metadata["generation_prompt"] = generation_prompt
+        metadata["generation_prompt_name"] = generation_prompt.get("prompt_name", "")
+        metadata["generation_source_node_id"] = generation_prompt.get("source_node_id", "")
+        metadata["generation_system_prompt"] = generation_prompt.get("system_prompt", "")
+        metadata["generation_user_prompt"] = generation_prompt.get("user_prompt", "")
+    return metadata
+
+
+def _run_row_metadata(state: dict[str, Any]) -> dict[str, Any]:
+    prompt_traces = generation_prompt_captures_from_node_outputs(state.get("node_outputs"))
+    if not prompt_traces:
+        return {}
+    latest_prompt_trace = prompt_traces[-1]
+    return {
+        "prompt_traces": prompt_traces,
+        "prompt_trace_count": len(prompt_traces),
+        "latest_prompt_trace": latest_prompt_trace,
+        "latest_prompt_name": latest_prompt_trace.get("prompt_name", ""),
+        "latest_prompt_source_node_id": latest_prompt_trace.get("source_node_id", ""),
+        "latest_system_prompt": latest_prompt_trace.get("system_prompt", ""),
+        "latest_user_prompt": latest_prompt_trace.get("user_prompt", ""),
+    }
 
 
 class SupabaseRunStore:
@@ -96,6 +170,7 @@ class SupabaseRunStore:
             "current_node_id": state.get("current_node_id"),
             "current_edge_id": state.get("current_edge_id"),
             "state_snapshot": state,
+            "metadata": _run_row_metadata(state),
             "created_at": created_at,
         }
         self._upsert_runs([row])
@@ -114,6 +189,7 @@ class SupabaseRunStore:
             "parent_run_id": event.get("parent_run_id"),
             "summary": event.get("summary"),
             "payload": event.get("payload", {}),
+            "metadata": _event_row_metadata(event),
         }
         self._request_json("POST", self._table_path(self.events_table), payload=[row], prefer="return=minimal")
 
@@ -137,6 +213,7 @@ class SupabaseRunStore:
             "current_node_id": normalized_state.get("current_node_id"),
             "current_edge_id": normalized_state.get("current_edge_id"),
             "state_snapshot": normalized_state,
+            "metadata": _run_row_metadata(normalized_state),
             "created_at": normalized_state.get("started_at") or utc_now_iso(),
         }
         self._upsert_runs([row])
@@ -152,6 +229,7 @@ class SupabaseRunStore:
             "agent_name": row.get("agent_name"),
             "parent_run_id": row.get("parent_run_id"),
             "input_payload": row.get("input_payload"),
+            "metadata": row.get("metadata"),
             "created_at": row.get("created_at"),
         }
 
@@ -209,7 +287,7 @@ class SupabaseRunStore:
 
     def list_runs(self, *, graph_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         query = {
-            "select": "run_id,graph_id,status,status_reason,started_at,ended_at,created_at,agent_id,agent_name,parent_run_id,runtime_instance_id,last_heartbeat_at",
+            "select": "run_id,graph_id,status,status_reason,started_at,ended_at,created_at,agent_id,agent_name,parent_run_id,runtime_instance_id,last_heartbeat_at,metadata",
             "order": "created_at.desc",
             "limit": str(limit),
         }

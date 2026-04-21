@@ -348,14 +348,9 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
             next_state["iterator_states"] = {
                 **next_state.get("iterator_states", {}),
                 node_id: {
-                    "iterator_type": payload.get("iterator_type"),
-                    "status": payload.get("status"),
-                    "current_row_index": payload.get("current_row_index"),
-                    "total_rows": payload.get("total_rows"),
-                    "headers": payload.get("headers"),
-                    "sheet_name": payload.get("sheet_name"),
-                    "source_file": payload.get("source_file"),
-                    "file_format": payload.get("file_format"),
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"node_id", "iterator_node_id", "iterator_row_index", "iterator_total_rows", "iteration_id"}
                 },
             }
         next_loop_regions = _update_loop_region_state(next_state.get("loop_regions"), payload, include_status=True)

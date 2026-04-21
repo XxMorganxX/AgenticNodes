@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, MouseEvent } from "react";
 
 import { NodeDetailsForm } from "./NodeDetailsForm";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
 import { insertTokenAtEnd, listPromptBlockAvailableVariables, PROMPT_BLOCK_STARTERS, renderPromptBlockPreview } from "../lib/promptBlockEditor";
 import type { EditorCatalog, GraphDefinition, GraphNode, RunState } from "../lib/types";
+import { useDebouncedValue } from "../lib/useDebouncedValue";
+import { useModalNodeDraft } from "../lib/useModalNodeDraft";
 
 type PromptBlockDetailsModalProps = {
   graph: GraphDefinition;
@@ -12,21 +14,11 @@ type PromptBlockDetailsModalProps = {
   catalog: EditorCatalog | null;
   runState: RunState | null;
   onGraphChange: (graph: GraphDefinition) => void;
+  onBackgroundPersistGraph?: (graph: GraphDefinition) => void;
   onClose: () => void;
 };
 
 type PromptBlockDetailsModalTab = "node" | "content" | "preview";
-
-function updatePromptBlockNode(
-  graph: GraphDefinition,
-  nodeId: string,
-  updater: (node: GraphNode) => GraphNode,
-): GraphDefinition {
-  return {
-    ...graph,
-    nodes: graph.nodes.map((node) => (node.id === nodeId ? updater(node) : node)),
-  };
-}
 
 export function PromptBlockDetailsModal({
   graph,
@@ -34,40 +26,62 @@ export function PromptBlockDetailsModal({
   catalog,
   runState,
   onGraphChange,
+  onBackgroundPersistGraph,
   onClose,
 }: PromptBlockDetailsModalProps) {
-  const nodeLabel = getNodeInstanceLabel(graph, node);
-  const availableVariables = listPromptBlockAvailableVariables(graph);
-  const renderedPreview = renderPromptBlockPreview(node, graph, runState);
+  const {
+    draftNode,
+    updateDraftNode,
+    flushCommit,
+  } = useModalNodeDraft({
+    graph,
+    node,
+    onGraphChange,
+    onBackgroundPersist: onBackgroundPersistGraph,
+    debounceMs: 750,
+  });
   const [activeTab, setActiveTab] = useState<PromptBlockDetailsModalTab>("node");
+  const debouncedPreviewNode = useDebouncedValue(draftNode, 150);
+  const nodeLabel = useMemo(() => {
+    const trimmedLabel = String(draftNode.label ?? "").trim();
+    if (trimmedLabel) {
+      return trimmedLabel;
+    }
+    return getNodeInstanceLabel(graph, draftNode);
+  }, [draftNode, graph]);
+  const availableVariables = listPromptBlockAvailableVariables(graph);
+  const renderedPreview = activeTab === "preview" ? renderPromptBlockPreview(debouncedPreviewNode, graph, runState) : "";
+
+  const handleRequestClose = useCallback(() => {
+    flushCommit();
+    onClose();
+  }, [flushCommit, onClose]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
-        onClose();
+        handleRequestClose();
       }
     }
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  }, [handleRequestClose]);
 
   useEffect(() => {
     setActiveTab("node");
   }, [node.id]);
 
   function updatePromptBlockConfig(updater: (config: GraphNode["config"]) => GraphNode["config"]) {
-    onGraphChange(
-      updatePromptBlockNode(graph, node.id, (currentNode) => ({
-        ...currentNode,
-        config: updater(currentNode.config),
-      })),
-    );
+    updateDraftNode((currentNode) => ({
+      ...currentNode,
+      config: updater(currentNode.config),
+    }));
   }
 
   function handleOverlayClick(event: MouseEvent<HTMLDivElement>) {
     if (event.target === event.currentTarget) {
-      onClose();
+      handleRequestClose();
     }
   }
 
@@ -116,6 +130,16 @@ export function PromptBlockDetailsModal({
     }));
   }
 
+  function handleNodeChange(nextNode: GraphNode) {
+    updateDraftNode(() => ({
+      ...nextNode,
+      config: {
+        ...nextNode.config,
+        mode: "prompt_block",
+      },
+    }));
+  }
+
   return (
     <div className="tool-details-modal-backdrop" onClick={handleOverlayClick} role="presentation">
       <section
@@ -130,7 +154,7 @@ export function PromptBlockDetailsModal({
             <h3 id="prompt-block-details-modal-title">{nodeLabel}</h3>
             <p>Edit this message block in a dedicated modal and preview the rendered prompt with current graph variables.</p>
           </div>
-          <button type="button" className="secondary-button" onClick={onClose}>
+          <button type="button" className="secondary-button" onClick={handleRequestClose}>
             Close
           </button>
         </div>
@@ -159,9 +183,9 @@ export function PromptBlockDetailsModal({
             {activeTab === "node" ? (
               <NodeDetailsForm
                 graph={graph}
-                node={node}
+                node={draftNode}
                 catalog={catalog}
-                onGraphChange={onGraphChange}
+                onNodeChange={handleNodeChange}
               />
             ) : null}
 
@@ -185,7 +209,7 @@ export function PromptBlockDetailsModal({
 
                 <label>
                   Message Role
-                  <select value={String(node.config.role ?? "user")} onChange={handleRoleChange}>
+                  <select value={String(draftNode.config.role ?? "user")} onChange={handleRoleChange}>
                     <option value="system">system</option>
                     <option value="user">user</option>
                     <option value="assistant">assistant</option>
@@ -195,7 +219,7 @@ export function PromptBlockDetailsModal({
                 <label>
                   Message Name
                   <input
-                    value={String(node.config.name ?? "")}
+                    value={String(draftNode.config.name ?? "")}
                     placeholder="Optional label for the message block"
                     onChange={handleNameChange}
                   />
@@ -205,7 +229,7 @@ export function PromptBlockDetailsModal({
                   Message Content
                   <textarea
                     rows={8}
-                    value={String(node.config.content ?? "")}
+                    value={String(draftNode.config.content ?? "")}
                     placeholder="Enter the message content to inject into downstream prompt assembly."
                     onChange={handleContentChange}
                   />

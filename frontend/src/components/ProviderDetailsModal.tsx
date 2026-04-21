@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { ChangeEvent, MouseEvent } from "react";
 
 import { fetchProviderDiagnostics, inspectSupabaseRuntimeStatus, preflightProvider, previewSupabaseSchema } from "../lib/api";
@@ -17,6 +17,8 @@ import { loadSessionSupabaseSchema, saveSessionSupabaseSchema } from "../lib/ses
 import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "../lib/spreadsheetMatrixPrompt";
 import { getSupabaseConnectionSelectOptions, resolveSupabaseBinding } from "../lib/supabaseConnections";
 import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
+import { useDebouncedValue } from "../lib/useDebouncedValue";
+import { useModalNodeDraft } from "../lib/useModalNodeDraft";
 import { NodeDetailsForm } from "./NodeDetailsForm";
 import type {
   EditorCatalog,
@@ -39,6 +41,7 @@ type ProviderDetailsModalProps = {
   runState?: RunState | null;
   catalog: EditorCatalog | null;
   onGraphChange: (graph: GraphDefinition) => void;
+  onBackgroundPersistGraph?: (graph: GraphDefinition) => void;
   onClose: () => void;
 };
 
@@ -48,17 +51,6 @@ type PersistedProviderVerification = {
   preflightResult: ProviderPreflightResult;
   diagnostics: ProviderDiagnosticsResult;
 };
-
-function updateModelNode(
-  graph: GraphDefinition,
-  nodeId: string,
-  updater: (node: GraphNode) => GraphNode,
-): GraphDefinition {
-  return {
-    ...graph,
-    nodes: graph.nodes.map((node) => (node.id === nodeId ? updater(node) : node)),
-  };
-}
 
 function resolveProviderDefinition(node: GraphNode, catalog: EditorCatalog | null) {
   const directProvider = (catalog?.node_providers ?? []).find((provider) => provider.provider_id === node.provider_id) ?? null;
@@ -370,14 +362,52 @@ function buildProviderVerificationStorageKey(providerName: string, providerConfi
   });
 }
 
+function getProviderHealthConfig(providerName: string, config: Record<string, unknown>): Record<string, unknown> {
+  const nextConfig: Record<string, unknown> = {
+    provider_name: providerName,
+  };
+  const includedKeys =
+    providerName === "claude_code"
+      ? ["cli_path", "timeout_seconds", "cwd"]
+      : ["api_key_env_var", "api_base", "api_key"];
+  for (const key of includedKeys) {
+    if (Object.prototype.hasOwnProperty.call(config, key)) {
+      nextConfig[key] = config[key];
+    }
+  }
+  return nextConfig;
+}
+
+function getResponseSchemaSummaryLabel(config: Record<string, unknown>): string {
+  if (isRecord(config.response_schema) || String(config[RESPONSE_SCHEMA_TEXT_CONFIG_KEY] ?? "").trim().length > 0) {
+    return "Custom schema configured";
+  }
+  return "Default flexible payload";
+}
+
 export function ProviderDetailsModal({
   graph,
-  node,
+  node: committedNode,
   runState = null,
   catalog,
   onGraphChange,
+  onBackgroundPersistGraph,
   onClose,
 }: ProviderDetailsModalProps) {
+  const {
+    draftNode,
+    updateDraftNode,
+    flushCommit,
+  } = useModalNodeDraft({
+    graph,
+    node: committedNode,
+    onGraphChange,
+    onBackgroundPersist: onBackgroundPersistGraph,
+    debounceMs: 750,
+  });
+  const node = draftNode;
+  const [activeTab, setActiveTab] = useState<ProviderDetailsModalTab>("node");
+  const debouncedPreviewNode = useDebouncedValue(node, 150);
   const nodeLabel = getNodeInstanceLabel(graph, node);
   const provider = resolveProviderDefinition(node, catalog);
   const isModelNode = node.kind === "model";
@@ -419,12 +449,13 @@ export function ProviderDetailsModal({
     return [...options.values()];
   }, [availableProviders]);
   const isSupabaseDataNode = node.provider_id === "core.supabase_data";
+  const isSupabaseTableRowsNode = node.provider_id === "core.supabase_table_rows";
   const isSupabaseRowWriteNode = node.provider_id === "core.supabase_row_write";
   const isOutboundEmailLoggerNode = node.provider_id === "core.outbound_email_logger";
   const isStructuredPayloadBuilderNode = node.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID;
   const isRuntimeNormalizerNode = node.provider_id === RUNTIME_NORMALIZER_PROVIDER_ID;
-  const isSupabaseCatalogNode = isSupabaseDataNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
-  const usesSupabaseTableSelection = isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
+  const isSupabaseCatalogNode = isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
+  const usesSupabaseTableSelection = isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
   const displayedUserMessageTemplate =
     node.provider_id === "core.spreadsheet_matrix_decision" &&
     (!String(node.config.user_message_template ?? "").trim() ||
@@ -459,7 +490,11 @@ export function ProviderDetailsModal({
   const standardCatalogTools = catalogTools.filter((tool) => tool.source_type !== "mcp");
   const allowedTools = Array.isArray(node.config.allowed_tool_names) ? (node.config.allowed_tool_names as string[]) : [];
   const selectedModelResponseMode = inferModelResponseMode(graph, node);
-  const responseSchemaDetails = resolveResponseSchemaDetails(node.config as Record<string, unknown>);
+  const responseSchemaDetails = useMemo(
+    () => (isModelNode && activeTab === "routing" ? resolveResponseSchemaDetails(node.config as Record<string, unknown>) : null),
+    [activeTab, isModelNode, node.config],
+  );
+  const responseSchemaStatusLabel = responseSchemaDetails?.statusLabel ?? getResponseSchemaSummaryLabel(node.config as Record<string, unknown>);
   const mcpToolByName = new Map<string, ToolDefinition>();
   for (const tool of mcpCatalogTools) {
     for (const identifier of [toolCanonicalName(tool), tool.name, ...(tool.aliases ?? [])]) {
@@ -612,48 +647,47 @@ export function ProviderDetailsModal({
     (token) => !requiredMcpPlaceholders.includes(token) && !contextBuilderPromptVariables.some((variable) => variable.token === token),
   );
   const modelGeneratedMcpPlaceholderTemplate = buildMcpToolPlaceholderTemplate(promptContextToolSummaries);
-  const systemPromptPreviewVariables: Record<string, string> = {
-    documents: "[]",
-    input_payload: "",
-    run_id: "",
-    graph_id: graph.graph_id,
-    current_node_id: node.id,
-    available_tools: JSON.stringify(
-      promptContextToolSummaries.map((tool) => ({
-        name: tool.toolName,
-        description: tool.displayName,
-        status: tool.status,
-      })),
-      null,
-      2,
-    ),
-    mcp_available_tool_names: JSON.stringify(callableMcpToolNames, null, 2),
-    mcp_tool_context: JSON.stringify(
-      {
-        tool_names: promptContextToolSummaries.map((tool) => tool.toolName),
-        prompt_blocks: promptContextToolSummaries.map((tool) => tool.renderedPromptText),
-        usage_hints_text: mcpToolGuidance,
-      },
-      null,
-      2,
-    ),
-    mcp_tool_context_prompt: mcpToolContextPrompt,
-    mcp_tool_context_block: mcpToolContextBlock,
-    mcp_tool_guidance: mcpToolGuidance,
-    mcp_tool_guidance_block: mcpToolGuidanceBlock,
-    mode: String(node.config.mode ?? node.prompt_name ?? ""),
-    preferred_tool_name: String(node.config.preferred_tool_name ?? ""),
-    response_mode: String(node.config.response_mode ?? "auto"),
-    prompt_blocks: "[]",
-    ...Object.fromEntries(promptContextToolSummaries.map((tool) => [tool.placeholderToken, tool.renderedPromptText])),
-    ...Object.fromEntries(
-      contextBuilderPromptVariables.map((variable) => [
-        variable.token,
-        `[Context Builder section: ${variable.header}]`,
-      ]),
-    ),
-  };
-  const systemPromptTemplatePreview = resolveGraphEnvReferences(systemPromptTemplate, graph, systemPromptPreviewVariables);
+  const systemPromptPreviewBaseVariables = useMemo<Record<string, string>>(
+    () => ({
+      documents: "[]",
+      input_payload: "",
+      run_id: "",
+      graph_id: graph.graph_id,
+      current_node_id: node.id,
+      available_tools: JSON.stringify(
+        promptContextToolSummaries.map((tool) => ({
+          name: tool.toolName,
+          description: tool.displayName,
+          status: tool.status,
+        })),
+        null,
+        2,
+      ),
+      mcp_available_tool_names: JSON.stringify(callableMcpToolNames, null, 2),
+      mcp_tool_context: JSON.stringify(
+        {
+          tool_names: promptContextToolSummaries.map((tool) => tool.toolName),
+          prompt_blocks: promptContextToolSummaries.map((tool) => tool.renderedPromptText),
+          usage_hints_text: mcpToolGuidance,
+        },
+        null,
+        2,
+      ),
+      mcp_tool_context_prompt: mcpToolContextPrompt,
+      mcp_tool_context_block: mcpToolContextBlock,
+      mcp_tool_guidance: mcpToolGuidance,
+      mcp_tool_guidance_block: mcpToolGuidanceBlock,
+      prompt_blocks: "[]",
+      ...Object.fromEntries(promptContextToolSummaries.map((tool) => [tool.placeholderToken, tool.renderedPromptText])),
+      ...Object.fromEntries(
+        contextBuilderPromptVariables.map((variable) => [
+          variable.token,
+          `[Context Builder section: ${variable.header}]`,
+        ]),
+      ),
+    }),
+    [callableMcpToolNames, contextBuilderPromptVariables, graph.graph_id, mcpToolContextBlock, mcpToolContextPrompt, mcpToolGuidance, mcpToolGuidanceBlock, node.id, promptContextToolSummaries],
+  );
   const lastRuntimeInput = isModelNode ? runState?.node_inputs?.[node.id] : null;
   const lastResolvedPromptMessages = resolvedPromptMessagesFromRuntimeInput(lastRuntimeInput);
   const lastResolvedPromptText = formatResolvedPromptMessages(lastResolvedPromptMessages);
@@ -661,40 +695,104 @@ export function ProviderDetailsModal({
     isRecord(lastRuntimeInput) && typeof lastRuntimeInput.response_mode === "string"
       ? lastRuntimeInput.response_mode
       : "";
-  const promptAssemblySections = node.kind === "model"
-    ? (() => {
-        const sections: string[] = [];
-        const hasInlineMcpGuidanceBlock = systemPromptTemplate.includes("{mcp_tool_guidance_block}");
-        const hasInlineMcpContextCoverage =
-          systemPromptTemplate.includes("{mcp_tool_context_block}")
-          || systemPromptTemplate.includes("{mcp_tool_context_prompt}")
-          || (
-            promptContextToolSummaries.length > 0
-            && promptContextToolSummaries.every((tool) => systemPromptTemplate.includes(`{${tool.placeholderToken}}`))
-          );
-        if (mcpToolGuidanceBlock && !hasInlineMcpGuidanceBlock) {
-          sections.push(mcpToolGuidanceBlock);
-        }
-        if (mcpToolContextBlock && !hasInlineMcpContextCoverage) {
-          sections.push(mcpToolContextBlock);
-        }
-        const contract = buildPromptOnlyMcpToolDecisionContract(promptContextToolSummaries.length > 0, callableMcpToolNames);
-        if (contract) {
-          sections.push(contract);
-        }
-        return sections;
-      })()
-    : [];
-  const finalSystemPromptPreview =
-    node.kind === "model"
-      ? [systemPromptTemplatePreview.trim(), ...promptAssemblySections.map((section) => section.trim()).filter(Boolean)]
-          .filter(Boolean)
-          .join("\n\n")
-      : "";
   const lastResolvedPromptEmptyText = runState
     ? "This API node has not started in the latest run yet."
     : "Run the graph to see the fully populated prompt from this API node.";
-  const [activeTab, setActiveTab] = useState<ProviderDetailsModalTab>("node");
+  const previewArtifacts = useMemo(() => {
+    if (activeTab !== "preview") {
+      return {
+        resolvedPreviewConfig: null as Record<string, unknown> | null,
+        supabaseRequestPreview: null as Record<string, unknown> | null,
+        systemPromptTemplatePreview: "",
+        finalSystemPromptPreview: "",
+      };
+    }
+    const resolvedPreviewConfig = Object.fromEntries(
+      [["provider_name", providerName], ...providerConfigFields.map((field) => [field.key, debouncedPreviewNode.config[field.key]])].map(
+        ([key, value]) => [
+          key,
+          typeof value === "string" ? resolveGraphEnvReferences(value, graph) || null : (value ?? null),
+        ],
+      ),
+    );
+    const previewSystemPromptTemplate = String(debouncedPreviewNode.config.system_prompt ?? "");
+    const previewSystemPromptVariables: Record<string, string> = {
+      ...systemPromptPreviewBaseVariables,
+      current_node_id: debouncedPreviewNode.id,
+      mode: String(debouncedPreviewNode.config.mode ?? debouncedPreviewNode.prompt_name ?? ""),
+      preferred_tool_name: String(debouncedPreviewNode.config.preferred_tool_name ?? ""),
+      response_mode: String(debouncedPreviewNode.config.response_mode ?? "auto"),
+    };
+    const systemPromptTemplatePreview = resolveGraphEnvReferences(previewSystemPromptTemplate, graph, previewSystemPromptVariables);
+    const promptAssemblySections = debouncedPreviewNode.kind === "model"
+      ? (() => {
+          const sections: string[] = [];
+          const hasInlineMcpGuidanceBlock = previewSystemPromptTemplate.includes("{mcp_tool_guidance_block}");
+          const hasInlineMcpContextCoverage =
+            previewSystemPromptTemplate.includes("{mcp_tool_context_block}")
+            || previewSystemPromptTemplate.includes("{mcp_tool_context_prompt}")
+            || (
+              promptContextToolSummaries.length > 0
+              && promptContextToolSummaries.every((tool) => previewSystemPromptTemplate.includes(`{${tool.placeholderToken}}`))
+            );
+          if (mcpToolGuidanceBlock && !hasInlineMcpGuidanceBlock) {
+            sections.push(mcpToolGuidanceBlock);
+          }
+          if (mcpToolContextBlock && !hasInlineMcpContextCoverage) {
+            sections.push(mcpToolContextBlock);
+          }
+          const contract = buildPromptOnlyMcpToolDecisionContract(promptContextToolSummaries.length > 0, callableMcpToolNames);
+          if (contract) {
+            sections.push(contract);
+          }
+          return sections;
+        })()
+      : [];
+    return {
+      resolvedPreviewConfig,
+      supabaseRequestPreview: isSupabaseDataNode
+        ? {
+            source_kind: String(debouncedPreviewNode.config.source_kind ?? "table") || "table",
+            source_name: String(debouncedPreviewNode.config.source_name ?? ""),
+            schema: String(debouncedPreviewNode.config.schema ?? "public"),
+            select: String(debouncedPreviewNode.config.select ?? "*") || "*",
+            filters: String(debouncedPreviewNode.config.filters_text ?? "")
+              .split("\n")
+              .map((line) => line.trim())
+              .filter(Boolean),
+            order_by: String(debouncedPreviewNode.config.order_by ?? ""),
+            order_desc: Boolean(debouncedPreviewNode.config.order_desc),
+            limit: Number(debouncedPreviewNode.config.limit ?? 25),
+            single_row: Boolean(debouncedPreviewNode.config.single_row),
+            output_mode: String(debouncedPreviewNode.config.output_mode ?? "records") || "records",
+            rpc_params_json: String(debouncedPreviewNode.config.rpc_params_json ?? "{}") || "{}",
+          }
+        : isSupabaseTableRowsNode
+          ? {
+              source_kind: "table",
+              source_name: String(debouncedPreviewNode.config.table_name ?? ""),
+              schema: String(debouncedPreviewNode.config.schema ?? "public"),
+              select: String(debouncedPreviewNode.config.select ?? "*") || "*",
+              filters: String(debouncedPreviewNode.config.filters_text ?? "")
+                .split("\n")
+                .map((line) => line.trim())
+                .filter(Boolean),
+              order_by: `${String(debouncedPreviewNode.config.cursor_column ?? "") || "cursor"} asc, ${String(debouncedPreviewNode.config.row_id_column ?? "id") || "id"} asc`,
+              order_desc: false,
+              limit: Number(debouncedPreviewNode.config.page_size ?? 500),
+              single_row: false,
+              output_mode: "records",
+            }
+        : null,
+      systemPromptTemplatePreview,
+      finalSystemPromptPreview:
+        debouncedPreviewNode.kind === "model"
+          ? [systemPromptTemplatePreview.trim(), ...promptAssemblySections.map((section) => section.trim()).filter(Boolean)]
+              .filter(Boolean)
+              .join("\n\n")
+          : "",
+    };
+  }, [activeTab, callableMcpToolNames, debouncedPreviewNode, graph, isSupabaseDataNode, isSupabaseTableRowsNode, mcpToolContextBlock, mcpToolGuidanceBlock, promptContextToolSummaries, providerConfigFields, providerName, systemPromptPreviewBaseVariables]);
   const [preflightResult, setPreflightResult] = useState<ProviderPreflightResult | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProviderDiagnosticsResult | null>(null);
   const [preflightError, setPreflightError] = useState<string | null>(null);
@@ -708,33 +806,41 @@ export function ProviderDetailsModal({
   const [selectedSupabaseSourceName, setSelectedSupabaseSourceName] = useState<string>("");
   const [structuredPayloadTemplateDraftEntries, setStructuredPayloadTemplateDraftEntries] = useState<StructuredPayloadTemplateEntry[]>([]);
 
+  const handleRequestClose = useCallback(() => {
+    flushCommit();
+    onClose();
+  }, [flushCommit, onClose]);
+
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
-        onClose();
+        handleRequestClose();
       }
     }
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  }, [handleRequestClose]);
 
-  const preflightConfig = useMemo<Record<string, unknown>>(() => {
-    if (!isModelNode) {
-      return Object.fromEntries(providerConfigFields.map((field) => [field.key, node.config[field.key]]));
-    }
-    const entries: Array<[string, unknown]> = [["provider_name", providerName]];
-    providerConfigFields.forEach((field) => {
-      entries.push([field.key, node.config[field.key]]);
-    });
-    return Object.fromEntries(entries);
-  }, [isModelNode, node.config, providerConfigFields, providerName]);
+  const providerHealthConfig = useMemo<Record<string, unknown>>(
+    () => getProviderHealthConfig(providerName, node.config as Record<string, unknown>),
+    [
+      node.config.api_base,
+      node.config.api_key,
+      node.config.api_key_env_var,
+      node.config.cli_path,
+      node.config.cwd,
+      node.config.timeout_seconds,
+      providerName,
+    ],
+  );
+  const debouncedProviderHealthConfig = useDebouncedValue(providerHealthConfig, 300);
   const structuredPayloadTemplateEntries = isStructuredPayloadBuilderNode
     ? structuredPayloadTemplateDraftEntries
     : [];
   const verificationStorageKey = useMemo(
-    () => buildProviderVerificationStorageKey(providerName, preflightConfig),
-    [preflightConfig, providerName],
+    () => buildProviderVerificationStorageKey(providerName, providerHealthConfig),
+    [providerHealthConfig, providerName],
   );
   const [persistedVerification, setPersistedVerification] = useState<PersistedProviderVerification | null>(null);
 
@@ -744,14 +850,14 @@ export function ProviderDetailsModal({
 
   useEffect(() => {
     setActiveTab("node");
-  }, [node.id, providerName]);
+  }, [committedNode.id]);
   useEffect(() => {
     if (isStructuredPayloadBuilderNode) {
       setStructuredPayloadTemplateDraftEntries(parseStructuredPayloadTemplateEntries(node.config.template_json));
       return;
     }
     setStructuredPayloadTemplateDraftEntries([]);
-  }, [isStructuredPayloadBuilderNode, node.id]);
+  }, [isStructuredPayloadBuilderNode, node.config.template_json, node.id]);
 
   useEffect(() => {
     let cancelled = false;
@@ -767,8 +873,8 @@ export function ProviderDetailsModal({
     setIsPreflighting(true);
     setPreflightError(null);
     Promise.all([
-      preflightProvider(providerName, preflightConfig, false),
-      fetchProviderDiagnostics(providerName, preflightConfig, false),
+      preflightProvider(providerName, debouncedProviderHealthConfig, false),
+      fetchProviderDiagnostics(providerName, debouncedProviderHealthConfig, false),
     ])
       .then(([result, diagnosticsResult]) => {
         if (!cancelled) {
@@ -792,7 +898,7 @@ export function ProviderDetailsModal({
     return () => {
       cancelled = true;
     };
-  }, [isModelNode, preflightConfig, providerName]);
+  }, [debouncedProviderHealthConfig, isModelNode, providerName]);
 
   const displayedPreflightResult = useMemo(() => {
     if (
@@ -820,16 +926,18 @@ export function ProviderDetailsModal({
     return diagnostics;
   }, [diagnostics, persistedVerification]);
 
+  const updateNodeConfig = useCallback((updater: (config: GraphNode["config"]) => GraphNode["config"]) => {
+    updateDraftNode((currentNode) => ({
+      ...currentNode,
+      config: updater(currentNode.config),
+    }));
+  }, [updateDraftNode]);
+
   function updateProviderConfig(key: string, value: string | number | boolean) {
-    onGraphChange(
-      updateModelNode(graph, node.id, (currentNode) => ({
-        ...currentNode,
-        config: {
-          ...currentNode.config,
-          [key]: value,
-        },
-      })),
-    );
+    updateNodeConfig((currentConfig) => ({
+      ...currentConfig,
+      [key]: value,
+    }));
   }
 
   function updateStructuredPayloadTemplateEntries(entries: StructuredPayloadTemplateEntry[]) {
@@ -839,27 +947,25 @@ export function ProviderDetailsModal({
 
   function updateResponseSchemaText(nextText: string) {
     const { parsedSchema } = parseResponseSchemaText(nextText);
-    onGraphChange(
-      updateModelNode(graph, node.id, (currentNode) => {
-        const nextConfig = { ...currentNode.config } as Record<string, unknown>;
-        if (nextText.length > 0) {
-          nextConfig[RESPONSE_SCHEMA_TEXT_CONFIG_KEY] = nextText;
-        } else {
-          delete nextConfig[RESPONSE_SCHEMA_TEXT_CONFIG_KEY];
-        }
-        if (parsedSchema) {
-          nextConfig.response_schema = parsedSchema;
-        } else {
-          delete nextConfig.response_schema;
-        }
-        return { ...currentNode, config: nextConfig };
-      }),
-    );
+    updateDraftNode((currentNode) => {
+      const nextConfig = { ...currentNode.config } as Record<string, unknown>;
+      if (nextText.length > 0) {
+        nextConfig[RESPONSE_SCHEMA_TEXT_CONFIG_KEY] = nextText;
+      } else {
+        delete nextConfig[RESPONSE_SCHEMA_TEXT_CONFIG_KEY];
+      }
+      if (parsedSchema) {
+        nextConfig.response_schema = parsedSchema;
+      } else {
+        delete nextConfig.response_schema;
+      }
+      return { ...currentNode, config: nextConfig };
+    });
   }
 
   function handleOverlayClick(event: MouseEvent<HTMLDivElement>) {
     if (event.target === event.currentTarget) {
-      onClose();
+      handleRequestClose();
     }
   }
 
@@ -889,21 +995,19 @@ export function ProviderDetailsModal({
         ]),
       ),
     );
-    onGraphChange(
-      updateModelNode(graph, node.id, (currentNode) => {
-        const nextConfig = { ...currentNode.config };
-        providerConfigKeys.forEach((key) => delete nextConfig[key]);
-        return {
-          ...currentNode,
-          model_provider_name: nextProviderName,
-          config: {
-            ...nextConfig,
-            ...nextProviderConfig,
-            provider_name: nextProviderName,
-          },
-        };
-      }),
-    );
+    updateDraftNode((currentNode) => {
+      const nextConfig = { ...currentNode.config };
+      providerConfigKeys.forEach((key) => delete nextConfig[key]);
+      return {
+        ...currentNode,
+        model_provider_name: nextProviderName,
+        config: {
+          ...nextConfig,
+          ...nextProviderConfig,
+          provider_name: nextProviderName,
+        },
+      };
+    });
   }
 
   async function handleLiveVerification() {
@@ -911,8 +1015,8 @@ export function ProviderDetailsModal({
     setPreflightError(null);
     try {
       const [result, diagnosticsResult] = await Promise.all([
-        preflightProvider(providerName, preflightConfig, true),
-        fetchProviderDiagnostics(providerName, preflightConfig, true),
+        preflightProvider(providerName, providerHealthConfig, true),
+        fetchProviderDiagnostics(providerName, providerHealthConfig, true),
       ]);
       setPreflightResult(result);
       setDiagnostics(diagnosticsResult);
@@ -928,13 +1032,9 @@ export function ProviderDetailsModal({
     }
   }
 
-  const resolvedPreviewConfig = Object.fromEntries(
-    [["provider_name", providerName], ...providerConfigFields.map((field) => [field.key, node.config[field.key]])].map(
-      ([key, value]) => [
-        key,
-        typeof value === "string" ? resolveGraphEnvReferences(value, graph) || null : (value ?? null),
-      ],
-    ),
+  const resolvedSchemaName = useMemo(
+    () => resolveGraphEnvReferences(String(node.config.schema ?? "public"), graph) || "public",
+    [graph, node.config.schema],
   );
   const supabaseSourceKind = String(node.config.source_kind ?? "table") || "table";
   const supabaseOutputMode = String(node.config.output_mode ?? "records") || "records";
@@ -1072,7 +1172,7 @@ export function ProviderDetailsModal({
       const result = await previewSupabaseSchema({
         supabase_url_env_var: supabaseUrlEnvVarName,
         supabase_key_env_var: supabaseKeyEnvVarName,
-        schema: String(resolvedPreviewConfig.schema ?? "public") || "public",
+        schema: resolvedSchemaName,
         graph_env_vars: getGraphEnvVars(graph),
       });
       saveSessionSupabaseSchema(graph, result, {
@@ -1142,30 +1242,28 @@ export function ProviderDetailsModal({
   }
 
   function applySupabaseSourceSelection(source: SupabaseSchemaSource, nextColumns?: string[]) {
-    onGraphChange(
-      updateModelNode(graph, node.id, (currentNode) => ({
-        ...currentNode,
-        config: {
-          ...currentNode.config,
-          ...(usesSupabaseTableSelection
-            ? {
-                table_name: source.name,
-              }
-            : (() => {
-                const availableColumns = source.columns.map((column) => column.name);
-                const resolvedColumns = nextColumns ?? parseSupabaseSelect(String(node.config.select ?? "*"), availableColumns);
-                return {
-                  source_kind: source.source_kind,
-                  source_name: source.name,
-                  select:
-                    resolvedColumns.length === 0 || resolvedColumns.length === availableColumns.length
-                      ? "*"
-                      : resolvedColumns.join(","),
-                };
-              })()),
-        },
-      })),
-    );
+    updateDraftNode((currentNode) => ({
+      ...currentNode,
+      config: {
+        ...currentNode.config,
+        ...(usesSupabaseTableSelection
+          ? {
+              table_name: source.name,
+            }
+          : (() => {
+              const availableColumns = source.columns.map((column) => column.name);
+              const resolvedColumns = nextColumns ?? parseSupabaseSelect(String(currentNode.config.select ?? "*"), availableColumns);
+              return {
+                source_kind: source.source_kind,
+                source_name: source.name,
+                select:
+                  resolvedColumns.length === 0 || resolvedColumns.length === availableColumns.length
+                    ? "*"
+                    : resolvedColumns.join(","),
+              };
+            })()),
+      },
+    }));
     setSelectedSupabaseSourceName(source.name);
   }
 
@@ -1207,10 +1305,10 @@ export function ProviderDetailsModal({
               <span className="provider-details-modal-meta-pill">provider {provider?.display_name ?? providerName}</span>
               <span className="provider-details-modal-meta-pill">node {node.kind}</span>
               {isModelNode ? <span className="provider-details-modal-meta-pill">response {selectedModelResponseMode ?? "message"}</span> : null}
-              {isModelNode ? <span className="provider-details-modal-meta-pill">{responseSchemaDetails.statusLabel}</span> : null}
+              {isModelNode ? <span className="provider-details-modal-meta-pill">{responseSchemaStatusLabel}</span> : null}
             </div>
           </div>
-          <button type="button" className="secondary-button" onClick={onClose}>
+          <button type="button" className="secondary-button" onClick={handleRequestClose}>
             Close
           </button>
         </div>
@@ -1244,7 +1342,7 @@ export function ProviderDetailsModal({
                   graph={graph}
                   node={node}
                   catalog={catalog}
-                  onGraphChange={onGraphChange}
+                  onNodeChange={(nextNode) => updateDraftNode(() => nextNode)}
                 />
                 {isModelNode ? (
                   <>
@@ -1253,17 +1351,15 @@ export function ProviderDetailsModal({
                       <input
                         value={String(node.config.prompt_name ?? node.prompt_name ?? "")}
                         onChange={(event) =>
-                          onGraphChange(
-                            updateModelNode(graph, node.id, (currentNode) => ({
-                              ...currentNode,
+                          updateDraftNode((currentNode) => ({
+                            ...currentNode,
+                            prompt_name: event.target.value,
+                            config: {
+                              ...currentNode.config,
                               prompt_name: event.target.value,
-                              config: {
-                                ...currentNode.config,
-                                prompt_name: event.target.value,
-                                mode: event.target.value,
-                              },
-                            })),
-                          )
+                              mode: event.target.value,
+                            },
+                          }))
                         }
                       />
                     </label>
@@ -1272,16 +1368,14 @@ export function ProviderDetailsModal({
                       <input
                         value={String(node.config.provider_name ?? node.model_provider_name ?? "")}
                         onChange={(event) =>
-                          onGraphChange(
-                            updateModelNode(graph, node.id, (currentNode) => ({
-                              ...currentNode,
-                              model_provider_name: event.target.value,
-                              config: {
-                                ...currentNode.config,
-                                provider_name: event.target.value,
-                              },
-                            })),
-                          )
+                          updateDraftNode((currentNode) => ({
+                            ...currentNode,
+                            model_provider_name: event.target.value,
+                            config: {
+                              ...currentNode.config,
+                              provider_name: event.target.value,
+                            },
+                          }))
                         }
                       />
                     </label>
@@ -1331,6 +1425,22 @@ export function ProviderDetailsModal({
                       <span className="provider-capability-chip">
                         {Boolean(node.config.single_row) ? "single row" : "multi row"}
                       </span>
+                    </div>
+                  </section>
+                ) : isSupabaseTableRowsNode ? (
+                  <section className="provider-details-summary">
+                    <div className="provider-details-summary-header">
+                      <strong>Supabase Iterator Shape</strong>
+                      <span>Sequential table loop</span>
+                    </div>
+                    <p>
+                      This provider reads unread rows from a Supabase table in ascending cursor order, remembers the
+                      last completed watermark across runs, and emits one row at a time through the loop body handle.
+                    </p>
+                    <div className="provider-details-capabilities">
+                      <span className="provider-capability-chip">table {String(node.config.table_name ?? "not set") || "not set"}</span>
+                      <span className="provider-capability-chip">cursor {String(node.config.cursor_column ?? "not set") || "not set"}</span>
+                      <span className="provider-capability-chip">page size {String(node.config.page_size ?? 500)}</span>
                     </div>
                   </section>
                 ) : null}
@@ -1426,8 +1536,21 @@ export function ProviderDetailsModal({
                             <div className="provider-diagnostics-section-title">Claude Code</div>
                             <div className="provider-diagnostics-row">
                               <span>Claude binary</span>
-                              <strong>{displayedDiagnostics.claude_binary_exists ? "found" : "not found"}</strong>
+                              <strong>
+                                {displayedDiagnostics.claude_binary_status === "permission_denied"
+                                  ? "permission denied"
+                                  : displayedDiagnostics.claude_binary_status === "found"
+                                    ? "found"
+                                    : displayedDiagnostics.claude_binary_exists
+                                      ? "found"
+                                      : "not found"}
+                              </strong>
                             </div>
+                            {displayedDiagnostics.claude_binary_detail ? (
+                              <div className="provider-diagnostics-list">
+                                <div>{displayedDiagnostics.claude_binary_detail}</div>
+                              </div>
+                            ) : null}
                           </div>
                         ) : null}
                         {displayedDiagnostics.active_backend === "claude_code" || displayedDiagnostics.active_backend === "anthropic_api" ? (
@@ -1687,7 +1810,7 @@ export function ProviderDetailsModal({
                   <textarea
                     rows={10}
                     className="tool-details-modal-code"
-                    value={responseSchemaDetails.schemaText}
+                    value={responseSchemaDetails?.schemaText ?? ""}
                     placeholder='Leave blank to allow any JSON value, or define a JSON Schema object like {"type":"object","properties":{...}}'
                     onChange={(event) => updateResponseSchemaText(event.target.value)}
                     spellCheck={false}
@@ -1696,13 +1819,13 @@ export function ProviderDetailsModal({
                     Optional JSON Schema for the final <code>message</code> payload this API block emits.
                   </small>
                 </label>
-                {responseSchemaDetails.schemaError ? (
+                {responseSchemaDetails?.schemaError ? (
                   <p className="error-text">Schema JSON error: {responseSchemaDetails.schemaError}</p>
                 ) : null}
 
                 <div className="contract-card">
                   <strong>Output Schema</strong>
-                  <span>Status: {responseSchemaDetails.statusLabel}</span>
+                  <span>Status: {responseSchemaDetails?.statusLabel ?? responseSchemaStatusLabel}</span>
                   <span>Applies whenever this API block emits a final message.</span>
                 </div>
 
@@ -1722,17 +1845,15 @@ export function ProviderDetailsModal({
                             const nextTools = event.target.checked
                               ? [...allowedTools.filter((name) => !toolMatchesReference(tool, name)), canonicalName]
                               : allowedTools.filter((name) => !toolMatchesReference(tool, name));
-                            onGraphChange(
-                              updateModelNode(graph, node.id, (currentNode) => ({
-                                ...currentNode,
-                                config: {
-                                  ...currentNode.config,
-                                  allowed_tool_names: nextTools,
-                                  preferred_tool_name:
-                                    nextTools.length > 0 ? String(currentNode.config.preferred_tool_name ?? nextTools[0]) : "",
-                                },
-                              })),
-                            );
+                            updateDraftNode((currentNode) => ({
+                              ...currentNode,
+                              config: {
+                                ...currentNode.config,
+                                allowed_tool_names: nextTools,
+                                preferred_tool_name:
+                                  nextTools.length > 0 ? String(currentNode.config.preferred_tool_name ?? nextTools[0]) : "",
+                              },
+                            }));
                           }}
                         />
                         <span>
@@ -1873,17 +1994,15 @@ export function ProviderDetailsModal({
                           <select
                             value={String(node.config.supabase_connection_id ?? "")}
                             onChange={(event) =>
-                              onGraphChange(
-                                updateModelNode(graph, node.id, (currentNode) => {
-                                  const nextConfig = { ...currentNode.config };
-                                  if (event.target.value) {
-                                    nextConfig.supabase_connection_id = event.target.value;
-                                  } else {
-                                    delete nextConfig.supabase_connection_id;
-                                  }
-                                  return { ...currentNode, config: nextConfig };
-                                }),
-                              )
+                              updateDraftNode((currentNode) => {
+                                const nextConfig = { ...currentNode.config };
+                                if (event.target.value) {
+                                  nextConfig.supabase_connection_id = event.target.value;
+                                } else {
+                                  delete nextConfig.supabase_connection_id;
+                                }
+                                return { ...currentNode, config: nextConfig };
+                              })
                             }
                           >
                             <option value="">Compatibility mode (raw env vars)</option>
@@ -1907,13 +2026,11 @@ export function ProviderDetailsModal({
                                 type="button"
                                 className="secondary-button"
                                 onClick={() =>
-                                  onGraphChange(
-                                    updateModelNode(graph, node.id, (currentNode) => {
-                                      const nextConfig = { ...currentNode.config };
-                                      delete nextConfig.supabase_connection_id;
-                                      return { ...currentNode, config: nextConfig };
-                                    }),
-                                  )
+                                  updateDraftNode((currentNode) => {
+                                    const nextConfig = { ...currentNode.config };
+                                    delete nextConfig.supabase_connection_id;
+                                    return { ...currentNode, config: nextConfig };
+                                  })
                                 }
                               >
                                 Switch to compatibility mode
@@ -1972,7 +2089,7 @@ export function ProviderDetailsModal({
                       </label>
                       <div className="provider-details-schema-browser-meta">
                         <span>{supabaseSchemaPreview ? `${filteredSupabaseSources.length}/${supabaseSchemaPreview.source_count} sources` : "No schema loaded yet"}</span>
-                        <span>Schema: {String(resolvedPreviewConfig.schema ?? "public") || "public"}</span>
+                        <span>Schema: {resolvedSchemaName}</span>
                       </div>
                     </div>
                       {supabaseSchemaError ? <p className="error-text">{supabaseSchemaError}</p> : null}
@@ -2217,17 +2334,15 @@ export function ProviderDetailsModal({
                                         const nextFieldNames = runtimeNormalizerFieldNames.map((candidate, candidateIndex) =>
                                           candidateIndex === index ? event.target.value : candidate,
                                         );
-                                        onGraphChange(
-                                          updateModelNode(graph, node.id, (currentNode) => ({
-                                            ...currentNode,
-                                            config: {
-                                              ...currentNode.config,
-                                              mode: "runtime_normalizer",
-                                              field_names: nextFieldNames,
-                                              field_name: serializeLegacyConfigStringList(nextFieldNames),
-                                            },
-                                          })),
-                                        );
+                                        updateDraftNode((currentNode) => ({
+                                          ...currentNode,
+                                          config: {
+                                            ...currentNode.config,
+                                            mode: "runtime_normalizer",
+                                            field_names: nextFieldNames,
+                                            field_name: serializeLegacyConfigStringList(nextFieldNames),
+                                          },
+                                        }));
                                       }}
                                     />
                                     <button
@@ -2235,17 +2350,15 @@ export function ProviderDetailsModal({
                                       className="secondary-button runtime-field-list-button"
                                       onClick={() => {
                                         const nextFieldNames = runtimeNormalizerFieldNames.filter((_, candidateIndex) => candidateIndex !== index);
-                                        onGraphChange(
-                                          updateModelNode(graph, node.id, (currentNode) => ({
-                                            ...currentNode,
-                                            config: {
-                                              ...currentNode.config,
-                                              mode: "runtime_normalizer",
-                                              field_names: nextFieldNames,
-                                              field_name: serializeLegacyConfigStringList(nextFieldNames),
-                                            },
-                                          })),
-                                        );
+                                        updateDraftNode((currentNode) => ({
+                                          ...currentNode,
+                                          config: {
+                                            ...currentNode.config,
+                                            mode: "runtime_normalizer",
+                                            field_names: nextFieldNames,
+                                            field_name: serializeLegacyConfigStringList(nextFieldNames),
+                                          },
+                                        }));
                                       }}
                                       disabled={runtimeNormalizerFieldNames.length <= 1}
                                     >
@@ -2258,17 +2371,15 @@ export function ProviderDetailsModal({
                                   className="secondary-button runtime-field-list-add"
                                   onClick={() => {
                                     const nextFieldNames = [...runtimeNormalizerFieldNames, ""];
-                                    onGraphChange(
-                                      updateModelNode(graph, node.id, (currentNode) => ({
-                                        ...currentNode,
-                                        config: {
-                                          ...currentNode.config,
-                                          mode: "runtime_normalizer",
-                                          field_names: nextFieldNames,
-                                          field_name: serializeLegacyConfigStringList(nextFieldNames),
-                                        },
-                                      })),
-                                    );
+                                    updateDraftNode((currentNode) => ({
+                                      ...currentNode,
+                                      config: {
+                                        ...currentNode.config,
+                                        mode: "runtime_normalizer",
+                                        field_names: nextFieldNames,
+                                        field_name: serializeLegacyConfigStringList(nextFieldNames),
+                                      },
+                                    }));
                                   }}
                                 >
                                   Add Field
@@ -2350,6 +2461,13 @@ export function ProviderDetailsModal({
                     <div>Choose <code>records</code> when downstream nodes need structured JSON, or <code>markdown</code> when you want prompt-ready text.</div>
                     <div>Use <code>single_row</code> when the result should collapse to one record instead of an array.</div>
                   </div>
+                ) : isSupabaseTableRowsNode ? (
+                  <div className="tool-details-modal-help">
+                    <strong>Supabase table rows node notes</strong>
+                    <div>Choose the destination table from the schema browser above, then set the timestamp-like <code>cursor_column</code> used for cross-run progress.</div>
+                    <div>Use <code>row_id_column</code> as the stable tie-breaker when multiple rows share the same cursor value.</div>
+                    <div>Use <code>filters_text</code> as one PostgREST query parameter per line, like <code>status=eq.pending</code>. The unread-row cursor filter is added automatically at runtime.</div>
+                  </div>
                 ) : isSupabaseRowWriteNode ? (
                   <div className="tool-details-modal-help">
                     <strong>Supabase row write node notes</strong>
@@ -2386,7 +2504,7 @@ export function ProviderDetailsModal({
                     <strong>Resolved Provider Config</strong>
                     <span>This preview shows provider settings after graph env references are substituted.</span>
                   </div>
-                  <pre>{JSON.stringify(resolvedPreviewConfig, null, 2)}</pre>
+                  <pre>{JSON.stringify(previewArtifacts.resolvedPreviewConfig ?? {}, null, 2)}</pre>
                 </section>
                 {isSupabaseDataNode ? (
                   <section className="tool-details-modal-preview provider-details-preview-card">
@@ -2394,19 +2512,7 @@ export function ProviderDetailsModal({
                       <strong>Supabase Request Preview</strong>
                       <span>This is the intended query shape before runtime credentials are applied.</span>
                     </div>
-                    <pre>{JSON.stringify({
-                      source_kind: supabaseSourceKind,
-                      source_name: String(node.config.source_name ?? ""),
-                      schema: String(node.config.schema ?? "public"),
-                      select: String(node.config.select ?? "*") || "*",
-                      filters: supabaseFilterLines,
-                      order_by: String(node.config.order_by ?? ""),
-                      order_desc: Boolean(node.config.order_desc),
-                      limit: Number(node.config.limit ?? 25),
-                      single_row: Boolean(node.config.single_row),
-                      output_mode: supabaseOutputMode,
-                      rpc_params_json: String(node.config.rpc_params_json ?? "{}") || "{}",
-                    }, null, 2)}</pre>
+                    <pre>{JSON.stringify(previewArtifacts.supabaseRequestPreview ?? {}, null, 2)}</pre>
                   </section>
                 ) : null}
                 {node.kind === "model" ? (
@@ -2428,7 +2534,7 @@ export function ProviderDetailsModal({
                       <strong>Final System Prompt Preview</strong>
                       <span>This is the complete prompt after placeholders, MCP guidance, and connected tool context are assembled.</span>
                     </div>
-                    <pre>{finalSystemPromptPreview || systemPromptTemplatePreview || "The final assembled system prompt will appear here."}</pre>
+                    <pre>{previewArtifacts.finalSystemPromptPreview || previewArtifacts.systemPromptTemplatePreview || "The final assembled system prompt will appear here."}</pre>
                   </section>
                 ) : null}
               </div>

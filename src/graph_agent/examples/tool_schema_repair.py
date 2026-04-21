@@ -943,6 +943,70 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="core.supabase_table_rows",
+            display_name="Supabase Table Rows",
+            category=NodeCategory.CONTROL_FLOW_UNIT,
+            node_kind="control_flow_unit",
+            description="Reads unread rows from a Supabase table in ascending cursor order and iterates each row sequentially through downstream execution steps.",
+            capabilities=["supabase table reads", "persistent row watermark", "timestamp plus id cursoring", "sequential row iteration"],
+            default_config={
+                "mode": "supabase_table_rows",
+                "supabase_connection_id": "",
+                "schema": "public",
+                "table_name": "",
+                "select": "*",
+                "filters_text": "",
+                "cursor_column": "",
+                "row_id_column": "id",
+                "page_size": 500,
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="schema",
+                    label="Schema",
+                    placeholder="public",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="table_name",
+                    label="Table Name",
+                    placeholder="outbound_email_messages",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="select",
+                    label="Select Columns",
+                    placeholder="*",
+                    help_text="Comma-separated columns to include in payload.row_data. The cursor and row id columns are always fetched automatically.",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="filters_text",
+                    label="Filters",
+                    input_type="textarea",
+                    help_text="Optional PostgREST query filters, one per line, such as status=eq.pending",
+                    placeholder="status=eq.pending",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="cursor_column",
+                    label="Cursor Column",
+                    placeholder="created_at",
+                    help_text="Timestamp-like column used to remember the last processed row across runs.",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="row_id_column",
+                    label="Row ID Column",
+                    placeholder="id",
+                    help_text="Stable tie-breaker column used when multiple rows share the same cursor timestamp.",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="page_size",
+                    label="Page Size",
+                    input_type="number",
+                    placeholder="500",
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.logic_conditions",
             display_name="Logic Conditions",
             category=NodeCategory.CONTROL_FLOW_UNIT,

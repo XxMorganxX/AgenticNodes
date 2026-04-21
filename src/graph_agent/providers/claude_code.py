@@ -337,7 +337,11 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
                 ok=False,
                 message=f"Claude Code CLI could not be started: {exc}",
                 warnings=warnings,
-                details={"cli_path": cli_path},
+                details={
+                    "cli_path": cli_path,
+                    "os_error_errno": exc.errno,
+                    "os_error_message": str(exc),
+                },
             )
 
         LOGGER.info(

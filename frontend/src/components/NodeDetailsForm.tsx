@@ -1,28 +1,17 @@
 import type { EditorCatalog, GraphDefinition, GraphNode } from "../lib/types";
 
 type NodeDetailsFormProps = {
-  graph: GraphDefinition;
+  graph: GraphDefinition | null;
   node: GraphNode;
   catalog?: EditorCatalog | null;
-  onGraphChange: (graph: GraphDefinition) => void;
+  onNodeChange: (node: GraphNode) => void;
 };
-
-function updateNode(
-  graph: GraphDefinition,
-  nodeId: string,
-  updater: (node: GraphNode) => GraphNode,
-): GraphDefinition {
-  return {
-    ...graph,
-    nodes: graph.nodes.map((node) => (node.id === nodeId ? updater(node) : node)),
-  };
-}
 
 export function NodeDetailsForm({
   graph,
   node,
   catalog = null,
-  onGraphChange,
+  onNodeChange,
 }: NodeDetailsFormProps) {
   const contract = catalog?.contracts[node.category];
 
@@ -36,9 +25,7 @@ export function NodeDetailsForm({
         Label
         <input
           value={node.label}
-          onChange={(event) =>
-            onGraphChange(updateNode(graph, node.id, (currentNode) => ({ ...currentNode, label: event.target.value })))
-          }
+          onChange={(event) => onNodeChange({ ...node, label: event.target.value })}
         />
       </label>
       <label>
@@ -46,14 +33,7 @@ export function NodeDetailsForm({
         <textarea
           rows={3}
           value={node.description ?? ""}
-          onChange={(event) =>
-            onGraphChange(
-              updateNode(graph, node.id, (currentNode) => ({
-                ...currentNode,
-                description: event.target.value,
-              })),
-            )
-          }
+          onChange={(event) => onNodeChange({ ...node, description: event.target.value })}
         />
       </label>
       <label>
@@ -61,14 +41,7 @@ export function NodeDetailsForm({
         <input
           type="number"
           value={node.position.x}
-          onChange={(event) =>
-            onGraphChange(
-              updateNode(graph, node.id, (currentNode) => ({
-                ...currentNode,
-                position: { ...currentNode.position, x: Number(event.target.value) },
-              })),
-            )
-          }
+          onChange={(event) => onNodeChange({ ...node, position: { ...node.position, x: Number(event.target.value) } })}
         />
       </label>
       <label>
@@ -76,14 +49,7 @@ export function NodeDetailsForm({
         <input
           type="number"
           value={node.position.y}
-          onChange={(event) =>
-            onGraphChange(
-              updateNode(graph, node.id, (currentNode) => ({
-                ...currentNode,
-                position: { ...currentNode.position, y: Number(event.target.value) },
-              })),
-            )
-          }
+          onChange={(event) => onNodeChange({ ...node, position: { ...node.position, y: Number(event.target.value) } })}
         />
       </label>
       <div className="inspector-meta">

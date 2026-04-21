@@ -196,6 +196,7 @@ function serializeStructuredPayloadTemplateEntries(entries: StructuredPayloadTem
 
 const CONTEXT_BUILDER_PROVIDER_ID = "core.context_builder";
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
+const SUPABASE_TABLE_ROWS_PROVIDER_ID = "core.supabase_table_rows";
 const SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision";
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
@@ -1089,6 +1090,7 @@ export function GraphInspector({
       selectedNode.kind === "data" && selectedNode.provider_id === RUNTIME_NORMALIZER_PROVIDER_ID;
     const isControlFlowUnitNode = isControlFlowNode(selectedNode);
     const isSpreadsheetRowNode = isControlFlowUnitNode && selectedNode.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
+    const isSupabaseTableRowsNode = isControlFlowUnitNode && selectedNode.provider_id === SUPABASE_TABLE_ROWS_PROVIDER_ID;
     const isSpreadsheetMatrixNode =
       selectedNode.kind === "model" && selectedNode.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID;
     const displayedUserMessageTemplate =
@@ -1106,13 +1108,14 @@ export function GraphInspector({
       ? Number.parseInt(String(selectedNode.config[PARALLEL_SPLITTER_HANDLE_COUNT_CONFIG_KEY] ?? "1"), 10) || 1
       : 0;
     const spreadsheetNode = isSpreadsheetRowNode || isSpreadsheetMatrixNode ? selectedNode : null;
+    const iteratorNode = isSpreadsheetRowNode || isSupabaseTableRowsNode ? selectedNode : null;
     const logicConditionConfig = isLogicConditionsNode ? normalizeLogicConditionConfig(selectedNode.config).normalized : null;
     const logicIncomingContractLabel = isLogicConditionsNode ? incomingEdgeContractLabel(graph, selectedNode) : "";
     const spreadsheetIteratorState =
-      isSpreadsheetRowNode && runState?.iterator_states
+      iteratorNode && runState?.iterator_states
         ? (runState.iterator_states[selectedNode.id] as Record<string, unknown> | undefined)
         : undefined;
-    const spreadsheetLoopRegion = isSpreadsheetRowNode ? runState?.loop_regions?.[selectedNode.id] : undefined;
+    const spreadsheetLoopRegion = iteratorNode ? runState?.loop_regions?.[selectedNode.id] : undefined;
     const spreadsheetLoopMemberLabels = Array.isArray(spreadsheetLoopRegion?.member_node_ids)
       ? spreadsheetLoopRegion.member_node_ids
           .map((nodeId) => graph.nodes.find((candidate) => candidate.id === nodeId)?.label ?? nodeId)
@@ -2911,6 +2914,42 @@ export function GraphInspector({
                         : "Preview output will appear here."}
                     </pre>
                   </div>
+                </>
+              ) : isSupabaseTableRowsNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Supabase Table Rows</strong>
+                    <span>Reads unread rows from a Supabase table in ascending cursor order and runs downstream nodes once per row in strict sequence.</span>
+                    <span>Each row is emitted through the `loop-body` handle as `payload.row_data` plus `row_id`, `cursor_value`, `schema`, and `table_name`.</span>
+                  </div>
+                  <div className="inspector-meta">
+                    <span>Schema: {String(selectedNode.config.schema ?? "public") || "public"}</span>
+                    <span>Table: {String(selectedNode.config.table_name ?? "not set") || "not set"}</span>
+                    <span>Cursor: {String(selectedNode.config.cursor_column ?? "not set") || "not set"}</span>
+                    <span>Row id: {String(selectedNode.config.row_id_column ?? "id") || "id"}</span>
+                    <span>Output handle: `loop-body`</span>
+                  </div>
+                  {spreadsheetIteratorState ? (
+                    <div className="contract-card">
+                      <strong>Iterator Progress</strong>
+                      <span>Status: {String(spreadsheetIteratorState.status ?? "unknown")}</span>
+                      <span>
+                        Row progress: {String(spreadsheetIteratorState.current_row_index ?? 0)} / {String(spreadsheetIteratorState.total_rows ?? 0)}
+                      </span>
+                      <span>Cached cursor: {String(spreadsheetIteratorState.last_cached_cursor_value ?? "none")}</span>
+                      {spreadsheetLoopRegion ? (
+                        <span>
+                          Loop region members: {String(spreadsheetLoopRegion.member_node_ids?.length ?? 0)}
+                          {spreadsheetLoopMemberLabels.length > 0 ? ` (${spreadsheetLoopMemberLabels.join(", ")})` : ""}
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {onOpenProviderDetails ? (
+                    <button type="button" className="secondary-button" onClick={() => onOpenProviderDetails(selectedNode.id)}>
+                      Open Provider Details
+                    </button>
+                  ) : null}
                 </>
               ) : isLogicConditionsNode ? (
                 <>

@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -121,6 +122,42 @@ class SpreadsheetMatrixDecisionTests(unittest.TestCase):
             with self.assertRaises(SpreadsheetParseError):
                 parse_spreadsheet_matrix(file_path=str(csv_path), file_format="csv")
 
+    def test_parse_spreadsheet_matrix_closes_xlsx_workbook(self) -> None:
+        class FakeWorksheet:
+            title = "Sheet1"
+
+            def iter_rows(self, values_only: bool = True):
+                return iter(
+                    [
+                        ("Audience", "SMB", "Enterprise"),
+                        ("High urgency", "Page support", "Escalate to dedicated team"),
+                    ]
+                )
+
+        class FakeWorkbook:
+            def __init__(self) -> None:
+                self.sheetnames = ["Sheet1"]
+                self.closed = False
+                self.worksheet = FakeWorksheet()
+
+            def __getitem__(self, name: str) -> FakeWorksheet:
+                if name not in self.sheetnames:
+                    raise KeyError(name)
+                return self.worksheet
+
+            def close(self) -> None:
+                self.closed = True
+
+        with TemporaryDirectory() as temp_dir:
+            xlsx_path = Path(temp_dir) / "matrix.xlsx"
+            xlsx_path.write_bytes(b"placeholder")
+            workbook = FakeWorkbook()
+            with patch("graph_agent.runtime.spreadsheets.load_workbook", return_value=workbook):
+                parsed = parse_spreadsheet_matrix(file_path=str(xlsx_path), file_format="xlsx")
+
+        self.assertEqual(parsed.file_format, "xlsx")
+        self.assertTrue(workbook.closed)
+
     def test_runtime_selects_matrix_cell_and_outputs_value(self) -> None:
         with TemporaryDirectory() as temp_dir:
             csv_path = Path(temp_dir) / "decision-matrix.csv"
@@ -215,6 +252,92 @@ class SpreadsheetMatrixDecisionTests(unittest.TestCase):
         self.assertIn("likely to respond to", provider.user_messages[0])
         self.assertIn("trust the detailed responsibilities over the headline title", provider.user_messages[0])
         self.assertIn("technical PM versus people manager", provider.user_messages[0])
+
+    def test_runtime_reuses_matrix_request_built_for_runtime_preview(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "decision-matrix.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["Audience", "SMB", "Enterprise"])
+                writer.writerow(["Low urgency", "Send help article", "Queue for success team"])
+                writer.writerow(["High urgency", "Page support", "Escalate to dedicated team"])
+
+            services = build_example_services()
+            provider = MatrixDecisionProvider()
+            services.model_providers[provider.name] = provider
+            runtime = GraphRuntime(
+                services=services,
+                max_steps=services.config["max_steps"],
+                max_visits_per_node=services.config["max_visits_per_node"],
+            )
+            graph = GraphDefinition.from_dict(
+                {
+                    "graph_id": "spreadsheet-matrix-preview-cache-graph",
+                    "name": "Spreadsheet Matrix Preview Cache Graph",
+                    "description": "",
+                    "version": "1.0",
+                    "start_node_id": "start",
+                    "nodes": [
+                        {
+                            "id": "start",
+                            "kind": "input",
+                            "category": "start",
+                            "label": "Start",
+                            "provider_id": "start.manual_run",
+                            "provider_label": "Run Button Start",
+                            "config": {"input_binding": {"type": "input_payload"}},
+                            "position": {"x": 0, "y": 0},
+                        },
+                        {
+                            "id": "matrix",
+                            "kind": "model",
+                            "category": "api",
+                            "label": "Matrix Decision",
+                            "provider_id": "core.spreadsheet_matrix_decision",
+                            "provider_label": "Spreadsheet Matrix Decision",
+                            "model_provider_name": provider.name,
+                            "prompt_name": "spreadsheet_matrix_prompt",
+                            "config": {
+                                "provider_name": provider.name,
+                                "model": "test-model",
+                                "prompt_name": "spreadsheet_matrix_prompt",
+                                "mode": "spreadsheet_matrix_decision",
+                                "system_prompt": "Use the matrix to decide the next action.",
+                                "user_message_template": "{input_payload}",
+                                "file_format": "csv",
+                                "file_path": str(csv_path),
+                                "sheet_name": "",
+                            },
+                            "position": {"x": 240, "y": 0},
+                        },
+                        {
+                            "id": "finish",
+                            "kind": "output",
+                            "category": "end",
+                            "label": "Finish",
+                            "provider_id": "core.output",
+                            "provider_label": "Core Output Node",
+                            "config": {},
+                            "position": {"x": 520, "y": 0},
+                        },
+                    ],
+                    "edges": [
+                        {"id": "e1", "source_id": "start", "target_id": "matrix", "label": "", "kind": "standard", "priority": 100},
+                        {"id": "e2", "source_id": "matrix", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                    ],
+                }
+            )
+
+            original_parser = parse_spreadsheet_matrix
+            with patch("graph_agent.runtime.core.parse_spreadsheet_matrix", side_effect=original_parser) as parser_mock:
+                state = runtime.run(
+                    graph,
+                    "An enterprise customer has a high urgency issue.",
+                    run_id="spreadsheet-matrix-preview-cache",
+                )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(parser_mock.call_count, 1)
 
     def test_validation_rejects_tool_capable_matrix_node(self) -> None:
         services = build_example_services()

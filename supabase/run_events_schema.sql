@@ -16,8 +16,12 @@ create table if not exists public.runs (
   current_node_id text,
   current_edge_id text,
   state_snapshot jsonb,
+  metadata jsonb not null default '{}'::jsonb,
   created_at text not null
 );
+
+alter table if exists public.runs
+  add column if not exists metadata jsonb not null default '{}'::jsonb;
 
 create index if not exists runs_graph_id_created_at_idx on public.runs (graph_id, created_at desc);
 create index if not exists runs_parent_run_id_idx on public.runs (parent_run_id);
@@ -32,8 +36,12 @@ create table if not exists public.run_events (
   parent_run_id text,
   summary text not null,
   payload jsonb not null default '{}'::jsonb,
+  metadata jsonb not null default '{}'::jsonb,
   unique (run_id, sequence_number)
 );
+
+alter table if exists public.run_events
+  add column if not exists metadata jsonb not null default '{}'::jsonb;
 
 create index if not exists run_events_run_id_sequence_idx on public.run_events (run_id, sequence_number asc);
 create index if not exists run_events_parent_run_id_idx on public.run_events (parent_run_id);

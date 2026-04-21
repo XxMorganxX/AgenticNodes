@@ -1886,6 +1886,18 @@ class ModelProviderTests(unittest.TestCase):
         self.assertIn("API billing", diagnostics["warning"])
         self.assertEqual(diagnostics["authentication_status"], "not_checked")
         self.assertEqual(diagnostics["preflight"]["status"], "installed")
+        self.assertEqual(diagnostics["claude_binary_status"], "found")
+
+    def test_manager_reports_claude_code_permission_denied_binary_status(self) -> None:
+        manager = GraphRunManager(services=build_example_services())
+        with patch("graph_agent.providers.claude_code.subprocess.run") as run_mock:
+            run_mock.side_effect = PermissionError(13, "Permission denied", "claude")
+            diagnostics = manager.provider_diagnostics("claude_code", {"cli_path": "claude"})
+
+        self.assertEqual(diagnostics["preflight"]["status"], "unavailable")
+        self.assertEqual(diagnostics["claude_binary_status"], "permission_denied")
+        self.assertFalse(diagnostics["claude_binary_exists"])
+        self.assertIn("Permission denied", diagnostics["claude_binary_detail"])
 
     def test_mock_provider_live_preflight_is_marked_not_applicable(self) -> None:
         manager = GraphRunManager(services=build_example_services())

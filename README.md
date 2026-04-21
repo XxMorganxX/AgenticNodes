@@ -2,6 +2,20 @@
 
 Graph Agent Studio is a local graph editor and runtime for building agent workflows, tool pipelines, and multi-agent test environments.
 
+## Screenshots
+
+### Studio overview
+
+![Graph Agent Studio overview showing the runtime controls, graph selector, project files, and workspace panels](visuals/graph-agent-studio-overview.png)
+
+### Graph canvas
+
+![Graph canvas showing a spreadsheet-driven workflow with branching nodes and envelope display steps](visuals/graph-agent-studio-canvas.png)
+
+### Agent run swimlanes
+
+![Agent run swimlanes showing lane-level milestones, node events, and execution payloads](visuals/graph-agent-studio-swimlanes.png)
+
 This repository contains:
 
 - a Python runtime and FastAPI API for graph execution
@@ -71,14 +85,14 @@ The current catalog includes support for:
 
 Supporting design notes live in:
 
-- [model.md](/Users/morgannstuart/Desktop/agentic-nodes/model.md)
-- [tool-registry.md](/Users/morgannstuart/Desktop/agentic-nodes/tool-registry.md)
-- [control-loop.md](/Users/morgannstuart/Desktop/agentic-nodes/control-loop.md)
-- [supabase-connections.md](/Users/morgannstuart/Desktop/agentic-nodes/supabase-connections.md)
-- [outreach-email-schema.md](/Users/morgannstuart/Desktop/agentic-nodes/outreach-email-schema.md)
-- [state.md](/Users/morgannstuart/Desktop/agentic-nodes/state.md)
-- [memory.md](/Users/morgannstuart/Desktop/agentic-nodes/memory.md)
-- [logging.md](/Users/morgannstuart/Desktop/agentic-nodes/logging.md)
+- [model.md](model.md)
+- [tool-registry.md](tool-registry.md)
+- [control-loop.md](control-loop.md)
+- [supabase-connections.md](supabase-connections.md)
+- [outreach-email-schema.md](outreach-email-schema.md)
+- [state.md](state.md)
+- [memory.md](memory.md)
+- [logging.md](logging.md)
 
 ## Quick Start
 
@@ -202,7 +216,7 @@ GRAPH_AGENT_RUN_STORE_SUPABASE_SECRET_KEY_ENV_VAR=GRAPH_AGENT_SUPABASE_ANALYTICS
 
 Supabase REST calls now support both legacy JWT-style `service_role` keys and newer `sb_secret_*` keys. Secret keys should remain server-side only.
 
-For the exact graph document shape, runtime precedence rules, compatibility mode behavior, and run-store selection logic, see [supabase-connections.md](/Users/morgannstuart/Desktop/agentic-nodes/supabase-connections.md).
+For the exact graph document shape, runtime precedence rules, compatibility mode behavior, and run-store selection logic, see [supabase-connections.md](supabase-connections.md).
 
 ## MCP Support
 

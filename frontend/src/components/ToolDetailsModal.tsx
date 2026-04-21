@@ -137,7 +137,7 @@ export function ToolDetailsModal({
                 graph={graph}
                 node={node}
                 catalog={catalog}
-                onGraphChange={onGraphChange}
+                onNodeChange={(nextNode) => onGraphChange(updateToolNode(graph, node.id, () => nextNode))}
               />
             ) : null}
 

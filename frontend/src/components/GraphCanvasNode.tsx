@@ -44,10 +44,12 @@ import type { EditorCatalog, GraphDefinition, GraphNode, ProjectFile, RunState }
 export type GraphCanvasNodeData = {
   node: GraphNode;
   graph: GraphDefinition | null;
+  graphRenderSignature?: string;
   tooltipGraph?: GraphDefinition | null;
   catalog: EditorCatalog | null;
   runState: RunState | null;
   availableProjectFiles?: ProjectFile[];
+  displayLabel?: string;
   runtimeOutput?: unknown;
   contextBuilderRuntime?: ContextBuilderRuntimeView | null;
   contextBuilderRuntimeKey?: string;
@@ -71,6 +73,7 @@ export type GraphCanvasNodeData = {
 };
 
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
+const SUPABASE_TABLE_ROWS_PROVIDER_ID = "core.supabase_table_rows";
 const SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision";
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
@@ -207,6 +210,7 @@ function GraphCanvasNodeComponent({
   const {
     node,
     graph,
+    displayLabel: providedDisplayLabel,
     tooltipGraph = null,
     catalog,
     runState,
@@ -242,11 +246,12 @@ function GraphCanvasNodeComponent({
   const isStructuredPayloadBuilderNode = node.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID;
   const isRuntimeNormalizerNode = node.provider_id === "core.runtime_normalizer";
   const isSupabaseDataNode = node.provider_id === "core.supabase_data";
+  const isSupabaseTableRowsNode = node.provider_id === SUPABASE_TABLE_ROWS_PROVIDER_ID;
   const isSupabaseRowWriteNode = node.provider_id === "core.supabase_row_write";
   const isOutboundEmailLogger = isOutboundEmailLoggerNode(node);
-  const isSupabaseNode = isSupabaseDataNode || isSupabaseRowWriteNode || isOutboundEmailLogger;
+  const isSupabaseNode = isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger;
   const isOutlookDraftNode = node.provider_id === "end.outlook_draft";
-  const displayLabel = getNodeInstanceLabel(graph, node);
+  const displayLabel = providedDisplayLabel ?? getNodeInstanceLabel(graph, node);
   const resolvedSupabaseBinding = isSupabaseNode ? resolveSupabaseBinding(graph, node.config as Record<string, unknown>) : null;
   const supabaseConnectionOptions = isSupabaseNode ? getSupabaseConnectionSelectOptions(graph, node.config as Record<string, unknown>) : [];
   const supabaseConnectionMissing = resolvedSupabaseBinding?.missingConnection ?? false;
@@ -424,7 +429,7 @@ function GraphCanvasNodeComponent({
   const isSpreadsheetMatrixDecisionNode = node.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID;
   const isSpreadsheetBackedNode = isSpreadsheetRowNode || isSpreadsheetMatrixDecisionNode;
   const showsModelToolHandles = isModelNode && !isSpreadsheetMatrixDecisionNode;
-  const spreadsheetIteratorState = isSpreadsheetRowNode ? runState?.iterator_states?.[node.id] : undefined;
+  const spreadsheetIteratorState = isSpreadsheetRowNode || isSupabaseTableRowsNode ? runState?.iterator_states?.[node.id] : undefined;
   const spreadsheetIteratorStatus =
     spreadsheetIteratorState && typeof spreadsheetIteratorState.status === "string" ? spreadsheetIteratorState.status : null;
   const spreadsheetRowSummary = spreadsheetIteratorState != null
@@ -843,7 +848,7 @@ function GraphCanvasNodeComponent({
             <span className="graph-node-inline-display-hint">Click to expand</span>
           </div>
         ) : null}
-        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isStructuredPayloadBuilderNode || isRuntimeNormalizerNode || isSupabaseDataNode || isSupabaseRowWriteNode || isOutboundEmailLogger) ? (
+        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isStructuredPayloadBuilderNode || isRuntimeNormalizerNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger) ? (
           <div className="graph-node-card-actions" aria-hidden="false">
             <button
               type="button"
@@ -871,6 +876,8 @@ function GraphCanvasNodeComponent({
                 : isRuntimeNormalizerNode
                   ? "Learn More"
                 : isSupabaseDataNode
+                  ? "Learn More"
+                : isSupabaseTableRowsNode
                   ? "Learn More"
                 : isSupabaseRowWriteNode
                   ? "Learn More"
@@ -1002,7 +1009,7 @@ function GraphCanvasNodeComponent({
           />
         </>
       ) : null}
-      {showSourceHandle && isControlFlowUnitNode && node.provider_id === SPREADSHEET_ROW_PROVIDER_ID ? (
+      {showSourceHandle && isControlFlowUnitNode && (node.provider_id === SPREADSHEET_ROW_PROVIDER_ID || node.provider_id === SUPABASE_TABLE_ROWS_PROVIDER_ID) ? (
         <>
           <div className="graph-node-output-port graph-node-output-port--success" style={controlFlowLoopHandleStyle} aria-hidden="true">
             <span className="graph-node-output-port-label">Loop Body</span>

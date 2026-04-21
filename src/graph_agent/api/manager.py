@@ -346,6 +346,32 @@ class GraphRunManager:
         is_claude_code = provider_name == "claude_code"
         is_anthropic_api = provider_name == "claude"
         claude_binary_path = shutil.which(cli_path) if is_claude_code else None
+        claude_binary_status = "not_applicable"
+        claude_binary_detail = None
+
+        if is_claude_code:
+            preflight_status = str(preflight.get("status") or "").strip().lower()
+            preflight_message = str(preflight.get("message") or "").strip()
+            preflight_details = preflight.get("details")
+            preflight_errno = None
+            if isinstance(preflight_details, dict):
+                raw_errno = preflight_details.get("os_error_errno")
+                if isinstance(raw_errno, int):
+                    preflight_errno = raw_errno
+                elif isinstance(raw_errno, str) and raw_errno.strip().isdigit():
+                    preflight_errno = int(raw_errno.strip())
+
+            if preflight_status in {"installed", "available", "unauthenticated", "timeout"}:
+                claude_binary_status = "found"
+            elif preflight_status == "missing_cli":
+                claude_binary_status = "not_found"
+            elif preflight_errno == 13 or "permission denied" in preflight_message.lower():
+                claude_binary_status = "permission_denied"
+                claude_binary_detail = preflight_message
+            elif claude_binary_path:
+                claude_binary_status = "found"
+            else:
+                claude_binary_status = "not_found"
 
         warning = None
         if is_claude_code and anthropic_api_key_present:
@@ -365,8 +391,10 @@ class GraphRunManager:
         return {
             "provider_name": provider_name,
             "active_backend": "claude_code" if is_claude_code else "anthropic_api" if is_anthropic_api else provider_name,
-            "claude_binary_exists": bool(claude_binary_path),
+            "claude_binary_exists": claude_binary_status == "found",
+            "claude_binary_status": claude_binary_status,
             "claude_binary_path": claude_binary_path,
+            "claude_binary_detail": claude_binary_detail,
             "anthropic_api_key_present": anthropic_api_key_present,
             "warning": warning,
             "child_env_sanitized": is_claude_code,

@@ -20,6 +20,7 @@ if str(SRC) not in sys.path:
 from graph_agent.api.graph_store import GraphStore
 from graph_agent.api.supabase_run_store import SupabaseRunStore
 from graph_agent.examples.tool_schema_repair import build_example_services
+from graph_agent.providers.base import ModelRequest, ModelResponse, ProviderPreflightResult
 from graph_agent.runtime.core import GraphDefinition, GraphValidationError
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.supabase_data import (
@@ -37,6 +38,81 @@ class _SupabaseStubHandler(BaseHTTPRequestHandler):
     last_query: dict[str, list[str]] = {}
     last_path: str = ""
     last_json_body: Any = None
+    table_rows: dict[str, list[dict[str, Any]]] = {}
+
+    @staticmethod
+    def _coerce_comparable(value: Any) -> Any:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+        text = str(value)
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return float(text)
+            except ValueError:
+                return text
+
+    @classmethod
+    def _apply_basic_filter(cls, rows: list[dict[str, Any]], key: str, expression: str) -> list[dict[str, Any]]:
+        operator, _, expected = expression.partition(".")
+        if not operator:
+            return rows
+        if operator == "eq":
+            return [row for row in rows if cls._coerce_comparable(row.get(key)) == cls._coerce_comparable(expected)]
+        if operator == "gt":
+            return [row for row in rows if cls._coerce_comparable(row.get(key)) > cls._coerce_comparable(expected)]
+        return rows
+
+    @classmethod
+    def _apply_or_filter(cls, rows: list[dict[str, Any]], expression: str) -> list[dict[str, Any]]:
+        normalized = str(expression or "").strip()
+        if not normalized.startswith("(") or not normalized.endswith(")"):
+            return rows
+        inner = normalized[1:-1]
+        marker = ",and("
+        if marker not in inner:
+            return rows
+        first_expression, _, remainder = inner.partition(marker)
+        remainder = remainder[:-1] if remainder.endswith(")") else remainder
+        second_expression, _, third_expression = remainder.partition(",")
+        key_one, _, op_one = first_expression.partition(".")
+        key_two, _, op_two = second_expression.partition(".")
+        key_three, _, op_three = third_expression.partition(".")
+        first_rows = cls._apply_basic_filter(rows, key_one, op_one)
+        second_rows = cls._apply_basic_filter(rows, key_two, op_two)
+        third_rows = cls._apply_basic_filter(second_rows, key_three, op_three)
+        seen: set[tuple[tuple[str, Any], ...]] = set()
+        merged: list[dict[str, Any]] = []
+        for row in [*first_rows, *third_rows]:
+            marker_key = tuple(sorted(row.items()))
+            if marker_key in seen:
+                continue
+            seen.add(marker_key)
+            merged.append(row)
+        return merged
+
+    @classmethod
+    def _apply_query(cls, rows: list[dict[str, Any]], parsed: Any) -> list[dict[str, Any]]:
+        filtered = [dict(row) for row in rows]
+        query = parse_qs(parsed.query)
+        for key, values in query.items():
+            if key in {"select", "order", "limit", "or"}:
+                continue
+            for value in values:
+                filtered = cls._apply_basic_filter(filtered, key, value)
+        for expression in query.get("or", []):
+            filtered = cls._apply_or_filter(filtered, expression)
+        for order_expression in reversed(query.get("order", [])):
+            column_name, _, direction = order_expression.partition(".")
+            filtered.sort(
+                key=lambda row, column_name=column_name: cls._coerce_comparable(row.get(column_name)),
+                reverse=direction.lower() == "desc",
+            )
+        limit_values = query.get("limit", [])
+        if limit_values:
+            filtered = filtered[: int(limit_values[0])]
+        return filtered
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -86,10 +162,26 @@ class _SupabaseStubHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if parsed.path == "/rest/v1/projects":
-            payload = [
-                {"id": 1, "name": "Alpha", "status": "active"},
-                {"id": 2, "name": "Beta", "status": "active"},
-            ]
+            payload = self._apply_query(
+                type(self).table_rows.get(
+                    "projects",
+                    [
+                        {"id": 1, "name": "Alpha", "status": "active"},
+                        {"id": 2, "name": "Beta", "status": "active"},
+                    ],
+                ),
+                parsed,
+            )
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        table_rows = type(self).table_rows.get(parsed.path.removeprefix("/rest/v1/"))
+        if table_rows is not None:
+            payload = self._apply_query(table_rows, parsed)
             body = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -154,6 +246,7 @@ class SupabaseStubServer:
         _SupabaseStubHandler.last_query = {}
         _SupabaseStubHandler.last_path = ""
         _SupabaseStubHandler.last_json_body = None
+        _SupabaseStubHandler.table_rows = {}
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _SupabaseStubHandler)
         self._thread = Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
@@ -307,6 +400,124 @@ def supabase_row_write_graph_payload(
     }
 
 
+def supabase_table_rows_graph_payload(
+    graph_id: str = "supabase-table-rows-graph",
+    *,
+    node_config: dict[str, object] | None = None,
+    finish_provider_id: str = "core.output",
+) -> dict[str, object]:
+    resolved_node_config: dict[str, object] = {
+        "mode": "supabase_table_rows",
+        "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_URL",
+        "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_SECRET_KEY",
+        "schema": "public",
+        "table_name": "projects",
+        "select": "id,name,status,created_at",
+        "filters_text": "status=eq.active",
+        "cursor_column": "created_at",
+        "row_id_column": "id",
+        "page_size": 500,
+    }
+    if node_config:
+        resolved_node_config.update(node_config)
+    return {
+        "graph_id": graph_id,
+        "name": "Supabase Table Rows Graph",
+        "description": "",
+        "version": "1.0",
+        "start_node_id": "start",
+        "nodes": [
+            {
+                "id": "start",
+                "kind": "input",
+                "category": "start",
+                "label": "Start",
+                "provider_id": "start.manual_run",
+                "provider_label": "Run Button Start",
+                "config": {"input_binding": {"type": "input_payload"}},
+                "position": {"x": 0, "y": 0},
+            },
+            {
+                "id": "iterator",
+                "kind": "control_flow_unit",
+                "category": "control_flow_unit",
+                "label": "Supabase Table Rows",
+                "provider_id": "core.supabase_table_rows",
+                "provider_label": "Supabase Table Rows",
+                "config": resolved_node_config,
+                "position": {"x": 220, "y": 0},
+            },
+            {
+                "id": "model",
+                "kind": "model",
+                "category": "api",
+                "label": "Model",
+                "provider_id": "core.api",
+                "provider_label": "API Call Node",
+                "model_provider_name": "spreadsheet_echo",
+                "prompt_name": "supabase_table_rows_prompt",
+                "config": {
+                    "provider_name": "spreadsheet_echo",
+                    "prompt_name": "supabase_table_rows_prompt",
+                    "system_prompt": "Process the current Supabase row.",
+                    "user_message_template": "{input_payload}",
+                    "response_mode": "message",
+                },
+                "position": {"x": 440, "y": 0},
+            },
+            {
+                "id": "finish",
+                "kind": "output",
+                "category": "end",
+                "label": "Finish",
+                "provider_id": finish_provider_id,
+                "provider_label": "Finish",
+                "config": {"source_binding": {"type": "latest_payload", "source": "model"}},
+                "position": {"x": 660, "y": 0},
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source_id": "start", "target_id": "iterator", "label": "", "kind": "standard", "priority": 100},
+            {"id": "e2", "source_id": "iterator", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+            {"id": "e3", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+        ],
+    }
+
+
+class SpreadsheetEchoProvider:
+    name = "spreadsheet_echo"
+
+    def __init__(self) -> None:
+        self.user_messages: list[str] = []
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        user_message = request.messages[-1].content if request.messages else ""
+        self.user_messages.append(user_message)
+        return ModelResponse(
+            content=user_message,
+            structured_output={
+                "message": user_message,
+                "need_tool": False,
+                "tool_calls": [],
+            },
+        )
+
+    def preflight(self, provider_config=None) -> ProviderPreflightResult:
+        return ProviderPreflightResult(
+            status="available",
+            ok=True,
+            message="Test echo provider is available.",
+            details={"backend_type": "test"},
+        )
+
+
+class FailingEchoProvider(SpreadsheetEchoProvider):
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        user_message = request.messages[-1].content if request.messages else ""
+        self.user_messages.append(user_message)
+        raise RuntimeError("Intentional provider failure")
+
+
 class SupabaseDataNodeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.services = build_example_services()
@@ -337,6 +548,16 @@ class SupabaseDataNodeTests(unittest.TestCase):
         self.assertEqual(provider["default_config"]["mode"], "supabase_row_write")
         self.assertEqual(provider["default_config"]["write_mode"], "insert")
         self.assertEqual(provider["default_config"]["returning"], "representation")
+
+    def test_supabase_table_rows_provider_appears_in_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = GraphStore(self.services, path=Path(directory) / "graphs.json")
+            catalog = store.catalog()
+
+        provider = next(candidate for candidate in catalog["node_providers"] if candidate["provider_id"] == "core.supabase_table_rows")
+        self.assertEqual(provider["default_config"]["mode"], "supabase_table_rows")
+        self.assertEqual(provider["default_config"]["row_id_column"], "id")
+        self.assertEqual(provider["default_config"]["page_size"], 500)
 
     def test_supabase_data_node_fetches_rows_and_emits_data_envelope(self) -> None:
         graph = GraphDefinition.from_dict(supabase_graph_payload())
@@ -795,6 +1016,15 @@ class SupabaseDataNodeTests(unittest.TestCase):
                 )
             )
 
+    def test_supabase_table_rows_connection_id_validation_rejects_missing_connection(self) -> None:
+        with self.assertRaisesRegex(GraphValidationError, "unknown Supabase connection 'missing-db'"):
+            GraphDefinition.from_dict(
+                supabase_table_rows_graph_payload(
+                    "supabase-table-rows-missing-connection",
+                    node_config={"supabase_connection_id": "missing-db"},
+                )
+            )
+
     def test_supabase_connection_id_rejects_registry_rows_dropped_by_normalization(self) -> None:
         with self.assertRaisesRegex(GraphValidationError, "unknown Supabase connection 'analytics-db'"):
             GraphDefinition.from_dict(
@@ -834,6 +1064,205 @@ class SupabaseDataNodeTests(unittest.TestCase):
                     "default_supabase_connection_id": "missing-db",
                 }
             )
+
+    def test_supabase_table_rows_runtime_processes_rows_in_cursor_order_and_persists_watermark(self) -> None:
+        provider = SpreadsheetEchoProvider()
+        self.services.model_providers["spreadsheet_echo"] = provider
+        graph = GraphDefinition.from_dict(
+            supabase_table_rows_graph_payload(
+                "supabase-table-rows-runtime",
+                node_config={"page_size": 1},
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cursor_db_path = Path(temp_dir) / "supabase-table-rows.sqlite3"
+            with SupabaseStubServer() as base_url, patch.dict(
+                os.environ,
+                {
+                    "GRAPH_AGENT_SUPABASE_URL": base_url,
+                    "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+                    "GRAPH_AGENT_SUPABASE_TABLE_ROWS_DB": str(cursor_db_path),
+                },
+                clear=False,
+            ):
+                _SupabaseStubHandler.table_rows["projects"] = [
+                    {"id": 1, "name": "Alpha", "status": "active", "created_at": "2026-04-10T12:00:00Z"},
+                    {"id": 2, "name": "Beta", "status": "active", "created_at": "2026-04-10T12:00:00Z"},
+                    {"id": 3, "name": "Gamma", "status": "active", "created_at": "2026-04-11T09:30:00Z"},
+                ]
+                first_state = runtime.run(graph, {"request": "process unread rows"}, run_id="run-supabase-table-rows-1")
+                second_state = runtime.run(graph, {"request": "process unread rows"}, run_id="run-supabase-table-rows-2")
+
+        self.assertEqual(first_state.status, "completed")
+        self.assertEqual(second_state.status, "completed")
+        self.assertEqual(len(provider.user_messages), 3)
+        self.assertIn('"id": 1', provider.user_messages[0])
+        self.assertIn('"id": 2', provider.user_messages[1])
+        self.assertIn('"id": 3', provider.user_messages[2])
+        self.assertEqual(first_state.iterator_states["iterator"]["iterator_type"], "supabase_table_rows")
+        self.assertEqual(first_state.iterator_states["iterator"]["current_row_index"], 3)
+        self.assertEqual(first_state.iterator_states["iterator"]["total_rows"], 3)
+        self.assertEqual(first_state.iterator_states["iterator"]["table_name"], "projects")
+        self.assertEqual(second_state.visit_counts.get("model", 0), 0)
+        self.assertEqual(second_state.iterator_states["iterator"]["total_rows"], 0)
+        self.assertEqual(second_state.iterator_states["iterator"]["last_cached_cursor_value"], "2026-04-11T09:30:00Z")
+        self.assertEqual(second_state.iterator_states["iterator"]["last_cached_row_id"], "3")
+
+    def test_supabase_table_rows_missing_cursor_column_fails_cleanly(self) -> None:
+        provider = SpreadsheetEchoProvider()
+        self.services.model_providers["spreadsheet_echo"] = provider
+        graph = GraphDefinition.from_dict(
+            supabase_table_rows_graph_payload(
+                "supabase-table-rows-missing-cursor-column",
+                node_config={"cursor_column": "processed_at"},
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cursor_db_path = Path(temp_dir) / "supabase-table-rows.sqlite3"
+            with SupabaseStubServer() as base_url, patch.dict(
+                os.environ,
+                {
+                    "GRAPH_AGENT_SUPABASE_URL": base_url,
+                    "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+                    "GRAPH_AGENT_SUPABASE_TABLE_ROWS_DB": str(cursor_db_path),
+                },
+                clear=False,
+            ):
+                _SupabaseStubHandler.table_rows["projects"] = [
+                    {"id": 1, "name": "Alpha", "status": "active", "created_at": "2026-04-10T12:00:00Z"},
+                ]
+                state = runtime.run(graph, {"request": "process unread rows"}, run_id="run-supabase-table-rows-missing-cursor")
+
+        self.assertEqual(state.status, "failed")
+        self.assertEqual(state.terminal_error["type"], "missing_supabase_iterator_field")
+        self.assertEqual(state.terminal_error["field_name"], "processed_at")
+
+    def test_supabase_table_rows_failure_does_not_advance_watermark(self) -> None:
+        provider = FailingEchoProvider()
+        self.services.model_providers["spreadsheet_echo"] = provider
+        graph = GraphDefinition.from_dict(supabase_table_rows_graph_payload("supabase-table-rows-failure"))
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cursor_db_path = Path(temp_dir) / "supabase-table-rows.sqlite3"
+            with SupabaseStubServer() as base_url, patch.dict(
+                os.environ,
+                {
+                    "GRAPH_AGENT_SUPABASE_URL": base_url,
+                    "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+                    "GRAPH_AGENT_SUPABASE_TABLE_ROWS_DB": str(cursor_db_path),
+                },
+                clear=False,
+            ):
+                _SupabaseStubHandler.table_rows["projects"] = [
+                    {"id": 1, "name": "Alpha", "status": "active", "created_at": "2026-04-10T12:00:00Z"},
+                ]
+                first_state = runtime.run(graph, {"request": "process unread rows"}, run_id="run-supabase-table-rows-failure-1")
+            self.services.model_providers["spreadsheet_echo"] = SpreadsheetEchoProvider()
+            runtime = self._runtime()
+            with SupabaseStubServer() as base_url, patch.dict(
+                os.environ,
+                {
+                    "GRAPH_AGENT_SUPABASE_URL": base_url,
+                    "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+                    "GRAPH_AGENT_SUPABASE_TABLE_ROWS_DB": str(cursor_db_path),
+                },
+                clear=False,
+            ):
+                _SupabaseStubHandler.table_rows["projects"] = [
+                    {"id": 1, "name": "Alpha", "status": "active", "created_at": "2026-04-10T12:00:00Z"},
+                ]
+                second_state = runtime.run(graph, {"request": "process unread rows"}, run_id="run-supabase-table-rows-failure-2")
+
+        self.assertEqual(first_state.status, "failed")
+        self.assertEqual(second_state.status, "completed")
+        self.assertEqual(second_state.visit_counts.get("model"), 1)
+        self.assertEqual(second_state.iterator_states["iterator"]["current_row_index"], 1)
+
+    def test_supabase_table_rows_terminated_run_does_not_advance_watermark(self) -> None:
+        provider = SpreadsheetEchoProvider()
+        self.services.model_providers["spreadsheet_echo"] = provider
+        graph = GraphDefinition.from_dict(
+            supabase_table_rows_graph_payload(
+                "supabase-table-rows-terminated",
+                finish_provider_id="end.agent_run",
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cursor_db_path = Path(temp_dir) / "supabase-table-rows.sqlite3"
+            with SupabaseStubServer() as base_url, patch.dict(
+                os.environ,
+                {
+                    "GRAPH_AGENT_SUPABASE_URL": base_url,
+                    "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+                    "GRAPH_AGENT_SUPABASE_TABLE_ROWS_DB": str(cursor_db_path),
+                },
+                clear=False,
+            ):
+                _SupabaseStubHandler.table_rows["projects"] = [
+                    {"id": 1, "name": "Alpha", "status": "active", "created_at": "2026-04-10T12:00:00Z"},
+                    {"id": 2, "name": "Beta", "status": "active", "created_at": "2026-04-11T09:30:00Z"},
+                ]
+                first_state = runtime.run(graph, {"request": "process unread rows"}, run_id="run-supabase-table-rows-terminated-1")
+                second_state = runtime.run(graph, {"request": "process unread rows"}, run_id="run-supabase-table-rows-terminated-2")
+
+        self.assertEqual(first_state.status, "completed")
+        self.assertEqual(first_state.iterator_states["iterator"]["status"], "terminated")
+        self.assertEqual(second_state.status, "completed")
+        self.assertEqual(second_state.visit_counts.get("model"), 1)
+        self.assertEqual(second_state.iterator_states["iterator"]["status"], "terminated")
+
+    def test_supabase_table_rows_scope_changes_when_filters_change(self) -> None:
+        provider = SpreadsheetEchoProvider()
+        self.services.model_providers["spreadsheet_echo"] = provider
+        runtime = self._runtime()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cursor_db_path = Path(temp_dir) / "supabase-table-rows.sqlite3"
+            first_graph = GraphDefinition.from_dict(
+                supabase_table_rows_graph_payload(
+                    "supabase-table-rows-scope-one",
+                    node_config={"filters_text": "status=eq.active"},
+                )
+            )
+            second_graph = GraphDefinition.from_dict(
+                supabase_table_rows_graph_payload(
+                    "supabase-table-rows-scope-two",
+                    node_config={"filters_text": "status=eq.paused"},
+                )
+            )
+            first_graph.validate_against_services(self.services)
+            second_graph.validate_against_services(self.services)
+            with SupabaseStubServer() as base_url, patch.dict(
+                os.environ,
+                {
+                    "GRAPH_AGENT_SUPABASE_URL": base_url,
+                    "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+                    "GRAPH_AGENT_SUPABASE_TABLE_ROWS_DB": str(cursor_db_path),
+                },
+                clear=False,
+            ):
+                _SupabaseStubHandler.table_rows["projects"] = [
+                    {"id": 1, "name": "Alpha", "status": "active", "created_at": "2026-04-10T12:00:00Z"},
+                    {"id": 2, "name": "Beta", "status": "paused", "created_at": "2026-04-11T09:30:00Z"},
+                ]
+                first_state = runtime.run(first_graph, {"request": "process active rows"}, run_id="run-supabase-table-rows-scope-1")
+                second_state = runtime.run(second_graph, {"request": "process paused rows"}, run_id="run-supabase-table-rows-scope-2")
+
+        self.assertEqual(first_state.status, "completed")
+        self.assertEqual(second_state.status, "completed")
+        self.assertEqual(first_state.visit_counts.get("model"), 1)
+        self.assertEqual(second_state.visit_counts.get("model"), 1)
 
     def test_supabase_secret_key_omits_authorization_header(self) -> None:
         with SupabaseStubServer() as base_url:

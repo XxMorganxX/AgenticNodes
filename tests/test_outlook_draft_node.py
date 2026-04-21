@@ -17,6 +17,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from graph_agent.examples.tool_schema_repair import build_example_services
+from graph_agent.providers.base import ModelProvider, ModelRequest, ModelResponse, ProviderPreflightResult
 from graph_agent.providers.outlook import OutlookDraftClient, OutlookDraftResult
 from graph_agent.runtime.core import GraphDefinition
 from graph_agent.runtime.engine import GraphRuntime
@@ -77,6 +78,31 @@ class FakeMicrosoftAuthService:
     def acquire_access_token(self, *, scopes=None) -> str:  # noqa: ANN001
         self.acquire_calls += 1
         return "graph-token"
+
+
+class EmailDraftCaptureProvider(ModelProvider):
+    name = "email_request_capture"
+
+    def __init__(self) -> None:
+        self.last_request: ModelRequest | None = None
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        self.last_request = request
+        return ModelResponse(
+            content="",
+            structured_output={
+                "message": {
+                    "subject": "Prompt-generated subject",
+                    "body": "Prompt-generated body.",
+                },
+                "need_tool": False,
+                "tool_calls": [],
+            },
+            metadata={"provider": self.name},
+        )
+
+    def preflight(self, provider_config=None) -> ProviderPreflightResult:  # noqa: ANN001
+        return ProviderPreflightResult(status="available", ok=True, message="ok")
 
 
 class _OutlookDraftStubHandler(BaseHTTPRequestHandler):
@@ -359,6 +385,116 @@ def build_outlook_draft_graph_with_logger_payload() -> dict[str, object]:
     payload["nodes"] = nodes
     payload["edges"] = edges
     return payload
+
+
+def build_model_outlook_draft_graph_with_logger_payload() -> dict[str, object]:
+    return {
+        "graph_id": "outlook-draft-model-agent",
+        "name": "Outlook Draft Model Agent",
+        "description": "",
+        "version": "1.0",
+        "start_node_id": "start",
+        "nodes": [
+            {
+                "id": "start",
+                "kind": "input",
+                "category": "start",
+                "label": "Run Button Start",
+                "provider_id": "start.manual_run",
+                "provider_label": "Run Button Start",
+                "description": "",
+                "position": {"x": 0, "y": 0},
+                "config": {"input_binding": {"type": "input_payload"}},
+            },
+            {
+                "id": "model",
+                "kind": "model",
+                "category": "api",
+                "label": "Compose Email",
+                "provider_id": "core.api",
+                "provider_label": "API Call Node",
+                "model_provider_name": "email_request_capture",
+                "prompt_name": "compose_email",
+                "config": {
+                    "provider_name": "email_request_capture",
+                    "prompt_name": "compose_email",
+                    "system_prompt": "Write a concise outreach email.",
+                    "user_message_template": "Prospect context:\n{input_payload}",
+                    "response_mode": "message",
+                },
+                "position": {"x": 180, "y": 0},
+            },
+            {
+                "id": "draft",
+                "kind": "output",
+                "category": "end",
+                "label": "Outlook Draft End",
+                "provider_id": "end.outlook_draft",
+                "provider_label": "Outlook Draft End",
+                "description": "",
+                "position": {"x": 420, "y": 0},
+                "config": {
+                    "to": "alex@example.com",
+                    "source_binding": {"type": "latest_payload", "source": "model"},
+                    "subject": "",
+                    "require_to": True,
+                    "require_subject": True,
+                    "require_body": True,
+                },
+            },
+            {
+                "id": "logger",
+                "kind": "data",
+                "category": "data",
+                "label": "Outbound Email Logger",
+                "provider_id": "core.outbound_email_logger",
+                "provider_label": "Outbound Email Logger",
+                "description": "",
+                "position": {"x": 420, "y": 140},
+                "config": {
+                    "mode": "outbound_email_logger",
+                    "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_URL",
+                    "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_SECRET_KEY",
+                    "schema": "public",
+                    "table_name": "outbound_email_messages",
+                    "message_type": "initial",
+                    "outreach_step": 0,
+                    "sales_approach": "warm intro",
+                    "sales_approach_version": "v1",
+                    "metadata_json": "{\"campaign\":\"spring-launch\",\"run_id\":\"{run_id}\"}",
+                },
+            },
+        ],
+        "edges": [
+            {
+                "id": "edge-start-model",
+                "source_id": "start",
+                "target_id": "model",
+                "label": "draft",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            },
+            {
+                "id": "edge-model-draft",
+                "source_id": "model",
+                "target_id": "draft",
+                "label": "draft",
+                "kind": "standard",
+                "priority": 100,
+                "condition": None,
+            },
+            {
+                "id": "edge-logger-draft",
+                "source_id": "logger",
+                "target_id": "draft",
+                "label": "email log",
+                "kind": "binding",
+                "priority": 0,
+                "condition": None,
+            },
+        ],
+    }
 
 
 def build_spreadsheet_outlook_draft_graph_payload(*, csv_path: str, duplicate_loop_edges: bool = False) -> dict[str, object]:
@@ -926,6 +1062,57 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertEqual(row["raw_provider_payload"]["conversationId"], "conversation-123")
         self.assertEqual(state.final_output["outbound_email_log"]["table_name"], "outbound_email_messages")
         self.assertTrue(state.node_outputs["draft"]["outbound_email_log"])
+
+    def test_outlook_draft_node_logs_generation_prompts_from_model_source(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        prompt_provider = EmailDraftCaptureProvider()
+        self.services.model_providers[prompt_provider.name] = prompt_provider
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph = GraphDefinition.from_dict(build_model_outlook_draft_graph_with_logger_payload())
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        with SupabaseEmailLogStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_SUPABASE_URL": base_url,
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+            },
+            clear=False,
+        ):
+            state = runtime.run(graph, "Alex runs growth at Example Co.", run_id="run-outlook-log-prompts")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(fake_client.calls[0]["subject"], "Prompt-generated subject")
+        self.assertEqual(fake_client.calls[0]["body"], "Prompt-generated body.")
+        self.assertIsInstance(_SupabaseEmailLogStubHandler.last_json_body, dict)
+        row = _SupabaseEmailLogStubHandler.last_json_body
+        assert isinstance(row, dict)
+        self.assertIn("generation_prompt", row["metadata"])
+        generation_prompt = row["metadata"]["generation_prompt"]
+        self.assertEqual(generation_prompt["source_node_id"], "model")
+        self.assertEqual(generation_prompt["prompt_name"], "compose_email")
+        self.assertEqual(generation_prompt["system_prompt"], "Write a concise outreach email.")
+        self.assertEqual(generation_prompt["user_prompt"], "Prospect context:\nAlex runs growth at Example Co.")
+        self.assertEqual(
+            generation_prompt["messages"],
+            [
+                {"role": "system", "content": "Write a concise outreach email."},
+                {"role": "user", "content": "Prospect context:\nAlex runs growth at Example Co."},
+            ],
+        )
+        self.assertIsNotNone(prompt_provider.last_request)
+        assert prompt_provider.last_request is not None
+        self.assertEqual(prompt_provider.last_request.messages[0].content, generation_prompt["system_prompt"])
+        self.assertEqual(prompt_provider.last_request.messages[-1].content, generation_prompt["user_prompt"])
+        self.assertEqual(state.final_output["outbound_email_log"]["inserted_row"]["metadata"]["generation_prompt"], generation_prompt)
 
     def test_outlook_draft_node_logs_outbound_email_row_when_sales_approach_is_blank(self) -> None:
         fake_client = FakeOutlookDraftClient()

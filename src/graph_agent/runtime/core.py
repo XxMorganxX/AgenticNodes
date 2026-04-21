@@ -81,6 +81,13 @@ from graph_agent.runtime.supabase_data import (
     validate_outbound_email_log_schema,
     write_supabase_row,
 )
+from graph_agent.runtime.supabase_table_rows import (
+    SupabaseTableRowsCursorScope,
+    SupabaseTableRowsCursorStore,
+    SupabaseTableRowsRequest,
+    SupabaseTableRowsWatermark,
+    materialize_supabase_table_rows,
+)
 from graph_agent.runtime.node_providers import (
     NodeCategory,
     NodeProviderRegistry,
@@ -140,6 +147,8 @@ RUNTIME_NORMALIZER_PROVIDER_ID = "core.runtime_normalizer"
 RUNTIME_NORMALIZER_MODE = "runtime_normalizer"
 SUPABASE_DATA_PROVIDER_ID = "core.supabase_data"
 SUPABASE_DATA_MODE = "supabase_data"
+SUPABASE_TABLE_ROWS_PROVIDER_ID = "core.supabase_table_rows"
+SUPABASE_TABLE_ROWS_MODE = "supabase_table_rows"
 SUPABASE_ROW_WRITE_PROVIDER_ID = "core.supabase_row_write"
 SUPABASE_ROW_WRITE_MODE = "supabase_row_write"
 OUTBOUND_EMAIL_LOGGER_PROVIDER_ID = "core.outbound_email_logger"
@@ -811,6 +820,131 @@ class MessageEnvelope:
         )
 
 
+def _message_envelope_from_value(value: Any) -> MessageEnvelope | None:
+    if isinstance(value, Mapping) and "schema_version" in value and "payload" in value:
+        try:
+            return MessageEnvelope.from_dict(value)
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _request_message_payloads(messages: Sequence[ModelMessage]) -> list[dict[str, str]]:
+    payloads: list[dict[str, str]] = []
+    for message in messages:
+        role = str(message.role or "").strip()
+        if not role:
+            continue
+        payloads.append(
+            {
+                "role": role,
+                "content": str(message.content or ""),
+            }
+        )
+    return payloads
+
+
+def _request_prompt_trace_artifacts(messages: Sequence[ModelMessage]) -> dict[str, Any]:
+    request_messages = _request_message_payloads(messages)
+    if not request_messages:
+        return {}
+    artifacts: dict[str, Any] = {"request_messages": request_messages}
+    system_messages = [message["content"] for message in request_messages if message["role"] == "system"]
+    user_messages = [message["content"] for message in request_messages if message["role"] == "user"]
+    if system_messages:
+        artifacts["system_prompt"] = "\n\n".join(system_messages)
+    if user_messages:
+        artifacts["user_prompt"] = user_messages[-1]
+    return artifacts
+
+
+def _generation_prompt_capture_from_envelope(envelope: MessageEnvelope) -> dict[str, Any] | None:
+    if str(envelope.metadata.get("node_kind", "") or "").strip() != "model":
+        return None
+    raw_request_messages = envelope.artifacts.get("request_messages", [])
+    if not isinstance(raw_request_messages, Sequence) or isinstance(raw_request_messages, (str, bytes, bytearray)):
+        return None
+    request_messages: list[dict[str, str]] = []
+    for candidate in raw_request_messages:
+        if not isinstance(candidate, Mapping):
+            continue
+        role = str(candidate.get("role", "") or "").strip()
+        if not role:
+            continue
+        request_messages.append(
+            {
+                "role": role,
+                "content": str(candidate.get("content", "") or ""),
+            }
+        )
+    if not request_messages:
+        return None
+    system_prompt = str(envelope.artifacts.get("system_prompt", "") or "")
+    if not system_prompt:
+        system_prompt = "\n\n".join(
+            message["content"] for message in request_messages if message["role"] == "system"
+        )
+    user_prompt = str(envelope.artifacts.get("user_prompt", "") or "")
+    if not user_prompt:
+        user_messages = [message["content"] for message in request_messages if message["role"] == "user"]
+        if user_messages:
+            user_prompt = user_messages[-1]
+    return {
+        "source_node_id": envelope.from_node_id,
+        "prompt_name": str(envelope.metadata.get("prompt_name", "") or "").strip(),
+        "messages": request_messages,
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+    }
+
+
+def _generation_prompt_capture_from_value(value: Any) -> dict[str, Any] | None:
+    envelope = _message_envelope_from_value(value)
+    if envelope is not None:
+        capture = _generation_prompt_capture_from_envelope(envelope)
+        if capture is not None:
+            return capture
+        display_envelope = envelope.artifacts.get("display_envelope")
+        if display_envelope is not None:
+            capture = _generation_prompt_capture_from_value(display_envelope)
+            if capture is not None:
+                return capture
+        payload = envelope.payload
+        if isinstance(payload, Mapping):
+            capture = _generation_prompt_capture_from_value(payload)
+            if capture is not None:
+                return capture
+        return None
+    if isinstance(value, Mapping):
+        for key in ("display_envelope", "payload", "source_payload"):
+            if key not in value:
+                continue
+            capture = _generation_prompt_capture_from_value(value.get(key))
+            if capture is not None:
+                return capture
+    return None
+
+
+def generation_prompt_capture_from_value(value: Any) -> dict[str, Any] | None:
+    capture = _generation_prompt_capture_from_value(value)
+    return dict(capture) if isinstance(capture, Mapping) else None
+
+
+def generation_prompt_captures_from_node_outputs(node_outputs: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(node_outputs, Mapping):
+        return []
+    captures: list[dict[str, Any]] = []
+    for node_id, value in node_outputs.items():
+        capture = generation_prompt_capture_from_value(value)
+        if capture is None:
+            continue
+        source_node_id = str(capture.get("source_node_id", "") or "").strip()
+        if not source_node_id and isinstance(node_id, str) and node_id:
+            capture["source_node_id"] = node_id
+        captures.append(capture)
+    return captures
+
+
 @dataclass
 class NodeExecutionResult:
     status: str
@@ -1105,6 +1239,7 @@ class RunState:
     final_output: Any = None
     terminal_error: dict[str, Any] | None = None
     agent_runs: dict[str, Any] = field(default_factory=dict)
+    runtime_preview_cache: dict[str, Any] = field(default_factory=dict)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -3744,7 +3879,197 @@ class ControlFlowNode(BaseNode):
                 "iterator_state": iterator_state,
                 "control_flow_handle_id": CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
                 "_internal": {
-                    "spreadsheet_row_envelopes": self._spreadsheet_row_envelopes(parse_result),
+                    "iterator_envelopes": self._spreadsheet_row_envelopes(parse_result),
+                    "iterator_type": "spreadsheet_rows",
+                    "iterator_item_label": "spreadsheet row",
+                    "iterator_handle_id": CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
+                },
+            },
+        )
+
+    def _supabase_table_rows_config(self, context: NodeContext) -> dict[str, Any]:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        supabase_url_env_var, supabase_key_env_var = resolve_supabase_runtime_env_var_names(resolved, context.graph)
+        return {
+            "supabase_url": resolve_graph_process_env(supabase_url_env_var, context.graph.env_vars),
+            "supabase_key": resolve_graph_process_env(supabase_key_env_var, context.graph.env_vars),
+            "supabase_connection_id": str(resolved.get("supabase_connection_id", "") or "").strip(),
+            "schema": str(resolved.get("schema", "public") or "public").strip() or "public",
+            "table_name": str(resolved.get("table_name", "") or "").strip(),
+            "select": str(resolved.get("select", "*") or "*").strip() or "*",
+            "filters_text": str(resolved.get("filters_text", "") or "").strip(),
+            "cursor_column": str(resolved.get("cursor_column", "") or "").strip(),
+            "row_id_column": str(resolved.get("row_id_column", "id") or "id").strip() or "id",
+            "page_size": _coerce_int(resolved.get("page_size"), default=500, minimum=1),
+        }
+
+    def _supabase_table_rows_scope(
+        self,
+        context: NodeContext,
+        resolved_config: Mapping[str, Any],
+    ) -> SupabaseTableRowsCursorScope:
+        connection_identity = str(resolved_config.get("supabase_url", "") or "").strip()
+        if not connection_identity:
+            connection_identity = str(resolved_config.get("supabase_connection_id", "") or "").strip()
+        return SupabaseTableRowsCursorScope(
+            graph_id=context.graph.graph_id,
+            agent_id=str(context.state.agent_id or ""),
+            node_id=self.id,
+            connection_identity=connection_identity,
+            schema=str(resolved_config.get("schema", "public") or "public").strip() or "public",
+            table_name=str(resolved_config.get("table_name", "") or "").strip(),
+            filters_text=str(resolved_config.get("filters_text", "") or "").strip(),
+            cursor_column=str(resolved_config.get("cursor_column", "") or "").strip(),
+            row_id_column=str(resolved_config.get("row_id_column", "id") or "id").strip() or "id",
+        )
+
+    def _supabase_table_rows_request(
+        self,
+        context: NodeContext,
+        *,
+        resolved_config: Mapping[str, Any],
+        watermark: SupabaseTableRowsWatermark | None,
+    ) -> SupabaseTableRowsRequest:
+        return SupabaseTableRowsRequest(
+            supabase_url=str(resolved_config.get("supabase_url", "") or "").strip(),
+            supabase_key=str(resolved_config.get("supabase_key", "") or "").strip(),
+            schema=str(resolved_config.get("schema", "public") or "public").strip() or "public",
+            table_name=str(resolved_config.get("table_name", "") or "").strip(),
+            select=str(resolved_config.get("select", "*") or "*").strip() or "*",
+            filters_text=str(resolved_config.get("filters_text", "") or "").strip(),
+            cursor_column=str(resolved_config.get("cursor_column", "") or "").strip(),
+            row_id_column=str(resolved_config.get("row_id_column", "id") or "id").strip() or "id",
+            page_size=_coerce_int(resolved_config.get("page_size"), default=500, minimum=1),
+            last_cursor_value=watermark.last_cursor_value if watermark is not None else "",
+            last_row_id=watermark.last_row_id if watermark is not None else "",
+        )
+
+    def _supabase_table_rows_iterator_state(
+        self,
+        result: Any,
+        *,
+        watermark: SupabaseTableRowsWatermark | None,
+    ) -> dict[str, Any]:
+        return {
+            "iterator_type": "supabase_table_rows",
+            "status": "ready" if result.row_count > 0 else "completed",
+            "current_row_index": 0,
+            "total_rows": result.row_count,
+            "schema": result.schema,
+            "table_name": result.table_name,
+            "cursor_column": result.cursor_column,
+            "row_id_column": result.row_id_column,
+            "last_cached_cursor_value": watermark.last_cursor_value if watermark is not None else None,
+            "last_cached_row_id": watermark.last_row_id if watermark is not None else None,
+        }
+
+    def _supabase_table_row_envelopes(self, result: Any) -> list[dict[str, Any]]:
+        row_envelopes: list[dict[str, Any]] = []
+        total_rows = result.row_count
+        for position, row in enumerate(result.rows, start=1):
+            row_id = row.get(result.row_id_column)
+            cursor_value = row.get(result.cursor_column)
+            envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id=self.id,
+                from_category=self.category.value,
+                payload={
+                    "row_index": position,
+                    "row_data": dict(row),
+                    "row_id": row_id,
+                    "cursor_column": result.cursor_column,
+                    "cursor_value": cursor_value,
+                    "schema": result.schema,
+                    "table_name": result.table_name,
+                },
+                metadata={
+                    "contract": "data_envelope",
+                    "node_kind": self.kind,
+                    "data_mode": "supabase_table_row",
+                    "provider_id": self.provider_id,
+                    "iterator_type": "supabase_table_rows",
+                    "row_index": position,
+                    "row_id": row_id,
+                    "cursor_column": result.cursor_column,
+                    "cursor_value": cursor_value,
+                    "row_id_column": result.row_id_column,
+                    "total_rows": total_rows,
+                    "schema": result.schema,
+                    "table_name": result.table_name,
+                },
+            )
+            row_envelopes.append(envelope.to_dict())
+        return row_envelopes
+
+    def _execute_supabase_table_rows(self, context: NodeContext) -> NodeExecutionResult:
+        try:
+            resolved_config = self._supabase_table_rows_config(context)
+            scope = self._supabase_table_rows_scope(context, resolved_config)
+            cursor_store = SupabaseTableRowsCursorStore()
+            watermark = cursor_store.load_watermark(scope)
+            request = self._supabase_table_rows_request(
+                context,
+                resolved_config=resolved_config,
+                watermark=watermark,
+            )
+            result = materialize_supabase_table_rows(request)
+        except SupabaseDataError as exc:
+            return NodeExecutionResult(
+                status="failed",
+                error=exc.to_error_payload(),
+                summary=str(exc),
+            )
+
+        iterator_state = self._supabase_table_rows_iterator_state(result, watermark=watermark)
+        summary_envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload={
+                "schema": result.schema,
+                "table_name": result.table_name,
+                "row_count": result.row_count,
+                "cursor_column": result.cursor_column,
+                "row_id_column": result.row_id_column,
+            },
+            artifacts={
+                "supabase_request_urls": list(result.request_urls),
+            },
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "control_flow_mode": SUPABASE_TABLE_ROWS_MODE,
+                "provider_id": self.provider_id,
+                "iterator_type": "supabase_table_rows",
+                "schema": result.schema,
+                "table_name": result.table_name,
+                "cursor_column": result.cursor_column,
+                "row_id_column": result.row_id_column,
+                "total_rows": result.row_count,
+            },
+        )
+
+        def _mark_completed() -> None:
+            cursor_store.mark_completed(
+                scope=scope,
+                last_cursor_value=result.last_cursor_value,
+                last_row_id=result.last_row_id,
+                run_id=context.state.run_id,
+            )
+
+        return NodeExecutionResult(
+            status="success",
+            output=summary_envelope.to_dict(),
+            summary=f"Prepared {result.row_count} Supabase row(s) from table '{result.table_name}'.",
+            metadata={
+                "iterator_state": iterator_state,
+                "control_flow_handle_id": CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
+                "_internal": {
+                    "iterator_envelopes": self._supabase_table_row_envelopes(result),
+                    "iterator_type": "supabase_table_rows",
+                    "iterator_item_label": "Supabase row",
+                    "iterator_handle_id": CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
+                    "iterator_on_completed": _mark_completed,
                 },
             },
         )
@@ -4112,6 +4437,28 @@ class ControlFlowNode(BaseNode):
     def runtime_input_preview(self, context: NodeContext) -> Any:
         if self.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
             return self._spreadsheet_config(context)
+        if self.provider_id == SUPABASE_TABLE_ROWS_PROVIDER_ID:
+            resolved_config = self._supabase_table_rows_config(context)
+            scope = self._supabase_table_rows_scope(context, resolved_config)
+            watermark = SupabaseTableRowsCursorStore().load_watermark(scope)
+            return {
+                "schema": resolved_config["schema"],
+                "table_name": resolved_config["table_name"],
+                "select": resolved_config["select"],
+                "filters_text": resolved_config["filters_text"],
+                "cursor_column": resolved_config["cursor_column"],
+                "row_id_column": resolved_config["row_id_column"],
+                "page_size": resolved_config["page_size"],
+                "supabase_url_present": bool(resolved_config["supabase_url"]),
+                "supabase_key_present": bool(resolved_config["supabase_key"]),
+                "watermark": None
+                if watermark is None
+                else {
+                    "last_cursor_value": watermark.last_cursor_value,
+                    "last_row_id": watermark.last_row_id,
+                    "updated_at": watermark.updated_at,
+                },
+            }
         source_envelope = self._source_envelope(context)
         return {
             "incoming_contract": source_envelope.metadata.get("contract"),
@@ -4121,6 +4468,8 @@ class ControlFlowNode(BaseNode):
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         if self.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
             return self._execute_spreadsheet_rows(context)
+        if self.provider_id == SUPABASE_TABLE_ROWS_PROVIDER_ID:
+            return self._execute_supabase_table_rows(context)
         if self.provider_id == PARALLEL_SPLITTER_PROVIDER_ID:
             return self._execute_parallel_splitter(context)
         if self.provider_id == LOGIC_CONDITIONS_PROVIDER_ID:
@@ -4415,6 +4764,7 @@ class ModelNode(BaseNode):
         )
         provider = context.services.model_providers[provider_name]
         request = self._build_request(context, bound_provider_node)
+        prompt_trace_artifacts = _request_prompt_trace_artifacts(request.messages)
         metadata = request.metadata
         response_mode_hint = request.response_mode
         available_tool_payloads = list(metadata.get("available_tools", []))
@@ -4472,6 +4822,7 @@ class ModelNode(BaseNode):
                 from_node_id=self.id,
                 from_category=self.category.value,
                 payload=None,
+                artifacts=dict(prompt_trace_artifacts),
                 errors=[error],
                 metadata={
                     "contract": "message_envelope",
@@ -4507,7 +4858,7 @@ class ModelNode(BaseNode):
 
         tool_envelope: MessageEnvelope | None = None
         if emit_tool_call_envelope:
-            tool_artifacts: dict[str, Any] = {}
+            tool_artifacts: dict[str, Any] = dict(prompt_trace_artifacts)
             source_input = context.resolve_binding(None)
             source_input_envelope: MessageEnvelope | None = None
             if isinstance(source_input, Mapping) and "metadata" in source_input:
@@ -4535,7 +4886,7 @@ class ModelNode(BaseNode):
             route_outputs[API_TOOL_CALL_HANDLE_ID] = tool_envelope.to_dict()
 
         if not emit_tool_call_envelope and callable_tool_names:
-            tool_artifacts_nt: dict[str, Any] = {}
+            tool_artifacts_nt: dict[str, Any] = dict(prompt_trace_artifacts)
             source_input_nt = context.resolve_binding(None)
             source_input_envelope_nt: MessageEnvelope | None = None
             if isinstance(source_input_nt, Mapping) and "metadata" in source_input_nt:
@@ -4571,6 +4922,7 @@ class ModelNode(BaseNode):
                 from_node_id=self.id,
                 from_category=self.category.value,
                 payload=message_payload,
+                artifacts=dict(prompt_trace_artifacts),
                 metadata={
                     "contract": "message_envelope",
                     **base_metadata,
@@ -4583,6 +4935,7 @@ class ModelNode(BaseNode):
             from_node_id=self.id,
             from_category=self.category.value,
             payload=decision_output["message"],
+            artifacts=dict(prompt_trace_artifacts),
             metadata={
                 "contract": "message_envelope",
                 **base_metadata,
@@ -4680,6 +5033,43 @@ class SpreadsheetMatrixDecisionNode(ModelNode):
     ) -> ModelRequest:
         request, _ = self._build_matrix_request(context, bound_provider_node)
         return request
+
+    def _matrix_request_cache_key(self, context: NodeContext) -> tuple[str, int, str | None, str | None]:
+        iteration_id = str(context.state.current_iteration_context.get("iteration_id", "") or "").strip() or None
+        incoming_edge_id = str(context.state.current_edge_id or "").strip() or None
+        visit_count = int(context.state.visit_counts.get(self.id, 0) or 0)
+        return (self.id, visit_count, incoming_edge_id, iteration_id)
+
+    def _cache_matrix_request(
+        self,
+        context: NodeContext,
+        request: ModelRequest,
+        matrix: SpreadsheetMatrixParseResult,
+    ) -> None:
+        context.state.runtime_preview_cache[self.id] = {
+            "key": self._matrix_request_cache_key(context),
+            "request": request,
+            "matrix": matrix,
+        }
+
+    def _consume_cached_matrix_request(
+        self,
+        context: NodeContext,
+    ) -> tuple[ModelRequest, SpreadsheetMatrixParseResult] | None:
+        cached = context.state.runtime_preview_cache.get(self.id)
+        if not isinstance(cached, Mapping):
+            return None
+        cached_key = cached.get("key")
+        if not isinstance(cached_key, tuple) or cached_key != self._matrix_request_cache_key(context):
+            context.state.runtime_preview_cache.pop(self.id, None)
+            return None
+        request = cached.get("request")
+        matrix = cached.get("matrix")
+        if not isinstance(request, ModelRequest) or not isinstance(matrix, SpreadsheetMatrixParseResult):
+            context.state.runtime_preview_cache.pop(self.id, None)
+            return None
+        context.state.runtime_preview_cache.pop(self.id, None)
+        return request, matrix
 
     def _build_matrix_request(
         self,
@@ -4826,7 +5216,11 @@ class SpreadsheetMatrixDecisionNode(ModelNode):
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         bound_provider_node = context.bound_provider_node(self.id)
         try:
-            request, matrix = self._build_matrix_request(context, bound_provider_node)
+            cached_request = self._consume_cached_matrix_request(context)
+            if cached_request is not None:
+                request, matrix = cached_request
+            else:
+                request, matrix = self._build_matrix_request(context, bound_provider_node)
         except SpreadsheetParseError as exc:
             return NodeExecutionResult(
                 status="failed",
@@ -4837,6 +5231,7 @@ class SpreadsheetMatrixDecisionNode(ModelNode):
         provider_name = self._resolved_provider_name(bound_provider_node)
         provider = context.services.model_providers[provider_name]
         response = provider.generate(request)
+        prompt_trace_artifacts = _request_prompt_trace_artifacts(request.messages)
         try:
             selection = self._selection_from_response(response, matrix)
         except ValueError as exc:
@@ -4846,6 +5241,7 @@ class SpreadsheetMatrixDecisionNode(ModelNode):
                 from_node_id=self.id,
                 from_category=self.category.value,
                 payload=None,
+                artifacts=dict(prompt_trace_artifacts),
                 errors=[error],
                 metadata={
                     "contract": "message_envelope",
@@ -4876,12 +5272,14 @@ class SpreadsheetMatrixDecisionNode(ModelNode):
             "sheet_name": matrix.sheet_name,
             "source_file": matrix.source_file,
         }
+        artifacts = dict(prompt_trace_artifacts)
+        artifacts["spreadsheet_matrix_selection"] = selection_payload
         envelope = MessageEnvelope(
             schema_version="1.0",
             from_node_id=self.id,
             from_category=self.category.value,
             payload=selected_value,
-            artifacts={"spreadsheet_matrix_selection": selection_payload},
+            artifacts=artifacts,
             metadata={
                 "contract": "message_envelope",
                 "node_kind": self.kind,
@@ -4913,7 +5311,9 @@ class SpreadsheetMatrixDecisionNode(ModelNode):
         try:
             request, matrix = self._build_matrix_request(context)
         except SpreadsheetParseError as exc:
+            context.state.runtime_preview_cache.pop(self.id, None)
             return {"error": str(exc)}
+        self._cache_matrix_request(context, request, matrix)
         return {
             "messages": [{"role": message.role, "content": message.content} for message in request.messages],
             "response_mode": request.response_mode,
@@ -5121,13 +5521,7 @@ class McpToolExecutorNode(BaseNode):
         )
 
     def _source_envelope_from_value(self, bound_value: Any) -> MessageEnvelope | None:
-        source_envelope: MessageEnvelope | None = None
-        if isinstance(bound_value, Mapping) and "schema_version" in bound_value and "payload" in bound_value:
-            try:
-                source_envelope = MessageEnvelope.from_dict(bound_value)
-            except Exception:  # noqa: BLE001
-                source_envelope = None
-        return source_envelope
+        return _message_envelope_from_value(bound_value)
 
     def _extract_tool_call_from_value(self, value: Any) -> tuple[MessageEnvelope | None, str, dict[str, Any]]:
         source_envelope = self._source_envelope_from_value(value)
@@ -6095,11 +6489,39 @@ class McpToolExecutorNode(BaseNode):
         }
 
 
-def _resolve_output_payload(context: NodeContext, binding: Mapping[str, Any] | None) -> Any:
-    bound_value = context.resolve_binding(binding)
+def _payload_from_bound_value(bound_value: Any) -> Any:
     if isinstance(bound_value, Mapping) and "payload" in bound_value:
         return bound_value.get("payload")
     return bound_value
+
+
+def _output_source_value_for_prompt_capture(context: NodeContext, binding: Mapping[str, Any] | None) -> Any:
+    source_value = context.resolve_binding(binding)
+    if _generation_prompt_capture_from_value(source_value) is not None:
+        return source_value
+    if not isinstance(binding, Mapping):
+        return source_value
+    binding_type = str(binding.get("type", "") or "").strip()
+    if binding_type == "latest_payload":
+        source_id = str(binding.get("source", "") or "").strip()
+        if source_id:
+            envelope = context.latest_envelope(source_id)
+            if envelope is not None:
+                return envelope.to_dict()
+        return source_value
+    if binding_type == "first_available_payload":
+        for source_id in context._binding_sources_in_resolution_order(binding.get("sources", [])):
+            envelope = context.latest_envelope(source_id)
+            if envelope is None:
+                continue
+            captured_value = envelope.to_dict()
+            if _generation_prompt_capture_from_value(captured_value) is not None:
+                return captured_value
+    return source_value
+
+
+def _resolve_output_payload(context: NodeContext, binding: Mapping[str, Any] | None) -> Any:
+    return _payload_from_bound_value(context.resolve_binding(binding))
 
 
 def _coerce_discord_message_text(value: Any) -> str:
@@ -6580,6 +7002,7 @@ class OutlookDraftOutputNode(OutputNode):
         self,
         context: NodeContext,
         *,
+        source_value: Any,
         payload: Any,
         auth_status: MicrosoftAuthStatus,
         draft: Any,
@@ -6599,6 +7022,7 @@ class OutlookDraftOutputNode(OutputNode):
                 details={"node_id": binding.node_id},
             )
 
+        generation_prompt = _generation_prompt_capture_from_value(source_value)
         metadata_extra = {
             "message_payload": payload,
             "message_json": _json_safe(payload),
@@ -6613,6 +7037,12 @@ class OutlookDraftOutputNode(OutputNode):
             "run_id": context.state.run_id,
             "graph_id": context.state.graph_id,
         }
+        if generation_prompt is not None:
+            metadata_extra["generation_prompt"] = generation_prompt
+            metadata_extra["generation_prompt_name"] = generation_prompt.get("prompt_name", "")
+            metadata_extra["generation_source_node_id"] = generation_prompt.get("source_node_id", "")
+            metadata_extra["generation_system_prompt"] = generation_prompt.get("system_prompt", "")
+            metadata_extra["generation_user_prompt"] = generation_prompt.get("user_prompt", "")
         sales_approach = self._render_outbound_email_logger_value(context, binding.sales_approach_template, metadata_extra)
         if binding.message_type not in {"initial", "follow_up"}:
             raise SupabaseDataError(
@@ -6645,6 +7075,8 @@ class OutlookDraftOutputNode(OutputNode):
             "source_payload": payload,
         }
         metadata.update(self._render_outbound_email_logger_metadata(context, binding, metadata_extra))
+        if generation_prompt is not None:
+            metadata["generation_prompt"] = generation_prompt
 
         row: dict[str, Any] = {}
 
@@ -6746,7 +7178,9 @@ class OutlookDraftOutputNode(OutputNode):
         )
 
     def execute(self, context: NodeContext) -> NodeExecutionResult:
-        payload = _resolve_output_payload(context, self.config.get("source_binding"))
+        source_binding = self.config.get("source_binding")
+        source_value = _output_source_value_for_prompt_capture(context, source_binding)
+        payload = _payload_from_bound_value(source_value)
         recipients = self._resolved_to_recipients(context, payload)
         subject = self._render_subject(context, payload)
         body = self._render_body(payload)
@@ -6873,6 +7307,7 @@ class OutlookDraftOutputNode(OutputNode):
             try:
                 logged_outbound_email = self._write_outbound_email_log(
                     context,
+                    source_value=source_value,
                     payload=payload,
                     auth_status=auth_status,
                     draft=draft,
@@ -7124,7 +7559,7 @@ class GraphDefinition:
         if not output_nodes:
             raise GraphValidationError("Graphs must include at least one 'end' category node.")
         for node in self.nodes.values():
-            if node.provider_id not in {SUPABASE_DATA_PROVIDER_ID, SUPABASE_ROW_WRITE_PROVIDER_ID, OUTBOUND_EMAIL_LOGGER_PROVIDER_ID}:
+            if node.provider_id not in {SUPABASE_DATA_PROVIDER_ID, SUPABASE_TABLE_ROWS_PROVIDER_ID, SUPABASE_ROW_WRITE_PROVIDER_ID, OUTBOUND_EMAIL_LOGGER_PROVIDER_ID}:
                 continue
             connection_id = str(node.config.get("supabase_connection_id", "") or "").strip()
             if connection_id and self.get_supabase_connection(connection_id) is None:
@@ -7246,7 +7681,7 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Outbound email logger '{node.id}' uses unsupported message_type '{message_type}'."
                     )
-            if node.provider_id in {SUPABASE_DATA_PROVIDER_ID, SUPABASE_ROW_WRITE_PROVIDER_ID, OUTBOUND_EMAIL_LOGGER_PROVIDER_ID}:
+            if node.provider_id in {SUPABASE_DATA_PROVIDER_ID, SUPABASE_TABLE_ROWS_PROVIDER_ID, SUPABASE_ROW_WRITE_PROVIDER_ID, OUTBOUND_EMAIL_LOGGER_PROVIDER_ID}:
                 connection_id = str(node.config.get("supabase_connection_id", "") or "").strip()
                 if connection_id and self.get_supabase_connection(connection_id) is None:
                     raise GraphValidationError(
@@ -7751,6 +8186,39 @@ class GraphDefinition:
                     if invalid_handles:
                         raise GraphValidationError(
                             f"Spreadsheet rows node '{node.id}' uses unsupported output handle(s): {', '.join(str(handle) for handle in invalid_handles)}."
+                        )
+                if node.provider_id == SUPABASE_TABLE_ROWS_PROVIDER_ID:
+                    table_name = str(node.config.get("table_name", "") or "").strip()
+                    cursor_column = str(node.config.get("cursor_column", "") or "").strip()
+                    row_id_column = str(node.config.get("row_id_column", "id") or "id").strip() or "id"
+                    if not table_name:
+                        raise GraphValidationError(
+                            f"Supabase table rows node '{node.id}' must declare a table_name."
+                        )
+                    if not cursor_column:
+                        raise GraphValidationError(
+                            f"Supabase table rows node '{node.id}' must declare a cursor_column."
+                        )
+                    if not row_id_column:
+                        raise GraphValidationError(
+                            f"Supabase table rows node '{node.id}' must declare a row_id_column."
+                        )
+                    try:
+                        if int(node.config.get("page_size", 500)) < 1:
+                            raise ValueError("page_size")
+                    except (TypeError, ValueError) as exc:
+                        raise GraphValidationError(
+                            f"Supabase table rows node '{node.id}' must declare a positive page_size value."
+                        ) from exc
+                    allowed_handles = {CONTROL_FLOW_LOOP_BODY_HANDLE_ID, None}
+                    invalid_handles = [
+                        edge.source_handle_id
+                        for edge in self.get_outgoing_edges(node.id)
+                        if edge.kind != "binding" and edge.source_handle_id not in allowed_handles
+                    ]
+                    if invalid_handles:
+                        raise GraphValidationError(
+                            f"Supabase table rows node '{node.id}' uses unsupported output handle(s): {', '.join(str(handle) for handle in invalid_handles)}."
                         )
                 if node.provider_id == LOGIC_CONDITIONS_PROVIDER_ID:
                     branch_handles: set[str] = set()

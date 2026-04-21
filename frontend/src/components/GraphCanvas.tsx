@@ -64,6 +64,8 @@ import type { GraphLayoutNodeDimensions } from "../lib/editor";
 import { logGraphDiagnostic, useGraphDiagnosticsEnabled, useRenderDiagnostics } from "../lib/dragDiagnostics";
 import { clearHotbarFavorite, getHotbarFavorites, setHotbarFavorite } from "../lib/hotbarFavorites";
 import type { HotbarFavorites } from "../lib/hotbarFavorites";
+import { buildNodeInstanceLabelMap } from "../lib/nodeInstanceLabels";
+import { RESPONSE_SCHEMA_TEXT_CONFIG_KEY } from "../lib/responseSchema";
 import { deleteSavedNode, getSavedNodes, saveNodeToLibrary } from "../lib/savedNodes";
 import type { SavedNode } from "../lib/savedNodes";
 import { buildContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
@@ -110,6 +112,8 @@ type GraphCanvasProps = {
   selectedNodeId: string | null;
   selectedEdgeId: string | null;
   onGraphChange: (graph: GraphDefinition) => void;
+  onBackgroundPersistGraph?: (graph: GraphDefinition) => void;
+  onGraphQuietChange: (graph: GraphDefinition) => void;
   onGraphDrag: (graph: GraphDefinition) => void;
   onFormatGraph: (nodeDimensions: Record<string, GraphLayoutNodeDimensions>) => void;
   onRunGraph: () => void;
@@ -448,6 +452,99 @@ type JunctionDragState = {
 type GraphCanvasRuntimeNodeData = GraphCanvasNodeData & {
   isConnectionMagnetized?: boolean;
 };
+
+const CANVAS_CONFIG_IGNORED_KEYS = new Set([
+  "system_prompt",
+  "user_message_template",
+  "content",
+  "response_schema",
+  RESPONSE_SCHEMA_TEXT_CONFIG_KEY,
+]);
+
+function stringifyCanvasConfigValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean" || value == null) {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function buildCanvasNodeRenderSignature(node: GraphNode): string {
+  const configSignature = Object.entries(node.config)
+    .filter(([key]) => !CANVAS_CONFIG_IGNORED_KEYS.has(key))
+    .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+    .map(([key, value]) => `${key}:${stringifyCanvasConfigValue(value)}`)
+    .join("|");
+  return [
+    node.id,
+    node.kind,
+    node.provider_id,
+    String(node.category ?? ""),
+    String(node.label ?? ""),
+    String(node.provider_label ?? ""),
+    String(node.model_provider_name ?? ""),
+    `${Math.round(node.position.x)}:${Math.round(node.position.y)}`,
+    configSignature,
+  ].join("::");
+}
+
+function buildCanvasGraphRenderSignature(graph: GraphDefinition | null): string {
+  if (!graph) {
+    return "";
+  }
+  const nodeSignature = graph.nodes.map((node) => buildCanvasNodeRenderSignature(node)).join("||");
+  const edgeSignature = graph.edges
+    .map((edge) => [
+      edge.id,
+      edge.kind,
+      edge.source_id,
+      edge.target_id,
+      edge.source_handle_id ?? "",
+      edge.target_handle_id ?? "",
+      String(edge.label ?? ""),
+      String(edge.condition?.label ?? ""),
+      (edge.waypoints ?? []).map((point) => `${Math.round(point.x)}:${Math.round(point.y)}`).join(";"),
+    ].join("::"))
+    .join("||");
+  const supabaseConnectionSignature = (graph.supabase_connections ?? [])
+    .map((connection) => [
+      connection.connection_id,
+      connection.name ?? "",
+      connection.supabase_url_env_var ?? "",
+      connection.supabase_key_env_var ?? "",
+    ].join("::"))
+    .join("||");
+  return [nodeSignature, edgeSignature, supabaseConnectionSignature, graph.default_supabase_connection_id ?? ""].join("###");
+}
+
+function buildEdgeGeometrySignature(graph: GraphDefinition | null): string {
+  if (!graph) {
+    return "";
+  }
+  const nodeSignature = graph.nodes
+    .map((node) => `${buildCanvasNodeRenderSignature(node)}@@${Math.round(node.position.x)}:${Math.round(node.position.y)}`)
+    .join("||");
+  const edgeSignature = graph.edges
+    .map((edge) => [
+      edge.id,
+      edge.kind,
+      edge.source_id,
+      edge.target_id,
+      edge.source_handle_id ?? "",
+      edge.target_handle_id ?? "",
+      String(edge.label ?? ""),
+      String(edge.condition?.label ?? ""),
+      (edge.waypoints ?? []).map((point) => `${Math.round(point.x)}:${Math.round(point.y)}`).join(";"),
+    ].join("::"))
+    .join("||");
+  return [nodeSignature, edgeSignature].join("###");
+}
 
 function formatConditionResultsText(value: unknown): string {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -851,6 +948,8 @@ export function GraphCanvas({
   selectedNodeId,
   selectedEdgeId,
   onGraphChange,
+  onBackgroundPersistGraph,
+  onGraphQuietChange,
   onGraphDrag,
   onFormatGraph,
   onRunGraph,
@@ -935,6 +1034,9 @@ export function GraphCanvas({
   const dragDiagnosticSessionIdRef = useRef(0);
   const zoomAnimationDuration = 120;
   const vizLocked = panLocked || isCommandHeld;
+  const canvasGraphRenderSignature = useMemo(() => buildCanvasGraphRenderSignature(graph), [graph]);
+  const edgeGeometrySignature = useMemo(() => buildEdgeGeometrySignature(graph), [graph]);
+  const nodeInstanceLabelMap = useMemo(() => buildNodeInstanceLabelMap(graph), [canvasGraphRenderSignature]);
   const outboundEmailLoggerValidationRequests = useMemo(() => {
     if (!graph) {
       return [] as Array<{
@@ -3784,7 +3886,9 @@ export function GraphCanvas({
               targetPosition: "left" as Position,
               data: nodeDataCacheRef.current.get(node.id) ?? {
                 node,
-                graph: null,
+                graph,
+                graphRenderSignature: canvasGraphRenderSignature,
+                displayLabel: nodeInstanceLabelMap.get(node.id) ?? node.id,
                 catalog,
                 runState,
                 availableProjectFiles,
@@ -3845,6 +3949,7 @@ export function GraphCanvas({
         node.provider_id === "core.context_builder"
           ? buildContextBuilderRuntimeView(graph, node, runState, normalizedEvents)
           : null;
+      const displayLabel = nodeInstanceLabelMap.get(node.id) ?? node.id;
       const contextBuilderRuntimeKey = contextBuilderRuntime
         ? [
             contextBuilderRuntime.fulfilledCount,
@@ -3884,7 +3989,8 @@ export function GraphCanvas({
         !isParallelSplitterNode &&
         previousData &&
         previousData.node === node &&
-        previousData.graph === graph &&
+        previousData.graphRenderSignature === canvasGraphRenderSignature &&
+        previousData.displayLabel === displayLabel &&
         previousData.tooltipGraph === tooltipGraph &&
         previousData.catalog === catalog &&
         previousData.runState === runState &&
@@ -3912,6 +4018,8 @@ export function GraphCanvas({
           : {
               node,
               graph,
+              graphRenderSignature: canvasGraphRenderSignature,
+              displayLabel,
               tooltipGraph,
               catalog,
               runState,
@@ -3978,13 +4086,13 @@ export function GraphCanvas({
     return nextNodes;
   }, [
     availableProjectFiles,
+    canvasGraphRenderSignature,
     catalog,
     dragDiagnosticsEnabled,
     dragRenderTick,
     draftConnection?.sourceNodeId,
     draftConnectionSnapTargetNodeId,
     getFlowNodeDimensions,
-    graph,
     handleJunctionPointerDown,
     handleNodeHandlePointerDown,
     handleOpenContextBuilderPayload,
@@ -3999,6 +4107,7 @@ export function GraphCanvas({
     handleToggleTooltip,
     isConnecting,
     isNodeDragActive,
+    nodeInstanceLabelMap,
     recordNodeBuildDiagnostic,
     runProjection,
     runState,
@@ -4289,7 +4398,7 @@ export function GraphCanvas({
       };
     });
     return edgeLayouts;
-  }, [dragRenderTick, getNodeDimensions, graph, handleWaypointPointerDown, isNodeDragActive, outboundEmailLoggerEdgeValidation, runState?.current_edge_id, selectedEdgeIdSet, waypointDrag]);
+  }, [dragRenderTick, edgeGeometrySignature, getNodeDimensions, handleWaypointPointerDown, isNodeDragActive, outboundEmailLoggerEdgeValidation, runState?.current_edge_id, selectedEdgeIdSet, waypointDrag]);
 
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -5189,6 +5298,7 @@ export function GraphCanvas({
           runState={runState}
           catalog={catalog}
           onGraphChange={onGraphChange}
+          onBackgroundPersistGraph={onBackgroundPersistGraph}
           onClose={() => setProviderDetailsNodeId(null)}
         />
       ) : null}
@@ -5219,6 +5329,7 @@ export function GraphCanvas({
           catalog={catalog}
           runState={runState}
           onGraphChange={onGraphChange}
+          onBackgroundPersistGraph={onBackgroundPersistGraph}
           onClose={() => setPromptBlockDetailsNodeId(null)}
         />
       ) : null}

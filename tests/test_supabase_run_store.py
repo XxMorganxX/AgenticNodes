@@ -126,6 +126,124 @@ def wait_for_run_completion(manager: GraphRunManager, run_id: str, timeout_secon
 
 
 class SupabaseRunStoreTests(unittest.TestCase):
+    def test_append_event_persists_generation_prompt_metadata(self) -> None:
+        with SupabaseStubServer() as url:
+            store = SupabaseRunStore(url=url, service_role_key="test-key")
+            state = build_run_state("run-1", "graph-1", {"prompt": "hello"})
+            store.initialize_run(state)
+            event = {
+                "event_type": "node.completed",
+                "summary": "model finished",
+                "payload": {
+                    "node_id": "model",
+                    "node_kind": "model",
+                    "node_provider_id": "core.model",
+                    "node_provider_label": "API Call Node",
+                    "status": "success",
+                    "output": {
+                        "schema_version": "1.0",
+                        "from_node_id": "model",
+                        "from_category": "model",
+                        "payload": "ok",
+                        "artifacts": {
+                            "request_messages": [
+                                {"role": "system", "content": "Be concise."},
+                                {"role": "user", "content": "Hello"},
+                            ],
+                            "system_prompt": "Be concise.",
+                            "user_prompt": "Hello",
+                        },
+                        "metadata": {
+                            "contract": "message_envelope",
+                            "node_kind": "model",
+                            "prompt_name": "reply_once",
+                            "provider": "mock",
+                            "response_mode": "message",
+                        },
+                    },
+                    "metadata": {
+                        "contract": "message_envelope",
+                        "prompt_name": "reply_once",
+                        "provider": "mock",
+                        "response_mode": "message",
+                    },
+                },
+                "run_id": "run-1",
+                "timestamp": "2026-04-02T00:00:02Z",
+                "agent_id": None,
+                "parent_run_id": None,
+            }
+            store.append_event("run-1", event)
+
+            rows = _SupabaseStubHandler.events["run-1"]
+            self.assertEqual(len(rows), 1)
+            row_metadata = rows[0]["metadata"]
+            assert isinstance(row_metadata, dict)
+            self.assertEqual(row_metadata["node_id"], "model")
+            self.assertEqual(row_metadata["contract"], "message_envelope")
+            self.assertEqual(row_metadata["generation_prompt_name"], "reply_once")
+            self.assertEqual(row_metadata["generation_system_prompt"], "Be concise.")
+            self.assertEqual(row_metadata["generation_user_prompt"], "Hello")
+            self.assertEqual(row_metadata["generation_prompt"]["messages"][0]["role"], "system")
+
+    def test_write_state_persists_prompt_traces_on_run_row_metadata(self) -> None:
+        with SupabaseStubServer() as url:
+            store = SupabaseRunStore(url=url, service_role_key="test-key")
+            state = build_run_state("run-1", "graph-1", {"prompt": "hello"})
+            state["node_outputs"] = {
+                "model_a": {
+                    "schema_version": "1.0",
+                    "from_node_id": "model_a",
+                    "from_category": "model",
+                    "payload": "first",
+                    "artifacts": {
+                        "request_messages": [
+                            {"role": "system", "content": "Prompt A"},
+                            {"role": "user", "content": "Input A"},
+                        ],
+                        "system_prompt": "Prompt A",
+                        "user_prompt": "Input A",
+                    },
+                    "metadata": {
+                        "contract": "message_envelope",
+                        "node_kind": "model",
+                        "prompt_name": "prompt_a",
+                    },
+                },
+                "model_b": {
+                    "schema_version": "1.0",
+                    "from_node_id": "model_b",
+                    "from_category": "model",
+                    "payload": "second",
+                    "artifacts": {
+                        "request_messages": [
+                            {"role": "system", "content": "Prompt B"},
+                            {"role": "user", "content": "Input B"},
+                        ],
+                        "system_prompt": "Prompt B",
+                        "user_prompt": "Input B",
+                    },
+                    "metadata": {
+                        "contract": "message_envelope",
+                        "node_kind": "model",
+                        "prompt_name": "prompt_b",
+                    },
+                },
+            }
+            store.write_state("run-1", state)
+
+            row = _SupabaseStubHandler.runs["run-1"]
+            row_metadata = row["metadata"]
+            assert isinstance(row_metadata, dict)
+            self.assertEqual(row_metadata["prompt_trace_count"], 2)
+            self.assertEqual(row_metadata["latest_prompt_name"], "prompt_b")
+            self.assertEqual(row_metadata["latest_system_prompt"], "Prompt B")
+            self.assertEqual(row_metadata["latest_user_prompt"], "Input B")
+            self.assertEqual(
+                [trace["prompt_name"] for trace in row_metadata["prompt_traces"]],
+                ["prompt_a", "prompt_b"],
+            )
+
     def test_store_recovers_run_state_from_events(self) -> None:
         with SupabaseStubServer() as url:
             store = SupabaseRunStore(url=url, service_role_key="test-key")
