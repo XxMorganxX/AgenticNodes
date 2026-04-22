@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, MouseEvent } from "react";
 
 import { fetchProviderDiagnostics, inspectSupabaseRuntimeStatus, preflightProvider, previewSupabaseSchema } from "../lib/api";
+import { applyClaudeCodePresetToNode, CLAUDE_CODE_PRESET_OPTIONS, getClaudeCodePreset } from "../lib/claudeCodePresets";
 import { getModelContextBuilderPromptVariables } from "../lib/contextBuilderPromptVariables";
 import { findProviderDefinition, inferModelResponseMode, modelProviderDefinitions, providerDefaultConfig, providerModelName } from "../lib/editor";
 import { getGraphEnvVars, resolveGraphEnvReferences } from "../lib/graphEnv";
@@ -34,6 +35,7 @@ import type {
 } from "../lib/types";
 
 const LIVE_PROVIDER_VERIFICATION_STORAGE_KEY = "agentic-nodes-live-provider-verifications";
+const SUPABASE_SQL_PROVIDER_ID = "core.supabase_sql";
 
 type ProviderDetailsModalProps = {
   graph: GraphDefinition;
@@ -239,6 +241,72 @@ function normalizedGraphEnvValue(graph: GraphDefinition, key: string): string {
 
 function extractTemplateTokens(template: string): string[] {
   return uniqueStrings(Array.from(template.matchAll(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g)).map((match) => match[1] ?? ""));
+}
+
+function collectStructuredPayloadTemplatePaths(templateJson: unknown): string[] {
+  const raw = String(templateJson ?? "").trim();
+  if (!raw) {
+    return [];
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return [];
+  }
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  const walk = (value: unknown, prefix: string) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return;
+    }
+    for (const [key, childValue] of Object.entries(value as Record<string, unknown>)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (!seen.has(path)) {
+        seen.add(path);
+        paths.push(path);
+      }
+      if (childValue && typeof childValue === "object" && !Array.isArray(childValue)) {
+        walk(childValue, path);
+      }
+    }
+  };
+  walk(parsed, "");
+  return paths;
+}
+
+type StructuredPayloadUpstreamSource = {
+  nodeId: string;
+  label: string;
+  paths: string[];
+};
+
+function collectUpstreamStructuredPayloadSources(graph: GraphDefinition, targetNodeId: string): StructuredPayloadUpstreamSource[] {
+  const sources: StructuredPayloadUpstreamSource[] = [];
+  const seen = new Set<string>();
+  for (const edge of graph.edges) {
+    if (edge.target_id !== targetNodeId || edge.kind === "binding") {
+      continue;
+    }
+    if (seen.has(edge.source_id)) {
+      continue;
+    }
+    const sourceNode = graph.nodes.find((candidate) => candidate.id === edge.source_id);
+    if (!sourceNode || sourceNode.provider_id !== STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID) {
+      continue;
+    }
+    seen.add(edge.source_id);
+    const paths = collectStructuredPayloadTemplatePaths(sourceNode.config.template_json);
+    sources.push({
+      nodeId: sourceNode.id,
+      label: sourceNode.label || sourceNode.id,
+      paths,
+    });
+  }
+  return sources;
 }
 
 function getModelMcpContextNodes(graph: GraphDefinition, modelNode: GraphNode): GraphNode[] {
@@ -456,11 +524,13 @@ export function ProviderDetailsModal({
     return [...options.values()];
   }, [availableProviders]);
   const isSupabaseDataNode = node.provider_id === "core.supabase_data";
+  const isSupabaseSqlNode = node.provider_id === SUPABASE_SQL_PROVIDER_ID;
   const isSupabaseTableRowsNode = node.provider_id === "core.supabase_table_rows";
   const isSupabaseRowWriteNode = node.provider_id === "core.supabase_row_write";
   const isOutboundEmailLoggerNode = node.provider_id === "core.outbound_email_logger";
   const isStructuredPayloadBuilderNode = node.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID;
   const isRuntimeNormalizerNode = node.provider_id === RUNTIME_NORMALIZER_PROVIDER_ID;
+  const isSupabaseConnectionNode = isSupabaseSqlNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
   const isSupabaseCatalogNode = isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
   const usesSupabaseTableSelection = isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
   const displayedUserMessageTemplate =
@@ -469,9 +539,23 @@ export function ProviderDetailsModal({
       String(node.config.user_message_template ?? "").trim() === "{input_payload}")
       ? SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE
       : String(node.config.user_message_template ?? "{input_payload}");
-  const displayedProviderConfigFields = (isSupabaseCatalogNode
-    ? providerConfigFields.filter((field) => !["supabase_url_env_var", "supabase_key_env_var"].includes(field.key))
-    : providerConfigFields.filter((field) => !(isStructuredPayloadBuilderNode && field.key === "template_json"))
+  const hiddenProviderConfigKeys = new Set<string>(
+    isSupabaseCatalogNode
+      ? ["supabase_url_env_var", "supabase_key_env_var"]
+      : isSupabaseSqlNode
+        ? [
+            "project_ref_env_var",
+            "access_token_env_var",
+            "query",
+            "read_only",
+            "output_mode",
+            "management_api_base_url",
+          ]
+        : [],
+  );
+  const displayedProviderConfigFields = (providerConfigFields
+    .filter((field) => !hiddenProviderConfigKeys.has(field.key))
+    .filter((field) => !(isStructuredPayloadBuilderNode && field.key === "template_json"))
   ).map((field) =>
     isModelNode && field.key === "model" && allModelOptions.length > 0
       ? {
@@ -757,40 +841,47 @@ export function ProviderDetailsModal({
       : [];
     return {
       resolvedPreviewConfig,
-      supabaseRequestPreview: isSupabaseDataNode
+      supabaseRequestPreview: isSupabaseSqlNode
         ? {
-            source_kind: String(debouncedPreviewNode.config.source_kind ?? "table") || "table",
-            source_name: String(debouncedPreviewNode.config.source_name ?? ""),
-            schema: String(debouncedPreviewNode.config.schema ?? "public"),
-            select: String(debouncedPreviewNode.config.select ?? "*") || "*",
-            filters: String(debouncedPreviewNode.config.filters_text ?? "")
-              .split("\n")
-              .map((line) => line.trim())
-              .filter(Boolean),
-            order_by: String(debouncedPreviewNode.config.order_by ?? ""),
-            order_desc: Boolean(debouncedPreviewNode.config.order_desc),
-            limit: Number(debouncedPreviewNode.config.limit ?? 25),
-            single_row: Boolean(debouncedPreviewNode.config.single_row),
+            query: String(debouncedPreviewNode.config.query ?? ""),
+            read_only: Boolean(debouncedPreviewNode.config.read_only ?? true),
             output_mode: String(debouncedPreviewNode.config.output_mode ?? "records") || "records",
-            rpc_params_json: String(debouncedPreviewNode.config.rpc_params_json ?? "{}") || "{}",
+            management_api_base_url: String(debouncedPreviewNode.config.management_api_base_url ?? "") || "https://api.supabase.com",
           }
-        : isSupabaseTableRowsNode
+        : isSupabaseDataNode
           ? {
-              source_kind: "table",
-              source_name: String(debouncedPreviewNode.config.table_name ?? ""),
+              source_kind: String(debouncedPreviewNode.config.source_kind ?? "table") || "table",
+              source_name: String(debouncedPreviewNode.config.source_name ?? ""),
               schema: String(debouncedPreviewNode.config.schema ?? "public"),
               select: String(debouncedPreviewNode.config.select ?? "*") || "*",
               filters: String(debouncedPreviewNode.config.filters_text ?? "")
                 .split("\n")
                 .map((line) => line.trim())
                 .filter(Boolean),
-              order_by: `${String(debouncedPreviewNode.config.cursor_column ?? "") || "cursor"} asc, ${String(debouncedPreviewNode.config.row_id_column ?? "id") || "id"} asc`,
-              order_desc: false,
-              limit: Number(debouncedPreviewNode.config.page_size ?? 500),
-              single_row: false,
-              output_mode: "records",
+              order_by: String(debouncedPreviewNode.config.order_by ?? ""),
+              order_desc: Boolean(debouncedPreviewNode.config.order_desc),
+              limit: Number(debouncedPreviewNode.config.limit ?? 25),
+              single_row: Boolean(debouncedPreviewNode.config.single_row),
+              output_mode: String(debouncedPreviewNode.config.output_mode ?? "records") || "records",
+              rpc_params_json: String(debouncedPreviewNode.config.rpc_params_json ?? "{}") || "{}",
             }
-        : null,
+          : isSupabaseTableRowsNode
+            ? {
+                source_kind: "table",
+                source_name: String(debouncedPreviewNode.config.table_name ?? ""),
+                schema: String(debouncedPreviewNode.config.schema ?? "public"),
+                select: String(debouncedPreviewNode.config.select ?? "*") || "*",
+                filters: String(debouncedPreviewNode.config.filters_text ?? "")
+                  .split("\n")
+                  .map((line) => line.trim())
+                  .filter(Boolean),
+                order_by: `${String(debouncedPreviewNode.config.cursor_column ?? "") || "cursor"} asc, ${String(debouncedPreviewNode.config.row_id_column ?? "id") || "id"} asc`,
+                order_desc: false,
+                limit: Number(debouncedPreviewNode.config.page_size ?? 500),
+                single_row: false,
+                output_mode: "records",
+              }
+          : null,
       systemPromptTemplatePreview,
       finalSystemPromptPreview:
         debouncedPreviewNode.kind === "model"
@@ -799,7 +890,7 @@ export function ProviderDetailsModal({
               .join("\n\n")
           : "",
     };
-  }, [activeTab, callableMcpToolNames, debouncedPreviewNode, graph, isSupabaseDataNode, isSupabaseTableRowsNode, mcpToolContextBlock, mcpToolGuidanceBlock, promptContextToolSummaries, providerConfigFields, providerName, systemPromptPreviewBaseVariables]);
+  }, [activeTab, callableMcpToolNames, debouncedPreviewNode, graph, isSupabaseDataNode, isSupabaseSqlNode, isSupabaseTableRowsNode, mcpToolContextBlock, mcpToolGuidanceBlock, promptContextToolSummaries, providerConfigFields, providerName, systemPromptPreviewBaseVariables]);
   const [preflightResult, setPreflightResult] = useState<ProviderPreflightResult | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProviderDiagnosticsResult | null>(null);
   const [preflightError, setPreflightError] = useState<string | null>(null);
@@ -812,6 +903,7 @@ export function ProviderDetailsModal({
   const [supabaseSourceSearch, setSupabaseSourceSearch] = useState("");
   const [selectedSupabaseSourceName, setSelectedSupabaseSourceName] = useState<string>("");
   const [structuredPayloadTemplateDraftEntries, setStructuredPayloadTemplateDraftEntries] = useState<StructuredPayloadTemplateEntry[]>([]);
+  const lastWrittenStructuredPayloadTemplateJsonRef = useRef<string | null>(null);
 
   const handleRequestClose = useCallback(() => {
     flushCommit();
@@ -859,11 +951,18 @@ export function ProviderDetailsModal({
     setActiveTab("node");
   }, [committedNode.id]);
   useEffect(() => {
-    if (isStructuredPayloadBuilderNode) {
-      setStructuredPayloadTemplateDraftEntries(parseStructuredPayloadTemplateEntries(node.config.template_json));
+    if (!isStructuredPayloadBuilderNode) {
+      setStructuredPayloadTemplateDraftEntries([]);
+      lastWrittenStructuredPayloadTemplateJsonRef.current = null;
       return;
     }
-    setStructuredPayloadTemplateDraftEntries([]);
+    const incomingTemplateJson = String(node.config.template_json ?? "");
+    const incomingMarker = `${node.id}::${incomingTemplateJson}`;
+    if (lastWrittenStructuredPayloadTemplateJsonRef.current === incomingMarker) {
+      return;
+    }
+    lastWrittenStructuredPayloadTemplateJsonRef.current = incomingMarker;
+    setStructuredPayloadTemplateDraftEntries(parseStructuredPayloadTemplateEntries(incomingTemplateJson));
   }, [isStructuredPayloadBuilderNode, node.config.template_json, node.id]);
 
   useEffect(() => {
@@ -933,6 +1032,11 @@ export function ProviderDetailsModal({
     return diagnostics;
   }, [diagnostics, persistedVerification]);
 
+  const selectedClaudeCodePreset = useMemo(
+    () => (providerName === "claude_code" ? getClaudeCodePreset(String(node.config.preset ?? "custom")) : null),
+    [node.config.preset, providerName],
+  );
+
   const updateNodeConfig = useCallback((updater: (config: GraphNode["config"]) => GraphNode["config"]) => {
     updateDraftNode((currentNode) => ({
       ...currentNode,
@@ -947,9 +1051,15 @@ export function ProviderDetailsModal({
     }));
   }
 
+  function applyClaudeCodePreset(presetId: string) {
+    updateDraftNode((currentNode) => applyClaudeCodePresetToNode(currentNode, presetId));
+  }
+
   function updateStructuredPayloadTemplateEntries(entries: StructuredPayloadTemplateEntry[]) {
     setStructuredPayloadTemplateDraftEntries(entries);
-    updateProviderConfig("template_json", serializeStructuredPayloadTemplateEntries(entries));
+    const serialized = serializeStructuredPayloadTemplateEntries(entries);
+    lastWrittenStructuredPayloadTemplateJsonRef.current = `${node.id}::${serialized}`;
+    updateProviderConfig("template_json", serialized);
   }
 
   function updateResponseSchemaText(nextText: string) {
@@ -987,6 +1097,46 @@ export function ProviderDetailsModal({
       updateProviderConfig(key, event.target.value === "" ? "" : Number(event.target.value));
     };
   }
+
+  const upstreamStructuredPayloadSources = useMemo(
+    () => (isSupabaseSqlNode ? collectUpstreamStructuredPayloadSources(graph, node.id) : []),
+    [graph, isSupabaseSqlNode, node.id],
+  );
+
+  const supabaseSqlQueryTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const insertSqlQueryToken = useCallback(
+    (fieldName: string) => {
+      const trimmed = fieldName.trim();
+      if (!trimmed) {
+        return;
+      }
+      const token = `{${trimmed}}`;
+      const textarea = supabaseSqlQueryTextareaRef.current;
+      updateNodeConfig((currentConfig) => {
+        const currentQuery = String(currentConfig.query ?? "");
+        let nextQuery: string;
+        let nextCursor: number;
+        if (textarea && document.activeElement === textarea) {
+          const start = textarea.selectionStart ?? currentQuery.length;
+          const end = textarea.selectionEnd ?? currentQuery.length;
+          nextQuery = `${currentQuery.slice(0, start)}${token}${currentQuery.slice(end)}`;
+          nextCursor = start + token.length;
+        } else {
+          nextQuery = currentQuery ? `${currentQuery}${token}` : token;
+          nextCursor = nextQuery.length;
+        }
+        if (textarea) {
+          window.requestAnimationFrame(() => {
+            textarea.focus();
+            textarea.setSelectionRange(nextCursor, nextCursor);
+          });
+        }
+        return { ...currentConfig, query: nextQuery };
+      });
+    },
+    [updateNodeConfig],
+  );
 
   function handleProviderChange(nextProviderName: string) {
     const nextProvider = findProviderDefinition(catalog, nextProviderName);
@@ -1447,7 +1597,30 @@ export function ProviderDetailsModal({
                     </div>
                   ) : null}
                 </section>
-                {isSupabaseDataNode ? (
+                {isSupabaseSqlNode ? (
+                  <section className="provider-details-summary">
+                    <div className="provider-details-summary-header">
+                      <strong>Supabase SQL Shape</strong>
+                      <span>{Boolean(node.config.read_only ?? true) ? "Read-only query" : "Read/write query"}</span>
+                    </div>
+                    <p>
+                      This provider sends a parameterized SQL statement to the Supabase Management API using the selected
+                      project ref and access token, then forwards the returned rows or payload as a normal data envelope.
+                    </p>
+                    <div className="provider-details-capabilities">
+                      <span className="provider-capability-chip">
+                        {Boolean(node.config.read_only ?? true) ? "read only" : "read/write"}
+                      </span>
+                      <span className="provider-capability-chip">output {String(node.config.output_mode ?? "records") || "records"}</span>
+                      <span className="provider-capability-chip">
+                        tokens {(() => {
+                          const matches = String(node.config.query ?? "").match(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g);
+                          return matches ? new Set(matches).size : 0;
+                        })()}
+                      </span>
+                    </div>
+                  </section>
+                ) : isSupabaseDataNode ? (
                   <section className="provider-details-summary">
                     <div className="provider-details-summary-header">
                       <strong>Supabase Query Shape</strong>
@@ -2025,7 +2198,7 @@ export function ProviderDetailsModal({
 
             {activeTab === "config" ? (
               <div className="modal-folder-section provider-details-config-layout">
-                {isSupabaseCatalogNode ? (
+                {isSupabaseConnectionNode ? (
                   <>
                     <section className="provider-details-status-card">
                       <div className="provider-details-status-card-header">
@@ -2049,7 +2222,9 @@ export function ProviderDetailsModal({
                               })
                             }
                           >
-                            <option value="">Compatibility mode (raw env vars)</option>
+                            <option value="">
+                              {isSupabaseSqlNode ? "Compatibility mode (raw env vars / tokens)" : "Compatibility mode (raw env vars)"}
+                            </option>
                             {supabaseConnectionOptions.map((connection) => (
                               <option key={connection.value} value={connection.value}>
                                 {connection.label}
@@ -2060,7 +2235,9 @@ export function ProviderDetailsModal({
                         <div>
                           {resolvedSupabaseBinding.isNamedConnection
                             ? "Named connections are managed from the Environment panel and keep node bindings stable when credentials change."
-                            : "Compatibility mode preserves the node's existing raw Supabase env-var names without forcing a migration."}
+                            : isSupabaseSqlNode
+                              ? "Compatibility mode preserves the node's existing project-ref and access-token env-var names without forcing a migration."
+                              : "Compatibility mode preserves the node's existing raw Supabase env-var names without forcing a migration."}
                         </div>
                         {supabaseConnectionMissing ? (
                           <div>
@@ -2080,6 +2257,11 @@ export function ProviderDetailsModal({
                                 Switch to compatibility mode
                               </button>
                             </div>
+                          </div>
+                        ) : null}
+                        {isSupabaseSqlNode ? (
+                          <div>
+                            Required for runtime: <code>{resolvedSupabaseBinding.projectRefEnvVar}</code> and <code>{resolvedSupabaseBinding.accessTokenEnvVar}</code>
                           </div>
                         ) : null}
                       </div>
@@ -2203,6 +2385,7 @@ export function ProviderDetailsModal({
                         </section>
                       );
                     })() : null}
+                    {isSupabaseCatalogNode ? (
                     <section className="provider-details-schema-browser">
                     {isSupabaseBrowserLocked ? (
                       <div className="tool-details-modal-help provider-details-schema-lock-banner">
@@ -2418,6 +2601,7 @@ export function ProviderDetailsModal({
                       </div>
                     </div>
                     </section>
+                    ) : null}
                   </>
                 ) : null}
                 {isStructuredPayloadBuilderNode ? (
@@ -2515,6 +2699,112 @@ export function ProviderDetailsModal({
                     </section>
                   </>
                 ) : null}
+                {isSupabaseSqlNode ? (
+                  <section className="provider-details-sql-builder">
+                    <div className="provider-details-sql-builder-header">
+                      <div>
+                        <strong>SQL Query Builder</strong>
+                        <span>Reference incoming payload fields as <code>{"{field_name}"}</code>. They resolve to parameter values at run time.</span>
+                      </div>
+                      <div className="provider-details-sql-provider-chip">
+                        <span>Provider</span>
+                        <strong>{provider?.display_name ?? providerName}</strong>
+                      </div>
+                    </div>
+
+                    <div className="provider-details-sql-layout">
+                      <label className="provider-details-grid-full provider-details-sql-field">
+                        SQL Query
+                        <textarea
+                          ref={supabaseSqlQueryTextareaRef}
+                          className="provider-details-sql-textarea provider-details-sql-textarea--query"
+                          rows={6}
+                          value={String(node.config.query ?? "")}
+                          placeholder="select id, name from public.projects where status = {status} limit {limit}"
+                          onChange={handleTextInputChange("query")}
+                        />
+                        <small>Write <code>{"{field_name}"}</code> where you want a value from the incoming payload. Tokens resolve to safe parameter bindings at run time.</small>
+                      </label>
+
+                      {upstreamStructuredPayloadSources.length > 0 ? (
+                        <div className="provider-details-grid-full provider-details-sql-variables">
+                          <div className="provider-details-sql-variables-header">
+                            <strong>Available Input Variables</strong>
+                            <span>
+                              Fields from connected Structured Payload Builder{upstreamStructuredPayloadSources.length > 1 ? "s" : ""}.
+                              Click a chip to insert <code>{"{field_name}"}</code> into the SQL query.
+                            </span>
+                          </div>
+                          {upstreamStructuredPayloadSources.map((source) => (
+                            <div key={source.nodeId} className="provider-details-sql-variables-group">
+                              <div className="provider-details-sql-variables-source">
+                                <span>Source</span>
+                                <strong>{source.label}</strong>
+                              </div>
+                              {source.paths.length > 0 ? (
+                                <div className="provider-details-sql-variables-chips">
+                                  {source.paths.map((path) => (
+                                    <button
+                                      key={`${source.nodeId}::${path}`}
+                                      type="button"
+                                      className="provider-details-sql-variable-chip"
+                                      onClick={() => insertSqlQueryToken(path)}
+                                      title={`Insert {${path}} into the SQL query`}
+                                    >
+                                      {path}
+                                    </button>
+                                  ))}
+                                </div>
+                              ) : (
+                                <div className="tool-details-modal-help">
+                                  This builder has no parseable template fields yet.
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      <label className="provider-details-sql-field">
+                        Output Mode
+                        <select
+                          value={String(node.config.output_mode ?? "records")}
+                          onChange={handleTextInputChange("output_mode")}
+                        >
+                          <option value="records">Records</option>
+                          <option value="markdown">Markdown</option>
+                        </select>
+                        <small>Choose <code>records</code> for downstream data nodes or <code>markdown</code> for prompt-ready text.</small>
+                      </label>
+
+                      <div className="provider-details-sql-toggle-card">
+                        <div className="provider-details-sql-toggle-copy">
+                          <strong>Read Only</strong>
+                          <span>Keep this enabled for selects and reporting queries. Turn it off only for intentional writes or DDL.</span>
+                        </div>
+                        <label className="provider-details-sql-toggle">
+                          <input
+                            type="checkbox"
+                            checked={Boolean(node.config.read_only ?? true)}
+                            onChange={(event) => updateProviderConfig("read_only", event.target.checked)}
+                          />
+                          <span>{Boolean(node.config.read_only ?? true) ? "Enabled" : "Disabled"}</span>
+                        </label>
+                      </div>
+
+                      <label className="provider-details-grid-full provider-details-sql-field">
+                        Management API Base URL
+                        <input
+                          value={String(node.config.management_api_base_url ?? "")}
+                          placeholder="https://api.supabase.com"
+                          onChange={handleTextInputChange("management_api_base_url")}
+                        />
+                        <small>Optional override for local testing. Leave blank to use the default Supabase Management API.</small>
+                      </label>
+                    </div>
+                  </section>
+                ) : null}
+                {!isSupabaseSqlNode ? (
                 <div className="provider-details-grid">
                   {isModelNode ? (
                     <label>
@@ -2546,13 +2836,15 @@ export function ProviderDetailsModal({
                         const currentValue = String(node.config[field.key] ?? "");
                         const isRuntimeFieldNamesField = isRuntimeNormalizerNode && field.key === "field_name";
                         const isSelectField = field.input_type === "select" && (field.options?.length ?? 0) > 0;
+                        const isClaudeCodePresetField = providerName === "claude_code" && field.key === "preset";
                         const isModelSelectField = isSelectField && field.key === "model";
                         const isCheckboxField = field.input_type === "checkbox";
                         const isTextareaField = field.input_type === "textarea";
+                        const configuredSelectOptions = isClaudeCodePresetField ? CLAUDE_CODE_PRESET_OPTIONS : (field.options ?? []);
                         const selectOptions =
-                          isSelectField && currentValue && !field.options?.some((option) => option.value === currentValue)
-                            ? [...(field.options ?? []), { value: currentValue, label: `Custom: ${currentValue}` }]
-                            : (field.options ?? []);
+                          isSelectField && currentValue && !configuredSelectOptions.some((option) => option.value === currentValue)
+                            ? [...configuredSelectOptions, { value: currentValue, label: `Custom: ${currentValue}` }]
+                            : configuredSelectOptions;
                         const datalistId = `${node.id}-${field.key}-modal-options`;
                         return (
                           <>
@@ -2618,6 +2910,36 @@ export function ProviderDetailsModal({
                                   Add Field
                                 </button>
                               </div>
+                            ) : isClaudeCodePresetField ? (
+                              <>
+                                <select
+                                  value={currentValue || "custom"}
+                                  onChange={(event) => applyClaudeCodePreset(event.target.value)}
+                                >
+                                  {selectOptions.map((option) => (
+                                    <option key={option.value} value={option.value}>
+                                      {option.label}
+                                    </option>
+                                  ))}
+                                </select>
+                                <small>
+                                  {selectedClaudeCodePreset?.description ?? "Preset recipes can update Claude Code provider settings on this API node without changing prompts."}
+                                </small>
+                                {selectedClaudeCodePreset && selectedClaudeCodePreset.id !== "custom" ? (
+                                  <div className="tool-details-modal-help">
+                                    <div>Applies to: {selectedClaudeCodePreset.appliesTo.join(", ")}.</div>
+                                    <div style={{ marginTop: "0.4rem" }}>
+                                      <button
+                                        type="button"
+                                        className="secondary-button"
+                                        onClick={() => applyClaudeCodePreset(selectedClaudeCodePreset.id)}
+                                      >
+                                        Reapply Preset
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : null}
+                              </>
                             ) : isModelSelectField ? (
                               <>
                                 <input
@@ -2679,6 +3001,7 @@ export function ProviderDetailsModal({
                     </label>
                   ))}
                 </div>
+                ) : null}
 
                 <div className="tool-details-modal-help">
                   {isModelNode
@@ -2686,7 +3009,14 @@ export function ProviderDetailsModal({
                     : "These fields define how this node provider behaves for the selected graph node."}
                 </div>
 
-                {isSupabaseDataNode ? (
+                {isSupabaseSqlNode ? (
+                  <div className="tool-details-modal-help">
+                    <strong>Supabase SQL node notes</strong>
+                    <div>Reference incoming payload fields inline as <code>{"{field_name}"}</code>. Each unique token becomes a <code>$N</code> bind parameter at run time.</div>
+                    <div>Connect a Structured Payload Builder upstream to browse its fields and click to insert them into the query.</div>
+                    <div>Leave <code>read_only</code> on unless you intentionally want this node to run mutating SQL through the Management API.</div>
+                  </div>
+                ) : isSupabaseDataNode ? (
                   <div className="tool-details-modal-help">
                     <strong>Supabase data node notes</strong>
                     <div>Choose your table or view from the schema browser above, then pick the columns you want returned.</div>
@@ -2740,11 +3070,15 @@ export function ProviderDetailsModal({
                   </div>
                   <pre>{JSON.stringify(previewArtifacts.resolvedPreviewConfig ?? {}, null, 2)}</pre>
                 </section>
-                {isSupabaseDataNode ? (
+                {isSupabaseSqlNode || isSupabaseDataNode ? (
                   <section className="tool-details-modal-preview provider-details-preview-card">
                     <div className="tool-details-modal-preview-header">
                       <strong>Supabase Request Preview</strong>
-                      <span>This is the intended query shape before runtime credentials are applied.</span>
+                      <span>
+                        {isSupabaseSqlNode
+                          ? "This is the intended SQL execution shape before runtime credentials are applied."
+                          : "This is the intended query shape before runtime credentials are applied."}
+                      </span>
                     </div>
                     <pre>{JSON.stringify(previewArtifacts.supabaseRequestPreview ?? {}, null, 2)}</pre>
                   </section>

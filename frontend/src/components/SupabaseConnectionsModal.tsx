@@ -31,10 +31,12 @@ type SupabaseConnectionsModalProps = {
   connections: DerivedSupabaseConnection[];
   envVars: Record<string, string>;
   defaultConnectionId: string;
+  runStoreConnectionId: string;
   referencedConnectionIds: Set<string>;
   onSave: (payload: {
     connections: SupabaseConnectionDefinition[];
     defaultConnectionId: string;
+    runStoreConnectionId: string;
     envVars: Record<string, string>;
     verification: SupabaseAuthVerificationResult | null;
   }) => void;
@@ -79,6 +81,7 @@ export function SupabaseConnectionsModal({
   connections,
   envVars,
   defaultConnectionId,
+  runStoreConnectionId,
   referencedConnectionIds,
   onSave,
   onClose,
@@ -86,6 +89,7 @@ export function SupabaseConnectionsModal({
   const [drafts, setDrafts] = useState<EditableSupabaseConnection[]>(() => connections.map((connection) => createDraftFromConnection(connection, envVars)));
   const [selectedDraftId, setSelectedDraftId] = useState<string>(() => connections[0]?.connection_id || "new-connection");
   const [selectedDefaultConnectionId, setSelectedDefaultConnectionId] = useState<string>(defaultConnectionId);
+  const [selectedRunStoreConnectionId, setSelectedRunStoreConnectionId] = useState<string>(runStoreConnectionId);
   const [isVerifying, setIsVerifying] = useState(false);
   const [verificationError, setVerificationError] = useState<string | null>(null);
   const [verification, setVerification] = useState<SupabaseAuthVerificationResult | null>(null);
@@ -162,6 +166,9 @@ export function SupabaseConnectionsModal({
     if (selectedDefaultConnectionId === effectiveConnectionId) {
       setSelectedDefaultConnectionId(remainingDrafts[0]?.connection_id ?? "");
     }
+    if (selectedRunStoreConnectionId === effectiveConnectionId) {
+      setSelectedRunStoreConnectionId("");
+    }
     setVerification(null);
     setVerificationError(null);
     setSaveError(null);
@@ -194,6 +201,7 @@ export function SupabaseConnectionsModal({
     connections: SupabaseConnectionDefinition[];
     nextEnvVars: Record<string, string>;
     defaultConnectionId: string;
+    runStoreConnectionId: string;
   } {
     const nextEnvVars = { ...envVars };
     const previousExplicitConnections = connections.filter((connection) => !connection.isImplicit);
@@ -271,7 +279,24 @@ export function SupabaseConnectionsModal({
     if (nextDefaultConnectionId && !retainedConnections.some((connection) => connection.connection_id === nextDefaultConnectionId)) {
       nextDefaultConnectionId = retainedConnections[0]?.connection_id ?? "";
     }
-    return { connections: retainedConnections, nextEnvVars, defaultConnectionId: nextDefaultConnectionId };
+    let nextRunStoreConnectionId = selectedRunStoreConnectionId.trim();
+    if (nextRunStoreConnectionId === IMPLICIT_LEGACY_SUPABASE_CONNECTION_ID) {
+      nextRunStoreConnectionId = retainedConnections.find(
+        (connection) =>
+          connection.supabase_url_env_var === LEGACY_SUPABASE_URL_ENV_VAR
+          && connection.supabase_key_env_var === LEGACY_SUPABASE_KEY_ENV_VAR,
+      )?.connection_id ?? "";
+    }
+    nextRunStoreConnectionId = connectionIdsByDraftId.get(nextRunStoreConnectionId) ?? nextRunStoreConnectionId;
+    if (nextRunStoreConnectionId && !retainedConnections.some((connection) => connection.connection_id === nextRunStoreConnectionId)) {
+      nextRunStoreConnectionId = "";
+    }
+    return {
+      connections: retainedConnections,
+      nextEnvVars,
+      defaultConnectionId: nextDefaultConnectionId,
+      runStoreConnectionId: nextRunStoreConnectionId,
+    };
   }
 
   function handleSaveChanges(): void {
@@ -281,6 +306,7 @@ export function SupabaseConnectionsModal({
         connections: nextState.connections,
         envVars: nextState.nextEnvVars,
         defaultConnectionId: nextState.defaultConnectionId,
+        runStoreConnectionId: nextState.runStoreConnectionId,
         verification,
       });
       onClose();
@@ -356,20 +382,36 @@ export function SupabaseConnectionsModal({
                       {selectedDraft.isImplicit ? " Saving this legacy connection will persist it explicitly for this graph." : ""}
                     </p>
                   </div>
-                  <label className="supabase-connections-default-select">
-                    <span>Default for new nodes</span>
-                    <select
-                      value={selectedDefaultConnectionId}
-                      onChange={(event) => setSelectedDefaultConnectionId(event.target.value)}
-                    >
-                      <option value="">No default</option>
-                      {selectableConnections.map((connection) => (
-                        <option key={connection.connection_id} value={connection.connection_id}>
-                          {connection.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                  <div className="supabase-connections-detail-selects">
+                    <label className="supabase-connections-default-select">
+                      <span>Default for new nodes</span>
+                      <select
+                        value={selectedDefaultConnectionId}
+                        onChange={(event) => setSelectedDefaultConnectionId(event.target.value)}
+                      >
+                        <option value="">No default</option>
+                        {selectableConnections.map((connection) => (
+                          <option key={connection.connection_id} value={connection.connection_id}>
+                            {connection.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="supabase-connections-default-select">
+                      <span>Run history tables project</span>
+                      <select
+                        value={selectedRunStoreConnectionId}
+                        onChange={(event) => setSelectedRunStoreConnectionId(event.target.value)}
+                      >
+                        <option value="">Not configured</option>
+                        {selectableConnections.map((connection) => (
+                          <option key={connection.connection_id} value={connection.connection_id}>
+                            {connection.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
                 </div>
 
                 <div className="supabase-connections-form-grid">

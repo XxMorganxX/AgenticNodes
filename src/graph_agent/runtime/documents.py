@@ -136,6 +136,7 @@ class AgentDefinition:
         *,
         supabase_connections: list[SupabaseConnectionDefinition] | None = None,
         default_supabase_connection_id: str = "",
+        run_store_supabase_connection_id: str = "",
     ) -> AgentDefinition:
         normalized_nodes = _normalize_legacy_graph_nodes(
             [dict(node) for node in payload.get("nodes", []) if isinstance(node, Mapping)]
@@ -151,6 +152,7 @@ class AgentDefinition:
             edges=[Edge.from_dict(edge) for edge in payload.get("edges", [])],
             supabase_connections=list(supabase_connections or []),
             default_supabase_connection_id=default_supabase_connection_id,
+            run_store_supabase_connection_id=run_store_supabase_connection_id,
         )
         return cls.from_graph(graph, agent_id=str(payload.get("agent_id", graph.graph_id)))
 
@@ -174,6 +176,7 @@ class AgentDefinition:
         shared_env_vars: Mapping[str, Any] | None = None,
         supabase_connections: list[SupabaseConnectionDefinition] | None = None,
         default_supabase_connection_id: str = "",
+        run_store_supabase_connection_id: str = "",
     ) -> GraphDefinition:
         merged_env_vars = _merge_env_vars(shared_env_vars, self.env_vars)
         nodes = [_node_from_dict(node) for node in self.nodes]
@@ -189,6 +192,7 @@ class AgentDefinition:
             edges=edges,
             supabase_connections=list(supabase_connections or []),
             default_supabase_connection_id=default_supabase_connection_id,
+            run_store_supabase_connection_id=run_store_supabase_connection_id,
         )
 
     def validate(self, *, graph_id: str, shared_env_vars: Mapping[str, Any] | None = None) -> None:
@@ -223,6 +227,7 @@ class TestEnvironmentDefinition:
     env_vars: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_GRAPH_ENV_VARS))
     supabase_connections: list[SupabaseConnectionDefinition] = field(default_factory=list)
     default_supabase_connection_id: str = ""
+    run_store_supabase_connection_id: str = ""
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> TestEnvironmentDefinition:
@@ -237,14 +242,17 @@ class TestEnvironmentDefinition:
             agents = [AgentDefinition.from_graph(legacy_graph, agent_id=legacy_agent_id)]
             supabase_connections = list(legacy_graph.supabase_connections)
             default_supabase_connection_id = legacy_graph.default_supabase_connection_id
+            run_store_supabase_connection_id = legacy_graph.run_store_supabase_connection_id
         else:
             supabase_connections = _normalize_supabase_connections(payload.get("supabase_connections"))
             default_supabase_connection_id = str(payload.get("default_supabase_connection_id", "") or "").strip()
+            run_store_supabase_connection_id = str(payload.get("run_store_supabase_connection_id", "") or "").strip()
             agents = [
                 AgentDefinition.from_dict(
                     agent,
                     supabase_connections=supabase_connections,
                     default_supabase_connection_id=default_supabase_connection_id,
+                    run_store_supabase_connection_id=run_store_supabase_connection_id,
                 )
                 for agent in payload.get("agents", [])
             ]
@@ -261,6 +269,7 @@ class TestEnvironmentDefinition:
             agents=agents,
             supabase_connections=supabase_connections,
             default_supabase_connection_id=default_supabase_connection_id,
+            run_store_supabase_connection_id=run_store_supabase_connection_id,
         )
         document.validate()
         return document
@@ -278,6 +287,7 @@ class TestEnvironmentDefinition:
                 shared_env_vars=self.env_vars,
                 supabase_connections=self.supabase_connections,
                 default_supabase_connection_id=self.default_supabase_connection_id,
+                run_store_supabase_connection_id=self.run_store_supabase_connection_id,
             )
 
     def validate_against_services(self, services: RuntimeServices) -> None:
@@ -288,6 +298,7 @@ class TestEnvironmentDefinition:
                 shared_env_vars=self.env_vars,
                 supabase_connections=self.supabase_connections,
                 default_supabase_connection_id=self.default_supabase_connection_id,
+                run_store_supabase_connection_id=self.run_store_supabase_connection_id,
             )
             agent_graph.validate_against_services(services)
 
@@ -322,6 +333,8 @@ class TestEnvironmentDefinition:
             payload["supabase_connections"] = [connection.to_dict() for connection in self.supabase_connections]
         if self.default_supabase_connection_id:
             payload["default_supabase_connection_id"] = self.default_supabase_connection_id
+        if self.run_store_supabase_connection_id:
+            payload["run_store_supabase_connection_id"] = self.run_store_supabase_connection_id
         return payload
 
     def as_graph(self, agent_id: str | None = None) -> GraphDefinition:
@@ -331,6 +344,7 @@ class TestEnvironmentDefinition:
             shared_env_vars=self.env_vars,
             supabase_connections=self.supabase_connections,
             default_supabase_connection_id=self.default_supabase_connection_id,
+            run_store_supabase_connection_id=self.run_store_supabase_connection_id,
         )
 
 

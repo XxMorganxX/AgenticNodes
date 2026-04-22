@@ -84,6 +84,23 @@ class RunLogStoreTests(unittest.TestCase):
         self.assertTrue(
             any("output" in event["payload"] for event in events if event["event_type"] == "node.completed")
         )
+        started_timing_events = [event for event in events if event["event_type"] == "node.started" and "timing_ms" in event["payload"]]
+        self.assertTrue(started_timing_events)
+        self.assertIn("queue_wait", started_timing_events[0]["payload"]["timing_ms"])
+        self.assertIn("runtime_input_preview", started_timing_events[0]["payload"]["timing_ms"])
+        self.assertIn("timing_counts", started_timing_events[0]["payload"])
+        self.assertIn("not_ready_requeues", started_timing_events[0]["payload"]["timing_counts"])
+
+        completed_timing_events = [event for event in events if event["event_type"] == "node.completed" and "timing_ms" in event["payload"]]
+        self.assertTrue(completed_timing_events)
+        self.assertIn("node_started_emit", completed_timing_events[0]["payload"]["timing_ms"])
+        self.assertIn("node_execute", completed_timing_events[0]["payload"]["timing_ms"])
+
+        edge_timing_events = [event for event in events if event["event_type"] == "edge.selected" and "source_timing_ms" in event["payload"]]
+        self.assertTrue(edge_timing_events)
+        self.assertIn("edge_selection", edge_timing_events[0]["payload"]["source_timing_ms"])
+        self.assertIn("edge_enqueue", edge_timing_events[0]["payload"]["source_timing_ms"])
+        self.assertIn("post_execute_bookkeeping", edge_timing_events[0]["payload"]["source_timing_ms"])
 
         logged_state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(logged_state, state)

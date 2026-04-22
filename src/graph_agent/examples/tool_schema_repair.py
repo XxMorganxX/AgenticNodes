@@ -311,12 +311,24 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             model_provider_name="claude_code",
             default_config={
                 "provider_name": "claude_code",
+                "preset": "custom",
                 "model": "sonnet",
                 "cli_path": "claude",
                 "timeout_seconds": 60,
-                "max_turns": 2,
+                "max_turns": 4,
             },
             config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="preset",
+                    label="Preset",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="custom", label="Custom"),
+                        ProviderConfigOptionDefinition(value="general_assistant", label="General Assistant"),
+                        ProviderConfigOptionDefinition(value="deep_reasoning", label="Deep Reasoning"),
+                        ProviderConfigOptionDefinition(value="email_repeated_style", label="Repeated Email Drafting"),
+                    ],
+                ),
                 ProviderConfigFieldDefinition(
                     key="model",
                     label="Model",
@@ -688,6 +700,52 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                     input_type="textarea",
                     placeholder="{\n  \"project_id\": \"123\"\n}",
                 ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
+            provider_id="core.supabase_sql",
+            display_name="Supabase SQL Query",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description="Runs a parameterized SQL query against a Supabase project through the Supabase Management API and forwards the result as a data envelope.",
+            capabilities=["parameterized SQL", "read-only queries", "management API execution"],
+            default_config={
+                "mode": "supabase_sql",
+                "project_ref_env_var": "SUPABASE_PROJECT_REF",
+                "access_token_env_var": "SUPABASE_ACCESS_TOKEN",
+                "query": "",
+                "read_only": True,
+                "output_mode": "records",
+                "management_api_base_url": "",
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="query",
+                    label="SQL Query",
+                    input_type="textarea",
+                    help_text="Reference fields from the incoming payload as {field_name}. They resolve to values and are passed as parameters at run time.",
+                    placeholder="select id, name from public.projects where status = {status} limit {limit}",
+                ),
+                ProviderConfigFieldDefinition(key="read_only", label="Read Only", input_type="checkbox"),
+                ProviderConfigFieldDefinition(
+                    key="output_mode",
+                    label="Output Mode",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="records", label="Records"),
+                        ProviderConfigOptionDefinition(value="markdown", label="Markdown"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(
+                    key="management_api_base_url",
+                    label="Management API Base URL",
+                    help_text="Optional override for local testing. Leave blank to use the default Supabase API.",
+                    placeholder="https://api.supabase.com",
+                ),
+                ProviderConfigFieldDefinition(key="project_ref_env_var", label="Project Ref Env Var"),
+                ProviderConfigFieldDefinition(key="access_token_env_var", label="Access Token Env Var"),
             ],
         )
     )

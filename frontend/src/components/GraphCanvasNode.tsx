@@ -74,6 +74,7 @@ export type GraphCanvasNodeData = {
 };
 
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
+const SUPABASE_SQL_PROVIDER_ID = "core.supabase_sql";
 const SUPABASE_TABLE_ROWS_PROVIDER_ID = "core.supabase_table_rows";
 const SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision";
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
@@ -248,10 +249,11 @@ function GraphCanvasNodeComponent({
   const isStructuredPayloadBuilderNode = node.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID;
   const isRuntimeNormalizerNode = node.provider_id === "core.runtime_normalizer";
   const isSupabaseDataNode = node.provider_id === "core.supabase_data";
+  const isSupabaseSqlNode = node.provider_id === SUPABASE_SQL_PROVIDER_ID;
   const isSupabaseTableRowsNode = node.provider_id === SUPABASE_TABLE_ROWS_PROVIDER_ID;
   const isSupabaseRowWriteNode = node.provider_id === "core.supabase_row_write";
   const isOutboundEmailLogger = isOutboundEmailLoggerNode(node);
-  const isSupabaseNode = isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger;
+  const isSupabaseNode = isSupabaseSqlNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger;
   const isOutlookDraftNode = node.provider_id === "end.outlook_draft";
   const displayLabel = providedDisplayLabel ?? getNodeInstanceLabel(graph, node);
   const resolvedSupabaseBinding = isSupabaseNode ? resolveSupabaseBinding(graph, node.config as Record<string, unknown>) : null;
@@ -872,7 +874,7 @@ function GraphCanvasNodeComponent({
             <span className="graph-node-inline-display-hint">Click to expand</span>
           </div>
         ) : null}
-        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isStructuredPayloadBuilderNode || isRuntimeNormalizerNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger) ? (
+        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isStructuredPayloadBuilderNode || isRuntimeNormalizerNode || isSupabaseSqlNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger) ? (
           <div className="graph-node-card-actions" aria-hidden="false">
             <button
               type="button"
@@ -898,6 +900,8 @@ function GraphCanvasNodeComponent({
                 : isStructuredPayloadBuilderNode
                   ? "Learn More"
                 : isRuntimeNormalizerNode
+                  ? "Learn More"
+                : isSupabaseSqlNode
                   ? "Learn More"
                 : isSupabaseDataNode
                   ? "Learn More"

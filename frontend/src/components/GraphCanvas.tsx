@@ -5268,7 +5268,7 @@ export function GraphCanvas({
                       </div>
                       <div>
                         <dt>Transitions</dt>
-                        <dd>{runSummary?.transitionCount ?? runState?.transition_history.length ?? 0}</dd>
+                        <dd>{runSummary?.transitionCount ?? runState?.transition_count ?? runState?.transition_history.length ?? 0}</dd>
                       </div>
                       <div>
                         <dt>Retries</dt>

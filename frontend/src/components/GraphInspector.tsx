@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { previewSpreadsheetRows } from "../lib/api";
+import { applyClaudeCodePresetToNode, CLAUDE_CODE_PRESET_OPTIONS } from "../lib/claudeCodePresets";
 import {
   CONTROL_FLOW_ELSE_HANDLE_ID,
   defaultModelName,
@@ -1797,18 +1798,35 @@ export function GraphInspector({
                 const value = selectedNode.config[field.key];
                 const isNumberField = field.input_type === "number";
                 const isSelectField = field.input_type === "select" && (field.options?.length ?? 0) > 0;
+                const isClaudeCodePresetField = selectedProviderName === "claude_code" && field.key === "preset";
                 const isModelSelectField = isSelectField && field.key === "model";
                 const currentValue = String(value ?? "");
+                const configuredSelectOptions = isClaudeCodePresetField ? CLAUDE_CODE_PRESET_OPTIONS : (field.options ?? []);
                 const selectOptions =
-                  isSelectField && currentValue && !field.options?.some((option) => option.value === currentValue)
-                    ? [...(field.options ?? []), { value: currentValue, label: `Custom: ${currentValue}` }]
-                    : (field.options ?? []);
+                  isSelectField && currentValue && !configuredSelectOptions.some((option) => option.value === currentValue)
+                    ? [...configuredSelectOptions, { value: currentValue, label: `Custom: ${currentValue}` }]
+                    : configuredSelectOptions;
                 const datalistId = `${selectedNode.id}-${field.key}-options`;
                 const inputProps = isNumberField ? { type: "number" } : {};
                 return (
                   <label key={field.key}>
                     {field.label}
-                    {isModelSelectField ? (
+                    {isClaudeCodePresetField ? (
+                      <select
+                        value={currentValue || "custom"}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => applyClaudeCodePresetToNode(node, event.target.value)),
+                          )
+                        }
+                      >
+                        {selectOptions.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    ) : isModelSelectField ? (
                       <>
                         <input
                           list={datalistId}

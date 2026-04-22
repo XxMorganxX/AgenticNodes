@@ -17,6 +17,27 @@ DEFAULT_FRONTEND_PORT = 5173
 PORT_SEARCH_LIMIT = 25
 
 
+def load_dotenv(path: Path) -> None:
+    if not path.is_file():
+        return
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ[key] = value
+
+
 def find_free_port(start_port: int) -> int:
     for port in range(start_port, start_port + PORT_SEARCH_LIMIT):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -50,6 +71,7 @@ def wait_for_early_exit(process: subprocess.Popen[bytes], name: str, timeout_sec
 
 def main() -> int:
     root = Path(__file__).resolve().parent
+    load_dotenv(root / ".env")
     frontend_dir = root / "frontend"
     local_python = root / ".venv" / "bin" / "python"
     backend_python = str(local_python if local_python.exists() else Path(sys.executable))

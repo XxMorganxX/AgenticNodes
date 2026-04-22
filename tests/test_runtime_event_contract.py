@@ -46,7 +46,12 @@ class RuntimeEventContractTests(unittest.TestCase):
             {
                 "event_type": "node.completed",
                 "summary": "done",
-                "payload": {"node_id": "node-a", "output": {"answer": "ok"}},
+                "payload": {
+                    "node_id": "node-a",
+                    "output": {"answer": "ok"},
+                    "timing_ms": {"queue_wait": 1.25, "node_execute": 4.5},
+                    "timing_counts": {"not_ready_requeues": 2},
+                },
                 "run_id": "run-1",
                 "timestamp": "2026-04-03T00:00:01Z",
             }
@@ -55,6 +60,8 @@ class RuntimeEventContractTests(unittest.TestCase):
         self.assertEqual(normalized["schema_version"], RUNTIME_EVENT_SCHEMA_VERSION)
         self.assertEqual(normalized["event_type"], "node.completed")
         self.assertEqual(normalized["payload"]["node_id"], "node-a")
+        self.assertEqual(normalized["payload"]["timing_ms"]["node_execute"], 4.5)
+        self.assertEqual(normalized["payload"]["timing_counts"]["not_ready_requeues"], 2)
 
     def test_normalize_runtime_state_snapshot_recurses_into_agent_runs(self) -> None:
         normalized = normalize_runtime_state_snapshot(

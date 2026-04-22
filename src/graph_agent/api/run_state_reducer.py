@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import uuid4
 
+from graph_agent.runtime.core import RUN_STATE_EVENT_HISTORY_LIMIT, RUN_STATE_TRANSITION_HISTORY_LIMIT
 from graph_agent.runtime.event_contract import normalize_runtime_event_dict
 
 
@@ -45,7 +46,9 @@ def build_run_state(
         "iterator_states": {},
         "loop_regions": {},
         "visit_counts": {},
+        "transition_count": 0,
         "transition_history": [],
+        "event_count": 0,
         "event_history": [],
         "final_output": None,
         "terminal_error": None,
@@ -85,6 +88,30 @@ def _resolve_edge_output_from_event_history(
             return candidate_payload["output"]
         return _MISSING
     return _MISSING
+
+
+def _bounded_history_append(values: list[Any], entry: Any, *, limit: int) -> list[Any]:
+    next_values = [*values, entry]
+    overflow = len(next_values) - limit
+    if overflow > 0:
+        return next_values[overflow:]
+    return next_values
+
+
+def _run_event_count(state: dict[str, Any]) -> int:
+    event_count = state.get("event_count")
+    if isinstance(event_count, int) and event_count >= 0:
+        return event_count
+    event_history = state.get("event_history")
+    return len(event_history) if isinstance(event_history, list) else 0
+
+
+def _run_transition_count(state: dict[str, Any]) -> int:
+    transition_count = state.get("transition_count")
+    if isinstance(transition_count, int) and transition_count >= 0:
+        return transition_count
+    transition_history = state.get("transition_history")
+    return len(transition_history) if isinstance(transition_history, list) else 0
 
 
 def _mark_terminal_node_statuses(
@@ -258,7 +285,12 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
     event = normalize_runtime_event_dict(event)
     next_state = {
         **previous,
-        "event_history": [*previous.get("event_history", []), event],
+        "event_count": _run_event_count(previous) + 1,
+        "event_history": _bounded_history_append(
+            previous.get("event_history", []),
+            event,
+            limit=RUN_STATE_EVENT_HISTORY_LIMIT,
+        ),
     }
     event_type = event.get("event_type")
     payload = event.get("payload")
@@ -383,15 +415,17 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
                 **next_state.get("edge_outputs", {}),
                 selected_edge_id: selected_edge_output,
             }
-        next_state["transition_history"] = [
-            *next_state.get("transition_history", []),
+        next_state["transition_count"] = _run_transition_count(next_state) + 1
+        next_state["transition_history"] = _bounded_history_append(
+            next_state.get("transition_history", []),
             {
                 "edge_id": payload.get("id"),
                 "source_id": payload.get("source_id"),
                 "target_id": payload.get("target_id"),
                 "timestamp": event.get("timestamp"),
             },
-        ]
+            limit=RUN_STATE_TRANSITION_HISTORY_LIMIT,
+        )
 
     if event_type == "run.completed":
         next_state["status"] = "completed"
@@ -469,7 +503,12 @@ def apply_event(previous: dict[str, Any], event: dict[str, Any]) -> dict[str, An
         payload = {}
     next_state = {
         **previous,
-        "event_history": [*previous.get("event_history", []), event],
+        "event_count": _run_event_count(previous) + 1,
+        "event_history": _bounded_history_append(
+            previous.get("event_history", []),
+            event,
+            limit=RUN_STATE_EVENT_HISTORY_LIMIT,
+        ),
         "agent_runs": dict(previous.get("agent_runs", {})),
     }
     agent_id = str(event.get("agent_id") or payload.get("agent_id") or "")

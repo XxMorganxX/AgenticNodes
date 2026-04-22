@@ -88,9 +88,24 @@ export function normalizeRunState(runState: RunState | null | undefined): RunSta
     return null;
   }
   const normalized = runState as RunState & Record<string, unknown>;
+  const eventHistory = normalizeRuntimeEventHistory(normalized.event_history);
+  const transitionHistory = Array.isArray(normalized.transition_history)
+    ? normalized.transition_history.filter((entry): entry is Record<string, unknown> => isRecord(entry))
+    : [];
   return {
     ...normalized,
-    event_history: normalizeRuntimeEventHistory(normalized.event_history),
+    event_count:
+      typeof normalized.event_count === "number" && Number.isFinite(normalized.event_count) && normalized.event_count >= 0
+        ? normalized.event_count
+        : eventHistory.length,
+    transition_count:
+      typeof normalized.transition_count === "number" &&
+      Number.isFinite(normalized.transition_count) &&
+      normalized.transition_count >= 0
+        ? normalized.transition_count
+        : transitionHistory.length,
+    transition_history: transitionHistory,
+    event_history: eventHistory,
     documents: normalizeRunDocuments(normalized.documents),
     node_statuses: isRecord(normalized.node_statuses)
       ? Object.fromEntries(Object.entries(normalized.node_statuses).map(([nodeId, status]) => [nodeId, String(status ?? "")]))

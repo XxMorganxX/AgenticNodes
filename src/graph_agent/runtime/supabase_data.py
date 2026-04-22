@@ -12,6 +12,7 @@ SUPPORTED_SUPABASE_SOURCE_KINDS = {"table", "rpc"}
 SUPPORTED_SUPABASE_OUTPUT_MODES = {"records", "markdown"}
 SUPPORTED_SUPABASE_WRITE_MODES = {"insert", "upsert"}
 SUPPORTED_SUPABASE_RETURNING_MODES = {"representation", "minimal"}
+DEFAULT_SUPABASE_MANAGEMENT_API_BASE_URL = "https://api.supabase.com"
 
 POSTGRES_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
     "string": (
@@ -80,6 +81,29 @@ class SupabaseDataResult:
     source_kind: str
     source_name: str
     schema: str
+    output_mode: str
+
+
+@dataclass(frozen=True)
+class SupabaseSqlQueryRequest:
+    project_ref: str
+    access_token: str
+    query: str
+    parameters: list[Any] | None = None
+    read_only: bool = True
+    output_mode: str = "records"
+    management_api_base_url: str = DEFAULT_SUPABASE_MANAGEMENT_API_BASE_URL
+
+
+@dataclass(frozen=True)
+class SupabaseSqlQueryResult:
+    payload: Any
+    raw_payload: Any
+    row_count: int | None
+    request_url: str
+    query: str
+    parameters: list[Any]
+    read_only: bool
     output_mode: str
 
 
@@ -632,6 +656,110 @@ def write_supabase_row(request: SupabaseRowWriteRequest) -> SupabaseRowWriteResu
         write_mode=write_mode,
         returning=returning,
         inserted_row=row,
+    )
+
+
+def execute_supabase_sql_query(request: SupabaseSqlQueryRequest) -> SupabaseSqlQueryResult:
+    project_ref = str(request.project_ref or "").strip()
+    access_token = str(request.access_token or "").strip()
+    query = str(request.query or "").strip()
+    output_mode = str(request.output_mode or "records").strip().lower() or "records"
+    read_only = bool(request.read_only)
+    parameters = list(request.parameters or [])
+    management_api_base_url = (
+        str(request.management_api_base_url or DEFAULT_SUPABASE_MANAGEMENT_API_BASE_URL).strip().rstrip("/")
+        or DEFAULT_SUPABASE_MANAGEMENT_API_BASE_URL
+    )
+
+    if not project_ref:
+        raise SupabaseDataError("Supabase project ref is required.", error_type="missing_supabase_project_ref")
+    if not access_token:
+        raise SupabaseDataError("Supabase access token is required.", error_type="missing_supabase_access_token")
+    if not query:
+        raise SupabaseDataError("Supabase SQL query is required.", error_type="missing_supabase_sql_query")
+    if output_mode not in SUPPORTED_SUPABASE_OUTPUT_MODES:
+        raise SupabaseDataError(
+            f"Unsupported Supabase output mode '{output_mode}'.",
+            error_type="invalid_supabase_output_mode",
+        )
+
+    path = (
+        f"/v1/projects/{quote(project_ref, safe='')}/database/query/read-only"
+        if read_only
+        else f"/v1/projects/{quote(project_ref, safe='')}/database/query"
+    )
+    request_url = f"{management_api_base_url}{path}"
+    request_body = {"query": query}
+    if parameters:
+        request_body["parameters"] = parameters
+    if not read_only:
+        request_body["read_only"] = False
+    http_request = Request(
+        request_url,
+        data=json.dumps(request_body).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": "graph-agent-supabase-sql/0.1",
+        },
+    )
+    try:
+        with urlopen(http_request) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise SupabaseDataError(
+            f"Supabase SQL query failed: {exc.code} {detail}".strip(),
+            error_type="supabase_sql_query_failed",
+            details={"status_code": exc.code, "project_ref": project_ref, "read_only": read_only},
+        ) from exc
+    except URLError as exc:
+        raise SupabaseDataError(
+            f"Supabase SQL query failed: {exc.reason}",
+            error_type="supabase_sql_query_failed",
+            details={"project_ref": project_ref, "read_only": read_only},
+        ) from exc
+
+    if not raw_body.strip():
+        decoded: Any = {}
+    else:
+        try:
+            decoded = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            raise SupabaseDataError(
+                "Supabase SQL query response was not valid JSON.",
+                error_type="invalid_supabase_sql_query_response",
+                details={"project_ref": project_ref, "read_only": read_only},
+            ) from exc
+
+    payload = decoded
+    if isinstance(decoded, dict) and "result" in decoded:
+        payload = decoded.get("result")
+        query_error = decoded.get("error")
+        if query_error not in (None, "", []):
+            raise SupabaseDataError(
+                f"Supabase SQL query returned an error: {query_error}",
+                error_type="supabase_sql_query_failed",
+                details={"project_ref": project_ref, "read_only": read_only},
+            )
+
+    row_count: int | None = None
+    if isinstance(payload, list):
+        row_count = len(payload)
+    elif isinstance(payload, dict):
+        row_count = 1 if payload else 0
+
+    return SupabaseSqlQueryResult(
+        payload=render_supabase_payload(payload, output_mode=output_mode),
+        raw_payload=decoded,
+        row_count=row_count,
+        request_url=request_url,
+        query=query,
+        parameters=parameters,
+        read_only=read_only,
+        output_mode=output_mode,
     )
 
 

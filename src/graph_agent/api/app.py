@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
+import os
 from queue import Empty
 from typing import Any, Optional
 
@@ -11,6 +13,19 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from graph_agent.api.manager import GraphRunManager
+
+
+_log_level_name = os.environ.get("GRAPH_AGENT_LOG_LEVEL", "").strip().upper()
+if _log_level_name:
+    _level = getattr(logging, _log_level_name, None)
+    if isinstance(_level, int):
+        _graph_agent_logger = logging.getLogger("graph_agent")
+        _graph_agent_logger.setLevel(_level)
+        if not _graph_agent_logger.handlers:
+            _handler = logging.StreamHandler()
+            _handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+            _graph_agent_logger.addHandler(_handler)
+            _graph_agent_logger.propagate = False
 
 
 class RunDocumentPayload(BaseModel):

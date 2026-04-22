@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 from collections.abc import Callable
+from time import perf_counter
 from uuid import uuid4
 
 from graph_agent.runtime.core import (
@@ -17,6 +18,8 @@ from graph_agent.runtime.core import (
     NodeContext,
     NodeExecutionResult,
     RunState,
+    RUN_STATE_EVENT_HISTORY_LIMIT,
+    RUN_STATE_TRANSITION_HISTORY_LIMIT,
     RuntimeEvent,
     RuntimeServices,
     TransitionRecord,
@@ -48,6 +51,11 @@ def _node_instance_labels(graph: GraphDefinition) -> dict[str, str]:
     return labels
 
 
+def _elapsed_ms(start: float, end: float | None = None) -> float:
+    finished_at = perf_counter() if end is None else end
+    return round(max(finished_at - start, 0.0) * 1000.0, 3)
+
+
 class GraphRuntime:
     def __init__(
         self,
@@ -64,6 +72,20 @@ class GraphRuntime:
         self.event_listeners = event_listeners or []
         self.cancel_requested = cancel_requested or (lambda: False)
 
+    def _append_bounded_history(self, history: list[Any], item: Any, *, limit: int) -> None:
+        history.append(item)
+        overflow = len(history) - limit
+        if overflow > 0:
+            del history[:overflow]
+
+    def _record_transition(self, state: RunState, transition: TransitionRecord) -> None:
+        state.transition_count += 1
+        self._append_bounded_history(
+            state.transition_history,
+            transition,
+            limit=RUN_STATE_TRANSITION_HISTORY_LIMIT,
+        )
+
     def add_event_listener(self, listener: Callable[[RuntimeEvent], None]) -> None:
         self.event_listeners.append(listener)
 
@@ -74,7 +96,12 @@ class GraphRuntime:
             payload=payload,
             run_id=state.run_id,
         )
-        state.event_history.append(event)
+        state.event_count += 1
+        self._append_bounded_history(
+            state.event_history,
+            event,
+            limit=RUN_STATE_EVENT_HISTORY_LIMIT,
+        )
         for listener in self.event_listeners:
             listener(event)
         return event
@@ -307,6 +334,9 @@ class GraphRuntime:
         binding_edges: list[Edge],
         *,
         iteration_context: dict[str, Any] | None = None,
+        source_timing_ms: dict[str, float] | None = None,
+        source_timing_counts: dict[str, int] | None = None,
+        source_visit_count: int | None = None,
     ) -> None:
         inherited_context = dict(iteration_context or {})
         ordered_next_edges = sorted(
@@ -321,42 +351,91 @@ class GraphRuntime:
         for next_edge, edge_result in ordered_next_edges:
             if edge_result.output is not None:
                 state.edge_outputs[next_edge.id] = edge_result.output
-            state.transition_history.append(
+            self._record_transition(
+                state,
                 TransitionRecord(
                     edge_id=next_edge.id,
                     source_id=next_edge.source_id,
                     target_id=next_edge.target_id,
-                )
+                ),
             )
-            self.emit(
-                state,
-                "edge.selected",
-                f"Transitioning from '{next_edge.source_id}' to '{next_edge.target_id}'.",
-                {**next_edge.to_dict(), **inherited_context},
-            )
-            frame = {"node_id": next_edge.target_id, "incoming_edge_id": next_edge.id, **inherited_context}
+            edge_enqueue_started_at = perf_counter()
+            frame = {
+                "node_id": next_edge.target_id,
+                "incoming_edge_id": next_edge.id,
+                "_queued_at_perf": perf_counter(),
+                "_not_ready_requeues": 0,
+                **inherited_context,
+            }
             target = graph.nodes.get(next_edge.target_id)
             if target is not None and getattr(target, "provider_id", None) == "core.context_builder":
                 pending_nodes.appendleft(frame)
             else:
                 pending_nodes.append(frame)
+            edge_enqueue_ms = _elapsed_ms(edge_enqueue_started_at)
+            per_edge_source_timing_ms = dict(source_timing_ms or {})
+            if per_edge_source_timing_ms:
+                edge_selection_ms = float(per_edge_source_timing_ms.get("edge_selection", 0.0) or 0.0)
+                node_completed_emit_ms = float(per_edge_source_timing_ms.get("node_completed_emit", 0.0) or 0.0)
+                per_edge_source_timing_ms["edge_enqueue"] = edge_enqueue_ms
+                per_edge_source_timing_ms["post_execute_bookkeeping"] = round(
+                    node_completed_emit_ms + edge_selection_ms + edge_enqueue_ms,
+                    3,
+                )
+            self.emit(
+                state,
+                "edge.selected",
+                f"Transitioning from '{next_edge.source_id}' to '{next_edge.target_id}'.",
+                {
+                    **next_edge.to_dict(),
+                    **inherited_context,
+                    **({"source_visit_count": source_visit_count} if isinstance(source_visit_count, int) and source_visit_count > 0 else {}),
+                    **({"source_timing_ms": per_edge_source_timing_ms} if per_edge_source_timing_ms else {}),
+                    **({"source_timing_counts": dict(source_timing_counts)} if source_timing_counts else {}),
+                },
+            )
 
         for edge in binding_edges:
-            state.transition_history.append(
+            self._record_transition(
+                state,
                 TransitionRecord(
                     edge_id=edge.id,
                     source_id=edge.source_id,
                     target_id=edge.target_id,
-                )
+                ),
             )
+            edge_enqueue_started_at = perf_counter()
+            binding_frame = {
+                "node_id": edge.target_id,
+                "incoming_edge_id": edge.id,
+                "_queued_at_perf": perf_counter(),
+                "_not_ready_requeues": 0,
+                **inherited_context,
+            }
+            pending_nodes.appendleft(
+                binding_frame,
+            )
+            edge_enqueue_ms = _elapsed_ms(edge_enqueue_started_at)
+            per_edge_source_timing_ms = dict(source_timing_ms or {})
+            if per_edge_source_timing_ms:
+                edge_selection_ms = float(per_edge_source_timing_ms.get("edge_selection", 0.0) or 0.0)
+                node_completed_emit_ms = float(per_edge_source_timing_ms.get("node_completed_emit", 0.0) or 0.0)
+                per_edge_source_timing_ms["edge_enqueue"] = edge_enqueue_ms
+                per_edge_source_timing_ms["post_execute_bookkeeping"] = round(
+                    node_completed_emit_ms + edge_selection_ms + edge_enqueue_ms,
+                    3,
+                )
             self.emit(
                 state,
                 "edge.selected",
                 f"Transitioning from '{edge.source_id}' to '{edge.target_id}'.",
-                {**edge.to_dict(), **inherited_context},
-            )
-            pending_nodes.appendleft(
-                {"node_id": edge.target_id, "incoming_edge_id": edge.id, **inherited_context},
+                {
+                    **edge.to_dict(),
+                    **inherited_context,
+                    **({"source_visit_count": source_visit_count} if isinstance(source_visit_count, int) and source_visit_count > 0 else {}),
+                    **({"source_timing_ms": per_edge_source_timing_ms} if per_edge_source_timing_ms else {}),
+                    **({"source_timing_counts": dict(source_timing_counts)} if source_timing_counts else {}),
+                },
             )
 
     def _complete_run(self, state: RunState, *, terminal_node_id: str | None) -> RunState:
@@ -509,7 +588,9 @@ class GraphRuntime:
         scoped_visit_counts: dict[tuple[str, str | None, int | None], int],
         complete_run_on_output: bool,
     ) -> RunState | None:
-        while pending_nodes and step_state["count"] < self.max_steps:
+        unlimited_steps = self.max_steps <= 0
+        consecutive_not_ready_count = 0
+        while pending_nodes and (unlimited_steps or step_state["count"] < self.max_steps):
             if self.cancel_requested():
                 return self.cancel_run(state, summary="Run cancelled before starting the next node.")
             frame = pending_nodes.popleft()
@@ -521,9 +602,27 @@ class GraphRuntime:
             node = graph.get_node(current_node_id)
             context = NodeContext(graph=graph, state=state, services=self.services, node_id=node.id)
             if not node.is_ready(context):
+                frame["_not_ready_requeues"] = int(frame.get("_not_ready_requeues", 0) or 0) + 1
                 pending_nodes.append(frame)
                 step_state["count"] += 1
+                consecutive_not_ready_count += 1
+                if consecutive_not_ready_count >= len(pending_nodes):
+                    return self.fail_run(
+                        state,
+                        summary="Run could not make progress because no pending node became ready.",
+                        error={
+                            "type": "execution_stalled",
+                            "node_id": current_node_id,
+                            "pending_node_ids": [str(candidate.get("node_id")) for candidate in pending_nodes],
+                        },
+                    )
                 continue
+            consecutive_not_ready_count = 0
+            queued_at_perf = frame.get("_queued_at_perf")
+            if not isinstance(queued_at_perf, (int, float)):
+                queued_at_perf = perf_counter()
+            queue_wait_ms = _elapsed_ms(float(queued_at_perf))
+            not_ready_requeues = int(frame.get("_not_ready_requeues", 0) or 0)
 
             scope_key = self._scoped_visit_key(current_node_id, frame)
             scoped_visit_count = scoped_visit_counts.get(scope_key, 0) + 1
@@ -541,10 +640,20 @@ class GraphRuntime:
                     },
                 )
 
+            preview_started_at = perf_counter()
             try:
                 received_input = node.runtime_input_preview(context)
             except Exception:  # noqa: BLE001
                 received_input = None
+            preview_ms = _elapsed_ms(preview_started_at)
+            started_timing_ms = {
+                "queue_wait": queue_wait_ms,
+                "runtime_input_preview": preview_ms,
+            }
+            started_timing_counts = {
+                "not_ready_requeues": not_ready_requeues,
+            }
+            started_emit_started_at = perf_counter()
             self.emit(
                 state,
                 "node.started",
@@ -557,12 +666,16 @@ class GraphRuntime:
                     "node_provider_label": node.provider_label,
                     "visit_count": visit_count,
                     "received_input": received_input,
+                    "timing_ms": started_timing_ms,
+                    "timing_counts": started_timing_counts,
                     **self._frame_iteration_context(frame),
                 },
             )
+            started_emit_ms = _elapsed_ms(started_emit_started_at)
 
             if self.cancel_requested():
                 return self.cancel_run(state, summary=f"Run cancelled before executing node '{node.label}'.")
+            execute_started_at = perf_counter()
             try:
                 result = node.execute(context)
             except Exception as exc:  # noqa: BLE001
@@ -571,6 +684,7 @@ class GraphRuntime:
                     summary=f"Node '{node.label}' raised an exception.",
                     error={"type": "node_exception", "node_id": node.id, "message": str(exc)},
                 )
+            execute_ms = _elapsed_ms(execute_started_at)
 
             if self.cancel_requested():
                 return self.cancel_run(state, summary=f"Run cancelled while node '{node.label}' was executing.")
@@ -586,23 +700,39 @@ class GraphRuntime:
                 "node_category": node.category.value,
                 "node_provider_id": node.provider_id,
                 "node_provider_label": node.provider_label,
+                "visit_count": visit_count,
                 "status": result.status,
                 "output": result.output,
                 "route_outputs": result.route_outputs,
                 "error": result.error,
                 "metadata": result.metadata,
+                "timing_ms": {
+                    **started_timing_ms,
+                    "node_started_emit": started_emit_ms,
+                    "node_execute": execute_ms,
+                },
+                "timing_counts": started_timing_counts,
                 **self._frame_iteration_context(frame),
             }
             result_session_id = self._result_session_id(result)
             if result_session_id is not None:
                 completed_payload["session_id"] = result_session_id
 
+            completed_emit_started_at = perf_counter()
             self.emit(
                 state,
                 "node.completed",
                 result.summary or f"Completed node '{node.label}'.",
                 completed_payload,
             )
+            completed_emit_ms = _elapsed_ms(completed_emit_started_at)
+            source_timing_ms = {
+                **started_timing_ms,
+                "node_started_emit": started_emit_ms,
+                "node_execute": execute_ms,
+                "node_completed_emit": completed_emit_ms,
+            }
+            source_timing_counts = dict(started_timing_counts)
 
             row_envelopes = internal_metadata.get("iterator_envelopes")
             if isinstance(row_envelopes, list):
@@ -634,8 +764,10 @@ class GraphRuntime:
                 step_state["count"] += 1
                 continue
 
+            edge_selection_started_at = perf_counter()
             next_edges = self.select_edges(graph, state, node.id, result)
             binding_edges = self._binding_edges_for_node(graph, node.id)
+            edge_selection_ms = _elapsed_ms(edge_selection_started_at)
             hold_outgoing = bool(result.metadata.get("hold_outgoing_edges"))
             if hold_outgoing:
                 next_edges = []
@@ -671,10 +803,16 @@ class GraphRuntime:
                 next_edges,
                 binding_edges,
                 iteration_context=self._frame_iteration_context(frame),
+                source_timing_ms={
+                    **source_timing_ms,
+                    "edge_selection": edge_selection_ms,
+                },
+                source_timing_counts=source_timing_counts,
+                source_visit_count=visit_count,
             )
             step_state["count"] += 1
 
-        if step_state["count"] >= self.max_steps:
+        if not unlimited_steps and step_state["count"] >= self.max_steps:
             return self.fail_run(
                 state,
                 summary="Run exceeded the maximum number of steps.",
@@ -703,7 +841,16 @@ class GraphRuntime:
             parent_run_id=parent_run_id,
             status="running",
         )
-        pending_nodes = deque([{"node_id": graph.start_node_id, "incoming_edge_id": None}])
+        pending_nodes = deque(
+            [
+                {
+                    "node_id": graph.start_node_id,
+                    "incoming_edge_id": None,
+                    "_queued_at_perf": perf_counter(),
+                    "_not_ready_requeues": 0,
+                }
+            ]
+        )
 
         self.emit(
             state,

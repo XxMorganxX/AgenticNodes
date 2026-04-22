@@ -15,11 +15,24 @@ from uuid import uuid4
 
 from graph_agent.api.graph_store import GraphStore
 from graph_agent.api.project_files import ProjectFileStore
-from graph_agent.api.run_store import RunStore, build_default_run_store
+from graph_agent.api.run_store import (
+    AsyncBatchingRunStoreMirror,
+    CompositeRunStore,
+    RunStore,
+    build_default_run_store,
+    close_run_store,
+    flush_run_store,
+)
 from graph_agent.api.run_state_reducer import apply_event, build_run_state
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.providers.discord import DiscordMessageEvent, DiscordTriggerService, normalize_discord_message_payload
-from graph_agent.runtime.core import GraphDefinition, resolve_graph_env_var_name, resolve_graph_process_env, utc_now_iso
+from graph_agent.runtime.core import (
+    GraphDefinition,
+    RUN_EVENT_BACKLOG_LIMIT,
+    resolve_graph_env_var_name,
+    resolve_graph_process_env,
+    utc_now_iso,
+)
 from graph_agent.runtime.documents import AgentDefinition, TestEnvironmentDefinition, load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
@@ -51,6 +64,13 @@ STATE_FLUSH_EVENT_TYPES = {
 }
 BUNDLED_MCP_TEMPLATE_PATH = Path(__file__).resolve().with_name("mcp_server_templates.json")
 DEFAULT_MCP_TEMPLATE_DIR = Path(__file__).resolve().parents[3] / ".graph-agent" / "mcp-server-templates"
+
+
+def _trim_event_backlog(events: list[dict[str, Any]], *, limit: int = RUN_EVENT_BACKLOG_LIMIT) -> list[dict[str, Any]]:
+    overflow = len(events) - limit
+    if overflow > 0:
+        return events[overflow:]
+    return events
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -204,6 +224,10 @@ class GraphRunManager:
         self._event_backlog: dict[str, list[dict[str, Any]]] = {}
         self._subscribers: dict[str, list[Queue[str | None]]] = {}
         self._run_store = run_store or run_log_store or build_default_run_store()
+        self._run_store_overrides: dict[str, RunStore] = {}
+        self._run_store_override_instances: dict[int, RunStore] = {}
+        self._run_store_override_run_ids: dict[int, set[str]] = {}
+        self._supabase_run_store_announced: set[tuple[str, str, str]] = set()
         self._project_file_store = project_file_store or ProjectFileStore()
         self._discord_service = discord_service or DiscordTriggerService(self.handle_discord_message)
         self._runtime_instance_id = str(uuid4())
@@ -709,8 +733,10 @@ class GraphRunManager:
                 )
             states_to_initialize = [self._run_states[run_id], *self._run_states[run_id]["agent_runs"].values()]
 
+        run_store = self._select_run_store_for_document(document)
+        self._register_run_store_for_states(states_to_initialize, run_store)
         for state in states_to_initialize:
-            self._run_store.initialize_run(state)
+            self._run_store_for(str(state.get("run_id") or "")).initialize_run(state)
         self._touch_run_liveness(run_id)
 
         if document.is_multi_agent:
@@ -741,6 +767,125 @@ class GraphRunManager:
         thread.start()
         return run_id
 
+    def _run_store_for(self, run_id: str) -> RunStore:
+        normalized_run_id = str(run_id or "").strip()
+        if normalized_run_id:
+            store = self._run_store_overrides.get(normalized_run_id)
+            if store is not None:
+                return store
+        return self._run_store
+
+    def _register_run_store_for_states(self, states: list[dict[str, Any]], run_store: RunStore) -> None:
+        if run_store is self._run_store:
+            return
+        store_id = id(run_store)
+        self._run_store_override_instances[store_id] = run_store
+        run_ids = self._run_store_override_run_ids.setdefault(store_id, set())
+        for state in states:
+            run_id = str(state.get("run_id") or "").strip()
+            if not run_id:
+                continue
+            existing_store = self._run_store_overrides.get(run_id)
+            if existing_store is not None and existing_store is not run_store:
+                self._discard_run_id_from_override_locked(id(existing_store), run_id)
+            self._run_store_overrides[run_id] = run_store
+            run_ids.add(run_id)
+
+    def _select_run_store_for_document(self, document: GraphDefinition | TestEnvironmentDefinition) -> RunStore:
+        supabase_mirror = self._build_graph_supabase_run_store(document)
+        if supabase_mirror is None:
+            return self._run_store
+        return CompositeRunStore(self._run_store, AsyncBatchingRunStoreMirror(supabase_mirror))
+
+    def _build_graph_supabase_run_store(
+        self,
+        document: GraphDefinition | TestEnvironmentDefinition,
+    ) -> RunStore | None:
+        from graph_agent.api.supabase_run_store import SupabaseRunStore
+
+        primary_delegate = getattr(self._run_store, "delegate", self._run_store)
+        if isinstance(primary_delegate, SupabaseRunStore):
+            return None
+
+        env_vars = document.env_vars
+        credentials = self._resolve_graph_supabase_run_store_credentials(document)
+        if credentials is None:
+            return None
+        url, service_role_key = credentials
+        schema = str(os.environ.get("GRAPH_AGENT_SUPABASE_SCHEMA", "") or env_vars.get("GRAPH_AGENT_SUPABASE_SCHEMA", "") or "public").strip() or "public"
+        graph_id = getattr(document, "graph_id", "") or ""
+        connection_id = str(getattr(document, "run_store_supabase_connection_id", "") or "").strip()
+        announce_key = (graph_id, connection_id, url)
+        store = SupabaseRunStore(url=url, service_role_key=service_role_key, schema=schema)
+        if announce_key not in self._supabase_run_store_announced:
+            self._supabase_run_store_announced.add(announce_key)
+            LOGGER.info(
+                "Supabase run-store mirror active for graph %r (connection %r, schema %r) — runs/run_events will be written to %s.",
+                graph_id,
+                connection_id,
+                schema,
+                url,
+            )
+            store.check_connectivity()
+        return store
+
+    def _resolve_graph_supabase_run_store_credentials(
+        self,
+        document: GraphDefinition | TestEnvironmentDefinition,
+    ) -> tuple[str, str] | None:
+        env_vars = document.env_vars
+        graph_id = getattr(document, "graph_id", "") or ""
+        run_store_connection_id = str(getattr(document, "run_store_supabase_connection_id", "") or "").strip()
+        if not run_store_connection_id:
+            configured_connections = [conn.connection_id for conn in document.supabase_connections]
+            if configured_connections:
+                dedupe_key = ("no-run-store-pointer", graph_id)
+                if dedupe_key not in self._supabase_run_store_announced:
+                    self._supabase_run_store_announced.add(dedupe_key)
+                    LOGGER.warning(
+                        "Graph %r has Supabase connection(s) %s but no run_store_supabase_connection_id is set — "
+                        "run logs will stay on the filesystem. In the UI, open the Supabase connections panel "
+                        "and mark one connection as the run-store target.",
+                        graph_id,
+                        configured_connections,
+                    )
+            return None
+
+        connection = next(
+            (
+                candidate
+                for candidate in document.supabase_connections
+                if candidate.connection_id == run_store_connection_id
+            ),
+            None,
+        )
+        if connection is None:
+            LOGGER.warning(
+                "Graph %r has run_store_supabase_connection_id=%r but no matching entry in supabase_connections; "
+                "run logs will stay on the filesystem.",
+                graph_id,
+                run_store_connection_id,
+            )
+            return None
+
+        url = resolve_graph_process_env(connection.supabase_url_env_var, env_vars)
+        service_role_key = resolve_graph_process_env(connection.supabase_key_env_var, env_vars)
+        if url and service_role_key:
+            return url, service_role_key
+        missing: list[str] = []
+        if not url:
+            missing.append(connection.supabase_url_env_var)
+        if not service_role_key:
+            missing.append(connection.supabase_key_env_var)
+        LOGGER.warning(
+            "Graph %r selects Supabase run-store connection %r but the env vars [%s] are empty in both process "
+            "and graph env; populate them in the app's Environment Variables section. Run logs will stay on the filesystem.",
+            graph_id,
+            run_store_connection_id,
+            ", ".join(missing),
+        )
+        return None
+
     def subscribe(self, run_id: str) -> tuple[list[dict[str, Any]], Queue[str | None]]:
         queue: Queue[str | None] = Queue()
         self._recover_run_state(run_id)
@@ -765,7 +910,13 @@ class GraphRunManager:
 
     def start_background_services(self) -> None:
         self._start_heartbeat_loop()
-        self._reconcile_persisted_runs()
+        try:
+            self._reconcile_persisted_runs()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "Unable to reconcile persisted runs during startup; continuing without startup reconciliation: %s",
+                exc,
+            )
         self._sync_discord_service()
         if self._services.mcp_server_manager is not None:
             self._services.mcp_server_manager.start_auto_boot()
@@ -778,6 +929,11 @@ class GraphRunManager:
         self._discord_service.stop()
         if self._services.mcp_server_manager is not None:
             self._services.mcp_server_manager.shutdown_all(preserve_desired_running=True)
+        for store in self._drain_override_stores():
+            flush_run_store(store)
+            close_run_store(store)
+        flush_run_store(self._run_store)
+        close_run_store(self._run_store)
 
     def stop_runtime(self) -> dict[str, Any]:
         active_run_ids = self._request_active_run_cancellation()
@@ -834,7 +990,7 @@ class GraphRunManager:
             runtime.run(graph, input_payload, run_id=run_id, agent_id=agent_id, documents=documents)
             with self._lock:
                 snapshot = deepcopy(self._run_states[run_id])
-            self._run_store.write_state(run_id, snapshot)
+            self._run_store_for(run_id).write_state(run_id, snapshot)
             self._close_streams(run_id)
         finally:
             self._release_run_control(run_id)
@@ -875,7 +1031,7 @@ class GraphRunManager:
                     )
                     with self._lock:
                         snapshot = deepcopy(self._run_states[parent_run_id])
-                    self._run_store.write_state(parent_run_id, snapshot)
+                    self._run_store_for(parent_run_id).write_state(parent_run_id, snapshot)
                     self._close_streams(parent_run_id)
                     return
                 child_snapshot = self._run_agent_in_environment(document, agent, input_payload, parent_run_id, documents)
@@ -888,7 +1044,7 @@ class GraphRunManager:
                     )
                     with self._lock:
                         snapshot = deepcopy(self._run_states[parent_run_id])
-                    self._run_store.write_state(parent_run_id, snapshot)
+                    self._run_store_for(parent_run_id).write_state(parent_run_id, snapshot)
                     self._close_streams(parent_run_id)
                     return
                 if child_snapshot.get("status") == "failed":
@@ -911,7 +1067,7 @@ class GraphRunManager:
             )
             with self._lock:
                 snapshot = deepcopy(self._run_states[parent_run_id])
-            self._run_store.write_state(parent_run_id, snapshot)
+            self._run_store_for(parent_run_id).write_state(parent_run_id, snapshot)
             self._close_streams(parent_run_id)
         except Exception as exc:  # noqa: BLE001
             self._record_event(
@@ -928,7 +1084,7 @@ class GraphRunManager:
             )
             with self._lock:
                 snapshot = deepcopy(self._run_states[parent_run_id])
-            self._run_store.write_state(parent_run_id, snapshot)
+            self._run_store_for(parent_run_id).write_state(parent_run_id, snapshot)
             self._close_streams(parent_run_id)
         finally:
             self._release_run_control(parent_run_id)
@@ -980,7 +1136,7 @@ class GraphRunManager:
             snapshot = deepcopy(self._run_states[parent_run_id]["agent_runs"][agent.agent_id])
             self._run_states[child_run_id] = snapshot
 
-        self._run_store.write_state(child_run_id, snapshot)
+        self._run_store_for(child_run_id).write_state(child_run_id, snapshot)
         return snapshot
 
     def _hydrate_spreadsheet_project_files(self, graph: GraphDefinition) -> None:
@@ -1038,12 +1194,16 @@ class GraphRunManager:
         event = normalize_runtime_event_dict(event)
         encoded = json.dumps(event)
         should_flush_state = event["event_type"] in STATE_FLUSH_EVENT_TYPES
+        store = self._run_store_for(run_id)
+        child_store: RunStore | None = None
         parent_snapshot: dict[str, Any] | None = None
         child_run_id: str | None = None
         child_event: dict[str, Any] | None = None
         child_snapshot: dict[str, Any] | None = None
         with self._lock:
-            self._event_backlog.setdefault(run_id, []).append(event)
+            backlog = self._event_backlog.setdefault(run_id, [])
+            backlog.append(event)
+            self._event_backlog[run_id] = _trim_event_backlog(backlog)
             state = self._run_states.get(run_id)
             if state is not None:
                 next_state = apply_event(state, event)
@@ -1066,16 +1226,72 @@ class GraphRunManager:
                             child_snapshot = deepcopy(agent_state)
             subscribers = list(self._subscribers.get(run_id, []))
 
-        self._run_store.append_event(run_id, event)
+        store.append_event(run_id, event)
         if parent_snapshot is not None:
-            self._run_store.write_state(run_id, parent_snapshot)
+            store.write_state(run_id, parent_snapshot)
         if child_run_id is not None and child_event is not None:
-            self._run_store.append_event(child_run_id, child_event)
+            child_store = self._run_store_for(child_run_id)
+            child_store.append_event(child_run_id, child_event)
         if child_run_id is not None and child_snapshot is not None:
-            self._run_store.write_state(child_run_id, child_snapshot)
+            child_store = self._run_store_for(child_run_id)
+            child_store.write_state(child_run_id, child_snapshot)
+        if should_flush_state:
+            flush_run_store(store)
+            if child_store is not None and child_store is not store:
+                flush_run_store(child_store)
+            self._close_override_store_if_terminal(run_id)
+            if child_run_id:
+                self._close_override_store_if_terminal(child_run_id)
 
         for subscriber in subscribers:
             subscriber.put(encoded)
+
+    def _discard_run_id_from_override_locked(self, store_id: int, run_id: str) -> None:
+        run_ids = self._run_store_override_run_ids.get(store_id)
+        if run_ids is None:
+            return
+        run_ids.discard(run_id)
+        if run_ids:
+            return
+        self._run_store_override_run_ids.pop(store_id, None)
+        self._run_store_override_instances.pop(store_id, None)
+
+    def _detach_override_store_locked(self, store_id: int) -> RunStore | None:
+        store = self._run_store_override_instances.pop(store_id, None)
+        run_ids = self._run_store_override_run_ids.pop(store_id, set())
+        for run_id in run_ids:
+            existing = self._run_store_overrides.get(run_id)
+            if existing is store:
+                self._run_store_overrides.pop(run_id, None)
+        return store
+
+    def _close_override_store_if_terminal(self, run_id: str) -> None:
+        detached_store: RunStore | None = None
+        with self._lock:
+            store = self._run_store_overrides.get(run_id)
+            if store is None or store is self._run_store:
+                return
+            store_id = id(store)
+            run_ids = set(self._run_store_override_run_ids.get(store_id, set()))
+            if not run_ids:
+                detached_store = self._detach_override_store_locked(store_id)
+            elif any(
+                str((self._run_states.get(candidate_run_id) or {}).get("status") or "") not in TERMINAL_RUN_STATUSES
+                for candidate_run_id in run_ids
+            ):
+                return
+            else:
+                detached_store = self._detach_override_store_locked(store_id)
+        if detached_store is not None:
+            close_run_store(detached_store)
+
+    def _drain_override_stores(self) -> list[RunStore]:
+        with self._lock:
+            stores = list(self._run_store_override_instances.values())
+            self._run_store_overrides.clear()
+            self._run_store_override_instances.clear()
+            self._run_store_override_run_ids.clear()
+        return stores
 
     def _record_agent_event(
         self,
@@ -1178,21 +1394,19 @@ class GraphRunManager:
             state = self._run_states.get(run_id)
             if state is None:
                 return
-            next_state = deepcopy(state)
-            self._stamp_run_liveness(next_state, heartbeat_value)
-            for agent_id, agent_state in next_state.get("agent_runs", {}).items():
+            self._stamp_run_liveness(state, heartbeat_value)
+            for agent_id, agent_state in state.get("agent_runs", {}).items():
                 self._stamp_run_liveness(agent_state, heartbeat_value)
                 child_run_id = str(agent_state.get("run_id") or "")
                 if child_run_id:
                     child_snapshots[child_run_id] = deepcopy(agent_state)
                     self._run_states[child_run_id] = deepcopy(agent_state)
-                next_state["agent_runs"][agent_id] = agent_state
-            self._run_states[run_id] = next_state
-            parent_snapshot = deepcopy(next_state)
+                state["agent_runs"][agent_id] = agent_state
+            parent_snapshot = deepcopy(state)
         if parent_snapshot is not None:
-            self._run_store.write_state(run_id, parent_snapshot)
+            self._run_store_for(run_id).write_state(run_id, parent_snapshot)
         for child_run_id, snapshot in child_snapshots.items():
-            self._run_store.write_state(child_run_id, snapshot)
+            self._run_store_for(child_run_id).write_state(child_run_id, snapshot)
 
     def _stamp_run_liveness(self, state: dict[str, Any], heartbeat_at: str) -> None:
         status = str(state.get("status") or "")

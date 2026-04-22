@@ -53,6 +53,7 @@ export type GraphDefinition = {
   env_vars?: Record<string, string>;
   supabase_connections?: SupabaseConnectionDefinition[];
   default_supabase_connection_id?: string;
+  run_store_supabase_connection_id?: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
   node_providers?: NodeProviderDefinition[];
@@ -80,6 +81,7 @@ export type TestEnvironmentDefinition = {
   env_vars?: Record<string, string>;
   supabase_connections?: SupabaseConnectionDefinition[];
   default_supabase_connection_id?: string;
+  run_store_supabase_connection_id?: string;
   agents: AgentDefinition[];
   node_providers?: NodeProviderDefinition[];
 };
@@ -481,7 +483,9 @@ export type RunState = {
   iterator_states?: Record<string, Record<string, unknown>>;
   loop_regions?: Record<string, LoopRegionState>;
   visit_counts: Record<string, number>;
+  transition_count?: number;
   transition_history: Array<Record<string, unknown>>;
+  event_count?: number;
   event_history: RuntimeEvent[];
   final_output: unknown;
   terminal_error: Record<string, unknown> | null;

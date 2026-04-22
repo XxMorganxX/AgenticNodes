@@ -138,6 +138,10 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
     () => getSupabaseConnectionById(graph, String(graph?.default_supabase_connection_id ?? "")),
     [graph],
   );
+  const runStoreSupabaseConnection = useMemo(
+    () => getSupabaseConnectionById(graph, String(graph?.run_store_supabase_connection_id ?? "")),
+    [graph],
+  );
   const visibleStandardFields = useMemo(
     () => STANDARD_GRAPH_ENV_FIELDS.filter((field) => !managedConnectionEnvKeys.has(field.key)),
     [managedConnectionEnvKeys],
@@ -294,6 +298,7 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
             {supabaseConfiguredCount ? `${supabaseConfiguredCount} ready for static auth` : "No connection values saved yet"}
           </span>
           {defaultSupabaseConnection ? <span className="env-integration-status is-ready">Default: {defaultSupabaseConnection.name}</span> : null}
+          {runStoreSupabaseConnection ? <span className="env-integration-status is-ready">Run history: {runStoreSupabaseConnection.name}</span> : null}
         </div>
         {supabaseBatchVerificationSummary ? (
           <div className="env-supabase-launcher-verification">{supabaseBatchVerificationSummary}</div>
@@ -490,8 +495,9 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
           connections={supabaseConnections}
           envVars={envVars}
           defaultConnectionId={String(graph.default_supabase_connection_id ?? "")}
+          runStoreConnectionId={String(graph.run_store_supabase_connection_id ?? "")}
           referencedConnectionIds={referencedSupabaseConnectionIds}
-          onSave={({ connections, defaultConnectionId, envVars: nextEnvVars, verification }) => {
+          onSave={({ connections, defaultConnectionId, runStoreConnectionId, envVars: nextEnvVars, verification }) => {
             setLastSupabaseVerification(verification);
             if (verification) {
               saveSessionSupabaseSchema(graph, {
@@ -509,6 +515,7 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
                 env_vars: sanitizeGraphEnvVars(nextEnvVars),
                 supabase_connections: connections,
                 default_supabase_connection_id: defaultConnectionId,
+                run_store_supabase_connection_id: runStoreConnectionId,
               },
             );
           }}

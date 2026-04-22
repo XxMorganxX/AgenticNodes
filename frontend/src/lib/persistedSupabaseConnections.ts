@@ -5,6 +5,7 @@ const STORAGE_KEY = "agentic-nodes-supabase-connections";
 type PersistedSupabaseConnectionState = {
   supabase_connections: SupabaseConnectionDefinition[];
   default_supabase_connection_id: string;
+  run_store_supabase_connection_id: string;
 };
 
 function sanitizeConnection(connection: SupabaseConnectionDefinition | null | undefined): SupabaseConnectionDefinition | null {
@@ -47,9 +48,11 @@ function sanitizeState(rawState: unknown): PersistedSupabaseConnectionState | nu
       })
     : [];
   const defaultConnectionId = String(record.default_supabase_connection_id ?? "").trim();
+  const runStoreConnectionId = String(record.run_store_supabase_connection_id ?? "").trim();
   return {
     supabase_connections: connections,
     default_supabase_connection_id: defaultConnectionId,
+    run_store_supabase_connection_id: runStoreConnectionId,
   };
 }
 
@@ -98,6 +101,7 @@ export function savePersistedSupabaseConnectionState(
   state: {
     supabase_connections?: SupabaseConnectionDefinition[] | null;
     default_supabase_connection_id?: string | null;
+    run_store_supabase_connection_id?: string | null;
   },
 ): void {
   if (!graphKey?.trim()) {
@@ -106,12 +110,17 @@ export function savePersistedSupabaseConnectionState(
   const sanitized = sanitizeState({
     supabase_connections: state.supabase_connections ?? [],
     default_supabase_connection_id: state.default_supabase_connection_id ?? "",
+    run_store_supabase_connection_id: state.run_store_supabase_connection_id ?? "",
   });
   if (!sanitized) {
     return;
   }
   const current = loadPersistedStateMap();
-  if (sanitized.supabase_connections.length === 0 && !sanitized.default_supabase_connection_id) {
+  if (
+    sanitized.supabase_connections.length === 0
+    && !sanitized.default_supabase_connection_id
+    && !sanitized.run_store_supabase_connection_id
+  ) {
     delete current[graphKey];
     savePersistedStateMap(current);
     return;

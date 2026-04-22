@@ -549,6 +549,33 @@ function saveSelectedAgentId(graph: GraphDocument | null | undefined, selectedAg
   }
 }
 
+const RUN_STATE_EVENT_HISTORY_LIMIT = 500;
+const RUN_STATE_TRANSITION_HISTORY_LIMIT = 500;
+
+function appendBoundedHistory<T>(history: T[] | undefined, entry: T, limit: number): T[] {
+  const next = [...(history ?? []), entry];
+  const overflow = next.length - limit;
+  return overflow > 0 ? next.slice(overflow) : next;
+}
+
+function nextEventCount(runState: RunState): number {
+  const currentCount =
+    typeof runState.event_count === "number" && Number.isFinite(runState.event_count) && runState.event_count >= 0
+      ? runState.event_count
+      : runState.event_history.length;
+  return currentCount + 1;
+}
+
+function nextTransitionCount(runState: RunState): number {
+  const currentCount =
+    typeof runState.transition_count === "number" &&
+    Number.isFinite(runState.transition_count) &&
+    runState.transition_count >= 0
+      ? runState.transition_count
+      : runState.transition_history.length;
+  return currentCount + 1;
+}
+
 function createEmptyRunState(runId: string, graphId: string, input: string, documents: RunDocument[] = []): RunState {
   return {
     run_id: runId,
@@ -573,7 +600,9 @@ function createEmptyRunState(runId: string, graphId: string, input: string, docu
     node_statuses: {},
     iterator_states: {},
     visit_counts: {},
+    transition_count: 0,
     transition_history: [],
+    event_count: 0,
     event_history: [],
     final_output: null,
     terminal_error: null,
@@ -659,7 +688,8 @@ function resolveEdgeOutputFromEventHistory(previous: RunState, edgePayload: Reco
 function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState {
   const next: RunState = {
     ...previous,
-    event_history: [...previous.event_history, event],
+    event_count: nextEventCount(previous),
+    event_history: appendBoundedHistory(previous.event_history, event, RUN_STATE_EVENT_HISTORY_LIMIT),
   };
 
   if (event.event_type === "run.started") {
@@ -765,15 +795,17 @@ function applySingleRunEvent(previous: RunState, event: RuntimeEvent): RunState 
         [selectedEdgeId]: selectedEdgeOutput,
       };
     }
-    next.transition_history = [
-      ...next.transition_history,
+    next.transition_count = nextTransitionCount(next);
+    next.transition_history = appendBoundedHistory(
+      next.transition_history,
       {
         edge_id: payload.id,
         source_id: payload.source_id,
         target_id: payload.target_id,
         timestamp: event.timestamp,
       },
-    ];
+      RUN_STATE_TRANSITION_HISTORY_LIMIT,
+    );
   }
 
   if (event.event_type === "run.completed") {
@@ -855,7 +887,8 @@ function applyEvent(
     return {
       ...next,
       status: next.status === "queued" ? "running" : next.status,
-      event_history: [...next.event_history, event],
+      event_count: nextEventCount(next),
+      event_history: appendBoundedHistory(next.event_history, event, RUN_STATE_EVENT_HISTORY_LIMIT),
       agent_runs: {
         ...(next.agent_runs ?? {}),
         [agentId]: applySingleRunEvent(priorAgentRun, normalizedEvent),
@@ -895,6 +928,8 @@ function applyPersistedSupabaseConnectionState(graph: GraphDocument, storageKey:
   );
   const savedDefaultConnectionId = String(graph.default_supabase_connection_id ?? "").trim();
   const persistedDefaultConnectionId = String(persistedState.default_supabase_connection_id ?? "").trim();
+  const savedRunStoreConnectionId = String(graph.run_store_supabase_connection_id ?? "").trim();
+  const persistedRunStoreConnectionId = String(persistedState.run_store_supabase_connection_id ?? "").trim();
   const supplementalPersistedConnections = persistedState.supabase_connections.filter((connection) => {
     const connectionId = String(connection.connection_id ?? "").trim();
     if (!connectionId || savedConnectionIds.has(connectionId)) {
@@ -915,9 +950,16 @@ function applyPersistedSupabaseConnectionState(graph: GraphDocument, storageKey:
       : persistedDefaultConnectionId && mergedConnectionIds.has(persistedDefaultConnectionId)
         ? persistedDefaultConnectionId
         : "";
+  const resolvedRunStoreConnectionId =
+    savedRunStoreConnectionId && mergedConnectionIds.has(savedRunStoreConnectionId)
+      ? savedRunStoreConnectionId
+      : persistedRunStoreConnectionId && mergedConnectionIds.has(persistedRunStoreConnectionId)
+        ? persistedRunStoreConnectionId
+        : "";
   if (
     supplementalPersistedConnections.length === 0
     && resolvedDefaultConnectionId === savedDefaultConnectionId
+    && resolvedRunStoreConnectionId === savedRunStoreConnectionId
   ) {
     return graph;
   }
@@ -925,6 +967,7 @@ function applyPersistedSupabaseConnectionState(graph: GraphDocument, storageKey:
     ...graph,
     supabase_connections: mergedConnections,
     default_supabase_connection_id: resolvedDefaultConnectionId,
+    run_store_supabase_connection_id: resolvedRunStoreConnectionId,
   };
 }
 
@@ -1014,6 +1057,14 @@ export default function App() {
     [runState, activeRunId, selectedAgentId],
   );
   const filteredEvents = useMemo(() => filterEventsForAgent(events, selectedAgentId), [events, selectedAgentId]);
+  const fileRefreshTrigger = useMemo(
+    () =>
+      filteredEvents.reduce((count, event) => {
+        const eventType = event.event_type;
+        return eventType === "node.completed" || eventType === "agent.node.completed" ? count + 1 : count;
+      }, 0),
+    [filteredEvents],
+  );
   const persistedGraphIds = useMemo(() => new Set(graphs.map((graph) => graph.graph_id)), [graphs]);
   const isEnvironment = isTestEnvironment(draftGraph);
   const emailRoutingMode = useMemo(() => resolveEmailRoutingMode(draftGraph), [draftGraph]);
@@ -1123,7 +1174,7 @@ export default function App() {
       return;
     }
     void refreshRunFiles(selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId);
-  }, [refreshRunFiles, selectedRunFilesRequest.runId, selectedRunState?.event_history.length]);
+  }, [refreshRunFiles, selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId, fileRefreshTrigger]);
 
   useEffect(() => {
     if (!selectedRunFilesRequest.runId || !selectedRunFilePath) {
@@ -1654,9 +1705,10 @@ export default function App() {
       {
         supabase_connections: draftGraph.supabase_connections ?? [],
         default_supabase_connection_id: draftGraph.default_supabase_connection_id ?? "",
+        run_store_supabase_connection_id: draftGraph.run_store_supabase_connection_id ?? "",
       },
     );
-  }, [draftGraph, draftGraph?.default_supabase_connection_id, draftGraph?.supabase_connections, selectedGraphId]);
+  }, [draftGraph, draftGraph?.default_supabase_connection_id, draftGraph?.run_store_supabase_connection_id, draftGraph?.supabase_connections, selectedGraphId]);
 
   useEffect(() => {
     setSelectedNodeId(null);

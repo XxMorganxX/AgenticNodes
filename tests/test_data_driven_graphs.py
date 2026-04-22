@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import types
 import unittest
 from pathlib import Path
 import sys
@@ -61,6 +62,82 @@ class DataDrivenGraphTests(unittest.TestCase):
         self.assertIsNotNone(state.final_output)
         self.assertIn("message", state.final_output)
         self.assertIn("repair_tool", [transition.target_id for transition in state.transition_history])
+
+    def test_zero_max_steps_runs_without_step_limit(self) -> None:
+        graph = GraphDefinition.from_dict(build_example_graph_payload())
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=0,
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        state = runtime.run(graph, "Find graph-agent references for a schema repair workflow.")
+
+        self.assertEqual(state.status, "completed")
+        self.assertGreater(state.event_count, 0)
+
+    def test_runtime_fails_when_no_pending_node_can_become_ready(self) -> None:
+        graph_payload: dict[str, Any] = {
+            "graph_id": "stalled-graph",
+            "name": "Stalled Graph",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "description": "",
+                    "position": {"x": 0, "y": 0},
+                    "config": {"input_binding": {"type": "input_payload"}},
+                },
+                {
+                    "id": "finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "description": "",
+                    "position": {"x": 240, "y": 0},
+                    "config": {},
+                },
+            ],
+            "edges": [
+                {
+                    "id": "edge-start-finish",
+                    "source_id": "start",
+                    "target_id": "finish",
+                    "label": "to finish",
+                    "kind": "standard",
+                    "priority": 0,
+                }
+            ],
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+        graph.nodes["finish"].is_ready = types.MethodType(lambda self, context: False, graph.nodes["finish"])
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=0,
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        state = runtime.run(graph, "hello")
+
+        self.assertEqual(state.status, "failed")
+        self.assertEqual(state.terminal_error, {
+            "type": "execution_stalled",
+            "node_id": "finish",
+            "pending_node_ids": ["finish"],
+        })
 
     def test_invalid_category_connection_is_rejected(self) -> None:
         payload = build_example_graph_payload()

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 from threading import Lock
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+
+LOGGER = logging.getLogger(__name__)
 
 from graph_agent.api.run_state_reducer import build_run_state, replay_events
 from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
@@ -112,6 +117,58 @@ def _run_row_metadata(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_SCHEMA_CACHE_MISSING_COLUMN_RE = re.compile(r"Could not find the '([^']+)' column of '([^']+)' in the schema cache")
+
+
+class _SchemaCacheColumnMissingError(RuntimeError):
+    def __init__(self, *, table: str, column: str, detail: str) -> None:
+        super().__init__(f"Supabase schema cache missing column {table}.{column}: {detail}")
+        self.table = table
+        self.column = column
+        self.detail = detail
+
+
+def _extract_schema_cache_missing_column(detail: str) -> tuple[str, str] | None:
+    try:
+        payload = json.loads(detail)
+    except json.JSONDecodeError:
+        payload = None
+    if not isinstance(payload, dict) or payload.get("code") != "PGRST204":
+        return None
+    message = str(payload.get("message") or "")
+    match = _SCHEMA_CACHE_MISSING_COLUMN_RE.search(message)
+    if match is None:
+        return None
+    column_name, table_name = match.groups()
+    return table_name, column_name
+
+
+def _looks_like_html_document(detail: str) -> bool:
+    stripped = detail.lstrip().lower()
+    return stripped.startswith("<!doctype html") or stripped.startswith("<html")
+
+
+def _format_http_error_detail(url: str, status_code: int, detail: str) -> str:
+    normalized_detail = detail.strip()
+    if status_code == 404 and _looks_like_html_document(normalized_detail):
+        return (
+            "404 Received an HTML page instead of the Supabase REST API. "
+            "This usually means the configured Supabase URL points at Supabase Studio/dashboard "
+            "rather than the project API base URL. Use a project URL like "
+            "https://<project-ref>.supabase.co so requests to /rest/v1/... resolve correctly."
+        )
+    if status_code == 404 and "/rest/v1/" in url:
+        return (
+            "404 Supabase PostgREST endpoint not found. Check that the configured Supabase URL is "
+            "your project API base URL and not a dashboard or Studio URL."
+        )
+    if not normalized_detail:
+        return f"{status_code} <empty body>"
+    if len(normalized_detail) > 400:
+        normalized_detail = f"{normalized_detail[:400]}..."
+    return f"{status_code} {normalized_detail}"
+
+
 class SupabaseRunStore:
     def __init__(
         self,
@@ -129,6 +186,8 @@ class SupabaseRunStore:
         self.events_table = events_table
         self._sequence_lock = Lock()
         self._sequence_cache: dict[str, int] = {}
+        self._unsupported_columns_lock = Lock()
+        self._unsupported_columns_by_table: dict[str, set[str]] = {}
 
     @classmethod
     def from_env(cls) -> "SupabaseRunStore":
@@ -145,78 +204,58 @@ class SupabaseRunStore:
         schema = os.environ.get("GRAPH_AGENT_SUPABASE_SCHEMA", "").strip() or "public"
         if not url or not service_role_key:
             raise RuntimeError(
-                "Supabase run store requires GRAPH_AGENT_SUPABASE_URL and GRAPH_AGENT_SUPABASE_SECRET_KEY."
+                "Supabase run store requires a URL (GRAPH_AGENT_SUPABASE_URL or SUPABASE_URL) "
+                "and a service-role key (GRAPH_AGENT_SUPABASE_SECRET_KEY, "
+                "GRAPH_AGENT_SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SERVICE_ROLE_KEY, "
+                "or SUPABASE_SECRET_KEY) in the process environment."
             )
         return cls(url=url, service_role_key=service_role_key, schema=schema)
 
     def initialize_run(self, state: dict[str, Any]) -> None:
-        run_id = str(state["run_id"])
-        created_at = utc_now_iso()
-        row = {
-            "run_id": run_id,
-            "graph_id": state.get("graph_id"),
-            "agent_id": state.get("agent_id"),
-            "agent_name": state.get("agent_name"),
-            "parent_run_id": state.get("parent_run_id"),
-            "status": state.get("status"),
-            "status_reason": state.get("status_reason"),
-            "started_at": state.get("started_at"),
-            "ended_at": state.get("ended_at"),
-            "runtime_instance_id": state.get("runtime_instance_id"),
-            "last_heartbeat_at": state.get("last_heartbeat_at"),
-            "input_payload": state.get("input_payload"),
-            "final_output": state.get("final_output"),
-            "terminal_error": state.get("terminal_error"),
-            "current_node_id": state.get("current_node_id"),
-            "current_edge_id": state.get("current_edge_id"),
-            "state_snapshot": state,
-            "metadata": _run_row_metadata(state),
-            "created_at": created_at,
-        }
-        self._upsert_runs([row])
-        with self._sequence_lock:
-            self._sequence_cache.setdefault(run_id, 0)
+        self.initialize_runs_batch([state])
 
     def append_event(self, run_id: str, event: dict[str, Any]) -> None:
-        event = normalize_runtime_event_dict(event)
-        sequence_number = self._next_sequence_number(run_id)
-        row = {
-            "run_id": run_id,
-            "sequence_number": sequence_number,
-            "event_type": event.get("event_type"),
-            "timestamp": event.get("timestamp"),
-            "agent_id": event.get("agent_id"),
-            "parent_run_id": event.get("parent_run_id"),
-            "summary": event.get("summary"),
-            "payload": event.get("payload", {}),
-            "metadata": _event_row_metadata(event),
-        }
-        self._request_json("POST", self._table_path(self.events_table), payload=[row], prefer="return=minimal")
+        self.append_events_batch([(run_id, event)])
 
     def write_state(self, run_id: str, state: dict[str, Any]) -> None:
-        normalized_state = normalize_runtime_state_snapshot(state) or state
-        row = {
-            "run_id": run_id,
-            "graph_id": normalized_state.get("graph_id"),
-            "agent_id": normalized_state.get("agent_id"),
-            "agent_name": normalized_state.get("agent_name"),
-            "parent_run_id": normalized_state.get("parent_run_id"),
-            "status": normalized_state.get("status"),
-            "status_reason": normalized_state.get("status_reason"),
-            "started_at": normalized_state.get("started_at"),
-            "ended_at": normalized_state.get("ended_at"),
-            "runtime_instance_id": normalized_state.get("runtime_instance_id"),
-            "last_heartbeat_at": normalized_state.get("last_heartbeat_at"),
-            "input_payload": normalized_state.get("input_payload"),
-            "final_output": normalized_state.get("final_output"),
-            "terminal_error": normalized_state.get("terminal_error"),
-            "current_node_id": normalized_state.get("current_node_id"),
-            "current_edge_id": normalized_state.get("current_edge_id"),
-            "state_snapshot": normalized_state,
-            "metadata": _run_row_metadata(normalized_state),
-            "created_at": normalized_state.get("started_at") or utc_now_iso(),
-        }
-        self._upsert_runs([row])
+        self.write_states_batch([(run_id, state)])
+
+    def initialize_runs_batch(self, states: list[dict[str, Any]]) -> None:
+        if not states:
+            return
+        rows = [self._build_run_row(state, created_at=utc_now_iso()) for state in states]
+        self._upsert_runs(rows)
+        with self._sequence_lock:
+            for state in states:
+                run_id = str(state.get("run_id") or "")
+                if run_id:
+                    self._sequence_cache.setdefault(run_id, 0)
+
+    def append_events_batch(self, items: list[tuple[str, dict[str, Any]]]) -> None:
+        if not items:
+            return
+        normalized_items = [(str(run_id), normalize_runtime_event_dict(event)) for run_id, event in items]
+        sequence_numbers = self._next_sequence_numbers([run_id for run_id, _ in normalized_items])
+        if len(sequence_numbers) != len(normalized_items):
+            raise RuntimeError(
+                "Supabase run store sequence allocation returned a mismatched event count during batch append."
+            )
+        rows = [
+            self._build_event_row(run_id, event, sequence_number=sequence_number)
+            for (run_id, event), sequence_number in zip(normalized_items, sequence_numbers)
+        ]
+        self._request_json_with_schema_fallback(
+            "POST",
+            self._table_path(self.events_table),
+            payload=rows,
+            prefer="return=minimal",
+        )
+
+    def write_states_batch(self, items: list[tuple[str, dict[str, Any]]]) -> None:
+        if not items:
+            return
+        rows = [self._build_run_row(state) for _, state in items]
+        self._upsert_runs(rows)
 
     def load_manifest(self, run_id: str) -> dict[str, Any] | None:
         row = self._load_run_row(run_id)
@@ -234,7 +273,7 @@ class SupabaseRunStore:
         }
 
     def load_events(self, run_id: str) -> list[dict[str, Any]]:
-        rows = self._request_json(
+        rows = self._request_json_with_schema_fallback(
             "GET",
             self._table_path(self.events_table),
             query={
@@ -293,11 +332,11 @@ class SupabaseRunStore:
         }
         if graph_id is not None:
             query["graph_id"] = f"eq.{graph_id}"
-        rows = self._request_json("GET", self._table_path(self.runs_table), query=query)
+        rows = self._request_json_with_schema_fallback("GET", self._table_path(self.runs_table), query=query)
         return [dict(row) for row in rows]
 
     def _load_run_row(self, run_id: str) -> dict[str, Any] | None:
-        rows = self._request_json(
+        rows = self._request_json_with_schema_fallback(
             "GET",
             self._table_path(self.runs_table),
             query={"run_id": f"eq.{run_id}", "select": "*", "limit": "1"},
@@ -307,7 +346,7 @@ class SupabaseRunStore:
         return dict(rows[0])
 
     def _upsert_runs(self, rows: list[dict[str, Any]]) -> None:
-        self._request_json(
+        self._request_json_with_schema_fallback(
             "POST",
             self._table_path(self.runs_table),
             payload=rows,
@@ -315,10 +354,17 @@ class SupabaseRunStore:
         )
 
     def _next_sequence_number(self, run_id: str) -> int:
+        return self._next_sequence_numbers([run_id])[0]
+
+    def _next_sequence_numbers(self, run_ids: list[str]) -> list[int]:
+        if not run_ids:
+            return []
         with self._sequence_lock:
-            cached = self._sequence_cache.get(run_id)
-            if cached is None:
-                rows = self._request_json(
+            for run_id in dict.fromkeys(run_ids):
+                cached = self._sequence_cache.get(run_id)
+                if cached is not None:
+                    continue
+                rows = self._request_json_with_schema_fallback(
                     "GET",
                     self._table_path(self.events_table),
                     query={
@@ -328,13 +374,128 @@ class SupabaseRunStore:
                         "limit": "1",
                     },
                 )
-                cached = int(rows[0]["sequence_number"]) if rows else 0
-            cached += 1
-            self._sequence_cache[run_id] = cached
-            return cached
+                self._sequence_cache[run_id] = int(rows[0]["sequence_number"]) if rows else 0
+            sequence_numbers: list[int] = []
+            for run_id in run_ids:
+                cached = int(self._sequence_cache.get(run_id, 0)) + 1
+                self._sequence_cache[run_id] = cached
+                sequence_numbers.append(cached)
+            return sequence_numbers
+
+    def _build_event_row(self, run_id: str, event: dict[str, Any], *, sequence_number: int) -> dict[str, Any]:
+        return {
+            "run_id": run_id,
+            "sequence_number": sequence_number,
+            "event_type": event.get("event_type"),
+            "timestamp": event.get("timestamp"),
+            "agent_id": event.get("agent_id"),
+            "parent_run_id": event.get("parent_run_id"),
+            "summary": event.get("summary"),
+            "payload": event.get("payload", {}),
+            "metadata": _event_row_metadata(event),
+        }
+
+    def _build_run_row(self, state: dict[str, Any], *, created_at: str | None = None) -> dict[str, Any]:
+        normalized_state = normalize_runtime_state_snapshot(state) or state
+        return {
+            "run_id": normalized_state.get("run_id"),
+            "graph_id": normalized_state.get("graph_id"),
+            "agent_id": normalized_state.get("agent_id"),
+            "agent_name": normalized_state.get("agent_name"),
+            "parent_run_id": normalized_state.get("parent_run_id"),
+            "status": normalized_state.get("status"),
+            "status_reason": normalized_state.get("status_reason"),
+            "started_at": normalized_state.get("started_at"),
+            "ended_at": normalized_state.get("ended_at"),
+            "runtime_instance_id": normalized_state.get("runtime_instance_id"),
+            "last_heartbeat_at": normalized_state.get("last_heartbeat_at"),
+            "input_payload": normalized_state.get("input_payload"),
+            "final_output": normalized_state.get("final_output"),
+            "terminal_error": normalized_state.get("terminal_error"),
+            "current_node_id": normalized_state.get("current_node_id"),
+            "current_edge_id": normalized_state.get("current_edge_id"),
+            "state_snapshot": normalized_state,
+            "metadata": _run_row_metadata(normalized_state),
+            "created_at": created_at or normalized_state.get("started_at") or utc_now_iso(),
+        }
 
     def _table_path(self, table_name: str) -> str:
         return f"/rest/v1/{table_name}"
+
+    def _request_json_with_schema_fallback(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict[str, str] | None = None,
+        payload: Any | None = None,
+        prefer: str | None = None,
+    ) -> Any:
+        table_name = self._table_name_from_path(path)
+        for _ in range(8):
+            try:
+                return self._request_json(
+                    method,
+                    path,
+                    query=self._sanitize_query(table_name, query),
+                    payload=self._sanitize_payload(table_name, payload),
+                    prefer=prefer,
+                )
+            except _SchemaCacheColumnMissingError as exc:
+                if not self._mark_column_unsupported(exc.table, exc.column):
+                    raise RuntimeError(
+                        f"Supabase run store request could not recover after repeated schema-cache errors "
+                        f"for {exc.table}.{exc.column}: {exc.detail}"
+                    ) from exc
+                LOGGER.warning(
+                    "Supabase run store detected missing column %s.%s in the PostgREST schema cache; "
+                    "future requests will omit it until the schema is updated or reloaded.",
+                    exc.table,
+                    exc.column,
+                )
+        raise RuntimeError(f"Supabase run store request could not recover after repeated schema-cache errors for {table_name}.")
+
+    def _sanitize_query(self, table_name: str, query: dict[str, str] | None) -> dict[str, str] | None:
+        if query is None:
+            return None
+        sanitized = dict(query)
+        unsupported_columns = self._unsupported_columns(table_name)
+        select_value = sanitized.get("select")
+        if unsupported_columns and isinstance(select_value, str) and select_value.strip() and select_value.strip() != "*":
+            selected_columns = [part.strip() for part in select_value.split(",") if part.strip()]
+            sanitized_columns = [column for column in selected_columns if column not in unsupported_columns]
+            sanitized["select"] = ",".join(sanitized_columns) if sanitized_columns else "*"
+        return sanitized
+
+    def _sanitize_payload(self, table_name: str, payload: Any | None) -> Any | None:
+        unsupported_columns = self._unsupported_columns(table_name)
+        if not unsupported_columns or payload is None:
+            return payload
+        if isinstance(payload, list):
+            return [self._sanitize_payload_row(row, unsupported_columns) for row in payload]
+        if isinstance(payload, dict):
+            return self._sanitize_payload_row(payload, unsupported_columns)
+        return payload
+
+    def _sanitize_payload_row(self, row: Any, unsupported_columns: set[str]) -> Any:
+        if not isinstance(row, dict):
+            return row
+        return {key: value for key, value in row.items() if key not in unsupported_columns}
+
+    def _table_name_from_path(self, path: str) -> str:
+        return path.rsplit("/", 1)[-1]
+
+    def _unsupported_columns(self, table_name: str) -> set[str]:
+        with self._unsupported_columns_lock:
+            return set(self._unsupported_columns_by_table.get(table_name, set()))
+
+    def _mark_column_unsupported(self, table_name: str, column_name: str) -> bool:
+        with self._unsupported_columns_lock:
+            unsupported_columns = self._unsupported_columns_by_table.setdefault(table_name, set())
+            if column_name in unsupported_columns:
+                return False
+            unsupported_columns.add(column_name)
+            return True
 
     def _request_json(
         self,
@@ -358,13 +519,57 @@ class SupabaseRunStore:
         if prefer:
             headers["Prefer"] = prefer
         body = None if payload is None else json.dumps(payload).encode("utf-8")
+        payload_len = len(body) if body is not None else 0
+        LOGGER.debug("Supabase run store %s %s (body=%d bytes)", method, url, payload_len)
         request = Request(url, data=body, method=method, headers=headers)
         try:
             with urlopen(request) as response:
                 raw = response.read()
+                status = response.status
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Supabase run store request failed: {exc.code} {detail}") from exc
+            missing_column = _extract_schema_cache_missing_column(detail)
+            if missing_column is not None:
+                table_name, column_name = missing_column
+                raise _SchemaCacheColumnMissingError(table=table_name, column=column_name, detail=detail) from exc
+            error_detail = _format_http_error_detail(url, exc.code, detail)
+            LOGGER.error(
+                "Supabase run store %s %s failed: HTTP %d — %s",
+                method,
+                url,
+                exc.code,
+                error_detail,
+            )
+            raise RuntimeError(f"Supabase run store request failed: {error_detail}") from exc
+        except URLError as exc:
+            LOGGER.error("Supabase run store %s %s network error: %s", method, url, exc.reason)
+            raise RuntimeError(f"Supabase run store network error: {exc.reason}") from exc
+        LOGGER.debug("Supabase run store %s %s ok (status=%s, bytes=%d)", method, url, status, len(raw))
         if not raw:
             return []
         return json.loads(raw.decode("utf-8"))
+
+    def check_connectivity(self) -> None:
+        try:
+            self._request_json_with_schema_fallback(
+                "GET",
+                self._table_path(self.runs_table),
+                query={"select": "run_id", "limit": "1"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "Supabase run store connectivity check failed for %s (schema=%s, table=%s): %s. "
+                "Writes will still be attempted; check credentials, schema, and that supabase/run_events_schema.sql has been applied.",
+                self.url,
+                self.schema,
+                self.runs_table,
+                exc,
+            )
+            return
+        LOGGER.info(
+            "Supabase run store reachable at %s (schema=%s, runs/%s + run_events/%s).",
+            self.url,
+            self.schema,
+            self.runs_table,
+            self.events_table,
+        )

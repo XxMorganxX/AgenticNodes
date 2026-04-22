@@ -131,6 +131,7 @@ These rules come from `.cursor/rules/` and are enforced for every change:
 Design intent for the major components lives in top-level docs — read these before making structural changes:
 
 - `model.md` — provider-agnostic `ModelProvider` contract, prompts live in `config.py`
+- `node-development-guide.md` — end-to-end checklist for adding new nodes across registry, runtime, editor, validation, and tests
 - `control-loop.md` — traversal rules and termination semantics
 - `state.md` — `RunState` fields and access patterns
 - `logging.md` — full `runtime.v1` event catalog and compatibility rules
@@ -141,7 +142,7 @@ Design intent for the major components lives in top-level docs — read these be
 
 ## Environment Variables
 
-`.env` is **not** auto-loaded — variables must be exported in the shell that runs `run.py` (or the standalone uvicorn/vite commands). `.env.example` is reference only.
+`run.py` auto-loads `<repo>/.env` into the process environment before launching the backend/frontend (shell-exported vars win — `.env` only fills gaps). For the standalone uvicorn/vite commands you must still export the vars yourself. `.env.example` documents the keys.
 
 Commonly needed: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DISCORD_BOT_TOKEN`, `GRAPH_AGENT_SUPABASE_URL`, `GRAPH_AGENT_SUPABASE_SECRET_KEY`, `APOLLO_API_KEY`. Supabase supports both legacy `service_role` JWT keys and newer `sb_secret_*` keys. Secret keys are server-side only.
 

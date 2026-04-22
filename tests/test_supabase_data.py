@@ -220,6 +220,29 @@ class _SupabaseStubHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if parsed.path.startswith("/v1/projects/") and (
+            parsed.path.endswith("/database/query") or parsed.path.endswith("/database/query/read-only")
+        ):
+            request_payload = type(self).last_json_body if isinstance(type(self).last_json_body, dict) else {}
+            parameters = request_payload.get("parameters", [])
+            query = str(request_payload.get("query", "") or "")
+            if "status = $1" in query:
+                result_rows = [
+                    {
+                        "id": 2,
+                        "name": "Beta",
+                        "status": parameters[0] if isinstance(parameters, list) and parameters else "unknown",
+                    }
+                ]
+            else:
+                result_rows = [{"query": query, "parameters": parameters}]
+            body = json.dumps({"result": result_rows, "error": None}).encode("utf-8")
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path.startswith("/rest/v1/") and parsed.path != "/rest/v1/":
             prefer = str(self.headers.get("Prefer", ""))
             if "return=minimal" in prefer:
@@ -400,6 +423,67 @@ def supabase_row_write_graph_payload(
     }
 
 
+def supabase_sql_graph_payload(
+    graph_id: str = "supabase-sql-graph",
+    *,
+    node_config: dict[str, object] | None = None,
+) -> dict[str, object]:
+    resolved_node_config: dict[str, object] = {
+        "mode": "supabase_sql",
+        "project_ref_env_var": "SUPABASE_PROJECT_REF",
+        "access_token_env_var": "SUPABASE_ACCESS_TOKEN",
+        "query": "select id, name from public.projects where status = {status} and id >= {minimum_id}",
+        "read_only": True,
+        "output_mode": "records",
+        "management_api_base_url": "",
+    }
+    if node_config:
+        resolved_node_config.update(node_config)
+    return {
+        "graph_id": graph_id,
+        "name": "Supabase SQL Graph",
+        "description": "",
+        "version": "1.0",
+        "start_node_id": "start",
+        "nodes": [
+            {
+                "id": "start",
+                "kind": "input",
+                "category": "start",
+                "label": "Start",
+                "provider_id": "start.manual_run",
+                "provider_label": "Run Button Start",
+                "config": {"input_binding": {"type": "input_payload"}},
+                "position": {"x": 0, "y": 0},
+            },
+            {
+                "id": "sql",
+                "kind": "data",
+                "category": "data",
+                "label": "Supabase SQL Query",
+                "provider_id": "core.supabase_sql",
+                "provider_label": "Supabase SQL Query",
+                "config": resolved_node_config,
+                "position": {"x": 240, "y": 0},
+            },
+            {
+                "id": "finish",
+                "kind": "output",
+                "category": "end",
+                "label": "Finish",
+                "provider_id": "core.output",
+                "provider_label": "Core Output Node",
+                "config": {"source_binding": {"type": "latest_payload", "source": "sql"}},
+                "position": {"x": 460, "y": 0},
+            },
+        ],
+        "edges": [
+            {"id": "e1", "source_id": "start", "target_id": "sql", "label": "", "kind": "standard", "priority": 100},
+            {"id": "e2", "source_id": "sql", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+        ],
+    }
+
+
 def supabase_table_rows_graph_payload(
     graph_id: str = "supabase-table-rows-graph",
     *,
@@ -550,6 +634,16 @@ class SupabaseDataNodeTests(unittest.TestCase):
         self.assertEqual(provider["default_config"]["write_mode"], "insert")
         self.assertEqual(provider["default_config"]["returning"], "representation")
 
+    def test_supabase_sql_provider_appears_in_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = GraphStore(self.services, path=Path(directory) / "graphs.json")
+            catalog = store.catalog()
+
+        provider = next(candidate for candidate in catalog["node_providers"] if candidate["provider_id"] == "core.supabase_sql")
+        self.assertEqual(provider["default_config"]["mode"], "supabase_sql")
+        self.assertTrue(provider["default_config"]["read_only"])
+        self.assertEqual(provider["default_config"]["output_mode"], "records")
+
     def test_supabase_table_rows_provider_appears_in_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = GraphStore(self.services, path=Path(directory) / "graphs.json")
@@ -605,6 +699,76 @@ class SupabaseDataNodeTests(unittest.TestCase):
 
         self.assertEqual(state.status, "failed")
         self.assertEqual(state.terminal_error["type"], "missing_supabase_url")
+
+    def test_supabase_sql_node_executes_parameterized_query(self) -> None:
+        graph = GraphDefinition.from_dict(
+            supabase_sql_graph_payload(
+                node_config={
+                    "management_api_base_url": "{SUPABASE_MANAGEMENT_API_BASE_URL}",
+                }
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with SupabaseStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "SUPABASE_PROJECT_REF": "project-123",
+                "SUPABASE_ACCESS_TOKEN": "access-token",
+                "SUPABASE_MANAGEMENT_API_BASE_URL": base_url,
+            },
+            clear=False,
+        ):
+            state = runtime.run(
+                graph,
+                {"status": "active", "minimum_id": 2},
+                run_id="run-supabase-sql",
+            )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output, [{"id": 2, "name": "Beta", "status": "active"}])
+        self.assertEqual(state.node_outputs["sql"]["metadata"]["data_mode"], "supabase_sql")
+        self.assertEqual(state.node_outputs["sql"]["metadata"]["row_count"], 1)
+        self.assertEqual(_SupabaseStubHandler.last_path, "/v1/projects/project-123/database/query/read-only")
+        self.assertEqual(_SupabaseStubHandler.last_headers.get("authorization"), "Bearer access-token")
+        self.assertEqual(
+            _SupabaseStubHandler.last_json_body,
+            {
+                "query": "select id, name from public.projects where status = $1 and id >= $2",
+                "parameters": ["active", 2],
+            },
+        )
+
+    def test_supabase_sql_node_reports_missing_payload_field(self) -> None:
+        graph = GraphDefinition.from_dict(
+            supabase_sql_graph_payload(
+                "supabase-sql-missing-field",
+                node_config={
+                    "management_api_base_url": "{SUPABASE_MANAGEMENT_API_BASE_URL}",
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with SupabaseStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "SUPABASE_PROJECT_REF": "project-123",
+                "SUPABASE_ACCESS_TOKEN": "access-token",
+                "SUPABASE_MANAGEMENT_API_BASE_URL": base_url,
+            },
+            clear=False,
+        ):
+            state = runtime.run(
+                graph,
+                {"status": "active"},
+                run_id="run-supabase-sql-missing",
+            )
+
+        self.assertEqual(state.status, "failed")
+        self.assertEqual(state.terminal_error["type"], "missing_supabase_sql_parameter")
 
     def test_supabase_data_node_can_exist_without_source_name_during_editing(self) -> None:
         graph = GraphDefinition.from_dict(

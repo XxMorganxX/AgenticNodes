@@ -1310,7 +1310,7 @@ export function buildFocusedRunProjection(
       currentNodeLabel: (currentNodeId ? labels.get(currentNodeId) : null) ?? currentNodeId ?? "n/a",
       completedNodes: Object.values(nodeStates).filter((nodeState) => nodeState.wasVisited).length,
       totalNodes: graph?.nodes.length ?? 0,
-      transitionCount: runState?.transition_history.length ?? 0,
+      transitionCount: runState?.transition_count ?? runState?.transition_history.length ?? 0,
       errorCount: errorSummaries.length,
       retryCount: normalizedEvents.filter((event) => event.event_type === "retry.triggered").length,
       elapsedLabel: formatElapsed(runState?.started_at, runState?.ended_at),

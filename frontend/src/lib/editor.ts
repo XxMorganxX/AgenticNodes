@@ -10,6 +10,7 @@ import { getExplicitSupabaseConnections } from "./supabaseConnections";
 import type { AgentDefinition, EditorCatalog, GraphDefinition, GraphDocument, GraphEdge, GraphNode, GraphPosition, NodeProviderDefinition } from "./types";
 
 const SPREADSHEET_ROWS_PROVIDER_ID = "core.spreadsheet_rows";
+const SUPABASE_SQL_PROVIDER_ID = "core.supabase_sql";
 const SUPABASE_TABLE_ROWS_PROVIDER_ID = "core.supabase_table_rows";
 
 export type GraphLayoutNodeDimensions = {
@@ -191,6 +192,7 @@ export function createBlankGraph(): GraphDefinition {
     env_vars: { ...DEFAULT_GRAPH_ENV_VARS },
     supabase_connections: [],
     default_supabase_connection_id: "",
+    run_store_supabase_connection_id: "",
     nodes: [],
     edges: [],
     node_providers: [],
@@ -378,7 +380,7 @@ export function createNodeFromProvider(
     const maybeSupabaseConnectionConfig =
       defaultSupabaseConnectionId &&
       validDefaultSupabaseConnectionIds.has(defaultSupabaseConnectionId) &&
-      ["core.supabase_data", "core.supabase_row_write", "core.outbound_email_logger"].includes(provider.provider_id)
+      [SUPABASE_SQL_PROVIDER_ID, "core.supabase_data", "core.supabase_row_write", "core.outbound_email_logger"].includes(provider.provider_id)
         ? { supabase_connection_id: defaultSupabaseConnectionId }
         : {};
     if (provider.provider_id === "core.context_builder") {

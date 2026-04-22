@@ -86,6 +86,7 @@ The current catalog includes support for:
 Supporting design notes live in:
 
 - [model.md](model.md)
+- [node-development-guide.md](node-development-guide.md)
 - [tool-registry.md](tool-registry.md)
 - [control-loop.md](control-loop.md)
 - [supabase-connections.md](supabase-connections.md)

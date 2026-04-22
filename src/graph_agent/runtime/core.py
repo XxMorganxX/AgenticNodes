@@ -74,6 +74,8 @@ from graph_agent.runtime.structured_payload_builder import (
 from graph_agent.runtime.supabase_data import (
     SupabaseDataError,
     SupabaseDataRequest,
+    SupabaseSqlQueryRequest,
+    execute_supabase_sql_query,
     fetch_supabase_schema_catalog,
     fetch_supabase_data,
     SupabaseRowWriteRequest,
@@ -122,6 +124,9 @@ API_TOOL_CALL_HANDLE_ID = "api-tool-call"
 API_MESSAGE_HANDLE_ID = "api-message"
 NO_TOOL_CALL_MESSAGE = "No Tool Call Made"
 MCP_TERMINAL_OUTPUT_HANDLE_ID = "mcp-terminal-output"
+RUN_STATE_EVENT_HISTORY_LIMIT = 500
+RUN_STATE_TRANSITION_HISTORY_LIMIT = 500
+RUN_EVENT_BACKLOG_LIMIT = 500
 PROMPT_BLOCK_PROVIDER_ID = "core.prompt_block"
 PROMPT_BLOCK_MODE = "prompt_block"
 PROMPT_BLOCK_ROLES = {"system", "user", "assistant"}
@@ -148,6 +153,8 @@ RUNTIME_NORMALIZER_PROVIDER_ID = "core.runtime_normalizer"
 RUNTIME_NORMALIZER_MODE = "runtime_normalizer"
 SUPABASE_DATA_PROVIDER_ID = "core.supabase_data"
 SUPABASE_DATA_MODE = "supabase_data"
+SUPABASE_SQL_PROVIDER_ID = "core.supabase_sql"
+SUPABASE_SQL_MODE = "supabase_sql"
 SUPABASE_TABLE_ROWS_PROVIDER_ID = "core.supabase_table_rows"
 SUPABASE_TABLE_ROWS_MODE = "supabase_table_rows"
 SUPABASE_ROW_WRITE_PROVIDER_ID = "core.supabase_row_write"
@@ -560,6 +567,7 @@ DEFAULT_SUPABASE_PROJECT_REF_ENV_VAR = "SUPABASE_PROJECT_REF"
 DEFAULT_SUPABASE_ACCESS_TOKEN_ENV_VAR = "SUPABASE_ACCESS_TOKEN"
 
 GRAPH_ENV_REFERENCE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+SUPABASE_SQL_TOKEN_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 CONTEXT_BUILDER_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 CONTEXT_BUILDER_SLUG_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 
@@ -762,6 +770,28 @@ def resolve_supabase_runtime_env_var_names(
     return (
         str(config.get("supabase_url_env_var", DEFAULT_SUPABASE_URL_ENV_VAR) or DEFAULT_SUPABASE_URL_ENV_VAR).strip() or DEFAULT_SUPABASE_URL_ENV_VAR,
         str(config.get("supabase_key_env_var", DEFAULT_SUPABASE_KEY_ENV_VAR) or DEFAULT_SUPABASE_KEY_ENV_VAR).strip() or DEFAULT_SUPABASE_KEY_ENV_VAR,
+    )
+
+
+def resolve_supabase_management_runtime_env_var_names(
+    config: Mapping[str, Any],
+    graph: GraphDefinition,
+) -> tuple[str, str]:
+    connection_id = str(config.get("supabase_connection_id", "") or "").strip()
+    if connection_id:
+        connection = graph.get_supabase_connection(connection_id)
+        if connection is None:
+            raise SupabaseDataError(
+                f"Supabase connection '{connection_id}' was not found.",
+                error_type="missing_supabase_connection",
+                details={"connection_id": connection_id},
+            )
+        return connection.project_ref_env_var, connection.access_token_env_var
+    return (
+        str(config.get("project_ref_env_var", DEFAULT_SUPABASE_PROJECT_REF_ENV_VAR) or DEFAULT_SUPABASE_PROJECT_REF_ENV_VAR).strip()
+        or DEFAULT_SUPABASE_PROJECT_REF_ENV_VAR,
+        str(config.get("access_token_env_var", DEFAULT_SUPABASE_ACCESS_TOKEN_ENV_VAR) or DEFAULT_SUPABASE_ACCESS_TOKEN_ENV_VAR).strip()
+        or DEFAULT_SUPABASE_ACCESS_TOKEN_ENV_VAR,
     )
 
 
@@ -1235,7 +1265,9 @@ class RunState:
     node_statuses: dict[str, str] = field(default_factory=dict)
     iterator_states: dict[str, Any] = field(default_factory=dict)
     visit_counts: dict[str, int] = field(default_factory=dict)
+    transition_count: int = 0
     transition_history: list[TransitionRecord] = field(default_factory=list)
+    event_count: int = 0
     event_history: list[RuntimeEvent] = field(default_factory=list)
     final_output: Any = None
     terminal_error: dict[str, Any] | None = None
@@ -1261,7 +1293,9 @@ class RunState:
             "node_statuses": self.node_statuses,
             "iterator_states": self.iterator_states,
             "visit_counts": self.visit_counts,
+            "transition_count": self.transition_count,
             "transition_history": [transition.to_dict() for transition in self.transition_history],
+            "event_count": self.event_count,
             "event_history": [event.to_dict() for event in self.event_history],
             "final_output": self.final_output,
             "terminal_error": self.terminal_error,
@@ -3214,6 +3248,79 @@ class DataNode(BaseNode):
             rpc_params=rpc_params if isinstance(rpc_params, dict) else {},
         )
 
+    def _supabase_sql_source_value(self, context: NodeContext) -> Any:
+        source_value = context.resolve_binding(self.config.get("input_binding"))
+        source_value = _parse_json_object_or_array(source_value)
+        if _is_message_envelope_like(source_value):
+            source_value = _parse_json_object_or_array(source_value.get("payload"))
+        return source_value
+
+    def _resolve_supabase_sql_query_tokens(self, query: str, source_value: Any) -> tuple[str, list[Any]]:
+        payload_lookup: Mapping[str, Any] = source_value if isinstance(source_value, Mapping) else {}
+        parameters: list[Any] = []
+        token_to_index: dict[str, int] = {}
+        missing_tokens: list[str] = []
+
+        def _replace(match: "re.Match[str]") -> str:
+            key = str(match.group(1) or "")
+            if key not in payload_lookup:
+                if key not in missing_tokens:
+                    missing_tokens.append(key)
+                return match.group(0)
+            if key not in token_to_index:
+                parameters.append(payload_lookup[key])
+                token_to_index[key] = len(parameters)
+            return f"${token_to_index[key]}"
+
+        parameterized_query = SUPABASE_SQL_TOKEN_PATTERN.sub(_replace, query)
+        if missing_tokens:
+            raise SupabaseDataError(
+                f"Supabase SQL query references {{{missing_tokens[0]}}} but the incoming payload has no field named '{missing_tokens[0]}'.",
+                error_type="missing_supabase_sql_parameter",
+                details={"missing_fields": missing_tokens},
+            )
+        return parameterized_query, parameters
+
+    def _supabase_sql_request(self, context: NodeContext) -> tuple[SupabaseSqlQueryRequest, Any]:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        source_value = self._supabase_sql_source_value(context)
+        raw_query = str(resolved.get("query", "") or "").strip()
+        parameterized_query, parameters = self._resolve_supabase_sql_query_tokens(raw_query, source_value)
+        project_ref_env_var, access_token_env_var = resolve_supabase_management_runtime_env_var_names(resolved, context.graph)
+        raw_management_api_base_url = str(resolved.get("management_api_base_url", "") or "").strip()
+        management_api_base_url_env_var = resolve_graph_env_reference_name(
+            raw_management_api_base_url,
+            context.graph.env_vars,
+            default="",
+        )
+        management_api_base_url = (
+            str(os.environ.get(management_api_base_url_env_var, "") or "").strip()
+            if management_api_base_url_env_var
+            else ""
+        ) or (
+            resolve_graph_process_env(raw_management_api_base_url, context.graph.env_vars)
+            if raw_management_api_base_url
+            else ""
+        ) or raw_management_api_base_url
+        return (
+            SupabaseSqlQueryRequest(
+                project_ref=resolve_graph_process_env(
+                    project_ref_env_var,
+                    context.graph.env_vars,
+                ),
+                access_token=resolve_graph_process_env(
+                    access_token_env_var,
+                    context.graph.env_vars,
+                ),
+                query=parameterized_query,
+                parameters=parameters,
+                read_only=_coerce_bool(resolved.get("read_only"), default=True),
+                output_mode=str(resolved.get("output_mode", "records") or "records").strip().lower() or "records",
+                management_api_base_url=management_api_base_url,
+            ),
+            source_value,
+        )
+
     def _supabase_row_write_source_value(self, context: NodeContext) -> Any:
         source_value = context.resolve_binding(self.config.get("input_binding"))
         source_value = _parse_json_object_or_array(source_value)
@@ -3439,6 +3546,48 @@ class DataNode(BaseNode):
             metadata=envelope.metadata,
         )
 
+    def _execute_supabase_sql(self, context: NodeContext) -> NodeExecutionResult:
+        try:
+            request, source_value = self._supabase_sql_request(context)
+            result = execute_supabase_sql_query(request)
+        except SupabaseDataError as exc:
+            return NodeExecutionResult(
+                status="failed",
+                error=exc.to_error_payload(),
+                summary=str(exc),
+            )
+
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=result.payload,
+            artifacts={
+                "supabase_raw_payload": result.raw_payload,
+                "supabase_request_url": result.request_url,
+                "supabase_sql_query": result.query,
+                "supabase_sql_parameters": result.parameters,
+                "supabase_sql_source_value": source_value,
+            },
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "data_mode": SUPABASE_SQL_MODE,
+                "provider_id": self.provider_id,
+                "read_only": result.read_only,
+                "row_count": result.row_count,
+                "output_mode": result.output_mode,
+            },
+        )
+        summary_prefix = "Executed read-only" if result.read_only else "Executed"
+        summary_count = "unknown rows" if result.row_count is None else f"{result.row_count} row(s)"
+        return NodeExecutionResult(
+            status="success",
+            output=envelope.to_dict(),
+            summary=f"{summary_prefix} Supabase SQL query returning {summary_count}.",
+            metadata=envelope.metadata,
+        )
+
     def runtime_input_preview(self, context: NodeContext) -> Any:
         mode = "passthrough" if bool(self.config.get("lock_passthrough", False)) else self.config.get("mode", "passthrough")
         if self.provider_id == SPREADSHEET_ROW_PROVIDER_ID:
@@ -3593,6 +3742,21 @@ class DataNode(BaseNode):
                 "supabase_key_present": bool(request.supabase_key),
                 "rpc_params": request.rpc_params,
             }
+        if self.provider_id == SUPABASE_SQL_PROVIDER_ID or mode == SUPABASE_SQL_MODE:
+            try:
+                request, source_value = self._supabase_sql_request(context)
+            except SupabaseDataError as exc:
+                return {"error": str(exc)}
+            return {
+                "query": request.query,
+                "parameters_preview": request.parameters,
+                "source_preview": source_value,
+                "read_only": request.read_only,
+                "output_mode": request.output_mode,
+                "project_ref_present": bool(request.project_ref),
+                "access_token_present": bool(request.access_token),
+                "management_api_base_url": request.management_api_base_url,
+            }
         if self.provider_id == SUPABASE_ROW_WRITE_PROVIDER_ID or mode == SUPABASE_ROW_WRITE_MODE:
             try:
                 request, source_value = self._supabase_row_write_request(context)
@@ -3677,6 +3841,8 @@ class DataNode(BaseNode):
             return self._execute_runtime_normalizer(context)
         if self.provider_id == SUPABASE_DATA_PROVIDER_ID or mode == SUPABASE_DATA_MODE:
             return self._execute_supabase_data(context)
+        if self.provider_id == SUPABASE_SQL_PROVIDER_ID or mode == SUPABASE_SQL_MODE:
+            return self._execute_supabase_sql(context)
         if self.provider_id == SUPABASE_ROW_WRITE_PROVIDER_ID or mode == SUPABASE_ROW_WRITE_MODE:
             return self._execute_supabase_row_write(context)
         if self.provider_id == OUTBOUND_EMAIL_LOGGER_PROVIDER_ID or mode == OUTBOUND_EMAIL_LOGGER_MODE:
@@ -7524,6 +7690,7 @@ class GraphDefinition:
         env_vars: Mapping[str, Any] | None = None,
         supabase_connections: Sequence[SupabaseConnectionDefinition] | None = None,
         default_supabase_connection_id: str = "",
+        run_store_supabase_connection_id: str = "",
     ) -> None:
         node_ids = [node.id for node in nodes]
         if len(node_ids) != len(set(node_ids)):
@@ -7537,6 +7704,7 @@ class GraphDefinition:
         self.env_vars = _normalize_graph_env_vars(env_vars)
         self.supabase_connections = list(supabase_connections or [])
         self.default_supabase_connection_id = str(default_supabase_connection_id or "").strip()
+        self.run_store_supabase_connection_id = str(run_store_supabase_connection_id or "").strip()
         for node in nodes:
             node.attach_graph_env_vars(self.env_vars)
         self.nodes = {node.id: node for node in nodes}
@@ -7557,6 +7725,7 @@ class GraphDefinition:
             env_vars=payload.get("env_vars"),
             supabase_connections=_normalize_supabase_connections(payload.get("supabase_connections")),
             default_supabase_connection_id=str(payload.get("default_supabase_connection_id", "") or "").strip(),
+            run_store_supabase_connection_id=str(payload.get("run_store_supabase_connection_id", "") or "").strip(),
             nodes=nodes,
             edges=edges,
         )
@@ -7575,6 +7744,10 @@ class GraphDefinition:
             raise GraphValidationError(
                 f"Unknown default Supabase connection '{self.default_supabase_connection_id}'."
             )
+        if self.run_store_supabase_connection_id and self.get_supabase_connection(self.run_store_supabase_connection_id) is None:
+            raise GraphValidationError(
+                f"Unknown run-store Supabase connection '{self.run_store_supabase_connection_id}'."
+            )
         start_node = self.nodes[self.start_node_id]
         if start_node.category != NodeCategory.START:
             raise GraphValidationError("The graph start node must use the 'start' category.")
@@ -7583,7 +7756,13 @@ class GraphDefinition:
         if not output_nodes:
             raise GraphValidationError("Graphs must include at least one 'end' category node.")
         for node in self.nodes.values():
-            if node.provider_id not in {SUPABASE_DATA_PROVIDER_ID, SUPABASE_TABLE_ROWS_PROVIDER_ID, SUPABASE_ROW_WRITE_PROVIDER_ID, OUTBOUND_EMAIL_LOGGER_PROVIDER_ID}:
+            if node.provider_id not in {
+                SUPABASE_DATA_PROVIDER_ID,
+                SUPABASE_SQL_PROVIDER_ID,
+                SUPABASE_TABLE_ROWS_PROVIDER_ID,
+                SUPABASE_ROW_WRITE_PROVIDER_ID,
+                OUTBOUND_EMAIL_LOGGER_PROVIDER_ID,
+            }:
                 continue
             connection_id = str(node.config.get("supabase_connection_id", "") or "").strip()
             if connection_id and self.get_supabase_connection(connection_id) is None:
@@ -7705,7 +7884,13 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Outbound email logger '{node.id}' uses unsupported message_type '{message_type}'."
                     )
-            if node.provider_id in {SUPABASE_DATA_PROVIDER_ID, SUPABASE_TABLE_ROWS_PROVIDER_ID, SUPABASE_ROW_WRITE_PROVIDER_ID, OUTBOUND_EMAIL_LOGGER_PROVIDER_ID}:
+            if node.provider_id in {
+                SUPABASE_DATA_PROVIDER_ID,
+                SUPABASE_SQL_PROVIDER_ID,
+                SUPABASE_TABLE_ROWS_PROVIDER_ID,
+                SUPABASE_ROW_WRITE_PROVIDER_ID,
+                OUTBOUND_EMAIL_LOGGER_PROVIDER_ID,
+            }:
                 connection_id = str(node.config.get("supabase_connection_id", "") or "").strip()
                 if connection_id and self.get_supabase_connection(connection_id) is None:
                     raise GraphValidationError(
@@ -8188,6 +8373,12 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Supabase data source node '{node.id}' must declare a positive limit value."
                     ) from exc
+            if node.kind == "data" and node.provider_id == SUPABASE_SQL_PROVIDER_ID:
+                output_mode = str(node.config.get("output_mode", "records") or "records").strip().lower() or "records"
+                if output_mode not in {"records", "markdown"}:
+                    raise GraphValidationError(
+                        f"Supabase SQL node '{node.id}' uses unsupported output_mode '{output_mode}'."
+                    )
             if node.kind == "data" and node.provider_id == SUPABASE_ROW_WRITE_PROVIDER_ID:
                 write_mode = str(node.config.get("write_mode", "insert") or "insert").strip().lower() or "insert"
                 if write_mode not in {"insert", "upsert"}:
@@ -8385,4 +8576,6 @@ class GraphDefinition:
             payload["supabase_connections"] = [connection.to_dict() for connection in self.supabase_connections]
         if self.default_supabase_connection_id:
             payload["default_supabase_connection_id"] = self.default_supabase_connection_id
+        if self.run_store_supabase_connection_id:
+            payload["run_store_supabase_connection_id"] = self.run_store_supabase_connection_id
         return payload

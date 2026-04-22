@@ -10,6 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from graph_agent.api.run_state_reducer import apply_event, apply_single_run_event, build_run_state
+from graph_agent.runtime.core import RUN_STATE_EVENT_HISTORY_LIMIT, RUN_STATE_TRANSITION_HISTORY_LIMIT
 from graph_agent.runtime.event_contract import RUNTIME_EVENT_SCHEMA_VERSION
 
 
@@ -116,6 +117,39 @@ class RunStateReducerTests(unittest.TestCase):
 
         self.assertEqual(state["visit_counts"]["node-a"], 2)
         self.assertEqual(state["visit_counts"]["node-b"], 1)
+
+    def test_single_run_reducer_bounds_hot_histories_but_keeps_total_counts(self) -> None:
+        state = build_run_state("run-history-bounds", "graph-1", None, execution_node_ids=["node-a", "node-b"])
+        for visit_count in range(1, RUN_STATE_EVENT_HISTORY_LIMIT + 26):
+            state = apply_single_run_event(
+                state,
+                _event(
+                    "node.started",
+                    run_id="run-history-bounds",
+                    payload={"node_id": "node-a", "visit_count": visit_count},
+                ),
+            )
+        for index in range(RUN_STATE_TRANSITION_HISTORY_LIMIT + 17):
+            state = apply_single_run_event(
+                state,
+                _event(
+                    "edge.selected",
+                    run_id="run-history-bounds",
+                    payload={
+                        "id": f"edge-{index}",
+                        "source_id": "node-a",
+                        "target_id": "node-b",
+                    },
+                ),
+            )
+
+        self.assertEqual(
+            state["event_count"],
+            (RUN_STATE_EVENT_HISTORY_LIMIT + 25) + (RUN_STATE_TRANSITION_HISTORY_LIMIT + 17),
+        )
+        self.assertEqual(len(state["event_history"]), RUN_STATE_EVENT_HISTORY_LIMIT)
+        self.assertEqual(state["transition_count"], RUN_STATE_TRANSITION_HISTORY_LIMIT + 17)
+        self.assertEqual(len(state["transition_history"]), RUN_STATE_TRANSITION_HISTORY_LIMIT)
 
     def test_single_run_reducer_tracks_failure_and_cancellation(self) -> None:
         failed_state = build_run_state("run-failed", "graph-1", None, execution_node_ids=["node-a", "node-b"])

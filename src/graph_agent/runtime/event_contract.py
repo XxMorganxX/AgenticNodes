@@ -100,6 +100,24 @@ def normalize_runtime_state_snapshot(state: Mapping[str, Any] | None) -> dict[st
         if isinstance(event_history, list)
         else []
     )
+    transition_history = state.get("transition_history")
+    normalized["transition_history"] = (
+        [dict(transition) for transition in transition_history if isinstance(transition, Mapping)]
+        if isinstance(transition_history, list)
+        else []
+    )
+    event_count = state.get("event_count")
+    normalized["event_count"] = (
+        int(event_count)
+        if isinstance(event_count, int) and event_count >= 0
+        else len(normalized["event_history"])
+    )
+    transition_count = state.get("transition_count")
+    normalized["transition_count"] = (
+        int(transition_count)
+        if isinstance(transition_count, int) and transition_count >= 0
+        else len(normalized["transition_history"])
+    )
     node_statuses = state.get("node_statuses")
     normalized["node_statuses"] = (
         {str(node_id): str(status or "") for node_id, status in node_statuses.items()}
