@@ -85,15 +85,15 @@ The current catalog includes support for:
 
 Supporting design notes live in:
 
-- [model.md](model.md)
-- [node-development-guide.md](node-development-guide.md)
-- [tool-registry.md](tool-registry.md)
-- [control-loop.md](control-loop.md)
-- [supabase-connections.md](supabase-connections.md)
-- [outreach-email-schema.md](outreach-email-schema.md)
-- [state.md](state.md)
-- [memory.md](memory.md)
-- [logging.md](logging.md)
+- [docs/model.md](docs/model.md)
+- [docs/node-development-guide.md](docs/node-development-guide.md)
+- [docs/tool-registry.md](docs/tool-registry.md)
+- [docs/control-loop.md](docs/control-loop.md)
+- [docs/supabase-connections.md](docs/supabase-connections.md)
+- [docs/outreach-email-schema.md](docs/outreach-email-schema.md)
+- [docs/state.md](docs/state.md)
+- [docs/memory.md](docs/memory.md)
+- [docs/logging.md](docs/logging.md)
 
 ## Quick Start
 
@@ -217,7 +217,7 @@ GRAPH_AGENT_RUN_STORE_SUPABASE_SECRET_KEY_ENV_VAR=GRAPH_AGENT_SUPABASE_ANALYTICS
 
 Supabase REST calls now support both legacy JWT-style `service_role` keys and newer `sb_secret_*` keys. Secret keys should remain server-side only.
 
-For the exact graph document shape, runtime precedence rules, compatibility mode behavior, and run-store selection logic, see [supabase-connections.md](supabase-connections.md).
+For the exact graph document shape, runtime precedence rules, compatibility mode behavior, and run-store selection logic, see [docs/supabase-connections.md](docs/supabase-connections.md).
 
 ## MCP Support
 

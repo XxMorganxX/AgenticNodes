@@ -31,6 +31,7 @@ venv/
 .graph-agent/
 .logs/
 visuals/
+.planning/
 
 # Frontend artifacts
 frontend/node_modules/

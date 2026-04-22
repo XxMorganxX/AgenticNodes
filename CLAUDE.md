@@ -86,7 +86,7 @@ Base event types: `run.started`, `node.started`, `node.completed`, `edge.selecte
 
 Compatibility rules inside `runtime.v1`:
 - adding optional payload fields is allowed
-- existing `event_type` names and reducer-critical payload keys (documented in `logging.md`) must stay stable
+- existing `event_type` names and reducer-critical payload keys (documented in `docs/logging.md`) must stay stable
 - renaming an event or changing its meaning requires a new schema version or adapter
 
 ### API layer
@@ -106,7 +106,7 @@ React 19 + Vite + reactflow studio in `frontend/src/`. `App.tsx` is the top-leve
 
 ### Supabase connections (multi-project)
 
-Graphs can declare multiple named Supabase connections. Connection metadata lives on the graph document, values live in graph env vars, and nodes bind to a `connection_id`. A connection rename must not break node bindings — use the stable generated env-var names. Full spec: `supabase-connections.md`.
+Graphs can declare multiple named Supabase connections. Connection metadata lives on the graph document, values live in graph env vars, and nodes bind to a `connection_id`. A connection rename must not break node bindings — use the stable generated env-var names. Full spec: `docs/supabase-connections.md`.
 
 ### Local persistence layout
 
@@ -128,17 +128,17 @@ These rules come from `.cursor/rules/` and are enforced for every change:
 
 ## Design Notes
 
-Design intent for the major components lives in top-level docs — read these before making structural changes:
+Design intent for the major components lives under `docs/` — read these before making structural changes:
 
-- `model.md` — provider-agnostic `ModelProvider` contract, prompts live in `config.py`
-- `node-development-guide.md` — end-to-end checklist for adding new nodes across registry, runtime, editor, validation, and tests
-- `control-loop.md` — traversal rules and termination semantics
-- `state.md` — `RunState` fields and access patterns
-- `logging.md` — full `runtime.v1` event catalog and compatibility rules
-- `tool-registry.md` — tool result envelope (success / validation failure / execution failure)
-- `supabase-connections.md` — connection document shape and runtime precedence
-- `outreach-email-schema.md` — email outbound log table contract
-- `memory.md` — placeholder; durable memory is not implemented
+- `docs/model.md` — provider-agnostic `ModelProvider` contract, prompts live in `config.py`
+- `docs/node-development-guide.md` — end-to-end checklist for adding new nodes across registry, runtime, editor, validation, and tests
+- `docs/control-loop.md` — traversal rules and termination semantics
+- `docs/state.md` — `RunState` fields and access patterns
+- `docs/logging.md` — full `runtime.v1` event catalog and compatibility rules
+- `docs/tool-registry.md` — tool result envelope (success / validation failure / execution failure)
+- `docs/supabase-connections.md` — connection document shape and runtime precedence
+- `docs/outreach-email-schema.md` — email outbound log table contract
+- `docs/memory.md` — placeholder; durable memory is not implemented
 
 ## Environment Variables
 
