@@ -6,15 +6,15 @@ Graph Agent Studio is a local graph editor and runtime for building agent workfl
 
 ### Studio overview
 
-![Graph Agent Studio overview showing the runtime controls, graph selector, project files, and workspace panels](visuals/graph-agent-studio-overview.png)
+![Graph Agent Studio overview showing the runtime controls, graph selector, project files, and workspace panels](docs/images/graph-agent-studio-overview.png)
 
 ### Graph canvas
 
-![Graph canvas showing a spreadsheet-driven workflow with branching nodes and envelope display steps](visuals/graph-agent-studio-canvas.png)
+![Graph canvas showing a spreadsheet-driven workflow with branching nodes and envelope display steps](docs/images/graph-agent-studio-canvas.png)
 
 ### Agent run swimlanes
 
-![Agent run swimlanes showing lane-level milestones, node events, and execution payloads](visuals/graph-agent-studio-swimlanes.png)
+![Agent run swimlanes showing lane-level milestones, node events, and execution payloads](docs/images/graph-agent-studio-swimlanes.png)
 
 This repository contains:
 
