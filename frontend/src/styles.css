@@ -697,13 +697,11 @@ pre {
 }
 .mosaic-graph {
   grid-area: graph;
-  align-self: start;
   width: 100%;
   min-height: 6.9rem;
 }
 .mosaic-env {
   grid-area: env;
-  align-self: start;
   width: 100%;
   max-width: 100%;
   min-height: 6.9rem;
@@ -850,7 +848,6 @@ pre {
 
 .mosaic-execution {
   grid-area: input;
-  align-self: start;
   padding-top: 0.9rem;
   padding-bottom: 0.95rem;
 }
@@ -1579,7 +1576,6 @@ pre {
 }
 
 .mosaic-env .env-tiles {
-  flex: 1;
   flex-direction: column;
   gap: 0.5rem;
 }

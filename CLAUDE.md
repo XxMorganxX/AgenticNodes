@@ -138,7 +138,10 @@ Design intent for the major components lives under `docs/` — read these before
 - `docs/tool-registry.md` — tool result envelope (success / validation failure / execution failure)
 - `docs/supabase-connections.md` — connection document shape and runtime precedence
 - `docs/outreach-email-schema.md` — email outbound log table contract
+- `docs/python-script-runner.md` — `core.python_script_runner` script authoring contract
 - `docs/memory.md` — placeholder; durable memory is not implemented
+
+Most of these have a paired skill under `.claude/skills/<name>/SKILL.md` that auto-loads when the trigger surface matches a request. **When you change a `docs/*.md` file, update the matching `.claude/skills/<name>/SKILL.md` in the same commit** — otherwise the auto-injected guidance drifts from the canonical doc. The `authoring-skills` skill is the canonical reference for adding or updating skills.
 
 ## Environment Variables
 
