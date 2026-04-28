@@ -507,12 +507,19 @@ export function ConditionDetailsModal({
       setSpreadsheetPreviewError("Spreadsheet suggestions need a resolvable file path on the connected spreadsheet rows node.");
       return;
     }
+    if (typeof config.start_row_index === "string" && config.start_row_index.trim().length === 0) {
+      setSpreadsheetPreviewError("Spreadsheet suggestions need a Starting Row Index on the connected spreadsheet rows node.");
+      return;
+    }
     void previewSpreadsheetRows({
       file_path: resolvedFilePath,
       file_format: String(config.file_format ?? "auto"),
       sheet_name: config.sheet_name == null ? null : String(config.sheet_name),
       header_row_index: typeof config.header_row_index === "number" ? config.header_row_index : 1,
-      start_row_index: typeof config.start_row_index === "number" ? config.start_row_index : 2,
+      start_row_index:
+        typeof config.start_row_index === "number" || typeof config.start_row_index === "string"
+          ? config.start_row_index
+          : 2,
       empty_row_policy: String(config.empty_row_policy ?? "skip"),
     })
       .then((preview) => {

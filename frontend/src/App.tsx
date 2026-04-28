@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AgentRunSwimlanes } from "./components/AgentRunSwimlanes";
+import { DocumentPreviewModal } from "./components/DocumentPreviewModal";
 import { GraphCanvas } from "./components/GraphCanvas";
 import { GraphEnvEditor } from "./components/GraphEnvEditor";
 import { McpServerModal } from "./components/McpServerModal";
@@ -16,12 +17,14 @@ import {
   deleteGraph,
   eventStreamUrl,
   fetchEditorCatalog,
+  fetchProjectFileContent,
   fetchProjectFiles,
   fetchRunFileContent,
   fetchRunFiles,
   fetchGraph,
   fetchGraphs,
   fetchRun,
+  fetchRunStatus,
   refreshMcpServer,
   resetRuntime,
   setMcpToolEnabled,
@@ -85,14 +88,49 @@ import type {
 import { getUserPreferences, resetUserPreferences, saveUserPreferences } from "./lib/userPreferences";
 import type { UserPreferences } from "./lib/userPreferences";
 import { useGraphHistory } from "./lib/useGraphHistory";
+import { usePageVisibility } from "./lib/visibility";
 
 const DEFAULT_INPUT = "Find graph-agent references for a schema repair workflow.";
 const DEFAULT_TEST_ENVIRONMENT_ID = "test-environment";
 const ENVIRONMENT_AGENT_SELECTION_STORAGE_KEY = "agentic-nodes-environment-agent-selection";
 const SELECTED_AGENT_ID_STORAGE_KEY = "agentic-nodes-selected-agent-id";
+const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
+
+function graphNodes(graph: GraphDocument): GraphDefinition["nodes"] {
+  return isTestEnvironment(graph) ? graph.agents.flatMap((agent) => agent.nodes) : graph.nodes;
+}
+
+function spreadsheetStartRowValidationMessage(graph: GraphDocument): string | null {
+  for (const node of graphNodes(graph)) {
+    if (node.provider_id !== SPREADSHEET_ROW_PROVIDER_ID) {
+      continue;
+    }
+    const label = String(node.label ?? node.id);
+    const rawValue = node.config.start_row_index;
+    if (rawValue == null) {
+      continue;
+    }
+    if (typeof rawValue === "string" && rawValue.trim().length === 0) {
+      return `Set a Starting Row Index for '${label}' before running.`;
+    }
+    const parsed =
+      typeof rawValue === "number"
+        ? rawValue
+        : typeof rawValue === "string"
+          ? Number(rawValue.trim())
+          : Number.NaN;
+    if (!Number.isInteger(parsed)) {
+      return `Starting Row Index for '${label}' must be a whole number.`;
+    }
+    if (parsed < 2) {
+      return `Starting Row Index for '${label}' must be 2 or greater.`;
+    }
+  }
+  return null;
+}
 
 function collectReferencedSupabaseConnectionIds(graph: GraphDocument): Set<string> {
-  const nodes = isTestEnvironment(graph) ? graph.agents.flatMap((agent) => agent.nodes) : graph.nodes;
+  const nodes = graphNodes(graph);
   return new Set(
     nodes
       .map((node) => String(node.config.supabase_connection_id ?? "").trim())
@@ -551,9 +589,20 @@ function saveSelectedAgentId(graph: GraphDocument | null | undefined, selectedAg
 
 const RUN_STATE_EVENT_HISTORY_LIMIT = 500;
 const RUN_STATE_TRANSITION_HISTORY_LIMIT = 500;
+const MAX_LIVE_EVENTS = 1000;
+const BACKGROUND_BUFFER_LIMIT = 5000;
 
 function appendBoundedHistory<T>(history: T[] | undefined, entry: T, limit: number): T[] {
   const next = [...(history ?? []), entry];
+  const overflow = next.length - limit;
+  return overflow > 0 ? next.slice(overflow) : next;
+}
+
+function appendBoundedEntries<T>(history: T[] | undefined, entries: T[], limit: number): T[] {
+  if (entries.length === 0) {
+    return history ?? [];
+  }
+  const next = [...(history ?? []), ...entries];
   const overflow = next.length - limit;
   return overflow > 0 ? next.slice(overflow) : next;
 }
@@ -1021,7 +1070,19 @@ export default function App() {
   const [isUploadingRunDocuments, setIsUploadingRunDocuments] = useState(false);
   const [isProjectFilesLoading, setIsProjectFilesLoading] = useState(false);
   const [projectFileError, setProjectFileError] = useState<string | null>(null);
+  const [expandedProjectFileSources, setExpandedProjectFileSources] = useState<Record<string, boolean>>({
+    upload: true,
+    scripts: true,
+  });
   const [runDocumentError, setRunDocumentError] = useState<string | null>(null);
+  const [documentPreview, setDocumentPreview] = useState<{
+    title: string;
+    subtitle: string;
+    content: string;
+    isLoading: boolean;
+    truncated: boolean;
+    error: string | null;
+  } | null>(null);
   const [events, setEvents] = useState<RuntimeEvent[]>([]);
   const [runState, setRunState] = useState<RunState | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -1036,7 +1097,12 @@ export default function App() {
   const [userPreferences, setUserPreferences] = useState<UserPreferences>(() => getUserPreferences());
   const [userPreferencesOpen, setUserPreferencesOpen] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
+  const pendingEventsRef = useRef<RuntimeEvent[]>([]);
+  const flushFrameRef = useRef<number | null>(null);
+  const isTabHiddenRef = useRef<boolean>(typeof document !== "undefined" ? document.hidden : false);
+  const flushPendingEventsRef = useRef<() => void>(() => {});
   const runPollTimeoutRef = useRef<number | null>(null);
+  const runPollDelayMsRef = useRef<number>(5000);
   const runStateRef = useRef<RunState | null>(null);
   const draftGraphRef = useRef<GraphDocument | null>(draftGraph);
   const graphsRef = useRef<GraphDocument[]>(graphs);
@@ -1086,6 +1152,14 @@ export default function App() {
   const hasUnsavedChanges = (Boolean(draftGraph) && draftGraphStateId !== savedGraphStateId) || input !== savedInputPrompt;
   const projectFileGraphId = selectedGraphId || draftGraph?.graph_id || "";
   const readyProjectFiles = useMemo(() => projectFiles.filter((file) => file.status === "ready"), [projectFiles]);
+  const uploadedProjectFiles = useMemo(
+    () => projectFiles.filter((file) => (file.source ?? "upload") === "upload"),
+    [projectFiles],
+  );
+  const scriptsProjectFiles = useMemo(
+    () => projectFiles.filter((file) => file.source === "scripts"),
+    [projectFiles],
+  );
   const readyRunDocuments = useMemo(() => runDocuments.filter((document) => document.status === "ready"), [runDocuments]);
   const visibleRunFiles = useMemo(() => {
     const files = runFileListing?.files ?? [];
@@ -1369,6 +1443,56 @@ export default function App() {
     }
   }, []);
 
+  const viewRunDocument = useCallback((documentId: string) => {
+    setRunDocuments((current) => {
+      const match = current.find((document) => document.document_id === documentId);
+      if (match) {
+        setDocumentPreview({
+          title: match.name,
+          subtitle: `${match.mime_type || "file"} · ${formatDocumentSize(match.size_bytes)}`,
+          content: match.text_content || match.text_excerpt || "",
+          isLoading: false,
+          truncated: false,
+          error: match.error ?? null,
+        });
+      }
+      return current;
+    });
+  }, []);
+
+  const viewProjectFile = useCallback(async (graphId: string, fileId: string) => {
+    if (!graphId.trim()) {
+      return;
+    }
+    const seed = projectFiles.find((file) => file.file_id === fileId);
+    setDocumentPreview({
+      title: seed?.name ?? "Project file",
+      subtitle: seed ? `${seed.mime_type || "file"} · ${formatDocumentSize(seed.size_bytes)}` : "",
+      content: "",
+      isLoading: true,
+      truncated: false,
+      error: null,
+    });
+    try {
+      const payload = await fetchProjectFileContent(graphId, fileId);
+      setDocumentPreview({
+        title: payload.name,
+        subtitle: `${payload.mime_type || "file"} · ${formatDocumentSize(payload.size_bytes)}`,
+        content: payload.content,
+        isLoading: false,
+        truncated: payload.truncated,
+        error: payload.error ?? null,
+      });
+    } catch (viewError) {
+      const message = viewError instanceof Error ? viewError.message : "Unable to load project file content.";
+      setDocumentPreview((current) =>
+        current
+          ? { ...current, isLoading: false, error: message }
+          : { title: seed?.name ?? "Project file", subtitle: "", content: "", isLoading: false, truncated: false, error: message },
+      );
+    }
+  }, [projectFiles]);
+
   useEffect(() => {
     if (!projectFileGraphId) {
       setProjectFiles([]);
@@ -1409,6 +1533,7 @@ export default function App() {
   }, [draftGraph, handleRun, isResettingRuntime, isRunning, isSaving, isUploadingRunDocuments, saveCurrentGraph, userPreferences.keyboardShortcuts]);
 
   const clearRunPolling = useCallback(() => {
+    runPollDelayMsRef.current = 5000;
     if (runPollTimeoutRef.current === null) {
       return;
     }
@@ -1507,37 +1632,65 @@ export default function App() {
   }, [cancelPersistedRunSnapshot, clearRunPolling, flushPersistedRunSnapshot]);
 
   const scheduleRunPoll = useCallback((runId: string, graphId: string) => {
-    clearRunPolling();
+    if (runPollTimeoutRef.current !== null) {
+      window.clearTimeout(runPollTimeoutRef.current);
+      runPollTimeoutRef.current = null;
+    }
+    const delayMs = runPollDelayMsRef.current;
+    // Exponential backoff capped at 30s. Each successive poll on a stuck run
+    // doubles the wait — this caps Supabase egress in the SSE-fallback path.
+    runPollDelayMsRef.current = Math.min(delayMs * 2, 30000);
     runPollTimeoutRef.current = window.setTimeout(() => {
-      void fetchRun(runId)
-        .then((nextRunState) => {
-          applyFetchedRunState(nextRunState);
-          if (isTerminalRunStatus(nextRunState.status)) {
-            cancelPersistedRunSnapshot(graphId);
-            clearPersistedRunSnapshot(graphId);
-            clearRunPolling();
-            return;
+      void fetchRunStatus(runId)
+        .then((status) => {
+          if (status.is_terminal) {
+            // Terminal — fetch full state once so the UI reflects final outputs.
+            return fetchRun(runId).then((nextRunState) => {
+              applyFetchedRunState(nextRunState);
+              cancelPersistedRunSnapshot(graphId);
+              clearPersistedRunSnapshot(graphId);
+              clearRunPolling();
+            });
           }
           scheduleRunPoll(runId, graphId);
+          return undefined;
         })
         .catch(() => {
           markRecoveredRunInterrupted(graphId, runStateRef.current, runId);
         });
-    }, 1500);
-  }, [applyFetchedRunState, clearRunPolling, markRecoveredRunInterrupted]);
+    }, delayMs);
+  }, [applyFetchedRunState, clearRunPolling, markRecoveredRunInterrupted, cancelPersistedRunSnapshot]);
 
   const connectToRunStream = useCallback((runId: string, graphId: string, inputValue: string, documents: RunDocument[] = []) => {
     clearRunPolling();
     sourceRef.current?.close();
+    if (flushFrameRef.current !== null) {
+      cancelAnimationFrame(flushFrameRef.current);
+      flushFrameRef.current = null;
+    }
+    pendingEventsRef.current = [];
+
     const source = new EventSource(eventStreamUrl(runId));
     sourceRef.current = source;
 
-    source.onmessage = (message) => {
-      const event = normalizeRuntimeEvent(JSON.parse(message.data) as RuntimeEvent);
-      setEvents((previous) => [...previous, event]);
-      setRunState((previous) => applyEvent(previous, event, graphId, inputValue, documents));
+    const flushPendingEvents = () => {
+      flushFrameRef.current = null;
+      const buffered = pendingEventsRef.current;
+      if (buffered.length === 0) {
+        return;
+      }
+      pendingEventsRef.current = [];
 
-      if (!event.agent_id && isTerminalRuntimeEvent(event)) {
+      setEvents((previous) => appendBoundedEntries(previous, buffered, MAX_LIVE_EVENTS));
+      setRunState((previous) =>
+        buffered.reduce(
+          (acc, event) => applyEvent(acc, event, graphId, inputValue, documents),
+          previous,
+        ),
+      );
+
+      const terminal = buffered.find((event) => !event.agent_id && isTerminalRuntimeEvent(event));
+      if (terminal && sourceRef.current === source) {
         source.close();
         sourceRef.current = null;
         setIsRunning(false);
@@ -1553,13 +1706,41 @@ export default function App() {
       }
     };
 
+    flushPendingEventsRef.current = flushPendingEvents;
+
+    const scheduleFlush = () => {
+      if (isTabHiddenRef.current) {
+        // Tab is backgrounded — keep accumulating in the buffer (capped) and flush on refocus.
+        if (pendingEventsRef.current.length > BACKGROUND_BUFFER_LIMIT) {
+          pendingEventsRef.current = pendingEventsRef.current.slice(-BACKGROUND_BUFFER_LIMIT);
+        }
+        return;
+      }
+      if (flushFrameRef.current === null) {
+        flushFrameRef.current = requestAnimationFrame(flushPendingEvents);
+      }
+    };
+
+    source.onmessage = (message) => {
+      const event = normalizeRuntimeEvent(JSON.parse(message.data) as RuntimeEvent);
+      pendingEventsRef.current.push(event);
+      scheduleFlush();
+    };
+
     source.onerror = () => {
       source.close();
       sourceRef.current = null;
+      if (flushFrameRef.current !== null) {
+        cancelAnimationFrame(flushFrameRef.current);
+        flushFrameRef.current = null;
+      }
+      if (pendingEventsRef.current.length > 0) {
+        flushPendingEvents();
+      }
       setIsRunning(false);
       scheduleRunPoll(runId, graphId);
     };
-  }, [applyFetchedRunState, clearRunPolling, scheduleRunPoll]);
+  }, [applyFetchedRunState, cancelPersistedRunSnapshot, clearRunPolling, scheduleRunPoll]);
 
   const restorePersistedRunSnapshot = useCallback(async (graphId: string) => {
     const snapshot = loadPersistedRunSnapshot(graphId);
@@ -1576,9 +1757,12 @@ export default function App() {
     if (!snapshotRunId) {
       return;
     }
+    // Cheap pre-check: ask the backend only for status. If the run is
+    // already terminal we never need to pull the (potentially huge) full
+    // state + event history from Supabase.
     try {
-      const recoveredRunState = await fetchRun(snapshotRunId);
-      if (isTerminalRunStatus(recoveredRunState.status)) {
+      const status = await fetchRunStatus(snapshotRunId);
+      if (status.is_terminal) {
         cancelPersistedRunSnapshot(graphId);
         clearPersistedRunSnapshot(graphId);
         setActiveRunId(null);
@@ -1587,12 +1771,13 @@ export default function App() {
         setIsRunning(false);
         return;
       }
+      const recoveredRunState = await fetchRun(snapshotRunId);
       applyFetchedRunState(recoveredRunState);
       connectToRunStream(recoveredRunState.run_id, graphId, inputRef.current, recoveredRunState.documents ?? []);
     } catch {
       markRecoveredRunInterrupted(graphId, shouldHydrateLocalSnapshot ? snapshotRunState : null, snapshotRunId, snapshot?.savedAt);
     }
-  }, [applyFetchedRunState, clearRunPolling, connectToRunStream, markRecoveredRunInterrupted]);
+  }, [applyFetchedRunState, clearRunPolling, connectToRunStream, markRecoveredRunInterrupted, cancelPersistedRunSnapshot]);
 
   useEffect(() => {
     Promise.all([fetchGraphs(), refreshCatalog()])
@@ -1633,11 +1818,32 @@ export default function App() {
     return () => {
       flushPersistedRunSnapshot();
       sourceRef.current?.close();
+      if (flushFrameRef.current !== null) {
+        cancelAnimationFrame(flushFrameRef.current);
+        flushFrameRef.current = null;
+      }
+      pendingEventsRef.current = [];
       if (runPollTimeoutRef.current !== null) {
         window.clearTimeout(runPollTimeoutRef.current);
       }
     };
   }, [flushPersistedRunSnapshot]);
+
+  usePageVisibility(useCallback((hidden: boolean) => {
+    isTabHiddenRef.current = hidden;
+    if (hidden) {
+      // Pause the rAF flush loop while hidden; events keep accumulating in the buffer (capped).
+      if (flushFrameRef.current !== null) {
+        cancelAnimationFrame(flushFrameRef.current);
+        flushFrameRef.current = null;
+      }
+      return;
+    }
+    // Tab became visible — drain the buffer in a single batched render.
+    if (pendingEventsRef.current.length > 0) {
+      flushPendingEventsRef.current();
+    }
+  }, []));
 
   useEffect(() => {
     if (!selectedGraphId) {
@@ -1733,19 +1939,22 @@ export default function App() {
     if (!draftGraph?.graph_id) {
       return;
     }
-    if (!activeRunId && !runState && events.length === 0) {
+    if (!activeRunId && !runState) {
       cancelPersistedRunSnapshot(draftGraph.graph_id);
       clearPersistedRunSnapshot(draftGraph.graph_id);
       return;
     }
+    // Persist only the bounded event_history from runState (capped at RUN_STATE_EVENT_HISTORY_LIMIT)
+    // rather than the full live events array. This prevents localStorage growth proportional to
+    // run length and silent quota errors during long-running sessions.
     schedulePersistedRunSnapshot({
       graphId: draftGraph.graph_id,
       activeRunId,
-      events,
+      events: runState?.event_history ?? [],
       runState,
       savedAt: new Date().toISOString(),
     });
-  }, [activeRunId, cancelPersistedRunSnapshot, draftGraph?.graph_id, events, runState, schedulePersistedRunSnapshot]);
+  }, [activeRunId, cancelPersistedRunSnapshot, draftGraph?.graph_id, runState, schedulePersistedRunSnapshot]);
 
   async function refreshGraphs(nextSelectedGraphId?: string) {
     const loadedGraphs = await fetchGraphs();
@@ -1899,6 +2108,11 @@ export default function App() {
     if (!draftGraph) {
       return;
     }
+    const startRowError = spreadsheetStartRowValidationMessage(draftGraph);
+    if (startRowError) {
+      setError(startRowError);
+      return;
+    }
     const agentIdsToRun = isTestEnvironment(draftGraph) ? getSelectedEnvironmentAgentIds(draftGraph, environmentAgentSelection) : undefined;
     if (isTestEnvironment(draftGraph) && (!agentIdsToRun || agentIdsToRun.length === 0)) {
       setError("Turn on at least one agent before running the environment.");
@@ -1947,6 +2161,11 @@ export default function App() {
 
   async function handleRun() {
     if (!draftGraph) {
+      return;
+    }
+    const startRowError = spreadsheetStartRowValidationMessage(draftGraph);
+    if (startRowError) {
+      setError(startRowError);
       return;
     }
     const agentIdsToRun = isTestEnvironment(draftGraph) ? getSelectedEnvironmentAgentIds(draftGraph, environmentAgentSelection) : undefined;
@@ -2281,7 +2500,7 @@ export default function App() {
                   </div>
                 </div>
                 <p>
-                  Upload reusable files into this project so spreadsheet-backed nodes can select them later.
+                  Upload reusable files into this project so spreadsheet-backed nodes can select them later. Browse, preview, or remove them from the Workspace panel.
                 </p>
                 <label className="execution-documents-picker">
                   <span>{isUploadingProjectFiles ? "Uploading..." : "Add Project Files"}</span>
@@ -2296,35 +2515,6 @@ export default function App() {
                     }}
                   />
                 </label>
-                {projectFiles.length > 0 ? (
-                  <div className="execution-documents-list">
-                    {projectFiles.map((file) => (
-                      <div key={file.file_id} className={`execution-document-card is-${file.status}`}>
-                        <div className="execution-document-card-header">
-                          <div>
-                            <strong>{file.name}</strong>
-                            <span>
-                              {formatDocumentSize(file.size_bytes)} · {file.mime_type || "file"}
-                            </span>
-                          </div>
-                          <button
-                            type="button"
-                            className="secondary-button execution-document-remove"
-                            onClick={() => void removeProjectFile(projectFileGraphId, file.file_id)}
-                            disabled={!projectFileGraphId || isSaving || isResettingRuntime}
-                          >
-                            Remove
-                          </button>
-                        </div>
-                        <span className={`execution-document-status execution-document-status--${file.status}`}>{file.status}</span>
-                        <pre className="execution-document-excerpt">{file.storage_path}</pre>
-                        {file.error ? <span className="execution-document-error">{file.error}</span> : null}
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p>{isProjectFilesLoading ? "Loading project files..." : "No project files uploaded yet."}</p>
-                )}
                 {projectFileError ? <p className="error-text">{projectFileError}</p> : null}
                 <div className="execution-documents-header">
                   <strong>Run Documents</strong>
@@ -2360,14 +2550,24 @@ export default function App() {
                               {formatDocumentSize(document.size_bytes)} · {document.mime_type || "file"}
                             </span>
                           </div>
-                          <button
-                            type="button"
-                            className="secondary-button execution-document-remove"
-                            onClick={() => removeRunDocument(document.document_id)}
-                            disabled={isSaving || isResettingRuntime}
-                          >
-                            Remove
-                          </button>
+                          <div className="execution-document-card-actions">
+                            <button
+                              type="button"
+                              className="secondary-button execution-document-view"
+                              onClick={() => viewRunDocument(document.document_id)}
+                              disabled={document.status !== "ready" && !document.text_content}
+                            >
+                              View
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-button execution-document-remove"
+                              onClick={() => removeRunDocument(document.document_id)}
+                              disabled={isSaving || isResettingRuntime}
+                            >
+                              Remove
+                            </button>
+                          </div>
                         </div>
                         <span className={`execution-document-status execution-document-status--${document.status}`}>{document.status}</span>
                         <pre className="execution-document-excerpt">{document.text_excerpt || document.storage_path}</pre>
@@ -2382,41 +2582,137 @@ export default function App() {
               </div>
 
               <div className="mosaic-tile panel mosaic-files">
-                <div className="execution-files-header">
-                  <div className="mosaic-section-heading">
-                    <span className="mosaic-section-kicker">Workspace</span>
+                <div className="mosaic-section-heading">
+                  <span className="mosaic-section-kicker">Workspace</span>
+                </div>
+
+                <section className="workspace-subsection">
+                  <div className="execution-documents-header">
+                    <strong>Project Files</strong>
+                    <span>
+                      {readyProjectFiles.length} ready
+                      {projectFiles.length !== readyProjectFiles.length ? ` / ${projectFiles.length} total` : ""}
+                    </span>
+                  </div>
+                  <p className="workspace-subsection-intro">
+                    Reusable files attached to this project. Uploads are per-graph; files in <code>scripts/</code> on disk are shared across every graph.
+                  </p>
+                  {isProjectFilesLoading ? (
+                    <p>Loading project files...</p>
+                  ) : projectFiles.length > 0 ? (
+                    <div className="project-files-accordion">
+                      {([
+                        { source: "upload" as const, label: "Uploaded", files: uploadedProjectFiles, emptyHint: "No files uploaded for this graph yet." },
+                        { source: "scripts" as const, label: "Scripts folder", files: scriptsProjectFiles, emptyHint: "Drop .py files in scripts/ and they'll show up here." },
+                      ]).map((group) => {
+                        const expanded = expandedProjectFileSources[group.source] ?? true;
+                        return (
+                          <div key={group.source} className={`project-files-group project-files-group--${group.source}`}>
+                            <button
+                              type="button"
+                              className="project-files-group-header"
+                              aria-expanded={expanded}
+                              onClick={() =>
+                                setExpandedProjectFileSources((prev) => ({
+                                  ...prev,
+                                  [group.source]: !(prev[group.source] ?? true),
+                                }))
+                              }
+                            >
+                              <span className="project-files-group-chevron">{expanded ? "▾" : "▸"}</span>
+                              <span className="project-files-group-label">{group.label}</span>
+                              <span className="project-files-group-count">
+                                {group.files.length} file{group.files.length === 1 ? "" : "s"}
+                              </span>
+                            </button>
+                            {expanded ? (
+                              group.files.length > 0 ? (
+                                <div className="execution-documents-list">
+                                  {group.files.map((file) => {
+                                    const isScripts = (file.source ?? "upload") === "scripts";
+                                    return (
+                                      <div key={file.file_id} className={`execution-document-card is-${file.status}`}>
+                                        <div className="execution-document-card-header">
+                                          <div>
+                                            <strong>{file.name}</strong>
+                                            <span>
+                                              {formatDocumentSize(file.size_bytes)} · {file.mime_type || "file"}
+                                            </span>
+                                          </div>
+                                          <div className="execution-document-card-actions">
+                                            <button
+                                              type="button"
+                                              className="secondary-button execution-document-view"
+                                              onClick={() => void viewProjectFile(projectFileGraphId, file.file_id)}
+                                              disabled={file.status !== "ready" || !projectFileGraphId}
+                                            >
+                                              View
+                                            </button>
+                                            {!isScripts ? (
+                                              <button
+                                                type="button"
+                                                className="secondary-button execution-document-remove"
+                                                onClick={() => void removeProjectFile(projectFileGraphId, file.file_id)}
+                                                disabled={isSaving || isResettingRuntime || !projectFileGraphId}
+                                              >
+                                                Remove
+                                              </button>
+                                            ) : null}
+                                          </div>
+                                        </div>
+                                        <span className={`execution-document-status execution-document-status--${file.status}`}>{file.status}</span>
+                                        {file.error ? <span className="execution-document-error">{file.error}</span> : null}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : (
+                                <p className="project-files-group-empty">{group.emptyHint}</p>
+                              )
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p>No project files yet. Upload from the Inputs tile or drop a .py file in scripts/.</p>
+                  )}
+                  {projectFileError ? <p className="error-text">{projectFileError}</p> : null}
+                </section>
+
+                <section className="workspace-subsection">
+                  <div className="execution-files-header">
                     <div className="execution-documents-header">
                       <strong>Agent Files</strong>
                       <span>{visibleRunFiles.length} file{visibleRunFiles.length === 1 ? "" : "s"}</span>
                     </div>
+                    <div className="execution-files-actions">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => setIsRunFilesExplorerOpen(true)}
+                        disabled={!selectedRunFilesRequest.runId}
+                      >
+                        Open Explorer
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => {
+                          if (selectedRunFilesRequest.runId) {
+                            void refreshRunFiles(selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId);
+                          }
+                        }}
+                        disabled={!selectedRunFilesRequest.runId || isRunFilesLoading}
+                      >
+                        {isRunFilesLoading ? "Refreshing..." : "Refresh Files"}
+                      </button>
+                    </div>
                   </div>
-                  <div className="execution-files-actions">
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      onClick={() => setIsRunFilesExplorerOpen(true)}
-                      disabled={!selectedRunFilesRequest.runId}
-                    >
-                      Open Explorer
-                    </button>
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      onClick={() => {
-                        if (selectedRunFilesRequest.runId) {
-                          void refreshRunFiles(selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId);
-                        }
-                      }}
-                      disabled={!selectedRunFilesRequest.runId || isRunFilesLoading}
-                    >
-                      {isRunFilesLoading ? "Refreshing..." : "Refresh Files"}
-                    </button>
-                  </div>
-                </div>
-                <p className="execution-files-intro">
-                  Inspect files created in the sandboxed workspace for the selected run
-                  {selectedRunState?.agent_name ? ` (${selectedRunState.agent_name})` : ""}.
-                </p>
+                  <p className="execution-files-intro">
+                    Inspect files created in the sandboxed workspace for the selected run
+                    {selectedRunState?.agent_name ? ` (${selectedRunState.agent_name})` : ""}.
+                  </p>
                 {runFileListing?.workspace_root ? (
                   <div className="execution-files-workspace">
                     <span>Workspace root</span>
@@ -2488,8 +2784,9 @@ export default function App() {
                     {selectedRunFilesRequest.runId ? "No files have been written in this run yet." : "Run the graph to inspect workspace files."}
                   </p>
                 )}
-                {runFilesError ? <p className="error-text">{runFilesError}</p> : null}
-                {runFileContentError ? <p className="error-text">{runFileContentError}</p> : null}
+                  {runFilesError ? <p className="error-text">{runFilesError}</p> : null}
+                  {runFileContentError ? <p className="error-text">{runFileContentError}</p> : null}
+                </section>
               </div>
             </div>
           </div>
@@ -2594,6 +2891,17 @@ export default function App() {
             setProductionRunConfirmOpen(false);
             void executeRun();
           }}
+        />
+      ) : null}
+      {documentPreview ? (
+        <DocumentPreviewModal
+          title={documentPreview.title}
+          subtitle={documentPreview.subtitle}
+          content={documentPreview.content}
+          isLoading={documentPreview.isLoading}
+          error={documentPreview.error}
+          truncated={documentPreview.truncated}
+          onClose={() => setDocumentPreview(null)}
         />
       ) : null}
       {mcpPanelOpen ? (

@@ -720,6 +720,17 @@ function selectionRectHeight(rect: SelectionRect) {
 }
 
 function formatLoopRegionProgress(region: FocusedLoopRegion): string | null {
+  if (region.iteratorType === "spreadsheet_rows" && typeof region.spreadsheetRowNumber === "number" && region.spreadsheetRowNumber > 0) {
+    if (
+      typeof region.currentRowIndex === "number"
+      && region.currentRowIndex > 0
+      && typeof region.totalRows === "number"
+      && region.totalRows > 0
+    ) {
+      return `Row ${region.spreadsheetRowNumber} (${Math.min(region.currentRowIndex, region.totalRows)}/${region.totalRows})`;
+    }
+    return `Row ${region.spreadsheetRowNumber}`;
+  }
   if (typeof region.totalRows !== "number") {
     return null;
   }
@@ -1567,6 +1578,60 @@ export function GraphCanvas({
             file_path: selectedFile.storage_path,
           },
         })),
+      );
+    },
+    [availableProjectFiles, graph, onGraphChange],
+  );
+
+  const handleChangeSpreadsheetStartRowIndex = useCallback(
+    (nodeId: string, startRowIndex: number | string) => {
+      if (!graph) {
+        return;
+      }
+      onGraphChange(
+        updateNode(graph, nodeId, (node) => ({
+          ...node,
+          config: {
+            ...node.config,
+            start_row_index: startRowIndex,
+          },
+        })),
+      );
+    },
+    [graph, onGraphChange],
+  );
+
+  const handleSelectPythonScriptFile = useCallback(
+    (nodeId: string, fileId: string) => {
+      if (!graph) {
+        return;
+      }
+      const normalizedFileId = fileId.trim();
+      onGraphChange(
+        updateNode(graph, nodeId, (node) => {
+          if (!normalizedFileId) {
+            return {
+              ...node,
+              config: {
+                ...node.config,
+                script_file_id: "",
+                script_file_name: "",
+              },
+            };
+          }
+          const selectedFile = availableProjectFiles.find((file) => file.file_id === normalizedFileId) ?? null;
+          if (!selectedFile) {
+            return node;
+          }
+          return {
+            ...node,
+            config: {
+              ...node.config,
+              script_file_id: selectedFile.file_id,
+              script_file_name: selectedFile.name,
+            },
+          };
+        }),
       );
     },
     [availableProjectFiles, graph, onGraphChange],
@@ -3924,6 +3989,8 @@ export function GraphCanvas({
                 onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
                 onOpenConditionResults: handleOpenConditionResults,
                 onSelectSpreadsheetFile: handleSelectSpreadsheetFile,
+                onChangeSpreadsheetStartRowIndex: handleChangeSpreadsheetStartRowIndex,
+                onSelectPythonScriptFile: handleSelectPythonScriptFile,
                 onSelectSupabaseConnection: handleSelectSupabaseConnection,
                 onHandlePointerDown: handleNodeHandlePointerDown,
                 onJunctionPointerDown: handleJunctionPointerDown,
@@ -4031,6 +4098,8 @@ export function GraphCanvas({
         previousData.onOpenContextBuilderPayload === handleOpenContextBuilderPayload &&
         previousData.onOpenConditionResults === handleOpenConditionResults &&
         previousData.onSelectSpreadsheetFile === handleSelectSpreadsheetFile &&
+        previousData.onChangeSpreadsheetStartRowIndex === handleChangeSpreadsheetStartRowIndex &&
+        previousData.onSelectPythonScriptFile === handleSelectPythonScriptFile &&
         previousData.onSelectSupabaseConnection === handleSelectSupabaseConnection &&
         previousData.onHandlePointerDown === handleNodeHandlePointerDown &&
         previousData.onJunctionPointerDown === handleJunctionPointerDown
@@ -4062,6 +4131,8 @@ export function GraphCanvas({
               onOpenContextBuilderPayload: handleOpenContextBuilderPayload,
               onOpenConditionResults: handleOpenConditionResults,
               onSelectSpreadsheetFile: handleSelectSpreadsheetFile,
+              onChangeSpreadsheetStartRowIndex: handleChangeSpreadsheetStartRowIndex,
+              onSelectPythonScriptFile: handleSelectPythonScriptFile,
               onSelectSupabaseConnection: handleSelectSupabaseConnection,
               onHandlePointerDown: handleNodeHandlePointerDown,
               onJunctionPointerDown: handleJunctionPointerDown,
@@ -4123,6 +4194,8 @@ export function GraphCanvas({
     handleOpenConditionResults,
     handleSelectSupabaseConnection,
     handleSelectSpreadsheetFile,
+    handleChangeSpreadsheetStartRowIndex,
+    handleSelectPythonScriptFile,
     handleToggleExecutorRetries,
     handleOpenToolDetails,
     handleToggleTooltip,

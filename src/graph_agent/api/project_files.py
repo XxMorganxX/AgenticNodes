@@ -10,10 +10,22 @@ import shutil
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
+from graph_agent.runtime.run_documents import (
+    RunDocumentIngestionError,
+    extract_document_text,
+)
 
-DEFAULT_PROJECT_FILE_STORAGE_DIR = Path(__file__).resolve().parents[3] / ".graph-agent" / "project-files"
-SUPPORTED_PROJECT_FILE_EXTENSIONS = {".csv", ".json", ".md", ".markdown", ".pdf", ".txt", ".xlsx"}
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_PROJECT_FILE_STORAGE_DIR = REPO_ROOT / ".graph-agent" / "project-files"
+DEFAULT_SCRIPTS_DIR = REPO_ROOT / "scripts"
+SUPPORTED_PROJECT_FILE_EXTENSIONS = {".csv", ".json", ".md", ".markdown", ".pdf", ".py", ".txt", ".xlsx"}
+SCRIPTS_SOURCE_EXTENSIONS = {".py"}
 MANIFEST_FILENAME = "manifest.json"
+PROJECT_FILE_CONTENT_PREVIEW_LIMIT = 256 * 1024
+PROJECT_FILE_SOURCE_UPLOAD = "upload"
+PROJECT_FILE_SOURCE_SCRIPTS = "scripts"
+SCRIPTS_FILE_ID_PREFIX = "scripts:"
 
 
 class ProjectFileError(ValueError):
@@ -31,6 +43,7 @@ class ProjectFileRecord:
     status: str
     created_at: str
     error: str | None = None
+    source: str = PROJECT_FILE_SOURCE_UPLOAD
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +56,7 @@ class ProjectFileRecord:
             "status": self.status,
             "created_at": self.created_at,
             "error": self.error,
+            "source": self.source,
         }
 
 
@@ -51,6 +65,13 @@ def resolve_project_file_storage_dir() -> Path:
     if configured:
         return Path(configured).expanduser()
     return DEFAULT_PROJECT_FILE_STORAGE_DIR
+
+
+def resolve_scripts_source_dir() -> Path:
+    configured = os.environ.get("GRAPH_AGENT_SCRIPTS_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return DEFAULT_SCRIPTS_DIR
 
 
 class ProjectFileStore:
@@ -62,7 +83,8 @@ class ProjectFileStore:
         normalized_graph_id = _normalize_graph_id(graph_id)
         records = self._load_manifest(normalized_graph_id)
         cleaned_records = self._prune_missing_files(normalized_graph_id, records)
-        return [record.to_dict() for record in cleaned_records]
+        script_records = _load_scripts_source_records(normalized_graph_id)
+        return [record.to_dict() for record in script_records + cleaned_records]
 
     def upload_files(self, graph_id: str, files: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
         normalized_graph_id = _normalize_graph_id(graph_id)
@@ -82,6 +104,10 @@ class ProjectFileStore:
         normalized_file_id = str(file_id).strip()
         if not normalized_file_id:
             raise ProjectFileError("Project file id is required.")
+        if normalized_file_id.startswith(SCRIPTS_FILE_ID_PREFIX):
+            raise ProjectFileError(
+                "Files sourced from the scripts/ directory can't be deleted here — remove them from disk instead."
+            )
         records = self._load_manifest(normalized_graph_id)
         next_records: list[ProjectFileRecord] = []
         deleted_record: ProjectFileRecord | None = None
@@ -99,6 +125,42 @@ class ProjectFileStore:
         graph_dir = self._graph_dir(normalized_graph_id)
         if graph_dir.exists() and not any(graph_dir.iterdir()):
             graph_dir.rmdir()
+
+    def read_file_content(self, graph_id: str, file_id: str) -> dict[str, Any]:
+        normalized_graph_id = _normalize_graph_id(graph_id)
+        normalized_file_id = str(file_id).strip()
+        if not normalized_file_id:
+            raise ProjectFileError("Project file id is required.")
+        candidate_records: list[ProjectFileRecord] = list(_load_scripts_source_records(normalized_graph_id))
+        candidate_records.extend(self._load_manifest(normalized_graph_id))
+        for record in candidate_records:
+            if record.file_id == normalized_file_id:
+                storage_path = Path(record.storage_path)
+                if not storage_path.exists():
+                    raise KeyError(normalized_file_id)
+                raw_bytes = storage_path.read_bytes()
+                try:
+                    text = extract_document_text(record.name, raw_bytes)
+                    error: str | None = None
+                except RunDocumentIngestionError as exc:
+                    text = ""
+                    error = str(exc)
+                content = text
+                truncated = False
+                if len(content) > PROJECT_FILE_CONTENT_PREVIEW_LIMIT:
+                    content = content[:PROJECT_FILE_CONTENT_PREVIEW_LIMIT]
+                    truncated = True
+                return {
+                    "file_id": record.file_id,
+                    "graph_id": record.graph_id,
+                    "name": record.name,
+                    "mime_type": record.mime_type,
+                    "size_bytes": record.size_bytes,
+                    "content": content,
+                    "truncated": truncated,
+                    "error": error,
+                }
+        raise KeyError(normalized_file_id)
 
     def rename_graph(self, previous_graph_id: str, next_graph_id: str) -> None:
         old_graph_id = _normalize_graph_id(previous_graph_id)
@@ -159,7 +221,7 @@ class ProjectFileStore:
         extension = Path(name).suffix.strip().lower()
         if extension not in SUPPORTED_PROJECT_FILE_EXTENSIONS:
             raise ProjectFileError(
-                "Unsupported file type. Upload .txt, .md, .markdown, .json, .csv, .xlsx, or .pdf files."
+                "Unsupported file type. Upload .txt, .md, .markdown, .json, .csv, .xlsx, .pdf, or .py files."
             )
         file_id = uuid4().hex
         safe_name = _safe_filename(name)
@@ -201,6 +263,8 @@ class ProjectFileStore:
             name = str(candidate.get("name") or "").strip()
             if not file_id or not name:
                 continue
+            raw_source = str(candidate.get("source") or PROJECT_FILE_SOURCE_UPLOAD).strip().lower()
+            source = raw_source if raw_source in {PROJECT_FILE_SOURCE_UPLOAD, PROJECT_FILE_SOURCE_SCRIPTS} else PROJECT_FILE_SOURCE_UPLOAD
             records.append(
                 ProjectFileRecord(
                     file_id=file_id,
@@ -212,6 +276,7 @@ class ProjectFileStore:
                     status=str(candidate.get("status") or "ready"),
                     created_at=str(candidate.get("created_at") or ""),
                     error=_coerce_optional_string(candidate.get("error")),
+                    source=source,
                 )
             )
         return records
@@ -229,6 +294,41 @@ class ProjectFileStore:
         if len(kept_records) != len(records):
             self._save_manifest(graph_id, kept_records)
         return kept_records
+
+
+def _load_scripts_source_records(graph_id: str) -> list[ProjectFileRecord]:
+    scripts_dir = resolve_scripts_source_dir()
+    if not scripts_dir.exists() or not scripts_dir.is_dir():
+        return []
+    records: list[ProjectFileRecord] = []
+    for script_path in sorted(scripts_dir.rglob("*")):
+        if not script_path.is_file():
+            continue
+        if script_path.suffix.lower() not in SCRIPTS_SOURCE_EXTENSIONS:
+            continue
+        try:
+            relative = script_path.relative_to(scripts_dir).as_posix()
+        except ValueError:
+            continue
+        try:
+            stat = script_path.stat()
+        except OSError:
+            continue
+        records.append(
+            ProjectFileRecord(
+                file_id=f"{SCRIPTS_FILE_ID_PREFIX}{relative}",
+                graph_id=graph_id,
+                name=relative,
+                mime_type="text/x-python",
+                size_bytes=max(int(stat.st_size), 0),
+                storage_path=str(script_path),
+                status="ready",
+                created_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                error=None,
+                source=PROJECT_FILE_SOURCE_SCRIPTS,
+            )
+        )
+    return records
 
 
 def _normalize_graph_id(graph_id: str) -> str:

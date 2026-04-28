@@ -5,11 +5,33 @@ import json
 import re
 from typing import Any, Mapping, Sequence
 
+SEARCH_SECTION_PAYLOAD = "payload"
+SEARCH_SECTION_METADATA = "metadata"
+SEARCH_SECTION_ARTIFACTS = "artifacts"
+SEARCH_SECTIONS: tuple[str, ...] = (
+    SEARCH_SECTION_PAYLOAD,
+    SEARCH_SECTION_METADATA,
+    SEARCH_SECTION_ARTIFACTS,
+)
+
+
+def normalize_search_section(value: Any, *, default: str = SEARCH_SECTION_PAYLOAD) -> str:
+    text = str(value or "").strip().lower()
+    if text in SEARCH_SECTIONS:
+        return text
+    return default
+
+
 @dataclass(frozen=True)
 class StructuredPayloadBuilderConfig:
     template_json: str
     case_sensitive: bool = False
     max_matches_per_field: int = 25
+    field_aliases: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Default section for entries that don't specify one. Single section per match.
+    default_search_section: str = SEARCH_SECTION_PAYLOAD
+    # Per-entry overrides: ((field_name, "payload" | "metadata" | "artifacts"), ...)
+    field_search_scopes: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -80,8 +102,12 @@ def _token_phrase(tokens: Sequence[str]) -> str:
     return " ".join(str(token).strip() for token in tokens if str(token).strip())
 
 
-def _target_keyword_variants(field_name: str, *, case_sensitive: bool) -> tuple[tuple[str, ...], ...]:
-    direct_tokens = _tokenize_keywords(field_name, case_sensitive=case_sensitive)
+def _target_keyword_variants(
+    field_name: str,
+    *,
+    case_sensitive: bool,
+    extra_aliases: Sequence[str] = (),
+) -> tuple[tuple[str, ...], ...]:
     variants: list[tuple[str, ...]] = []
     seen: set[tuple[str, ...]] = set()
 
@@ -91,10 +117,18 @@ def _target_keyword_variants(field_name: str, *, case_sensitive: bool) -> tuple[
         variants.append(tokens)
         seen.add(tokens)
 
+    if extra_aliases:
+        # User-provided search keys fully replace the output field label —
+        # the matcher searches for those keys only, not the entry's output name
+        # or any built-in aliases.
+        for alias in extra_aliases:
+            add_variant(_tokenize_keywords(alias, case_sensitive=case_sensitive))
+        return tuple(variants)
+
+    direct_tokens = _tokenize_keywords(field_name, case_sensitive=case_sensitive)
     direct_phrase = _token_phrase(direct_tokens)
-    alias_phrases = _FIELD_ALIASES.get(direct_phrase, ())
     add_variant(direct_tokens)
-    for alias in alias_phrases:
+    for alias in _FIELD_ALIASES.get(direct_phrase, ()):
         add_variant(_tokenize_keywords(alias, case_sensitive=case_sensitive))
     return tuple(variants)
 
@@ -159,23 +193,37 @@ def _match_details_for_candidate(
     *,
     field_name: str,
     case_sensitive: bool,
+    extra_aliases: Sequence[str] = (),
 ) -> dict[str, Any] | None:
-    target_variants = _target_keyword_variants(field_name, case_sensitive=case_sensitive)
+    target_variants = _target_keyword_variants(
+        field_name, case_sensitive=case_sensitive, extra_aliases=extra_aliases
+    )
     if not target_variants:
         return None
 
     candidate_field_value = str(candidate.field or "").strip()
-    target_field_value = str(field_name or "").strip()
-    if case_sensitive:
-        is_raw_exact = candidate_field_value == target_field_value
+    target_raw_values: list[str] = []
+    if extra_aliases:
+        for alias in extra_aliases:
+            alias_text = str(alias or "").strip()
+            if alias_text and alias_text not in target_raw_values:
+                target_raw_values.append(alias_text)
     else:
-        is_raw_exact = candidate_field_value.lower() == target_field_value.lower()
-    if is_raw_exact:
-        return {
-            "match_type": "exact_key",
-            "matched_keywords": list(_tokenize_keywords(field_name, case_sensitive=False)),
-            "score": (0, 0, 0, candidate.depth, candidate.discovery_index),
-        }
+        field_text = str(field_name or "").strip()
+        if field_text:
+            target_raw_values.append(field_text)
+
+    for raw_target in target_raw_values:
+        if case_sensitive:
+            is_raw_exact = candidate_field_value == raw_target
+        else:
+            is_raw_exact = candidate_field_value.lower() == raw_target.lower()
+        if is_raw_exact:
+            return {
+                "match_type": "exact_key",
+                "matched_keywords": list(_tokenize_keywords(raw_target, case_sensitive=False)),
+                "score": (0, 0, 0, candidate.depth, candidate.discovery_index),
+            }
 
     primary_phrase = _token_phrase(target_variants[0])
     if candidate.field_phrase == primary_phrase:
@@ -228,6 +276,14 @@ def _match_details_for_candidate(
     return None
 
 
+def _is_empty_source_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
 def _find_first_match(
     field_name: str,
     source_roots: Sequence[Any],
@@ -235,6 +291,7 @@ def _find_first_match(
     case_sensitive: bool,
     max_matches: int,
     expected_shape: str | None = None,
+    extra_aliases: Sequence[str] = (),
 ) -> dict[str, Any] | None:
     best_match: dict[str, Any] | None = None
     best_score: tuple[Any, ...] | None = None
@@ -243,7 +300,14 @@ def _find_first_match(
         for candidate in candidates:
             if not _value_matches_expected_shape(candidate.value, expected_shape):
                 continue
-            match_details = _match_details_for_candidate(candidate, field_name=field_name, case_sensitive=case_sensitive)
+            if _is_empty_source_value(candidate.value):
+                continue
+            match_details = _match_details_for_candidate(
+                candidate,
+                field_name=field_name,
+                case_sensitive=case_sensitive,
+                extra_aliases=extra_aliases,
+            )
             if match_details is None:
                 continue
             candidate_score = (root_index, *tuple(match_details["score"]))
@@ -273,17 +337,160 @@ def _is_missing_template_value(value: Any) -> bool:
     return False
 
 
+def _normalize_field_aliases(
+    field_aliases: Mapping[str, Sequence[str]] | None,
+) -> dict[str, tuple[str, ...]]:
+    if not field_aliases:
+        return {}
+    normalized: dict[str, tuple[str, ...]] = {}
+    for raw_key, raw_values in field_aliases.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        if isinstance(raw_values, str):
+            raw_iterable: Sequence[Any] = [raw_values]
+        elif isinstance(raw_values, Sequence):
+            raw_iterable = raw_values
+        else:
+            continue
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for entry in raw_iterable:
+            text = str(entry or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            cleaned.append(text)
+        if cleaned:
+            normalized[key] = tuple(cleaned)
+    return normalized
+
+
+def _normalize_field_search_scopes(
+    field_search_scopes: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Normalize per-entry scope overrides to ``{key: "payload" | "metadata" | "artifacts"}``.
+
+    Accepts plain strings (``{key: "metadata"}``), as well as the legacy mapping/sequence
+    shapes that were briefly written to disk (``{key: {"metadata": bool, "artifacts": bool}}``
+    or ``{key: [bool, bool]}``). Legacy shapes are best-effort migrated by picking the first
+    enabled section in the order metadata → artifacts → payload.
+    """
+    if not field_search_scopes:
+        return {}
+    normalized: dict[str, str] = {}
+    for raw_key, raw_scope in field_search_scopes.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        if isinstance(raw_scope, str):
+            normalized[key] = normalize_search_section(raw_scope)
+            continue
+        if isinstance(raw_scope, Mapping):
+            sm = bool(raw_scope.get("metadata", True))
+            sa = bool(raw_scope.get("artifacts", True))
+            if sm and not sa:
+                normalized[key] = SEARCH_SECTION_METADATA
+            elif sa and not sm:
+                normalized[key] = SEARCH_SECTION_ARTIFACTS
+            else:
+                normalized[key] = SEARCH_SECTION_PAYLOAD
+            continue
+        if isinstance(raw_scope, Sequence) and not isinstance(raw_scope, (str, bytes, bytearray)):
+            scope_list = list(raw_scope)
+            sm = bool(scope_list[0]) if len(scope_list) >= 1 else True
+            sa = bool(scope_list[1]) if len(scope_list) >= 2 else True
+            if sm and not sa:
+                normalized[key] = SEARCH_SECTION_METADATA
+            elif sa and not sm:
+                normalized[key] = SEARCH_SECTION_ARTIFACTS
+            else:
+                normalized[key] = SEARCH_SECTION_PAYLOAD
+    return normalized
+
+
+def _section_for_field(
+    field_name: str | None,
+    *,
+    normalized_scopes: Mapping[str, str],
+    case_sensitive: bool,
+    default_search_section: str,
+) -> str:
+    if not field_name:
+        return default_search_section
+    if field_name in normalized_scopes:
+        return normalized_scopes[field_name]
+    if not case_sensitive:
+        lowered = field_name.lower()
+        for key, scope in normalized_scopes.items():
+            if key.lower() == lowered:
+                return scope
+    return default_search_section
+
+
 def build_structured_payload(
     template: Mapping[str, Any],
     source_roots: Sequence[Any],
     *,
     case_sensitive: bool = False,
     max_matches_per_field: int = 25,
+    field_aliases: Mapping[str, Sequence[str]] | None = None,
+    source_root_kinds: Sequence[str] | None = None,
+    field_search_scopes: Mapping[str, Any] | None = None,
+    default_search_section: str = SEARCH_SECTION_PAYLOAD,
 ) -> StructuredPayloadBuildResult:
     filled_paths: list[str] = []
     preserved_paths: list[str] = []
     unresolved_paths: list[str] = []
     field_matches: list[dict[str, Any]] = []
+    normalized_aliases = _normalize_field_aliases(field_aliases)
+    normalized_scopes = _normalize_field_search_scopes(field_search_scopes)
+
+    if source_root_kinds is not None and len(source_root_kinds) != len(source_roots):
+        raise ValueError(
+            "source_root_kinds must be parallel to source_roots when provided."
+        )
+
+    def aliases_for(field_name: str | None) -> tuple[str, ...]:
+        if not field_name:
+            return ()
+        if normalized_aliases:
+            direct = normalized_aliases.get(field_name)
+            if direct:
+                return direct
+            if not case_sensitive:
+                lowered = field_name.lower()
+                for key, values in normalized_aliases.items():
+                    if key.lower() == lowered:
+                        return values
+        return ()
+
+    normalized_default_section = normalize_search_section(default_search_section)
+
+    def scoped_roots_for(field_name: str | None, fallback_roots: Sequence[Any]) -> Sequence[Any]:
+        if source_root_kinds is None:
+            return fallback_roots
+        section = _section_for_field(
+            field_name,
+            normalized_scopes=normalized_scopes,
+            case_sensitive=case_sensitive,
+            default_search_section=normalized_default_section,
+        )
+        # Prefix extras (contextual mappings derived from a parent match) have no kind
+        # in the original lookup; preserve them regardless so nested templates still
+        # see their container.
+        prefix_extras: list[Any] = []
+        original_subset: list[Any] = []
+        original_lookup = {id(root): kind for root, kind in zip(source_roots, source_root_kinds)}
+        for value in fallback_roots:
+            kind = original_lookup.get(id(value))
+            if kind is None:
+                prefix_extras.append(value)
+                continue
+            if kind != section:
+                continue
+            original_subset.append(value)
+        return [*prefix_extras, *original_subset]
 
     def build_value(
         template_value: Any,
@@ -292,13 +499,16 @@ def build_structured_payload(
         path: str,
         active_source_roots: Sequence[Any],
     ) -> Any:
-        contextual_roots = list(active_source_roots)
+        scoped_roots = scoped_roots_for(field_name, active_source_roots)
+        contextual_roots = list(scoped_roots)
+        field_aliases_for_call = aliases_for(field_name)
         if field_name:
             container_match = _find_first_match(
                 field_name,
-                active_source_roots,
+                scoped_roots,
                 case_sensitive=case_sensitive,
                 max_matches=max_matches_per_field,
+                extra_aliases=field_aliases_for_call,
             )
             if container_match is not None and isinstance(container_match.get("value"), Mapping):
                 contextual_roots = [container_match["value"], *contextual_roots]
@@ -307,10 +517,11 @@ def build_structured_payload(
             if not template_value and field_name:
                 match = _find_first_match(
                     field_name,
-                    active_source_roots,
+                    scoped_roots,
                     case_sensitive=case_sensitive,
                     max_matches=max_matches_per_field,
                     expected_shape="mapping",
+                    extra_aliases=field_aliases_for_call,
                 )
                 if match is not None and isinstance(match.get("value"), Mapping):
                     filled_paths.append(path)
@@ -338,10 +549,11 @@ def build_structured_payload(
             if field_name:
                 match = _find_first_match(
                     field_name,
-                    active_source_roots,
+                    scoped_roots,
                     case_sensitive=case_sensitive,
                     max_matches=max_matches_per_field,
                     expected_shape="list",
+                    extra_aliases=field_aliases_for_call,
                 )
                 if match is not None and isinstance(match.get("value"), list):
                     filled_paths.append(path)
@@ -360,10 +572,11 @@ def build_structured_payload(
 
         match = _find_first_match(
             field_name,
-            active_source_roots,
+            scoped_roots,
             case_sensitive=case_sensitive,
             max_matches=max_matches_per_field,
             expected_shape="scalar",
+            extra_aliases=field_aliases_for_call,
         )
         if match is None:
             unresolved_paths.append(path)

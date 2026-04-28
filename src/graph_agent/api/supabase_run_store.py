@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import socket
 from threading import Lock
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -12,6 +13,59 @@ from urllib.request import Request, urlopen
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _read_request_timeout_seconds() -> float:
+    raw = os.environ.get("GRAPH_AGENT_SUPABASE_RUN_STORE_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return 10.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 10.0
+    return value if value > 0 else 10.0
+
+
+_REQUEST_TIMEOUT_SECONDS = _read_request_timeout_seconds()
+# HTTP read/connect timeout used by urllib (mirrors tune flush waits relative to this).
+SUPABASE_RUN_STORE_REQUEST_TIMEOUT_SECONDS = float(_REQUEST_TIMEOUT_SECONDS)
+
+
+# Egress instrumentation — set GRAPH_AGENT_SUPABASE_EGRESS_LOG=1 to log every
+# response's byte size at INFO so we can see which queries dominate Supabase
+# egress. Totals are accumulated per (method, table, select) tuple in-memory.
+_EGRESS_LOG_ENABLED = os.environ.get("GRAPH_AGENT_SUPABASE_EGRESS_LOG", "").strip() in {"1", "true", "yes", "on"}
+_EGRESS_TOTALS: dict[tuple[str, str, str], list[int]] = {}
+_EGRESS_TOTALS_LOCK = Lock()
+
+
+def _record_egress(method: str, table: str, select_clause: str, byte_count: int) -> None:
+    if not _EGRESS_LOG_ENABLED:
+        return
+    key = (method, table, select_clause or "*")
+    with _EGRESS_TOTALS_LOCK:
+        bucket = _EGRESS_TOTALS.setdefault(key, [0, 0])
+        bucket[0] += 1
+        bucket[1] += byte_count
+        running_count, running_bytes = bucket[0], bucket[1]
+    LOGGER.info(
+        "Supabase run store EGRESS %s %s select=%s bytes=%d total_calls=%d total_bytes=%d",
+        method,
+        table,
+        select_clause or "*",
+        byte_count,
+        running_count,
+        running_bytes,
+    )
+
+
+def supabase_egress_totals_snapshot() -> list[tuple[str, str, str, int, int]]:
+    """Return a snapshot of (method, table, select, calls, bytes) for the current process."""
+    with _EGRESS_TOTALS_LOCK:
+        return [
+            (method, table, select_clause, bucket[0], bucket[1])
+            for (method, table, select_clause), bucket in _EGRESS_TOTALS.items()
+        ]
 
 from graph_agent.api.run_state_reducer import build_run_state, replay_events
 from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
@@ -128,6 +182,12 @@ class _SchemaCacheColumnMissingError(RuntimeError):
         self.detail = detail
 
 
+class _DuplicateRunEventSequenceError(RuntimeError):
+    def __init__(self, *, detail: str) -> None:
+        super().__init__(f"Duplicate run_events sequence number: {detail}")
+        self.detail = detail
+
+
 def _extract_schema_cache_missing_column(detail: str) -> tuple[str, str] | None:
     try:
         payload = json.loads(detail)
@@ -141,6 +201,25 @@ def _extract_schema_cache_missing_column(detail: str) -> tuple[str, str] | None:
         return None
     column_name, table_name = match.groups()
     return table_name, column_name
+
+
+def _is_duplicate_run_event_sequence_violation(detail: str) -> bool:
+    try:
+        payload = json.loads(detail)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("code") or "") != "23505":
+        return False
+    constraint_indicators = (
+        "run_events_run_id_sequence_number",
+        "(run_id, sequence_number)",
+    )
+    haystack = " ".join(
+        str(payload.get(key) or "") for key in ("message", "details", "hint")
+    )
+    return any(indicator in haystack for indicator in constraint_indicators)
 
 
 def _looks_like_html_document(detail: str) -> bool:
@@ -235,21 +314,45 @@ class SupabaseRunStore:
         if not items:
             return
         normalized_items = [(str(run_id), normalize_runtime_event_dict(event)) for run_id, event in items]
-        sequence_numbers = self._next_sequence_numbers([run_id for run_id, _ in normalized_items])
-        if len(sequence_numbers) != len(normalized_items):
-            raise RuntimeError(
-                "Supabase run store sequence allocation returned a mismatched event count during batch append."
-            )
-        rows = [
-            self._build_event_row(run_id, event, sequence_number=sequence_number)
-            for (run_id, event), sequence_number in zip(normalized_items, sequence_numbers)
-        ]
-        self._request_json_with_schema_fallback(
-            "POST",
-            self._table_path(self.events_table),
-            payload=rows,
-            prefer="return=minimal",
-        )
+        affected_run_ids = list(dict.fromkeys(run_id for run_id, _ in normalized_items))
+        last_error: _DuplicateRunEventSequenceError | None = None
+        for attempt in range(3):
+            sequence_numbers = self._next_sequence_numbers([run_id for run_id, _ in normalized_items])
+            if len(sequence_numbers) != len(normalized_items):
+                raise RuntimeError(
+                    "Supabase run store sequence allocation returned a mismatched event count during batch append."
+                )
+            rows = [
+                self._build_event_row(run_id, event, sequence_number=sequence_number)
+                for (run_id, event), sequence_number in zip(normalized_items, sequence_numbers)
+            ]
+            try:
+                self._request_json_with_schema_fallback(
+                    "POST",
+                    self._table_path(self.events_table),
+                    payload=rows,
+                    prefer="return=minimal",
+                )
+                return
+            except _DuplicateRunEventSequenceError as exc:
+                last_error = exc
+                LOGGER.warning(
+                    "Supabase run_events sequence collision on attempt %d for run_ids=%s; "
+                    "refreshing sequence cache and retrying. Detail: %s",
+                    attempt + 1,
+                    affected_run_ids,
+                    exc.detail,
+                )
+                self._invalidate_sequence_cache(affected_run_ids)
+        assert last_error is not None
+        raise RuntimeError(
+            f"Supabase run store could not resolve sequence-number collision after retries: {last_error.detail}"
+        ) from last_error
+
+    def _invalidate_sequence_cache(self, run_ids: list[str]) -> None:
+        with self._sequence_lock:
+            for run_id in run_ids:
+                self._sequence_cache.pop(run_id, None)
 
     def write_states_batch(self, items: list[tuple[str, dict[str, Any]]]) -> None:
         if not items:
@@ -257,8 +360,21 @@ class SupabaseRunStore:
         rows = [self._build_run_row(state) for _, state in items]
         self._upsert_runs(rows)
 
+    # Tight column lists keep Supabase egress down: callers that only need
+    # the manifest must NOT trigger a fetch of the (potentially MB-sized)
+    # state_snapshot column.
+    _MANIFEST_COLUMNS = (
+        "run_id,graph_id,agent_id,agent_name,parent_run_id,input_payload,metadata,created_at,"
+        "status,status_reason,started_at,ended_at,runtime_instance_id,last_heartbeat_at"
+    )
+    _STATE_COLUMNS = "run_id,state_snapshot"
+    _MANIFEST_AND_STATE_COLUMNS = (
+        "run_id,graph_id,agent_id,agent_name,parent_run_id,input_payload,metadata,created_at,"
+        "status,status_reason,started_at,ended_at,runtime_instance_id,last_heartbeat_at,state_snapshot"
+    )
+
     def load_manifest(self, run_id: str) -> dict[str, Any] | None:
-        row = self._load_run_row(run_id)
+        row = self._load_run_row(run_id, columns=self._MANIFEST_COLUMNS)
         if row is None:
             return None
         return {
@@ -270,17 +386,31 @@ class SupabaseRunStore:
             "input_payload": row.get("input_payload"),
             "metadata": row.get("metadata"),
             "created_at": row.get("created_at"),
+            "status": row.get("status"),
+            "status_reason": row.get("status_reason"),
+            "started_at": row.get("started_at"),
+            "ended_at": row.get("ended_at"),
+            "runtime_instance_id": row.get("runtime_instance_id"),
+            "last_heartbeat_at": row.get("last_heartbeat_at"),
         }
 
-    def load_events(self, run_id: str) -> list[dict[str, Any]]:
+    def load_events(
+        self,
+        run_id: str,
+        *,
+        since_sequence: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = {
+            "run_id": f"eq.{run_id}",
+            "select": "run_id,event_type,timestamp,agent_id,parent_run_id,summary,payload",
+            "order": "sequence_number.asc",
+        }
+        if since_sequence is not None:
+            query["sequence_number"] = f"gt.{int(since_sequence)}"
         rows = self._request_json_with_schema_fallback(
             "GET",
             self._table_path(self.events_table),
-            query={
-                "run_id": f"eq.{run_id}",
-                "select": "run_id,event_type,timestamp,agent_id,parent_run_id,summary,payload",
-                "order": "sequence_number.asc",
-            },
+            query=query,
         )
         return [
             normalize_runtime_event_dict({
@@ -296,15 +426,30 @@ class SupabaseRunStore:
         ]
 
     def load_state(self, run_id: str) -> dict[str, Any] | None:
-        row = self._load_run_row(run_id)
+        row = self._load_run_row(run_id, columns=self._STATE_COLUMNS)
         if row is None:
             return None
         snapshot = row.get("state_snapshot")
         return normalize_runtime_state_snapshot(snapshot if isinstance(snapshot, dict) else None)
 
     def recover_run_state(self, run_id: str) -> dict[str, Any] | None:
-        manifest = self.load_manifest(run_id) or {}
-        snapshot = self.load_state(run_id)
+        # Single round-trip for both manifest and state_snapshot, plus one for events.
+        row = self._load_run_row(run_id, columns=self._MANIFEST_AND_STATE_COLUMNS)
+        manifest: dict[str, Any] = {}
+        snapshot: dict[str, Any] | None = None
+        if row is not None:
+            manifest = {
+                "run_id": row.get("run_id"),
+                "graph_id": row.get("graph_id"),
+                "agent_id": row.get("agent_id"),
+                "agent_name": row.get("agent_name"),
+                "parent_run_id": row.get("parent_run_id"),
+                "input_payload": row.get("input_payload"),
+                "metadata": row.get("metadata"),
+                "created_at": row.get("created_at"),
+            }
+            raw_snapshot = row.get("state_snapshot")
+            snapshot = normalize_runtime_state_snapshot(raw_snapshot if isinstance(raw_snapshot, dict) else None)
         events = self.load_events(run_id)
         if not manifest and snapshot is None and not events:
             return None
@@ -312,7 +457,7 @@ class SupabaseRunStore:
             return snapshot
         graph_id = str(manifest.get("graph_id") or (snapshot or {}).get("graph_id") or run_id)
         input_payload = manifest.get("input_payload", (snapshot or {}).get("input_payload"))
-        documents = manifest.get("documents", (snapshot or {}).get("documents"))
+        documents = (snapshot or {}).get("documents")
         initial_state = build_run_state(
             run_id,
             graph_id,
@@ -335,11 +480,14 @@ class SupabaseRunStore:
         rows = self._request_json_with_schema_fallback("GET", self._table_path(self.runs_table), query=query)
         return [dict(row) for row in rows]
 
-    def _load_run_row(self, run_id: str) -> dict[str, Any] | None:
+    def _load_run_row(self, run_id: str, *, columns: str | None = None) -> dict[str, Any] | None:
+        # Default to the manifest columns. Callers that need the (potentially
+        # large) state_snapshot must opt in via _STATE_COLUMNS or _MANIFEST_AND_STATE_COLUMNS.
+        select_clause = columns if columns is not None else self._MANIFEST_COLUMNS
         rows = self._request_json_with_schema_fallback(
             "GET",
             self._table_path(self.runs_table),
-            query={"run_id": f"eq.{run_id}", "select": "*", "limit": "1"},
+            query={"run_id": f"eq.{run_id}", "select": select_clause, "limit": "1"},
         )
         if not rows:
             return None
@@ -523,15 +671,27 @@ class SupabaseRunStore:
         LOGGER.debug("Supabase run store %s %s (body=%d bytes)", method, url, payload_len)
         request = Request(url, data=body, method=method, headers=headers)
         try:
-            with urlopen(request) as response:
+            with urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
                 raw = response.read()
                 status = response.status
+        except (socket.timeout, TimeoutError) as exc:
+            LOGGER.warning(
+                "Supabase run store %s %s timed out after %.1fs",
+                method,
+                url,
+                _REQUEST_TIMEOUT_SECONDS,
+            )
+            raise RuntimeError(
+                f"Supabase run store request timed out after {_REQUEST_TIMEOUT_SECONDS}s ({method} {path})"
+            ) from exc
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             missing_column = _extract_schema_cache_missing_column(detail)
             if missing_column is not None:
                 table_name, column_name = missing_column
                 raise _SchemaCacheColumnMissingError(table=table_name, column=column_name, detail=detail) from exc
+            if exc.code == 409 and _is_duplicate_run_event_sequence_violation(detail):
+                raise _DuplicateRunEventSequenceError(detail=detail) from exc
             error_detail = _format_http_error_detail(url, exc.code, detail)
             LOGGER.error(
                 "Supabase run store %s %s failed: HTTP %d — %s",
@@ -545,6 +705,12 @@ class SupabaseRunStore:
             LOGGER.error("Supabase run store %s %s network error: %s", method, url, exc.reason)
             raise RuntimeError(f"Supabase run store network error: {exc.reason}") from exc
         LOGGER.debug("Supabase run store %s %s ok (status=%s, bytes=%d)", method, url, status, len(raw))
+        _record_egress(
+            method,
+            self._table_name_from_path(path),
+            (query or {}).get("select", "") if query else "",
+            len(raw),
+        )
         if not raw:
             return []
         return json.loads(raw.decode("utf-8"))

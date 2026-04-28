@@ -138,10 +138,47 @@ type StructuredPayloadTemplateEntry = {
   id: string;
   key: string;
   value: string;
+  searchKeys: string[];
 };
 
-function parseStructuredPayloadTemplateEntries(value: unknown): StructuredPayloadTemplateEntry[] {
+function parseStructuredPayloadFieldAliases(value: unknown): Record<string, string[]> {
+  if (!value) {
+    return {};
+  }
+  let raw = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return {};
+    }
+    try {
+      raw = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  const out: Record<string, string[]> = {};
+  for (const [key, entry] of Object.entries(raw as Record<string, unknown>)) {
+    if (!key) continue;
+    if (Array.isArray(entry)) {
+      out[key] = entry.map((item) => String(item ?? "").trim()).filter((item) => item.length > 0);
+    } else if (typeof entry === "string") {
+      const text = entry.trim();
+      out[key] = text ? [text] : [];
+    }
+  }
+  return out;
+}
+
+function parseStructuredPayloadTemplateEntries(
+  value: unknown,
+  fieldAliases?: unknown,
+): StructuredPayloadTemplateEntry[] {
   const raw = String(value ?? "").trim();
+  const aliases = parseStructuredPayloadFieldAliases(fieldAliases);
   if (!raw) {
     return [];
   }
@@ -159,6 +196,7 @@ function parseStructuredPayloadTemplateEntries(value: unknown): StructuredPayloa
           : entryValue == null
             ? ""
             : JSON.stringify(entryValue),
+      searchKeys: aliases[key] ?? [],
     }));
   } catch {
     return [];
@@ -193,6 +231,21 @@ function serializeStructuredPayloadTemplateEntries(entries: StructuredPayloadTem
     payload[key] = rawValue;
   }
   return JSON.stringify(payload, null, 2);
+}
+
+function serializeStructuredPayloadFieldAliases(entries: StructuredPayloadTemplateEntry[]): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const entry of entries) {
+    const key = entry.key.trim();
+    if (!key) continue;
+    const cleaned = entry.searchKeys
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+    if (cleaned.length > 0) {
+      out[key] = Array.from(new Set(cleaned));
+    }
+  }
+  return out;
 }
 
 const CONTEXT_BUILDER_PROVIDER_ID = "core.context_builder";
@@ -540,6 +593,10 @@ export function GraphInspector({
   const selectedNode = selectedNodeId ? graph.nodes.find((node) => node.id === selectedNodeId) ?? null : null;
   const selectedEdge = selectedEdgeId ? graph.edges.find((edge) => edge.id === selectedEdgeId) ?? null : null;
   const spreadsheetProjectFiles = availableProjectFiles.filter(isSpreadsheetProjectFile);
+  const selectedSpreadsheetStartRowValue =
+    typeof selectedNode?.config.start_row_index === "number" || typeof selectedNode?.config.start_row_index === "string"
+      ? String(selectedNode.config.start_row_index)
+      : "2";
   const spreadsheetPreviewKey =
     selectedNode?.provider_id === SPREADSHEET_ROW_PROVIDER_ID ||
     selectedNode?.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID
@@ -565,7 +622,12 @@ export function GraphInspector({
   }, [selectedNode]);
   useEffect(() => {
     if (selectedNode?.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID) {
-      setStructuredPayloadTemplateDraftEntries(parseStructuredPayloadTemplateEntries(selectedNode.config.template_json));
+      setStructuredPayloadTemplateDraftEntries(
+        parseStructuredPayloadTemplateEntries(
+          selectedNode.config.template_json,
+          selectedNode.config.field_aliases,
+        ),
+      );
       return;
     }
     setStructuredPayloadTemplateDraftEntries([]);
@@ -1136,6 +1198,12 @@ export function GraphInspector({
       if (!spreadsheetNode) {
         return;
       }
+      const rawStartRowIndex = spreadsheetNode.config.start_row_index;
+      if (typeof rawStartRowIndex === "string" && rawStartRowIndex.trim().length === 0) {
+        setSpreadsheetPreview(null);
+        setSpreadsheetPreviewError("Starting Row Index is required before previewing spreadsheet rows.");
+        return;
+      }
       setIsSpreadsheetPreviewLoading(true);
       setSpreadsheetPreviewError(null);
       try {
@@ -1144,7 +1212,10 @@ export function GraphInspector({
           file_format: String(spreadsheetNode.config.file_format ?? "auto"),
           sheet_name: String(spreadsheetNode.config.sheet_name ?? "") || null,
           header_row_index: Number(spreadsheetNode.config.header_row_index ?? 1) || 1,
-          start_row_index: Number(spreadsheetNode.config.start_row_index ?? 2) || 2,
+          start_row_index:
+            typeof rawStartRowIndex === "number" || typeof rawStartRowIndex === "string"
+              ? rawStartRowIndex
+              : 2,
           empty_row_policy: String(spreadsheetNode.config.empty_row_policy ?? "skip"),
         });
         setSpreadsheetPreview(preview);
@@ -1247,6 +1318,7 @@ export function GraphInspector({
             ...node.config,
             mode: "structured_payload_builder",
             template_json: serializeStructuredPayloadTemplateEntries(entries),
+            field_aliases: serializeStructuredPayloadFieldAliases(entries),
           },
         })),
       );
@@ -1687,12 +1759,32 @@ export function GraphInspector({
                       }
                     />
                   </label>
+                  <label>
+                    Signature
+                    <textarea
+                      rows={4}
+                      value={String(selectedNode.config.signature ?? "")}
+                      placeholder={"Best,\nMorgan"}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              signature: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
                   <div className="contract-card">
                     <strong>Draft Behavior</strong>
                     <span>The body comes from the selected Body Source and is stored as plain text in Outlook.</span>
                     <span>Leave To blank to auto-use a payload email when the resolved data includes fields like <code>email</code>.</span>
                     <span>Use <code>{"{input_payload}"}</code>, <code>{"{message_payload}"}</code>, or <code>{"{message_json}"}</code> in the subject if you want it templated.</span>
                     <span>The To field also supports top-level payload placeholders like <code>{"{email}"}</code>.</span>
+                    <span>The signature is appended after the body, and switches to HTML mode automatically if either body or signature contains HTML markup.</span>
                     <span>Authentication is handled globally through Microsoft device-code sign-in, not graph env vars.</span>
                     <span>Only the toggled fields are required before saving the draft.</span>
                   </div>
@@ -1798,6 +1890,48 @@ export function GraphInspector({
                 const value = selectedNode.config[field.key];
                 const isNumberField = field.input_type === "number";
                 const isSelectField = field.input_type === "select" && (field.options?.length ?? 0) > 0;
+                const isPythonScriptFileField =
+                  selectedNode.provider_id === "core.python_script_runner" && field.key === "script_file_id";
+                if (isPythonScriptFileField) {
+                  const pythonScriptFiles = availableProjectFiles.filter(
+                    (file) =>
+                      file.status === "ready" &&
+                      `${file.name} ${file.storage_path}`.toLowerCase().endsWith(".py"),
+                  );
+                  const currentFileId = String(value ?? "");
+                  return (
+                    <label key={field.key}>
+                      {field.label}
+                      <select
+                        value={currentFileId}
+                        onChange={(event) => {
+                          const nextId = event.target.value;
+                          const match = pythonScriptFiles.find((file) => file.file_id === nextId) ?? null;
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                script_file_id: nextId,
+                                script_file_name: match?.name ?? "",
+                              },
+                            })),
+                          );
+                        }}
+                      >
+                        <option value="">
+                          {pythonScriptFiles.length === 0 ? "Upload a .py project file…" : "Select a .py project file…"}
+                        </option>
+                        {pythonScriptFiles.map((file) => (
+                          <option key={file.file_id} value={file.file_id}>
+                            {file.name}
+                          </option>
+                        ))}
+                      </select>
+                      {field.help_text ? <small>{field.help_text}</small> : null}
+                    </label>
+                  );
+                }
                 const isClaudeCodePresetField = selectedProviderName === "claude_code" && field.key === "preset";
                 const isModelSelectField = isSelectField && field.key === "model";
                 const currentValue = String(value ?? "");
@@ -2872,10 +3006,35 @@ export function GraphInspector({
                         <option value="include">Include empty rows</option>
                       </select>
                     </label>
+                    <label>
+                      Starting Row Index
+                      <input
+                        type="number"
+                        min={2}
+                        step={1}
+                        value={selectedSpreadsheetStartRowValue}
+                        onChange={(event) => {
+                          const rawValue = event.target.value;
+                          const nextStart =
+                            rawValue === ""
+                              ? ""
+                              : (() => {
+                                  const parsed = Number(rawValue);
+                                  return Number.isInteger(parsed) && parsed >= 2 ? Math.floor(parsed) : rawValue;
+                                })();
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: { ...node.config, start_row_index: nextStart, mode: "spreadsheet_rows" },
+                            })),
+                          );
+                        }}
+                      />
+                    </label>
                   </div>
                   <p className="node-help-text">
-                    Row 1 is always treated as the header row. Each later row is emitted as one iteration using those
-                    header titles as the parsed row keys.
+                    Row 1 is always treated as the header row. The run begins at the Starting Row Index (default 2) and
+                    emits each later row as one iteration using the header titles as the parsed row keys.
                   </p>
                   <div className="context-builder-binding-actions">
                     <button
@@ -3141,10 +3300,35 @@ export function GraphInspector({
                         <option value="include">Include empty rows</option>
                       </select>
                     </label>
+                    <label>
+                      Starting Row Index
+                      <input
+                        type="number"
+                        min={2}
+                        step={1}
+                        value={selectedSpreadsheetStartRowValue}
+                        onChange={(event) => {
+                          const rawValue = event.target.value;
+                          const nextStart =
+                            rawValue === ""
+                              ? ""
+                              : (() => {
+                                  const parsed = Number(rawValue);
+                                  return Number.isInteger(parsed) && parsed >= 2 ? Math.floor(parsed) : rawValue;
+                                })();
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: { ...node.config, start_row_index: nextStart, mode: "spreadsheet_rows" },
+                            })),
+                          );
+                        }}
+                      />
+                    </label>
                   </div>
                   <p className="node-help-text">
-                    Row 1 is always treated as the header row. Each later row is emitted as one iteration using those
-                    header titles as the parsed row keys.
+                    Row 1 is always treated as the header row. The run begins at the Starting Row Index (default 2) and
+                    emits each later row as one iteration using the header titles as the parsed row keys.
                   </p>
                   <div className="context-builder-binding-actions">
                     <button
@@ -3315,6 +3499,7 @@ export function GraphInspector({
                             id: `template-entry-new-${structuredPayloadTemplateEntries.length + 1}`,
                             key: "",
                             value: "",
+                            searchKeys: [],
                           },
                         ])
                       }
@@ -3346,7 +3531,7 @@ export function GraphInspector({
                             </div>
                           </div>
                           <label>
-                            Key
+                            Output Key
                             <input
                               value={entry.key}
                               placeholder="email"
@@ -3360,6 +3545,7 @@ export function GraphInspector({
                                 )
                               }
                             />
+                            <small>Name used in the output payload.</small>
                           </label>
                           <label>
                             Value
@@ -3376,6 +3562,50 @@ export function GraphInspector({
                                 )
                               }
                             />
+                          </label>
+                          <label>
+                            Search Keys
+                            <textarea
+                              rows={Math.max(2, entry.searchKeys.length + 1)}
+                              value={entry.searchKeys.join("\n")}
+                              placeholder={"resolved_email\nwork_email"}
+                              onChange={(event) =>
+                                updateStructuredPayloadTemplateEntries(
+                                  structuredPayloadTemplateEntries.map((candidate) =>
+                                    candidate.id === entry.id
+                                      ? {
+                                          ...candidate,
+                                          searchKeys: event.target.value
+                                            .split(/\r?\n/)
+                                            .map((value) => value)
+                                            .filter((_, index, source) => index < source.length),
+                                        }
+                                      : candidate,
+                                  ),
+                                )
+                              }
+                              onBlur={(event) =>
+                                updateStructuredPayloadTemplateEntries(
+                                  structuredPayloadTemplateEntries.map((candidate) =>
+                                    candidate.id === entry.id
+                                      ? {
+                                          ...candidate,
+                                          searchKeys: event.target.value
+                                            .split(/\r?\n/)
+                                            .map((value) => value.trim())
+                                            .filter((value) => value.length > 0),
+                                        }
+                                      : candidate,
+                                  ),
+                                )
+                              }
+                            />
+                            <small>
+                              Optional. One key per line — the matcher uses these instead of the Output Key
+                              when looking up values in the source payload. Leave blank to fall back to the
+                              Output Key. Use this when the source uses a different name
+                              (e.g. <code>resolved_email</code>, <code>work_email</code>).
+                            </small>
                           </label>
                         </div>
                       ))}
@@ -3425,6 +3655,34 @@ export function GraphInspector({
                         )
                       }
                     />
+                  </label>
+                  <label>
+                    Default Search Section
+                    <select
+                      value={(() => {
+                        const raw = String(selectedNode.config.default_search_section ?? "payload").trim().toLowerCase();
+                        return ["payload", "metadata", "artifacts"].includes(raw) ? raw : "payload";
+                      })()}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              mode: "structured_payload_builder",
+                              default_search_section: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    >
+                      <option value="payload">Payload</option>
+                      <option value="metadata">Metadata</option>
+                      <option value="artifacts">Artifacts</option>
+                    </select>
+                    <small>
+                      Which section of the upstream MessageEnvelope new template entries search by default. Each entry can override this in the modal.
+                    </small>
                   </label>
                   <div className="inspector-meta">
                     <span>Write the output shape you want as JSON, then leave any field blank, null, an empty object, or an empty array to let this node auto-fill it from upstream data.</span>
@@ -3618,7 +3876,7 @@ export function GraphInspector({
                     <label className="checkbox-option">
                       <input
                         type="checkbox"
-                        checked={Boolean(selectedNode.config.reveal_personal_emails ?? false)}
+                        checked={Boolean(selectedNode.config.reveal_personal_emails ?? true)}
                         onChange={(event) =>
                           onGraphChange(
                             updateNode(graph, selectedNode.id, (node) => ({
@@ -3634,7 +3892,29 @@ export function GraphInspector({
                       />
                       <span>
                         Reveal Personal Emails
-                        <small>Leave off by default to minimize credit usage and keep lookups work-email focused.</small>
+                        <small>Spend Apollo credits to unlock personal emails. Leave on to populate person.personal_emails and avoid `email_not_unlocked` placeholders.</small>
+                      </span>
+                    </label>
+                    <label className="checkbox-option">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(selectedNode.config.reveal_phone_number ?? false)}
+                        onChange={(event) =>
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: {
+                                ...node.config,
+                                mode: "apollo_email_lookup",
+                                reveal_phone_number: event.target.checked,
+                              },
+                            })),
+                          )
+                        }
+                      />
+                      <span>
+                        Reveal Phone Number
+                        <small>Spend Apollo credits to unlock phone numbers. Off by default.</small>
                       </span>
                     </label>
                     <label className="checkbox-option">

@@ -25,6 +25,21 @@ from graph_agent.runtime.supabase_data import (
 
 DEFAULT_SUPABASE_TABLE_ROWS_DB_PATH = resolve_agent_filesystem_root().parent / "supabase-table-rows.sqlite3"
 
+DEFAULT_SUPABASE_MAX_ITERATOR_ROWS = 10_000
+
+
+def _resolve_max_iterator_rows() -> int:
+    raw = os.environ.get("GRAPH_AGENT_SUPABASE_MAX_ITERATOR_ROWS", "").strip()
+    if not raw:
+        return DEFAULT_SUPABASE_MAX_ITERATOR_ROWS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return DEFAULT_SUPABASE_MAX_ITERATOR_ROWS
+    if parsed < 1:
+        return DEFAULT_SUPABASE_MAX_ITERATOR_ROWS
+    return parsed
+
 
 @dataclass(frozen=True)
 class SupabaseTableRowsCursorScope:
@@ -92,6 +107,8 @@ class SupabaseTableRowsResult:
     cursor_column: str
     row_id_column: str
     include_previously_processed_rows: bool
+    truncated: bool = False
+    max_rows: int = 0
 
 
 def _utc_now_iso() -> str:
@@ -281,6 +298,8 @@ def materialize_supabase_table_rows(request: SupabaseTableRowsRequest) -> Supaba
     request_urls: list[str] = []
     last_cursor_value = str(request.last_cursor_value or "").strip()
     last_row_id = str(request.last_row_id or "").strip()
+    max_rows = _resolve_max_iterator_rows()
+    truncated = False
 
     while True:
         request_url, page_rows = _fetch_supabase_table_rows_page(
@@ -295,6 +314,10 @@ def materialize_supabase_table_rows(request: SupabaseTableRowsRequest) -> Supaba
         last_row = page_rows[-1]
         last_cursor_value = _normalize_filter_value(last_row.get(request.cursor_column), field_name=request.cursor_column)
         last_row_id = _normalize_filter_value(last_row.get(request.row_id_column), field_name=request.row_id_column)
+        if len(all_rows) >= max_rows:
+            truncated = True
+            del all_rows[max_rows:]
+            break
         if len(page_rows) < int(request.page_size):
             break
 
@@ -310,6 +333,8 @@ def materialize_supabase_table_rows(request: SupabaseTableRowsRequest) -> Supaba
         cursor_column=str(request.cursor_column or "").strip(),
         row_id_column=str(request.row_id_column or "").strip(),
         include_previously_processed_rows=bool(request.include_previously_processed_rows),
+        truncated=truncated,
+        max_rows=max_rows,
     )
 
 

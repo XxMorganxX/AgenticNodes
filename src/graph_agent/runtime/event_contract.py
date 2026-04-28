@@ -13,6 +13,7 @@ BASE_RUNTIME_EVENT_TYPES = (
     "node.started",
     "node.completed",
     "node.iterator.updated",
+    "node.iterator.config_patch",
     "edge.selected",
     "condition.evaluated",
     "retry.triggered",

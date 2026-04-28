@@ -27,6 +27,7 @@ from graph_agent.runtime.supabase_data import (
     SupabaseSchemaColumn,
     SupabaseSchemaSource,
     SupabaseRowWriteRequest,
+    extract_supabase_sql_payload,
     fetch_supabase_schema_catalog,
     validate_outbound_email_log_schema,
     write_supabase_row,
@@ -236,7 +237,13 @@ class _SupabaseStubHandler(BaseHTTPRequestHandler):
                 ]
             else:
                 result_rows = [{"query": query, "parameters": parameters}]
-            body = json.dumps({"result": result_rows, "error": None}).encode("utf-8")
+            if "data_wrapper" in query:
+                payload = {"data": result_rows, "error": None}
+            elif "rows_wrapper" in query:
+                payload = {"rows": result_rows, "error": None}
+            else:
+                payload = {"result": result_rows, "error": None}
+            body = json.dumps(payload).encode("utf-8")
             self.send_response(201)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -740,6 +747,48 @@ class SupabaseDataNodeTests(unittest.TestCase):
             },
         )
 
+    def test_supabase_sql_node_unwraps_data_payload(self) -> None:
+        graph = GraphDefinition.from_dict(
+            supabase_sql_graph_payload(
+                "supabase-sql-data-wrapper",
+                node_config={
+                    "query": "select id, name from public.projects /* data_wrapper */ where status = {status} and id >= {minimum_id}",
+                    "management_api_base_url": "{SUPABASE_MANAGEMENT_API_BASE_URL}",
+                }
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with SupabaseStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "SUPABASE_PROJECT_REF": "project-123",
+                "SUPABASE_ACCESS_TOKEN": "access-token",
+                "SUPABASE_MANAGEMENT_API_BASE_URL": base_url,
+            },
+            clear=False,
+        ):
+            state = runtime.run(
+                graph,
+                {"status": "active", "minimum_id": 2},
+                run_id="run-supabase-sql-data-wrapper",
+            )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output, [{"id": 2, "name": "Beta", "status": "active"}])
+        self.assertEqual(state.node_outputs["sql"]["metadata"]["row_count"], 1)
+
+    def test_extract_supabase_sql_payload_unwraps_rows_wrapper(self) -> None:
+        payload = extract_supabase_sql_payload(
+            {
+                "rows": [{"id": 1, "name": "Alpha"}],
+                "error": None,
+            }
+        )
+
+        self.assertEqual(payload, [{"id": 1, "name": "Alpha"}])
+
     def test_supabase_sql_node_reports_missing_payload_field(self) -> None:
         graph = GraphDefinition.from_dict(
             supabase_sql_graph_payload(
@@ -832,6 +881,36 @@ class SupabaseDataNodeTests(unittest.TestCase):
         self.assertEqual(_SupabaseStubHandler.last_path, "/mcp")
         self.assertEqual(_SupabaseStubHandler.last_headers.get("authorization"), "Bearer access-token-xyz")
         self.assertEqual(_SupabaseStubHandler.last_headers.get("accept"), "application/json, text/event-stream")
+
+    def test_manager_verify_supabase_auth_downgrades_mcp_failure_to_warning(self) -> None:
+        with SupabaseStubServer() as base_url:
+            from graph_agent.api.manager import GraphRunManager
+            from graph_agent.runtime.supabase_data import SupabaseDataError
+
+            manager = GraphRunManager(services=self.services)
+            with patch(
+                "graph_agent.api.manager.verify_supabase_mcp_auth",
+                side_effect=SupabaseDataError(
+                    'Supabase MCP authentication failed: 401 {"message":"Format is Authorization: Bearer [token]"}'
+                ),
+            ):
+                result = manager.verify_supabase_auth(
+                    {
+                        "supabase_url": base_url,
+                        "supabase_key": "service-role-key",
+                        "schema": "public",
+                        "project_ref": "project-123",
+                        "access_token": "bad-token",
+                        "mcp_base_url": f"{base_url}/mcp",
+                    }
+                )
+
+        self.assertTrue(result["static_auth_valid"])
+        self.assertTrue(result["mcp_auth_checked"])
+        self.assertFalse(result["mcp_auth_valid"])
+        self.assertEqual(result["source_count"], 1)
+        self.assertEqual(result["sources"][0]["name"], "projects")
+        self.assertTrue(any("Authorization: Bearer [token]" in warning for warning in result["warnings"]))
 
     def test_supabase_data_node_uses_graph_env_literal_values(self) -> None:
         graph_payload = supabase_graph_payload("supabase-data-graph-env-literals")
@@ -1583,6 +1662,180 @@ class SupabaseDataNodeTests(unittest.TestCase):
 
         self.assertEqual(store.url, "https://db.example.supabase.co")
         self.assertEqual(store.service_role_key, "sb_secret_custom")
+
+
+class SupabaseTableRowsRowCapTests(unittest.TestCase):
+    def test_materialize_supabase_table_rows_caps_total_rows(self) -> None:
+        from graph_agent.runtime import supabase_table_rows as table_rows_module
+        from graph_agent.runtime.supabase_table_rows import (
+            SupabaseTableRowsRequest,
+            materialize_supabase_table_rows,
+        )
+
+        page_size = 50
+        request = SupabaseTableRowsRequest(
+            supabase_url="https://stub.supabase.co",
+            supabase_key="key",
+            schema="public",
+            table_name="big_table",
+            select="*",
+            filters_text="",
+            cursor_column="created_at",
+            row_id_column="id",
+            page_size=page_size,
+            include_previously_processed_rows=False,
+        )
+
+        next_id = {"value": 0}
+
+        def _fake_page(_request: SupabaseTableRowsRequest, *, last_cursor_value: str, last_row_id: str) -> tuple[str, list[dict[str, Any]]]:
+            rows: list[dict[str, Any]] = []
+            for _ in range(page_size):
+                next_id["value"] += 1
+                rows.append({
+                    "id": next_id["value"],
+                    "created_at": f"2026-01-01T00:00:{next_id['value']:02d}Z",
+                })
+            return f"https://stub/page/{next_id['value']}", rows
+
+        with patch.dict(os.environ, {"GRAPH_AGENT_SUPABASE_MAX_ITERATOR_ROWS": "120"}, clear=False), \
+             patch.object(table_rows_module, "_fetch_supabase_table_rows_page", side_effect=_fake_page) as fetch_mock:
+            result = materialize_supabase_table_rows(request)
+
+        self.assertEqual(result.row_count, 120)
+        self.assertEqual(len(result.rows), 120)
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.max_rows, 120)
+        self.assertEqual(fetch_mock.call_count, 3)
+
+    def test_materialize_supabase_table_rows_does_not_set_truncated_under_cap(self) -> None:
+        from graph_agent.runtime import supabase_table_rows as table_rows_module
+        from graph_agent.runtime.supabase_table_rows import (
+            SupabaseTableRowsRequest,
+            materialize_supabase_table_rows,
+        )
+
+        page_size = 50
+        request = SupabaseTableRowsRequest(
+            supabase_url="https://stub.supabase.co",
+            supabase_key="key",
+            schema="public",
+            table_name="big_table",
+            select="*",
+            filters_text="",
+            cursor_column="created_at",
+            row_id_column="id",
+            page_size=page_size,
+            include_previously_processed_rows=False,
+        )
+
+        calls = {"count": 0}
+
+        def _fake_page(_request: SupabaseTableRowsRequest, *, last_cursor_value: str, last_row_id: str) -> tuple[str, list[dict[str, Any]]]:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                rows = [
+                    {"id": index, "created_at": f"2026-01-01T00:00:{index:02d}Z"}
+                    for index in range(1, 11)
+                ]
+                return "https://stub/page/1", rows
+            return "https://stub/page/2", []
+
+        with patch.dict(os.environ, {"GRAPH_AGENT_SUPABASE_MAX_ITERATOR_ROWS": "5000"}, clear=False), \
+             patch.object(table_rows_module, "_fetch_supabase_table_rows_page", side_effect=_fake_page):
+            result = materialize_supabase_table_rows(request)
+
+        self.assertEqual(result.row_count, 10)
+        self.assertFalse(result.truncated)
+        self.assertEqual(result.max_rows, 5000)
+
+
+class SupabaseSchemaCatalogCacheTests(unittest.TestCase):
+    def _build_manager(self):
+        from graph_agent.api.manager import GraphRunManager
+        return GraphRunManager()
+
+    def test_schema_catalog_cache_returns_cached_sources_within_ttl(self) -> None:
+        manager = self._build_manager()
+        sentinel_sources = [
+            SupabaseSchemaSource(
+                name="users",
+                source_kind="table",
+                columns=[SupabaseSchemaColumn(name="id", data_type="bigint", nullable=False, description="")],
+                description="",
+            ),
+        ]
+        with patch(
+            "graph_agent.api.manager.fetch_supabase_schema_catalog",
+            return_value=sentinel_sources,
+        ) as fetch_mock:
+            first = manager._fetch_supabase_schema_catalog_cached(
+                supabase_url="https://project.supabase.co",
+                supabase_key="key-A",
+                schema="public",
+            )
+            second = manager._fetch_supabase_schema_catalog_cached(
+                supabase_url="https://project.supabase.co",
+                supabase_key="key-A",
+                schema="public",
+            )
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(fetch_mock.call_count, 1)
+
+    def test_schema_catalog_cache_keys_by_url_key_digest_and_schema(self) -> None:
+        manager = self._build_manager()
+        sentinel_sources = [
+            SupabaseSchemaSource(
+                name="rows",
+                source_kind="table",
+                columns=[],
+                description="",
+            ),
+        ]
+        with patch(
+            "graph_agent.api.manager.fetch_supabase_schema_catalog",
+            return_value=sentinel_sources,
+        ) as fetch_mock:
+            manager._fetch_supabase_schema_catalog_cached(
+                supabase_url="https://project.supabase.co",
+                supabase_key="key-A",
+                schema="public",
+            )
+            manager._fetch_supabase_schema_catalog_cached(
+                supabase_url="https://project.supabase.co",
+                supabase_key="key-B",
+                schema="public",
+            )
+            manager._fetch_supabase_schema_catalog_cached(
+                supabase_url="https://project.supabase.co",
+                supabase_key="key-A",
+                schema="reporting",
+            )
+
+        self.assertEqual(fetch_mock.call_count, 3)
+
+    def test_invalidate_supabase_schema_cache_removes_entries(self) -> None:
+        manager = self._build_manager()
+        sentinel_sources: list[SupabaseSchemaSource] = []
+        with patch(
+            "graph_agent.api.manager.fetch_supabase_schema_catalog",
+            return_value=sentinel_sources,
+        ) as fetch_mock:
+            manager._fetch_supabase_schema_catalog_cached(
+                supabase_url="https://project.supabase.co",
+                supabase_key="key-A",
+                schema="public",
+            )
+            manager.invalidate_supabase_schema_cache()
+            manager._fetch_supabase_schema_catalog_cached(
+                supabase_url="https://project.supabase.co",
+                supabase_key="key-A",
+                schema="public",
+            )
+
+        self.assertEqual(fetch_mock.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -205,7 +205,12 @@ def parse_spreadsheet(
     if normalized_empty_policy not in {"skip", "include"}:
         raise SpreadsheetParseError("Empty row policy must be either 'skip' or 'include'.")
     header_row_index = SPREADSHEET_HEADER_ROW_INDEX
-    start_row_index = SPREADSHEET_FIRST_DATA_ROW_INDEX
+    if start_row_index is None:
+        start_row_index = SPREADSHEET_FIRST_DATA_ROW_INDEX
+    if start_row_index <= header_row_index:
+        raise SpreadsheetParseError(
+            f"Starting row index must be greater than the header row ({header_row_index}). Got {start_row_index}."
+        )
     return _build_parse_result(
         source_file=grid.source_file,
         file_format=grid.file_format,

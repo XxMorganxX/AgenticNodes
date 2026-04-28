@@ -68,6 +68,8 @@ export type GraphCanvasNodeData = {
   onOpenContextBuilderPayload: (nodeId: string) => void;
   onOpenConditionResults: (nodeId: string) => void;
   onSelectSpreadsheetFile: (nodeId: string, fileId: string) => void;
+  onChangeSpreadsheetStartRowIndex: (nodeId: string, startRowIndex: number | string) => void;
+  onSelectPythonScriptFile: (nodeId: string, fileId: string) => void;
   onSelectSupabaseConnection: (nodeId: string, connectionId: string) => void;
   onHandlePointerDown: (nodeId: string, handleType: "source" | "target", handleId: string | null) => boolean;
   onJunctionPointerDown: (nodeId: string, clientPosition: { x: number; y: number }) => void;
@@ -80,6 +82,7 @@ const SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decisio
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
 const STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID = "core.structured_payload_builder";
+const PYTHON_SCRIPT_RUNNER_PROVIDER_ID = "core.python_script_runner";
 const PARALLEL_SPLITTER_HANDLE_SLOT_HEIGHT = 28;
 const PARALLEL_SPLITTER_HANDLE_GAP = 12;
 
@@ -204,6 +207,11 @@ function isSpreadsheetProjectFile(file: ProjectFile): boolean {
   return file.status === "ready" && (candidate.endsWith(".csv") || candidate.endsWith(".xlsx"));
 }
 
+function isPythonProjectFile(file: ProjectFile): boolean {
+  const candidate = `${file.name} ${file.storage_path}`.toLowerCase();
+  return file.status === "ready" && candidate.endsWith(".py");
+}
+
 function GraphCanvasNodeComponent({
   data,
   selected,
@@ -234,6 +242,8 @@ function GraphCanvasNodeComponent({
     onOpenContextBuilderPayload,
     onOpenConditionResults,
     onSelectSpreadsheetFile,
+    onChangeSpreadsheetStartRowIndex,
+    onSelectPythonScriptFile,
     onSelectSupabaseConnection,
     onJunctionPointerDown,
   } = data;
@@ -460,6 +470,20 @@ function GraphCanvasNodeComponent({
   const spreadsheetSelectLabel =
     selectedSpreadsheetFile?.name ??
     (hasManualSpreadsheetPath ? String(node.config.file_path ?? "").trim().split("/").pop() ?? "Manual path" : "No spreadsheet");
+  const spreadsheetStartRowValue =
+    typeof node.config.start_row_index === "number" || typeof node.config.start_row_index === "string"
+      ? String(node.config.start_row_index)
+      : "2";
+  const isPythonScriptRunnerNode = node.provider_id === PYTHON_SCRIPT_RUNNER_PROVIDER_ID;
+  const availablePythonScriptFiles = isPythonScriptRunnerNode
+    ? availableProjectFiles.filter(isPythonProjectFile)
+    : [];
+  const selectedPythonScriptFile = isPythonScriptRunnerNode
+    ? availablePythonScriptFiles.find((file) => file.file_id === String(node.config.script_file_id ?? "").trim()) ??
+      availablePythonScriptFiles.find((file) => file.name === String(node.config.script_file_name ?? "").trim()) ??
+      null
+    : null;
+  const pythonScriptSelectValue = selectedPythonScriptFile?.file_id ?? "";
   const logicBranchSummary =
     isLogicConditionsNode &&
     runtimeOutput &&
@@ -770,6 +794,64 @@ function GraphCanvasNodeComponent({
             </select>
           </div>
         ) : null}
+        {!preview && isSpreadsheetRowNode ? (
+          <div className="graph-node-inline-select-row">
+            <span className="graph-node-inline-toggle-label">Start Row</span>
+            <input
+              type="number"
+              min={2}
+              step={1}
+              className="graph-node-inline-select nodrag"
+              value={spreadsheetStartRowValue}
+              aria-label={`Starting row index for ${displayLabel}`}
+              onMouseDown={stopInlineControlPropagation}
+              onPointerDown={stopInlineControlPropagation}
+              onClick={stopInlineControlPropagation}
+              onKeyDown={stopInlineControlPropagation}
+              onChange={(event) => {
+                event.stopPropagation();
+                const rawValue = event.target.value;
+                if (rawValue === "") {
+                  onChangeSpreadsheetStartRowIndex(node.id, "");
+                  return;
+                }
+                const parsed = Number(rawValue);
+                if (Number.isInteger(parsed) && parsed >= 2) {
+                  onChangeSpreadsheetStartRowIndex(node.id, Math.floor(parsed));
+                  return;
+                }
+                onChangeSpreadsheetStartRowIndex(node.id, rawValue);
+              }}
+            />
+          </div>
+        ) : null}
+        {!preview && isPythonScriptRunnerNode ? (
+          <div className="graph-node-inline-select-row">
+            <span className="graph-node-inline-toggle-label">Script</span>
+            <select
+              className="graph-node-inline-select nodrag"
+              value={pythonScriptSelectValue}
+              aria-label={`Select Python script for ${displayLabel}`}
+              onMouseDown={stopInlineControlPropagation}
+              onPointerDown={stopInlineControlPropagation}
+              onClick={stopInlineControlPropagation}
+              onKeyDown={stopInlineControlPropagation}
+              onChange={(event) => {
+                event.stopPropagation();
+                onSelectPythonScriptFile(node.id, event.target.value);
+              }}
+            >
+              <option value="">
+                {availablePythonScriptFiles.length === 0 ? "Upload a .py project file…" : "Select a .py project file…"}
+              </option>
+              {availablePythonScriptFiles.map((file) => (
+                <option key={file.file_id} value={file.file_id}>
+                  {file.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        ) : null}
         {!preview && isSupabaseNode ? (
           <>
             <div className="graph-node-inline-select-row">
@@ -874,7 +956,7 @@ function GraphCanvasNodeComponent({
             <span className="graph-node-inline-display-hint">Click to expand</span>
           </div>
         ) : null}
-        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isStructuredPayloadBuilderNode || isRuntimeNormalizerNode || isSupabaseSqlNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger) ? (
+        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isStructuredPayloadBuilderNode || isRuntimeNormalizerNode || isSupabaseSqlNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger || isPythonScriptRunnerNode) ? (
           <div className="graph-node-card-actions" aria-hidden="false">
             <button
               type="button"
@@ -910,6 +992,8 @@ function GraphCanvasNodeComponent({
                 : isSupabaseRowWriteNode
                   ? "Learn More"
                 : isOutboundEmailLogger
+                  ? "Learn More"
+                : isPythonScriptRunnerNode
                   ? "Learn More"
                 : isPromptBlockNode(node)
                   ? "More Info"

@@ -32,6 +32,7 @@ venv/
 .logs/
 visuals/
 .planning/
+scripts/
 
 # Frontend artifacts
 frontend/node_modules/

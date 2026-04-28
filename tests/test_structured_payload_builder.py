@@ -326,6 +326,217 @@ class StructuredPayloadBuilderTests(unittest.TestCase):
         self.assertEqual(email_match["match_type"], "alias_keywords")
         self.assertEqual(linkedin_match["match_type"], "alias_path_keywords")
 
+    def test_user_defined_search_keys_resolve_arbitrary_field_names(self) -> None:
+        graph = GraphDefinition.from_dict(
+            structured_payload_builder_graph_payload(
+                "structured-payload-field-aliases",
+                node_config={
+                    "template_json": json.dumps({"recipient_email": "", "subject": "", "body": ""}),
+                    "field_aliases": {
+                        "recipient_email": ["resolved_email", "work_email"],
+                        "subject": ["headline", "title"],
+                    },
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        state = runtime.run(
+            graph,
+            {
+                "metadata": {"resolved_email": "peterm@anthropic.com"},
+                "person": {"headline": "Member of Technical Staff"},
+                "body": "Hello Peter,",
+            },
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output["recipient_email"], "peterm@anthropic.com")
+        self.assertEqual(state.final_output["subject"], "Member of Technical Staff")
+        self.assertEqual(state.final_output["body"], "Hello Peter,")
+        field_matches = state.node_outputs["builder"]["artifacts"]["field_matches"]
+        recipient_match = next(match for match in field_matches if match["target_path"] == "recipient_email")
+        self.assertEqual(recipient_match["path"], "metadata.resolved_email")
+        self.assertEqual(recipient_match["match_type"], "exact_key")
+
+    def test_field_aliases_accept_json_string_payload(self) -> None:
+        graph = GraphDefinition.from_dict(
+            structured_payload_builder_graph_payload(
+                "structured-payload-field-aliases-string",
+                node_config={
+                    "template_json": json.dumps({"recipient_email": ""}),
+                    "field_aliases": json.dumps({"recipient_email": ["resolved_email"]}),
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        state = runtime.run(
+            graph,
+            {"metadata": {"resolved_email": "peterm@anthropic.com"}},
+        )
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output["recipient_email"], "peterm@anthropic.com")
+
+    def test_builder_scans_envelope_metadata_when_payload_does_not_have_value(self) -> None:
+        graph = GraphDefinition.from_dict(
+            structured_payload_builder_graph_payload(
+                "structured-payload-envelope-metadata",
+                node_config={
+                    "template_json": json.dumps({"recipient_email": ""}),
+                    "field_aliases": {"recipient_email": ["resolved_email"]},
+                    "default_search_section": "metadata",
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        envelope = {
+            "schema_version": "1.0",
+            "from_node_id": "upstream",
+            "from_category": "data",
+            "payload": {"person": {"name": "Taylor"}},
+            "metadata": {"resolved_email": "peterm@anthropic.com"},
+            "artifacts": {},
+        }
+
+        state = runtime.run(graph, envelope)
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output["recipient_email"], "peterm@anthropic.com")
+        match = next(
+            entry
+            for entry in state.node_outputs["builder"]["artifacts"]["field_matches"]
+            if entry["target_path"] == "recipient_email"
+        )
+        self.assertEqual(match["path"], "resolved_email")
+
+    def test_null_source_value_does_not_win_over_template_default(self) -> None:
+        graph = GraphDefinition.from_dict(
+            structured_payload_builder_graph_payload(
+                "structured-payload-skip-null",
+                node_config={
+                    "template_json": json.dumps({"email": "", "subject": "", "body": ""}),
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        state = runtime.run(
+            graph,
+            {
+                "email": None,
+                "subject": "From Airbnb to Anthropic",
+                "body": "Hello Peter,",
+            },
+        )
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output["email"], "")
+        self.assertEqual(state.final_output["subject"], "From Airbnb to Anthropic")
+        self.assertEqual(state.final_output["body"], "Hello Peter,")
+        self.assertIn("email", state.node_outputs["builder"]["artifacts"]["unresolved_paths"])
+        self.assertNotIn("email", state.node_outputs["builder"]["artifacts"]["filled_paths"])
+
+    def test_default_search_section_payload_skips_envelope_metadata(self) -> None:
+        # default_search_section defaults to "payload" — metadata is not scanned.
+        graph = GraphDefinition.from_dict(
+            structured_payload_builder_graph_payload(
+                "structured-payload-skip-metadata",
+                node_config={
+                    "template_json": json.dumps({"recipient_email": ""}),
+                    "field_aliases": {"recipient_email": ["resolved_email"]},
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        envelope = {
+            "schema_version": "1.0",
+            "from_node_id": "upstream",
+            "from_category": "data",
+            "payload": {"person": {"name": "Taylor"}},
+            "metadata": {"resolved_email": "peterm@anthropic.com"},
+            "artifacts": {},
+        }
+        state = runtime.run(graph, envelope)
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(state.final_output["recipient_email"], "")
+        self.assertIn("recipient_email", state.node_outputs["builder"]["artifacts"]["unresolved_paths"])
+
+    def test_per_entry_search_scope_overrides_global_default(self) -> None:
+        # Global default is payload; per-entry override on primary_email points it
+        # at metadata, while fallback_email stays on payload.
+        graph = GraphDefinition.from_dict(
+            structured_payload_builder_graph_payload(
+                "structured-payload-per-entry-scope",
+                node_config={
+                    "template_json": json.dumps({"primary_email": "", "fallback_email": ""}),
+                    "field_aliases": {
+                        "primary_email": ["resolved_email"],
+                        "fallback_email": ["resolved_email"],
+                    },
+                    "default_search_section": "payload",
+                    "field_search_scopes": {"primary_email": "metadata"},
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        envelope = {
+            "schema_version": "1.0",
+            "from_node_id": "upstream",
+            "from_category": "data",
+            "payload": {"person": {"name": "Taylor"}},
+            "metadata": {"resolved_email": "peterm@anthropic.com"},
+            "artifacts": {},
+        }
+        state = runtime.run(graph, envelope)
+        self.assertEqual(state.status, "completed")
+        # primary_email is scoped to metadata → resolved from envelope.metadata.
+        self.assertEqual(state.final_output["primary_email"], "peterm@anthropic.com")
+        # fallback_email follows global default (payload) → not found.
+        self.assertEqual(state.final_output["fallback_email"], "")
+        self.assertIn(
+            "fallback_email", state.node_outputs["builder"]["artifacts"]["unresolved_paths"]
+        )
+
+    def test_search_keys_replace_output_field_label(self) -> None:
+        # When search keys are configured for an entry, the matcher searches for
+        # those keys only. A source field whose name matches the entry's output
+        # label (but not the search keys) must NOT be picked.
+        graph = GraphDefinition.from_dict(
+            structured_payload_builder_graph_payload(
+                "structured-payload-search-keys-replace-label",
+                node_config={
+                    "template_json": json.dumps({"email": "", "subject": ""}),
+                    "field_aliases": {"email": ["resolved_email"]},
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        state = runtime.run(
+            graph,
+            {
+                "email": "label@example.com",
+                "metadata": {"resolved_email": "search-key@example.com"},
+                "subject": "Hello",
+            },
+        )
+
+        self.assertEqual(state.status, "completed")
+        # `email` has a search key configured → only `resolved_email` is matched,
+        # the literal `email` field at the root is ignored.
+        self.assertEqual(state.final_output["email"], "search-key@example.com")
+        # `subject` has no search keys → falls back to matching the output label.
+        self.assertEqual(state.final_output["subject"], "Hello")
+
     def test_invalid_template_json_is_rejected_during_validation(self) -> None:
         graph = GraphDefinition.from_dict(
             structured_payload_builder_graph_payload(

@@ -3,14 +3,18 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import shutil
-from queue import Queue
+import time
+from queue import Empty, Full, Queue
+
+SSE_SUBSCRIBER_QUEUE_MAX = 512
 from threading import Event, Lock, Thread
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 from graph_agent.api.graph_store import GraphStore
@@ -48,10 +52,39 @@ from graph_agent.tools.mcp import McpServerDefinition
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _iter_supabase_run_stores(store: Any) -> Iterator[Any]:
+    """Yield every SupabaseRunStore reachable through composite/mirror wrappers.
+
+    Walks `.primary` + `.mirrors` (CompositeRunStore) and `.delegate`
+    (AsyncBatchingRunStoreMirror) so callers can detect when adding another
+    Supabase target would duplicate an existing one.
+    """
+    from graph_agent.api.supabase_run_store import SupabaseRunStore
+
+    if isinstance(store, SupabaseRunStore):
+        yield store
+        return
+    primary = getattr(store, "primary", None)
+    if primary is not None and primary is not store:
+        yield from _iter_supabase_run_stores(primary)
+    mirrors = getattr(store, "mirrors", None)
+    if isinstance(mirrors, (list, tuple)):
+        for mirror in mirrors:
+            if mirror is store:
+                continue
+            yield from _iter_supabase_run_stores(mirror)
+    delegate = getattr(store, "delegate", None)
+    if delegate is not None and delegate is not store:
+        yield from _iter_supabase_run_stores(delegate)
+
+
 DISCORD_START_PROVIDER_ID = "start.discord_message"
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 SPREADSHEET_NODE_PROVIDER_IDS = {"core.spreadsheet_rows", "core.spreadsheet_matrix_decision"}
 SPREADSHEET_FILE_SUFFIXES = {".csv", ".xlsx"}
+PYTHON_SCRIPT_RUNNER_PROVIDER_ID = "core.python_script_runner"
 STATE_FLUSH_EVENT_TYPES = {
     "run.completed",
     "run.failed",
@@ -235,6 +268,11 @@ class GraphRunManager:
         self._heartbeat_timeout_seconds = _read_interval_env("GRAPH_AGENT_RUN_HEARTBEAT_TIMEOUT_SECONDS", 5.0)
         self._catalog_status_ttl_seconds = _read_interval_env("GRAPH_AGENT_CATALOG_STATUS_TTL_SECONDS", 15.0)
         self._catalog_status_cache: tuple[float, dict[str, Any]] | None = None
+        self._supabase_schema_cache_ttl_seconds = _read_interval_env(
+            "GRAPH_AGENT_SUPABASE_SCHEMA_CACHE_TTL_SECONDS", 300.0
+        )
+        self._supabase_schema_cache: dict[tuple[str, str, str], tuple[float, list[Any]]] = {}
+        self._supabase_schema_cache_lock = Lock()
         self._node_provider_payloads = [
             provider.to_dict() for provider in self._services.node_provider_registry.list_definitions()
         ]
@@ -429,17 +467,91 @@ class GraphRunManager:
 
     def preview_spreadsheet_rows(self, config: dict[str, Any]) -> dict[str, Any]:
         try:
+            raw_start_row_index = config.get("start_row_index", 2)
+            if raw_start_row_index is None:
+                start_row_index = 2
+            elif isinstance(raw_start_row_index, str):
+                normalized_start_row_index = raw_start_row_index.strip()
+                if not normalized_start_row_index:
+                    raise ValueError("Starting row index is required.")
+                try:
+                    start_row_index = int(normalized_start_row_index)
+                except ValueError as exc:
+                    raise ValueError("Starting row index must be a whole number.") from exc
+            else:
+                try:
+                    start_row_index = int(raw_start_row_index)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Starting row index must be a whole number.") from exc
             parsed = parse_spreadsheet(
                 file_path=str(config.get("file_path", "") or "").strip(),
                 file_format=str(config.get("file_format", "auto") or "auto").strip().lower() or "auto",
                 sheet_name=str(config.get("sheet_name", "") or "").strip() or None,
                 header_row_index=int(config.get("header_row_index", 1) or 1),
-                start_row_index=int(config.get("start_row_index", 2) or 2),
+                start_row_index=start_row_index,
                 empty_row_policy=str(config.get("empty_row_policy", "skip") or "skip").strip().lower() or "skip",
             )
-        except SpreadsheetParseError as exc:
+        except (SpreadsheetParseError, ValueError) as exc:
             raise ValueError(str(exc)) from exc
         return parsed.preview()
+
+    def _supabase_schema_cache_key(
+        self,
+        *,
+        supabase_url: str,
+        supabase_key: str,
+        schema: str,
+    ) -> tuple[str, str, str]:
+        normalized_url = str(supabase_url or "").strip().rstrip("/")
+        normalized_key = str(supabase_key or "").strip()
+        normalized_schema = str(schema or "public").strip() or "public"
+        key_digest = hashlib.sha256(normalized_key.encode("utf-8")).hexdigest() if normalized_key else ""
+        return (normalized_url, key_digest, normalized_schema)
+
+    def _fetch_supabase_schema_catalog_cached(
+        self,
+        *,
+        supabase_url: str,
+        supabase_key: str,
+        schema: str,
+    ) -> list[Any]:
+        cache_key = self._supabase_schema_cache_key(
+            supabase_url=supabase_url, supabase_key=supabase_key, schema=schema
+        )
+        ttl_seconds = max(0.0, float(self._supabase_schema_cache_ttl_seconds))
+        now = time.monotonic()
+        with self._supabase_schema_cache_lock:
+            cached = self._supabase_schema_cache.get(cache_key)
+            if cached is not None:
+                cached_at, cached_sources = cached
+                if ttl_seconds > 0 and (now - cached_at) <= ttl_seconds:
+                    return list(cached_sources)
+        sources = fetch_supabase_schema_catalog(
+            supabase_url=supabase_url,
+            supabase_key=supabase_key,
+            schema=schema,
+        )
+        with self._supabase_schema_cache_lock:
+            self._supabase_schema_cache[cache_key] = (now, list(sources))
+        return list(sources)
+
+    def invalidate_supabase_schema_cache(
+        self,
+        *,
+        supabase_url: str | None = None,
+        supabase_key: str | None = None,
+        schema: str | None = None,
+    ) -> None:
+        with self._supabase_schema_cache_lock:
+            if supabase_url is None and supabase_key is None and schema is None:
+                self._supabase_schema_cache.clear()
+                return
+            target = self._supabase_schema_cache_key(
+                supabase_url=supabase_url or "",
+                supabase_key=supabase_key or "",
+                schema=schema or "public",
+            )
+            self._supabase_schema_cache.pop(target, None)
 
     def preview_supabase_schema(self, config: dict[str, Any]) -> dict[str, Any]:
         graph_env_vars = config.get("graph_env_vars", {})
@@ -454,7 +566,7 @@ class GraphRunManager:
         )
         schema = str(config.get("schema", "public") or "public").strip() or "public"
         try:
-            sources = fetch_supabase_schema_catalog(
+            sources = self._fetch_supabase_schema_catalog_cached(
                 supabase_url=supabase_url,
                 supabase_key=supabase_key,
                 schema=schema,
@@ -481,7 +593,7 @@ class GraphRunManager:
         schema = str(config.get("schema", "public") or "public").strip() or "public"
         table_name = str(config.get("table_name", "") or "").strip()
         try:
-            sources = fetch_supabase_schema_catalog(
+            sources = self._fetch_supabase_schema_catalog_cached(
                 supabase_url=supabase_url,
                 supabase_key=supabase_key,
                 schema=schema,
@@ -543,7 +655,7 @@ class GraphRunManager:
         mcp_base_url = str(config.get("mcp_base_url", "") or "").strip() or None
 
         try:
-            sources = fetch_supabase_schema_catalog(
+            sources = self._fetch_supabase_schema_catalog_cached(
                 supabase_url=supabase_url,
                 supabase_key=supabase_key,
                 schema=schema,
@@ -571,10 +683,13 @@ class GraphRunManager:
                         base_url=mcp_base_url,
                     )
                 except SupabaseDataError as exc:
-                    raise ValueError(str(exc)) from exc
-                response["mcp_auth_checked"] = True
-                response["mcp_auth_valid"] = True
-                response["mcp_server"] = mcp_result
+                    response["mcp_auth_checked"] = True
+                    response["mcp_auth_valid"] = False
+                    response["warnings"].append(str(exc))
+                else:
+                    response["mcp_auth_checked"] = True
+                    response["mcp_auth_valid"] = True
+                    response["mcp_server"] = mcp_result
         return response
 
     def get_microsoft_auth_status(self) -> dict[str, Any]:
@@ -611,6 +726,9 @@ class GraphRunManager:
 
     def delete_project_file(self, graph_id: str, file_id: str) -> None:
         self._project_file_store.delete_file(graph_id, file_id)
+
+    def read_project_file_content(self, graph_id: str, file_id: str) -> dict[str, Any]:
+        return self._project_file_store.read_file_content(graph_id, file_id)
 
     def list_run_files(self, run_id: str) -> dict[str, Any]:
         state = self.get_run(run_id)
@@ -651,6 +769,50 @@ class GraphRunManager:
                 raise KeyError(run_id)
             return normalize_runtime_state_snapshot(self._run_states[run_id]) or {}
 
+    def get_run_status(self, run_id: str) -> dict[str, Any]:
+        """Lightweight status lookup that never pulls state_snapshot or events.
+
+        Used by the frontend SSE-fallback poller; the full get_run() path
+        triggers a full recovery (state_snapshot + every event payload),
+        which is a major source of Supabase egress when a stream drops.
+        """
+        with self._lock:
+            cached = self._run_states.get(run_id)
+        if cached is not None:
+            cached_status = cached.get("status")
+            return {
+                "run_id": cached.get("run_id") or run_id,
+                "graph_id": cached.get("graph_id"),
+                "status": cached_status,
+                "status_reason": cached.get("status_reason"),
+                "started_at": cached.get("started_at"),
+                "ended_at": cached.get("ended_at"),
+                "agent_id": cached.get("agent_id"),
+                "agent_name": cached.get("agent_name"),
+                "parent_run_id": cached.get("parent_run_id"),
+                "runtime_instance_id": cached.get("runtime_instance_id"),
+                "last_heartbeat_at": cached.get("last_heartbeat_at"),
+                "is_terminal": cached_status in TERMINAL_RUN_STATUSES,
+            }
+        manifest = self._run_store_for(run_id).load_manifest(run_id)
+        if manifest is None:
+            raise KeyError(run_id)
+        manifest_status = manifest.get("status")
+        return {
+            "run_id": manifest.get("run_id") or run_id,
+            "graph_id": manifest.get("graph_id"),
+            "status": manifest_status,
+            "status_reason": manifest.get("status_reason"),
+            "started_at": manifest.get("started_at"),
+            "ended_at": manifest.get("ended_at"),
+            "agent_id": manifest.get("agent_id"),
+            "agent_name": manifest.get("agent_name"),
+            "parent_run_id": manifest.get("parent_run_id"),
+            "runtime_instance_id": manifest.get("runtime_instance_id"),
+            "last_heartbeat_at": manifest.get("last_heartbeat_at"),
+            "is_terminal": manifest_status in TERMINAL_RUN_STATUSES,
+        }
+
     def list_runs(self, graph_id: str | None = None, *, limit: int = 50) -> list[dict[str, Any]]:
         rows = self._run_store.list_runs(graph_id=graph_id, limit=limit)
         history: list[dict[str, Any]] = []
@@ -661,11 +823,17 @@ class GraphRunManager:
             if row.get("status") != "running":
                 history.append(row)
                 continue
-            state = self._recover_run_state(run_id)
-            state = self._reconcile_run_state(run_id) if state is not None else None
-            if state is None:
+            # Avoid pulling state_snapshot + every event for every "running" row
+            # on every list call — that path was a major Supabase egress driver.
+            # Use the in-memory state if we already have it (live or recovered),
+            # otherwise fall back to the lightweight manifest row.
+            with self._lock:
+                cached_state = deepcopy(self._run_states.get(run_id))
+            if cached_state is None:
                 history.append(row)
                 continue
+            reconciled = self._reconcile_run_state(run_id)
+            state = reconciled if reconciled is not None else cached_state
             history.append(
                 {
                     **row,
@@ -754,6 +922,7 @@ class GraphRunManager:
                 cancel_requested=lambda current_run_id=run_id: self._cancel_requested(current_run_id),
             )
             self._hydrate_spreadsheet_project_files(graph)
+            self._hydrate_python_script_project_files(graph)
             thread = Thread(
                 target=self._execute_run,
                 args=(runtime, graph, input_payload, run_id, normalized_documents, default_agent.agent_id),
@@ -803,16 +972,26 @@ class GraphRunManager:
     ) -> RunStore | None:
         from graph_agent.api.supabase_run_store import SupabaseRunStore
 
-        primary_delegate = getattr(self._run_store, "delegate", self._run_store)
-        if isinstance(primary_delegate, SupabaseRunStore):
-            return None
-
         env_vars = document.env_vars
         credentials = self._resolve_graph_supabase_run_store_credentials(document)
         if credentials is None:
             return None
         url, service_role_key = credentials
         schema = str(os.environ.get("GRAPH_AGENT_SUPABASE_SCHEMA", "") or env_vars.get("GRAPH_AGENT_SUPABASE_SCHEMA", "") or "public").strip() or "public"
+
+        # If the global run store already writes to the same Supabase tables,
+        # adding another mirror would create two writers with independent
+        # sequence_number caches — guaranteed to collide on (run_id, seq).
+        target_url = url.rstrip("/")
+        for existing in _iter_supabase_run_stores(self._run_store):
+            if (
+                existing.url == target_url
+                and existing.schema == schema
+                and existing.runs_table == "runs"
+                and existing.events_table == "run_events"
+            ):
+                return None
+
         graph_id = getattr(document, "graph_id", "") or ""
         connection_id = str(getattr(document, "run_store_supabase_connection_id", "") or "").strip()
         announce_key = (graph_id, connection_id, url)
@@ -887,7 +1066,7 @@ class GraphRunManager:
         return None
 
     def subscribe(self, run_id: str) -> tuple[list[dict[str, Any]], Queue[str | None]]:
-        queue: Queue[str | None] = Queue()
+        queue: Queue[str | None] = Queue(maxsize=SSE_SUBSCRIBER_QUEUE_MAX)
         self._recover_run_state(run_id)
         self._reconcile_run_state(run_id)
         with self._lock:
@@ -1123,6 +1302,7 @@ class GraphRunManager:
             default_supabase_connection_id=document.default_supabase_connection_id,
         )
         self._hydrate_spreadsheet_project_files(graph)
+        self._hydrate_python_script_project_files(graph)
         runtime.run(
             graph,
             input_payload,
@@ -1138,6 +1318,35 @@ class GraphRunManager:
 
         self._run_store_for(child_run_id).write_state(child_run_id, snapshot)
         return snapshot
+
+    def _hydrate_python_script_project_files(self, graph: GraphDefinition) -> None:
+        project_files: list[dict[str, Any]] | None = None
+        for node in graph.nodes.values():
+            if node.provider_id != PYTHON_SCRIPT_RUNNER_PROVIDER_ID:
+                continue
+            script_file_id = str(node.config.get("script_file_id", "") or "").strip()
+            if not script_file_id:
+                continue
+            if project_files is None:
+                project_files = self._project_file_store.list_files(graph.graph_id)
+            resolved_path = ""
+            resolved_name = ""
+            for file in project_files:
+                if str(file.get("file_id") or "").strip() != script_file_id:
+                    continue
+                if str(file.get("status") or "") != "ready":
+                    break
+                storage_path = str(file.get("storage_path") or "").strip()
+                if not storage_path or Path(storage_path).suffix.lower() != ".py":
+                    break
+                resolved_path = storage_path
+                resolved_name = str(file.get("name") or "").strip()
+                break
+            config = dict(node.config)
+            config["script_path"] = resolved_path
+            if resolved_name:
+                config["script_file_name"] = resolved_name
+            node.config = config
 
     def _hydrate_spreadsheet_project_files(self, graph: GraphDefinition) -> None:
         project_files = self._project_file_store.list_files(graph.graph_id)
@@ -1244,7 +1453,34 @@ class GraphRunManager:
                 self._close_override_store_if_terminal(child_run_id)
 
         for subscriber in subscribers:
-            subscriber.put(encoded)
+            try:
+                subscriber.put_nowait(encoded)
+            except Full:
+                # A slow consumer must not block the producer thread (which would stall the
+                # entire run). Drop the oldest event for this subscriber, inject a lag marker,
+                # and proceed. The frontend can re-fetch state via the run endpoint after a lag.
+                dropped = 0
+                while True:
+                    try:
+                        subscriber.get_nowait()
+                        dropped += 1
+                    except Empty:
+                        break
+                    if subscriber.qsize() <= SSE_SUBSCRIBER_QUEUE_MAX // 2:
+                        break
+                lag_marker = json.dumps({
+                    "schema_version": "runtime.v1",
+                    "event_type": "subscriber.lagged",
+                    "summary": "subscriber queue overflow; events dropped",
+                    "payload": {"dropped_count": dropped},
+                    "run_id": run_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                try:
+                    subscriber.put_nowait(lag_marker)
+                    subscriber.put_nowait(encoded)
+                except Full:
+                    pass
 
     def _discard_run_id_from_override_locked(self, store_id: int, run_id: str) -> None:
         run_ids = self._run_store_override_run_ids.get(store_id)
@@ -1416,12 +1652,25 @@ class GraphRunManager:
         state["last_heartbeat_at"] = heartbeat_at
 
     def _reconcile_persisted_runs(self, *, limit: int = 200) -> None:
+        # Eagerly recovering every "running" row used to pull state_snapshot
+        # and the full event history per run on every startup, which is a
+        # major Supabase egress source. Recovery now happens lazily on first
+        # access via _recover_run_state(); we only walk stale rows here to
+        # surface them in logs. (No state_snapshot or event history is
+        # fetched — list_runs() already returns the manifest-only columns
+        # including last_heartbeat_at.)
+        stale_count = 0
         for row in self._run_store.list_runs(limit=limit):
             run_id = str(row.get("run_id") or "")
             if not run_id or row.get("status") != "running":
                 continue
-            self._recover_run_state(run_id)
-            self._reconcile_run_state(run_id)
+            if self._heartbeat_expired(row.get("last_heartbeat_at")):
+                stale_count += 1
+        if stale_count:
+            LOGGER.info(
+                "Run store has %d stale 'running' run(s); recovery will be performed lazily on first access.",
+                stale_count,
+            )
 
     def _reconcile_run_state(self, run_id: str) -> dict[str, Any] | None:
         if self._has_live_run_control(run_id):

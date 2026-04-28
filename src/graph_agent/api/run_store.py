@@ -8,10 +8,21 @@ from threading import Condition, Event, Thread
 from time import monotonic
 from typing import Any, Protocol
 
+from graph_agent.api.supabase_run_store import SUPABASE_RUN_STORE_REQUEST_TIMEOUT_SECONDS
 from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _is_transient_supabase_delegate_error(exc: BaseException) -> bool:
+    """Network-ish failures from SupabaseRunStore where a full traceback is usually noise."""
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc)
+        return msg.startswith("Supabase run store request timed out") or "Supabase run store network error" in msg
+    return False
 
 
 class RunStore(Protocol):
@@ -82,7 +93,16 @@ class CompositeRunStore:
         for store in self.mirrors:
             try:
                 getattr(store, method_name)(*args)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                if _is_transient_supabase_delegate_error(exc):
+                    LOGGER.warning(
+                        "Mirrored run-store write failed (transient): method=%s store=%s%s — %s",
+                        method_name,
+                        type(store).__name__,
+                        f" ({context_str})" if context_str else "",
+                        exc,
+                    )
+                    continue
                 LOGGER.exception(
                     "Mirrored run-store write failed: method=%s store=%s%s",
                     method_name,
@@ -99,9 +119,10 @@ _SUPABASE_KEY_ENV_VARS = (
     "SUPABASE_SECRET_KEY",
 )
 _DEFAULT_MIRROR_FLUSH_INTERVAL_MS = 100
-_DEFAULT_MIRROR_EVENT_BATCH_SIZE = 100
-_DEFAULT_MIRROR_RUN_BATCH_SIZE = 25
-_DEFAULT_MIRROR_FLUSH_TIMEOUT_SECONDS = 5.0
+_DEFAULT_MIRROR_EVENT_BATCH_SIZE = 40
+_DEFAULT_MIRROR_RUN_BATCH_SIZE = 10
+# Must exceed worst-case Supabase HTTP timeout so terminal flushes don't give up early.
+_DEFAULT_MIRROR_FLUSH_TIMEOUT_SECONDS = max(35.0, float(SUPABASE_RUN_STORE_REQUEST_TIMEOUT_SECONDS) + 25.0)
 
 
 def _read_positive_int_env(name: str, default: int) -> int:
@@ -356,7 +377,16 @@ class AsyncBatchingRunStoreMirror:
             else:
                 for state in states:
                     self.delegate.initialize_run(state)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if _is_transient_supabase_delegate_error(exc):
+                LOGGER.warning(
+                    "Async run-store mirror dropped initialize batch after transient delegate failure "
+                    "(delegate=%s, count=%d): %s",
+                    type(self.delegate).__name__,
+                    len(states),
+                    exc,
+                )
+                return
             LOGGER.exception(
                 "Async run-store mirror dropped initialize batch after delegate failure (delegate=%s, count=%d).",
                 type(self.delegate).__name__,
@@ -373,7 +403,16 @@ class AsyncBatchingRunStoreMirror:
             else:
                 for run_id, event in items:
                     self.delegate.append_event(run_id, event)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if _is_transient_supabase_delegate_error(exc):
+                LOGGER.warning(
+                    "Async run-store mirror dropped event batch after transient delegate failure "
+                    "(delegate=%s, count=%d): %s",
+                    type(self.delegate).__name__,
+                    len(items),
+                    exc,
+                )
+                return
             LOGGER.exception(
                 "Async run-store mirror dropped event batch after delegate failure (delegate=%s, count=%d).",
                 type(self.delegate).__name__,
@@ -390,7 +429,16 @@ class AsyncBatchingRunStoreMirror:
             else:
                 for run_id, state in items:
                     self.delegate.write_state(run_id, state)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if _is_transient_supabase_delegate_error(exc):
+                LOGGER.warning(
+                    "Async run-store mirror dropped state batch after transient delegate failure "
+                    "(delegate=%s, count=%d): %s",
+                    type(self.delegate).__name__,
+                    len(items),
+                    exc,
+                )
+                return
             LOGGER.exception(
                 "Async run-store mirror dropped state batch after delegate failure (delegate=%s, count=%d).",
                 type(self.delegate).__name__,
@@ -413,18 +461,31 @@ def build_default_run_store() -> RunStore:
     backend = os.environ.get("GRAPH_AGENT_RUN_STORE", "filesystem").strip().lower() or "filesystem"
     if backend == "supabase":
         from graph_agent.api.supabase_run_store import SupabaseRunStore
+        from graph_agent.api.run_log_store import FilesystemRunStore
 
         supabase_store = SupabaseRunStore.from_env()
-        if _read_bool_env("GRAPH_AGENT_RUN_STORE_MIRROR_DISABLED", False):
-            return supabase_store
-        return AsyncBatchingRunStoreMirror(supabase_store)
+        mirror_disabled = _read_bool_env("GRAPH_AGENT_RUN_STORE_MIRROR_DISABLED", False)
+        supabase_primary = _read_bool_env("GRAPH_AGENT_RUN_STORE_SUPABASE_PRIMARY", False)
+
+        # Legacy: Supabase is the only persistence/query target (still wrapped in AsyncBatchingRunStoreMirror by default).
+        if supabase_primary:
+            if mirror_disabled:
+                return supabase_store
+            return AsyncBatchingRunStoreMirror(supabase_store)
+
+        # Default: durable local filesystem + async mirror to Supabase (mirroring drops do not lose local runs).
+        fs_store = FilesystemRunStore()
+        if mirror_disabled:
+            return CompositeRunStore(fs_store, supabase_store)
+        return CompositeRunStore(fs_store, AsyncBatchingRunStoreMirror(supabase_store))
     has_url = any(os.environ.get(name, "").strip() for name in _SUPABASE_URL_ENV_VARS)
     has_key = any(os.environ.get(name, "").strip() for name in _SUPABASE_KEY_ENV_VARS)
     if has_url and has_key:
         LOGGER.warning(
             "Supabase credentials are present in the environment but GRAPH_AGENT_RUN_STORE is %r; "
-            "run logs will stay on the filesystem. Set GRAPH_AGENT_RUN_STORE=supabase to persist "
-            "runs and run_events to Supabase.",
+            "run logs stay under .logs/runs/ unless you set GRAPH_AGENT_RUN_STORE=supabase "
+            "(filesystem primary + Supabase mirror by default). Use GRAPH_AGENT_RUN_STORE_SUPABASE_PRIMARY=1 "
+            "only if you need legacy Supabase-only reads.",
             backend,
         )
     from graph_agent.api.run_log_store import FilesystemRunStore

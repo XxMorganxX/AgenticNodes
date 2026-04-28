@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 import tempfile
 from threading import Event, Thread
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -17,9 +19,17 @@ if str(SRC) not in sys.path:
 
 from graph_agent.api.graph_store import GraphStore
 from graph_agent.api.manager import GraphRunManager, RunControl
-from graph_agent.api.project_files import ProjectFileStore
+from graph_agent.api.project_files import (
+    PROJECT_FILE_SOURCE_SCRIPTS,
+    PROJECT_FILE_SOURCE_UPLOAD,
+    ProjectFileError,
+    ProjectFileStore,
+    SCRIPTS_FILE_ID_PREFIX,
+)
 from graph_agent.api.run_log_store import RunLogStore
 from graph_agent.examples.tool_schema_repair import build_example_services
+
+
 
 
 def wait_for_run_completion(manager: GraphRunManager, run_id: str, timeout_seconds: float = 5.0) -> dict[str, object]:
@@ -35,6 +45,15 @@ def wait_for_run_completion(manager: GraphRunManager, run_id: str, timeout_secon
 
 
 class ProjectFileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._scripts_isolation_dir = tempfile.TemporaryDirectory()
+        self._scripts_env_patch = patch.dict(
+            os.environ, {"GRAPH_AGENT_SCRIPTS_DIR": self._scripts_isolation_dir.name}
+        )
+        self._scripts_env_patch.start()
+        self.addCleanup(self._scripts_env_patch.stop)
+        self.addCleanup(self._scripts_isolation_dir.cleanup)
+
     def test_manager_resolves_spreadsheet_rows_project_file_when_file_path_is_blank(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -333,6 +352,52 @@ class ProjectFileTests(unittest.TestCase):
                 self.assertFalse(original_path.exists())
             finally:
                 manager.stop_background_services()
+
+    def test_scripts_folder_surfaces_as_virtual_project_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            scripts_dir = temp_path / "scripts"
+            scripts_dir.mkdir()
+            (scripts_dir / "sync.py").write_text("def run():\n    return True\n", encoding="utf-8")
+            (scripts_dir / "README.md").write_text("ignored", encoding="utf-8")
+            nested = scripts_dir / "nested"
+            nested.mkdir()
+            (nested / "helper.py").write_text("def run():\n    return True\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"GRAPH_AGENT_SCRIPTS_DIR": str(scripts_dir)}):
+                store = ProjectFileStore(temp_path / ".graph-agent" / "project-files")
+
+                listed = store.list_files("some-graph")
+                names_by_source: dict[str, list[str]] = {}
+                for entry in listed:
+                    names_by_source.setdefault(entry["source"], []).append(entry["name"])
+                self.assertIn(PROJECT_FILE_SOURCE_SCRIPTS, names_by_source)
+                self.assertEqual(sorted(names_by_source[PROJECT_FILE_SOURCE_SCRIPTS]), ["nested/helper.py", "sync.py"])
+                self.assertNotIn(PROJECT_FILE_SOURCE_UPLOAD, names_by_source)
+
+                scripts_entry = next(entry for entry in listed if entry["name"] == "sync.py")
+                self.assertEqual(scripts_entry["file_id"], f"{SCRIPTS_FILE_ID_PREFIX}sync.py")
+                self.assertEqual(scripts_entry["status"], "ready")
+                self.assertEqual(scripts_entry["storage_path"], str(scripts_dir / "sync.py"))
+
+                content = store.read_file_content("some-graph", scripts_entry["file_id"])
+                self.assertIn("def run()", content["content"])
+
+                with self.assertRaises(ProjectFileError):
+                    store.delete_file("some-graph", scripts_entry["file_id"])
+
+                uploaded = store.upload_files(
+                    "some-graph",
+                    [{"name": "notes.txt", "content_type": "text/plain", "data": b"hi"}],
+                )
+                self.assertEqual(uploaded[0]["source"], PROJECT_FILE_SOURCE_UPLOAD)
+
+                merged = store.list_files("some-graph")
+                merged_sources = [entry["source"] for entry in merged]
+                self.assertEqual(
+                    sorted(merged_sources),
+                    [PROJECT_FILE_SOURCE_SCRIPTS, PROJECT_FILE_SOURCE_SCRIPTS, PROJECT_FILE_SOURCE_UPLOAD],
+                )
 
 
 if __name__ == "__main__":

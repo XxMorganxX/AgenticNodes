@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from collections import deque
 from typing import Any
 from collections.abc import Callable
 from time import perf_counter
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 from graph_agent.runtime.core import (
     API_MESSAGE_HANDLE_ID,
@@ -103,7 +106,19 @@ class GraphRuntime:
             limit=RUN_STATE_EVENT_HISTORY_LIMIT,
         )
         for listener in self.event_listeners:
-            listener(event)
+            try:
+                listener(event)
+            except Exception as listener_error:  # noqa: BLE001
+                # A misbehaving listener (telemetry, sync, UI bridge) must never crash the run.
+                # Long-running runs are especially exposed because the listener may have worked
+                # for hours before encountering bad input.
+                logger.warning(
+                    "event listener %r failed for %s: %s",
+                    getattr(listener, "__name__", repr(listener)),
+                    event_type,
+                    listener_error,
+                    exc_info=True,
+                )
         return event
 
     def _describe_edge(self, edge: Edge, graph: GraphDefinition) -> dict[str, Any]:

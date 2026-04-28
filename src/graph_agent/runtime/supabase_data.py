@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import time
 from typing import Any, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -9,6 +10,10 @@ from urllib.request import Request, urlopen
 
 
 SUPPORTED_SUPABASE_SOURCE_KINDS = {"table", "rpc"}
+_TRANSIENT_HTTP_STATUSES = {502, 503, 504, 522, 524}
+_SCHEMA_FETCH_MAX_ATTEMPTS = 3
+_SCHEMA_FETCH_BACKOFF_SECONDS = (1.0, 3.0)
+_SCHEMA_FETCH_REQUEST_TIMEOUT_SECONDS = 15.0
 SUPPORTED_SUPABASE_OUTPUT_MODES = {"records", "markdown"}
 SUPPORTED_SUPABASE_WRITE_MODES = {"insert", "upsert"}
 SUPPORTED_SUPABASE_RETURNING_MODES = {"representation", "minimal"}
@@ -424,6 +429,29 @@ def render_supabase_payload(payload: Any, *, output_mode: str) -> Any:
     return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True)
 
 
+def extract_supabase_sql_payload(decoded: Any) -> Any:
+    payload = decoded
+    if not isinstance(decoded, dict):
+        return payload
+
+    # Supabase has returned SQL query rows under different wrapper keys.
+    for key in ("result", "data", "rows"):
+        if key not in decoded:
+            continue
+        candidate = decoded.get(key)
+        if candidate is not None:
+            payload = candidate
+            break
+
+    query_error = decoded.get("error")
+    if query_error not in (None, "", []):
+        raise SupabaseDataError(
+            f"Supabase SQL query returned an error: {query_error}",
+            error_type="supabase_sql_query_failed",
+        )
+    return payload
+
+
 def fetch_supabase_data(request: SupabaseDataRequest) -> SupabaseDataResult:
     supabase_url = str(request.supabase_url or "").strip().rstrip("/")
     supabase_key = str(request.supabase_key or "").strip()
@@ -734,16 +762,14 @@ def execute_supabase_sql_query(request: SupabaseSqlQueryRequest) -> SupabaseSqlQ
                 details={"project_ref": project_ref, "read_only": read_only},
             ) from exc
 
-    payload = decoded
-    if isinstance(decoded, dict) and "result" in decoded:
-        payload = decoded.get("result")
-        query_error = decoded.get("error")
-        if query_error not in (None, "", []):
-            raise SupabaseDataError(
-                f"Supabase SQL query returned an error: {query_error}",
-                error_type="supabase_sql_query_failed",
-                details={"project_ref": project_ref, "read_only": read_only},
-            )
+    try:
+        payload = extract_supabase_sql_payload(decoded)
+    except SupabaseDataError as exc:
+        raise SupabaseDataError(
+            str(exc),
+            error_type=exc.error_type,
+            details={"project_ref": project_ref, "read_only": read_only},
+        ) from exc
 
     row_count: int | None = None
     if isinstance(payload, list):
@@ -822,21 +848,53 @@ def fetch_supabase_schema_catalog(*, supabase_url: str, supabase_key: str, schem
             "Content-Profile": normalized_schema,
         },
     )
-    try:
-        with urlopen(request) as response:
-            raw_body = response.read().decode("utf-8", errors="replace")
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
+    raw_body: str | None = None
+    last_http_error: HTTPError | None = None
+    last_url_error: URLError | None = None
+    for attempt in range(1, _SCHEMA_FETCH_MAX_ATTEMPTS + 1):
+        try:
+            with urlopen(request, timeout=_SCHEMA_FETCH_REQUEST_TIMEOUT_SECONDS) as response:
+                raw_body = response.read().decode("utf-8", errors="replace")
+            break
+        except HTTPError as exc:
+            last_http_error = exc
+            last_url_error = None
+            if exc.code not in _TRANSIENT_HTTP_STATUSES or attempt == _SCHEMA_FETCH_MAX_ATTEMPTS:
+                detail = exc.read().decode("utf-8", errors="replace")
+                hint = ""
+                if exc.code in _TRANSIENT_HTTP_STATUSES:
+                    hint = (
+                        f" (Supabase project at {normalized_url} appears temporarily unreachable; "
+                        "retry in a few minutes.)"
+                    )
+                raise SupabaseDataError(
+                    f"Supabase schema request failed: {exc.code} {detail}{hint}".strip(),
+                    error_type="supabase_schema_request_failed",
+                    details={"status_code": exc.code, "attempts": attempt, "transient": exc.code in _TRANSIENT_HTTP_STATUSES},
+                ) from exc
+        except URLError as exc:
+            last_url_error = exc
+            last_http_error = None
+            if attempt == _SCHEMA_FETCH_MAX_ATTEMPTS:
+                raise SupabaseDataError(
+                    f"Supabase schema request failed after {attempt} attempts: {exc.reason} "
+                    f"(Supabase project at {normalized_url} appears unreachable; retry in a few minutes.)",
+                    error_type="supabase_schema_request_failed",
+                    details={"attempts": attempt, "transient": True},
+                ) from exc
+        time.sleep(_SCHEMA_FETCH_BACKOFF_SECONDS[min(attempt - 1, len(_SCHEMA_FETCH_BACKOFF_SECONDS) - 1)])
+    if raw_body is None:
+        # Defensive: loop should have either populated raw_body or raised.
         raise SupabaseDataError(
-            f"Supabase schema request failed: {exc.code} {detail}".strip(),
+            "Supabase schema request failed: no response received.",
             error_type="supabase_schema_request_failed",
-            details={"status_code": exc.code},
-        ) from exc
-    except URLError as exc:
-        raise SupabaseDataError(
-            f"Supabase schema request failed: {exc.reason}",
-            error_type="supabase_schema_request_failed",
-        ) from exc
+            details={
+                "attempts": _SCHEMA_FETCH_MAX_ATTEMPTS,
+                "transient": True,
+                "last_status": getattr(last_http_error, "code", None),
+                "last_reason": str(getattr(last_url_error, "reason", "")) or None,
+            },
+        )
 
     try:
         spec = json.loads(raw_body)

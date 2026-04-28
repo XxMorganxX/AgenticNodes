@@ -504,6 +504,52 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="core.python_script_runner",
+            display_name="Python Script Runner",
+            category=NodeCategory.DATA,
+            node_kind="data",
+            description=(
+                "Executes a .py project file in an isolated subprocess. The script must define "
+                "run() -> bool; returning True marks the node successful, returning False marks it "
+                "failed, and raising an exception is treated as an unhandled failure. The upstream "
+                "payload is piped to the script as JSON on stdin, and the node output captures "
+                "stdout, stderr, exit code, and duration."
+            ),
+            capabilities=[
+                "subprocess execution",
+                "stdin payload injection",
+                "exit-code success contract",
+            ],
+            produces_side_effects=True,
+            default_config={
+                "mode": "python_script_runner",
+                "script_file_id": "",
+                "script_file_name": "",
+                "timeout_seconds": 30,
+                "input_binding": None,
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="script_file_id",
+                    label="Script (.py project file)",
+                    help_text=(
+                        "Upload a .py file as a project file, then paste its file_id here. "
+                        "The script must define a callable run() that returns True for success."
+                    ),
+                    placeholder="project file id",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="timeout_seconds",
+                    label="Timeout (seconds)",
+                    input_type="number",
+                    help_text="Wall-clock limit before the subprocess is killed. Default 30.",
+                    placeholder="30",
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.apollo_email_lookup",
             display_name="Apollo Email Lookup",
             category=NodeCategory.DATA,
@@ -522,7 +568,8 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 "email": "",
                 "twitter_url": "",
                 "conversation": "",
-                "reveal_personal_emails": False,
+                "reveal_personal_emails": True,
+                "reveal_phone_number": False,
                 "use_cache": True,
                 "force_refresh": False,
                 "workspace_cache_path_template": "cache/apollo-email/{cache_key}.json",
@@ -546,6 +593,13 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                     key="reveal_personal_emails",
                     label="Reveal Personal Emails",
                     input_type="checkbox",
+                    help_text="Spend Apollo credits to unlock personal emails. Required to populate person.personal_emails.",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="reveal_phone_number",
+                    label="Reveal Phone Number",
+                    input_type="checkbox",
+                    help_text="Spend Apollo credits to unlock phone numbers. Off by default.",
                 ),
                 ProviderConfigFieldDefinition(key="use_cache", label="Use Cache", input_type="checkbox"),
                 ProviderConfigFieldDefinition(key="force_refresh", label="Force Refresh", input_type="checkbox"),
@@ -615,6 +669,9 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 "template_json": "{\n  \"name\": \"\",\n  \"domain\": \"\",\n  \"linkedin_url\": \"\",\n  \"email\": \"\"\n}",
                 "case_sensitive": False,
                 "max_matches_per_field": 25,
+                "field_aliases": {},
+                "default_search_section": "payload",
+                "field_search_scopes": {},
             },
             config_fields=[
                 ProviderConfigFieldDefinition(
@@ -633,6 +690,17 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                     key="max_matches_per_field",
                     label="Max Matches Per Field",
                     input_type="number",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="default_search_section",
+                    label="Default Search Section",
+                    input_type="select",
+                    options=[
+                        ProviderConfigOptionDefinition(value="payload", label="Payload"),
+                        ProviderConfigOptionDefinition(value="metadata", label="Metadata"),
+                        ProviderConfigOptionDefinition(value="artifacts", label="Artifacts"),
+                    ],
+                    help_text="Which envelope section new template entries search by default. Each entry can override this in the modal.",
                 ),
             ],
         )
@@ -1176,6 +1244,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             default_config={
                 "to": "",
                 "subject": "",
+                "signature": "",
                 "require_to": True,
                 "require_subject": True,
                 "require_body": True,
@@ -1190,6 +1259,13 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                     key="subject",
                     label="Subject",
                     placeholder="Draft subject",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="signature",
+                    label="Signature",
+                    input_type="textarea",
+                    help_text="Optional signature appended to the drafted email body. Plain text and HTML are both supported.",
+                    placeholder="Best,\nMorgan",
                 ),
             ],
         )

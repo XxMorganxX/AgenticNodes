@@ -20,7 +20,11 @@ from graph_agent.runtime.core import GraphDefinition
 from graph_agent.runtime.documents import load_graph_document
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.event_contract import normalize_runtime_state_snapshot
-from graph_agent.runtime.spreadsheets import parse_spreadsheet, resolve_spreadsheet_path_from_run_documents
+from graph_agent.runtime.spreadsheets import (
+    SpreadsheetParseError,
+    parse_spreadsheet,
+    resolve_spreadsheet_path_from_run_documents,
+)
 
 
 class SpreadsheetEchoProvider:
@@ -237,12 +241,48 @@ class SpreadsheetRowTests(unittest.TestCase):
                 file_path=str(csv_path),
                 file_format="csv",
                 header_row_index=9,
-                start_row_index=10,
+                start_row_index=2,
             )
 
         self.assertEqual(parsed.headers, ["city", "temperature"])
         self.assertEqual(parsed.rows[0].row_number, 2)
         self.assertEqual(parsed.rows[0].row_data, {"city": "Seattle", "temperature": "58"})
+
+    def test_parse_spreadsheet_honors_custom_start_row_index(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "people.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["city", "temperature"])
+                writer.writerow(["Seattle", "58"])
+                writer.writerow(["Portland", "62"])
+                writer.writerow(["Boise", "71"])
+
+            parsed = parse_spreadsheet(
+                file_path=str(csv_path),
+                file_format="csv",
+                start_row_index=3,
+            )
+
+        self.assertEqual(parsed.row_count, 2)
+        self.assertEqual(parsed.rows[0].row_number, 3)
+        self.assertEqual(parsed.rows[0].row_data, {"city": "Portland", "temperature": "62"})
+        self.assertEqual(parsed.rows[1].row_number, 4)
+
+    def test_parse_spreadsheet_rejects_start_row_index_at_or_before_header(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "people.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["city", "temperature"])
+                writer.writerow(["Seattle", "58"])
+
+            with self.assertRaises(SpreadsheetParseError):
+                parse_spreadsheet(
+                    file_path=str(csv_path),
+                    file_format="csv",
+                    start_row_index=1,
+                )
 
     def test_parse_xlsx_uses_selected_sheet(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -794,6 +834,81 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertNotEqual(state.terminal_error.get("type"), "max_steps_exceeded")
         self.assertEqual(state.visit_counts.get("compose"), None)
         self.assertFalse(any(transition.target_id == "compose" for transition in state.transition_history))
+
+    def test_runtime_rejects_blank_start_row_index(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "rows.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["city", "temperature"])
+                writer.writerow(["Seattle", "58"])
+
+            services = build_example_services()
+            runtime = GraphRuntime(
+                services=services,
+                max_steps=services.config["max_steps"],
+                max_visits_per_node=services.config["max_visits_per_node"],
+            )
+            graph_payload = {
+                "graph_id": "spreadsheet-row-empty-start-row-graph",
+                "name": "Spreadsheet Row Empty Start Row Graph",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "sheet",
+                        "kind": "control_flow_unit",
+                        "category": "control_flow_unit",
+                        "label": "Spreadsheet Rows",
+                        "provider_id": "core.spreadsheet_rows",
+                        "provider_label": "Spreadsheet Rows",
+                        "config": {
+                            "mode": "spreadsheet_rows",
+                            "file_format": "csv",
+                            "file_path": str(csv_path),
+                            "sheet_name": "",
+                            "empty_row_policy": "skip",
+                            "start_row_index": "",
+                        },
+                        "position": {"x": 100, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "sheet"}},
+                        "position": {"x": 220, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "e1", "source_id": "start", "target_id": "sheet", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e2", "source_id": "sheet", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+            graph = GraphDefinition.from_dict(graph_payload)
+            graph.validate_against_services(services)
+
+            state = runtime.run(graph, {"request": "Process spreadsheet rows"}, run_id="spreadsheet-row-empty-start-row")
+
+        self.assertEqual(state.status, "failed")
+        assert isinstance(state.terminal_error, dict)
+        self.assertEqual(state.terminal_error.get("type"), "spreadsheet_parse_error")
+        self.assertEqual(state.terminal_error.get("message"), "Starting row index is required.")
+        self.assertEqual(state.visit_counts.get("finish"), None)
 
     def test_load_graph_document_migrates_legacy_spreadsheet_nodes(self) -> None:
         legacy_graph = load_graph_document(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import socket
 from pathlib import Path
 from threading import Thread
 import sys
@@ -20,7 +21,7 @@ if str(SRC) not in sys.path:
 from graph_agent.api.graph_store import GraphStore
 from graph_agent.api.manager import GraphRunManager
 from graph_agent.api.run_log_store import RunLogStore
-from graph_agent.api.run_store import AsyncBatchingRunStoreMirror
+from graph_agent.api.run_store import AsyncBatchingRunStoreMirror, build_default_run_store
 from graph_agent.api.run_state_reducer import apply_single_run_event, build_run_state
 from graph_agent.api.supabase_run_store import SupabaseRunStore
 from graph_agent.examples.tool_schema_repair import build_example_graph_payload, build_example_services
@@ -32,12 +33,14 @@ class _SupabaseStubHandler(BaseHTTPRequestHandler):
     events: dict[str, list[dict[str, object]]] = {}
     run_requests: list[list[dict[str, object]]] = []
     event_requests: list[list[dict[str, object]]] = []
+    get_queries: list[tuple[str, dict[str, list[str]]]] = []
     unsupported_columns: dict[str, set[str]] = {"runs": set(), "run_events": set()}
     force_runs_html_404 = False
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        self.__class__.get_queries.append((parsed.path, query))
         if parsed.path == "/rest/v1/runs":
             if self.__class__.force_runs_html_404:
                 return self._write_html_404()
@@ -61,6 +64,10 @@ class _SupabaseStubHandler(BaseHTTPRequestHandler):
             if self._reject_if_select_has_unsupported_column("run_events", _single_query_value(query, "select")):
                 return
             rows = list(self.__class__.events.get(_single_query_value(query, "run_id").removeprefix("eq."), []))
+            sequence_filter = _single_query_value(query, "sequence_number")
+            if sequence_filter.startswith("gt."):
+                threshold = int(sequence_filter.removeprefix("gt."))
+                rows = [row for row in rows if int(row.get("sequence_number", 0)) > threshold]
             order = _single_query_value(query, "order")
             reverse = order == "sequence_number.desc"
             rows.sort(key=lambda row: int(row.get("sequence_number", 0)), reverse=reverse)
@@ -171,6 +178,7 @@ class SupabaseStubServer:
         _SupabaseStubHandler.events = {}
         _SupabaseStubHandler.run_requests = []
         _SupabaseStubHandler.event_requests = []
+        _SupabaseStubHandler.get_queries = []
         _SupabaseStubHandler.unsupported_columns = {"runs": set(), "run_events": set()}
         _SupabaseStubHandler.force_runs_html_404 = False
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _SupabaseStubHandler)
@@ -1005,6 +1013,174 @@ class SupabaseRunStoreTests(unittest.TestCase):
 
             manager.start_background_services()
             manager.stop_background_services()
+
+    def test_load_manifest_does_not_request_state_snapshot_column(self) -> None:
+        with SupabaseStubServer() as url:
+            store = SupabaseRunStore(url=url, service_role_key="test-key")
+            store.initialize_run(build_run_state("run-egress", "graph-egress", {"prompt": "x"}))
+            _SupabaseStubHandler.get_queries.clear()
+
+            store.load_manifest("run-egress")
+
+            run_get_queries = [q for path, q in _SupabaseStubHandler.get_queries if path == "/rest/v1/runs"]
+            self.assertEqual(len(run_get_queries), 1)
+            select_clause = _single_query_value(run_get_queries[0], "select")
+            self.assertNotIn(
+                "state_snapshot",
+                select_clause,
+                msg=f"load_manifest must not request state_snapshot; select was {select_clause!r}",
+            )
+            self.assertNotEqual(select_clause, "*")
+
+    def test_load_state_only_requests_state_snapshot_column(self) -> None:
+        with SupabaseStubServer() as url:
+            store = SupabaseRunStore(url=url, service_role_key="test-key")
+            store.initialize_run(build_run_state("run-egress", "graph-egress", {"prompt": "x"}))
+            _SupabaseStubHandler.get_queries.clear()
+
+            store.load_state("run-egress")
+
+            run_get_queries = [q for path, q in _SupabaseStubHandler.get_queries if path == "/rest/v1/runs"]
+            self.assertEqual(len(run_get_queries), 1)
+            select_clause = _single_query_value(run_get_queries[0], "select")
+            self.assertIn("state_snapshot", select_clause)
+            self.assertNotEqual(select_clause, "*")
+
+    def test_recover_run_state_uses_single_run_row_request(self) -> None:
+        with SupabaseStubServer() as url:
+            store = SupabaseRunStore(url=url, service_role_key="test-key")
+            state = build_run_state("run-egress", "graph-egress", {"prompt": "x"})
+            store.initialize_run(state)
+            store.append_event(
+                "run-egress",
+                {
+                    "event_type": "run.started",
+                    "summary": "started",
+                    "payload": {},
+                    "run_id": "run-egress",
+                    "timestamp": "2026-04-02T00:00:00Z",
+                },
+            )
+            _SupabaseStubHandler.get_queries.clear()
+
+            store.recover_run_state("run-egress")
+
+            run_get_queries = [q for path, q in _SupabaseStubHandler.get_queries if path == "/rest/v1/runs"]
+            self.assertEqual(
+                len(run_get_queries),
+                1,
+                msg=f"recover_run_state should fetch the run row exactly once, got {len(run_get_queries)} fetches",
+            )
+            select_clause = _single_query_value(run_get_queries[0], "select")
+            self.assertIn("state_snapshot", select_clause)
+            self.assertIn("graph_id", select_clause)
+
+    def test_load_events_since_sequence_filters_by_sequence_number(self) -> None:
+        with SupabaseStubServer() as url:
+            store = SupabaseRunStore(url=url, service_role_key="test-key")
+            store.initialize_run(build_run_state("run-egress", "graph-egress", {"prompt": "x"}))
+            for index in range(3):
+                store.append_event(
+                    "run-egress",
+                    {
+                        "event_type": "node.completed",
+                        "summary": f"event-{index}",
+                        "payload": {"index": index},
+                        "run_id": "run-egress",
+                        "timestamp": f"2026-04-02T00:00:0{index}Z",
+                    },
+                )
+            _SupabaseStubHandler.get_queries.clear()
+
+            events = store.load_events("run-egress", since_sequence=1)
+
+            self.assertEqual(len(events), 2)
+            event_get_queries = [q for path, q in _SupabaseStubHandler.get_queries if path == "/rest/v1/run_events"]
+            self.assertEqual(len(event_get_queries), 1)
+            sequence_filter = _single_query_value(event_get_queries[0], "sequence_number")
+            self.assertEqual(sequence_filter, "gt.1")
+
+
+class BuildDefaultRunStoreTests(unittest.TestCase):
+    def test_supabase_backend_defaults_to_local_primary_with_async_mirror(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_RUN_STORE": "supabase",
+                "GRAPH_AGENT_SUPABASE_URL": "http://127.0.0.1:9",
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "test-secret",
+            },
+            clear=False,
+        ):
+            from graph_agent.api.run_log_store import FilesystemRunStore
+            from graph_agent.api.run_store import AsyncBatchingRunStoreMirror, CompositeRunStore
+
+            store = build_default_run_store()
+            self.assertIsInstance(store, CompositeRunStore)
+            self.assertIsInstance(store.primary, FilesystemRunStore)
+            self.assertEqual(len(store.mirrors), 1)
+            self.assertIsInstance(store.mirrors[0], AsyncBatchingRunStoreMirror)
+
+    def test_supabase_primary_legacy_async_mirror(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_RUN_STORE": "supabase",
+                "GRAPH_AGENT_SUPABASE_URL": "http://127.0.0.1:9",
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "test-secret",
+                "GRAPH_AGENT_RUN_STORE_SUPABASE_PRIMARY": "1",
+            },
+            clear=False,
+        ):
+            from graph_agent.api.run_store import AsyncBatchingRunStoreMirror
+
+            store = build_default_run_store()
+            self.assertIsInstance(store, AsyncBatchingRunStoreMirror)
+
+    def test_supabase_primary_legacy_sync_store_when_mirror_disabled(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_RUN_STORE": "supabase",
+                "GRAPH_AGENT_SUPABASE_URL": "http://127.0.0.1:9",
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "test-secret",
+                "GRAPH_AGENT_RUN_STORE_SUPABASE_PRIMARY": "1",
+                "GRAPH_AGENT_RUN_STORE_MIRROR_DISABLED": "1",
+            },
+            clear=False,
+        ):
+            store = build_default_run_store()
+            self.assertIsInstance(store, SupabaseRunStore)
+
+    def test_local_primary_sync_supabase_when_mirror_disabled(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_RUN_STORE": "supabase",
+                "GRAPH_AGENT_SUPABASE_URL": "http://127.0.0.1:9",
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "test-secret",
+                "GRAPH_AGENT_RUN_STORE_MIRROR_DISABLED": "1",
+            },
+            clear=False,
+        ):
+            from graph_agent.api.run_log_store import FilesystemRunStore
+            from graph_agent.api.run_store import CompositeRunStore
+
+            store = build_default_run_store()
+            self.assertIsInstance(store, CompositeRunStore)
+            self.assertIsInstance(store.primary, FilesystemRunStore)
+            self.assertEqual(len(store.mirrors), 1)
+            self.assertIsInstance(store.mirrors[0], SupabaseRunStore)
+
+
+class SupabaseRunStoreTimeoutTests(unittest.TestCase):
+    def test_list_runs_times_out_with_concise_runtime_error(self) -> None:
+        with SupabaseStubServer() as url:
+            store = SupabaseRunStore(url=url, service_role_key="test-key")
+            with patch("graph_agent.api.supabase_run_store.urlopen", side_effect=socket.timeout()):
+                with self.assertRaises(RuntimeError) as ctx:
+                    store.list_runs(limit=1)
+                self.assertIn("timed out", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":

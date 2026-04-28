@@ -124,6 +124,7 @@ export type FocusedLoopRegion = {
   iteratorType: string | null;
   status: string | null;
   currentRowIndex: number | null;
+  spreadsheetRowNumber: number | null;
   totalRows: number | null;
   activeIterationId: string | null;
   memberNodeIds: string[];
@@ -421,6 +422,19 @@ function buildIterationId(iteratorNodeId: unknown, iteratorRowIndex: unknown): s
   return `${iteratorNodeId}:row:${iteratorRowIndex}`;
 }
 
+function extractSpreadsheetRowNumber(value: unknown): number | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (typeof value.row_number === "number" && Number.isInteger(value.row_number) && value.row_number > 0) {
+    return value.row_number;
+  }
+  if (isRecord(value.payload)) {
+    return extractSpreadsheetRowNumber(value.payload);
+  }
+  return null;
+}
+
 function createFocusedLoopRegion(iteratorNodeId: string, labels: Map<string, string>): FocusedLoopRegion {
   return {
     id: iteratorNodeId,
@@ -429,6 +443,7 @@ function createFocusedLoopRegion(iteratorNodeId: string, labels: Map<string, str
     iteratorType: null,
     status: null,
     currentRowIndex: null,
+    spreadsheetRowNumber: null,
     totalRows: null,
     activeIterationId: null,
     memberNodeIds: [],
@@ -507,6 +522,10 @@ function buildFocusedLoopRegions(
         iterationIds: appendUniqueString(region.iterationIds, iterationId),
         currentRowIndex:
           typeof event.payload.iterator_row_index === "number" ? event.payload.iterator_row_index : region.currentRowIndex,
+        spreadsheetRowNumber:
+          extractSpreadsheetRowNumber(event.payload.received_input) ??
+          extractSpreadsheetRowNumber(event.payload.output) ??
+          region.spreadsheetRowNumber,
         totalRows:
           typeof event.payload.iterator_total_rows === "number" ? event.payload.iterator_total_rows : region.totalRows,
         activeIterationId: iterationId ?? region.activeIterationId,
@@ -536,7 +555,18 @@ function buildFocusedLoopRegions(
 
   Object.entries(runState?.loop_regions ?? {}).forEach(([iteratorNodeId, loopRegion]) => {
     const region = upsertFocusedLoopRegion(regions, iteratorNodeId, labels);
-    regions.set(iteratorNodeId, mergeLoopRegionState(region, iteratorNodeId, loopRegion));
+    const mergedRegion = mergeLoopRegionState(region, iteratorNodeId, loopRegion);
+    regions.set(
+      iteratorNodeId,
+      mergedRegion.iteratorType === "spreadsheet_rows"
+        ? {
+            ...mergedRegion,
+            spreadsheetRowNumber:
+              mergedRegion.spreadsheetRowNumber
+              ?? extractSpreadsheetRowNumber(runState?.node_outputs?.[iteratorNodeId]),
+          }
+        : mergedRegion,
+    );
   });
 
   return Array.from(regions.values()).filter((region) => region.memberNodeIds.length > 0);

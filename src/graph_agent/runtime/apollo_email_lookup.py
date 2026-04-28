@@ -27,6 +27,15 @@ APOLLO_EMAIL_LOOKUP_FIELDS = (
 )
 APOLLO_LOOKUP_STATUSES = {"matched", "no_email", "no_match"}
 SAFE_CACHE_KEY_SEGMENT_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+APOLLO_CACHE_SCHEMA_VERSION = "1.1"
+APOLLO_PLACEHOLDER_EMAIL_LOCAL_PARTS = frozenset(
+    {
+        "email_not_unlocked",
+        "email_disabled",
+        "email_locked",
+        "domain_catch_all",
+    }
+)
 
 
 class ApolloLookupError(RuntimeError):
@@ -54,6 +63,7 @@ class ApolloEmailLookupRequest:
     email: str = ""
     twitter_url: str = ""
     reveal_personal_emails: bool = False
+    reveal_phone_number: bool = False
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> ApolloEmailLookupRequest:
@@ -68,6 +78,7 @@ class ApolloEmailLookupRequest:
             email=_normalize_optional_text(payload.get("email")),
             twitter_url=_normalize_optional_text(payload.get("twitter_url")),
             reveal_personal_emails=_normalize_bool(payload.get("reveal_personal_emails"), default=False),
+            reveal_phone_number=_normalize_bool(payload.get("reveal_phone_number"), default=False),
         )
 
     def to_lookup_fields(self) -> dict[str, Any]:
@@ -81,13 +92,14 @@ class ApolloEmailLookupRequest:
             "email": self.email,
             "twitter_url": self.twitter_url,
             "reveal_personal_emails": self.reveal_personal_emails,
+            "reveal_phone_number": self.reveal_phone_number,
         }
         return {key: value for key, value in payload.items() if value not in {"", None}}
 
     def to_query_params(self) -> dict[str, str]:
         params = {
             "reveal_personal_emails": str(self.reveal_personal_emails).lower(),
-            "reveal_phone_number": "false",
+            "reveal_phone_number": str(self.reveal_phone_number).lower(),
         }
         for key in APOLLO_EMAIL_LOOKUP_FIELDS:
             value = getattr(self, key)
@@ -149,6 +161,8 @@ def extract_apollo_lookup_fields(value: Any) -> dict[str, Any]:
             extracted[key] = candidate
     if "reveal_personal_emails" in value:
         extracted["reveal_personal_emails"] = _normalize_bool(value.get("reveal_personal_emails"), default=False)
+    if "reveal_phone_number" in value:
+        extracted["reveal_phone_number"] = _normalize_bool(value.get("reveal_phone_number"), default=False)
     return extracted
 
 
@@ -191,6 +205,7 @@ def build_apollo_email_lookup_cache_info(request: ApolloEmailLookupRequest) -> A
         "email": request.email.lower(),
         "twitter_url": request.twitter_url,
         "reveal_personal_emails": request.reveal_personal_emails,
+        "reveal_phone_number": request.reveal_phone_number,
     }
     serialized = json.dumps(normalized_lookup, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
@@ -223,18 +238,164 @@ def describe_apollo_email_cache_file(path: Path, *, root: Path | None = None) ->
     }
 
 
+def _is_apollo_placeholder_email(value: str) -> bool:
+    if "@" not in value:
+        return value.strip().lower() in APOLLO_PLACEHOLDER_EMAIL_LOCAL_PARTS
+    local_part = value.split("@", 1)[0].strip().lower()
+    return local_part in APOLLO_PLACEHOLDER_EMAIL_LOCAL_PARTS
+
+
+def _select_real_apollo_email(*candidates: Any) -> str | None:
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            text = candidate.strip()
+            if text and not _is_apollo_placeholder_email(text):
+                return text
+        elif isinstance(candidate, list):
+            for item in candidate:
+                if isinstance(item, Mapping):
+                    item_email = _normalize_optional_text(item.get("email"))
+                    if item_email and not _is_apollo_placeholder_email(item_email):
+                        return item_email
+                elif isinstance(item, str):
+                    text = item.strip()
+                    if text and not _is_apollo_placeholder_email(text):
+                        return text
+    return None
+
+
 def extract_apollo_email(payload: Mapping[str, Any]) -> str | None:
     person = payload.get("person")
     if not isinstance(person, Mapping):
         return None
     direct_email = _normalize_optional_text(person.get("email"))
-    if direct_email:
+    if direct_email and not _is_apollo_placeholder_email(direct_email):
         return direct_email
-    contact = person.get("contact")
-    if not isinstance(contact, Mapping):
-        return None
-    contact_email = _normalize_optional_text(contact.get("email"))
-    return contact_email or None
+    contact = person.get("contact") if isinstance(person.get("contact"), Mapping) else None
+    if contact is not None:
+        contact_email = _normalize_optional_text(contact.get("email"))
+        if contact_email and not _is_apollo_placeholder_email(contact_email):
+            return contact_email
+    return _select_real_apollo_email(
+        person.get("personal_emails"),
+        person.get("contact_emails"),
+        contact.get("personal_emails") if contact is not None else None,
+        contact.get("emails") if contact is not None else None,
+    )
+
+
+def _collect_phone_numbers(*sources: Any) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for source in sources:
+        if isinstance(source, list):
+            for item in source:
+                if isinstance(item, Mapping):
+                    raw = _normalize_optional_text(
+                        item.get("sanitized_number")
+                        or item.get("raw_number")
+                        or item.get("number")
+                    )
+                elif isinstance(item, str):
+                    raw = item.strip()
+                else:
+                    raw = ""
+                if raw and raw not in seen:
+                    seen.add(raw)
+                    ordered.append(raw)
+        elif isinstance(source, str):
+            text = source.strip()
+            if text and text not in seen:
+                seen.add(text)
+                ordered.append(text)
+    return ordered
+
+
+def _summarize_apollo_organization(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    summary: dict[str, Any] = {}
+    name = _normalize_optional_text(value.get("name"))
+    if name:
+        summary["name"] = name
+    domain = _normalize_optional_text(value.get("primary_domain") or value.get("domain"))
+    if domain:
+        summary["domain"] = domain
+    website = _normalize_optional_text(value.get("website_url") or value.get("website"))
+    if website:
+        summary["website_url"] = website
+    industry = _normalize_optional_text(value.get("industry"))
+    if industry:
+        summary["industry"] = industry
+    linkedin = _normalize_optional_text(value.get("linkedin_url"))
+    if linkedin:
+        summary["linkedin_url"] = linkedin
+    return summary
+
+
+def build_apollo_person_summary(
+    payload: Mapping[str, Any],
+    *,
+    resolved_email: str | None,
+    lookup_status: str,
+) -> dict[str, Any]:
+    """Compress the raw Apollo people/match response into a flat envelope payload.
+
+    The envelope payload that downstream nodes consume should contain only the
+    person's resolved email, core career attributes, and contact info — not the
+    deeply nested raw Apollo response, which stays in the cache file for audit.
+    """
+    summary: dict[str, Any] = {"email": resolved_email or "", "lookup_status": lookup_status}
+    person = payload.get("person") if isinstance(payload.get("person"), Mapping) else None
+    if person is None:
+        organization = _summarize_apollo_organization(payload.get("organization"))
+        if organization:
+            summary["organization"] = organization
+        return summary
+
+    contact = person.get("contact") if isinstance(person.get("contact"), Mapping) else {}
+
+    text_fields = (
+        ("name", ("name",)),
+        ("first_name", ("first_name",)),
+        ("last_name", ("last_name",)),
+        ("title", ("title",)),
+        ("headline", ("headline",)),
+        ("seniority", ("seniority",)),
+        ("linkedin_url", ("linkedin_url",)),
+        ("twitter_url", ("twitter_url",)),
+        ("github_url", ("github_url",)),
+        ("city", ("city",)),
+        ("state", ("state",)),
+        ("country", ("country",)),
+    )
+    for output_key, source_keys in text_fields:
+        for source_key in source_keys:
+            value = _normalize_optional_text(person.get(source_key))
+            if value:
+                summary[output_key] = value
+                break
+
+    departments = person.get("departments")
+    if isinstance(departments, list):
+        cleaned_departments = [str(item).strip() for item in departments if str(item).strip()]
+        if cleaned_departments:
+            summary["departments"] = cleaned_departments
+
+    phone_numbers = _collect_phone_numbers(
+        contact.get("phone_numbers") if isinstance(contact, Mapping) else None,
+        person.get("phone_numbers"),
+    )
+    if phone_numbers:
+        summary["phone_numbers"] = phone_numbers
+
+    organization = _summarize_apollo_organization(
+        person.get("organization") or payload.get("organization")
+    )
+    if organization:
+        summary["organization"] = organization
+
+    return summary
 
 
 def determine_apollo_lookup_status(payload: Mapping[str, Any]) -> str:
@@ -258,7 +419,7 @@ def build_apollo_email_cache_entry(
 ) -> dict[str, Any]:
     lookup_status = determine_apollo_lookup_status(payload)
     return {
-        "schema_version": "1.0",
+        "schema_version": APOLLO_CACHE_SCHEMA_VERSION,
         "source": "apollo_people_match",
         "lookup": request.to_lookup_fields(),
         "lookup_status": lookup_status,
@@ -284,7 +445,12 @@ def read_cached_apollo_email_lookup(
         return None, None
     cached_payload = payload.get("payload")
     lookup_status = str(payload.get("lookup_status", "") or "").strip()
-    if not isinstance(cached_payload, dict) or lookup_status not in APOLLO_LOOKUP_STATUSES:
+    schema_version = str(payload.get("schema_version", "") or "").strip()
+    if (
+        schema_version != APOLLO_CACHE_SCHEMA_VERSION
+        or not isinstance(cached_payload, dict)
+        or lookup_status not in APOLLO_LOOKUP_STATUSES
+    ):
         return None, None
     return payload, describe_apollo_email_cache_file(
         cache_info.shared_cache_path,

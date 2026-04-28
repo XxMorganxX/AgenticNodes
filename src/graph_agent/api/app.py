@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from queue import Empty
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -70,7 +70,7 @@ class SpreadsheetPreviewRequest(BaseModel):
     file_format: str = "auto"
     sheet_name: Optional[str] = None
     header_row_index: int = 1
-    start_row_index: int = 2
+    start_row_index: Optional[Union[int, str]] = 2
     empty_row_policy: str = "skip"
 
 
@@ -274,6 +274,16 @@ def delete_project_file(graph_id: str, file_id: str) -> dict[str, str]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"deleted": file_id}
+
+
+@app.get("/api/graphs/{graph_id}/files/{file_id}/content")
+def read_project_file_content(graph_id: str, file_id: str) -> dict[str, Any]:
+    try:
+        return manager.read_project_file_content(graph_id, file_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown project file '{file_id}'.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/editor/catalog")
@@ -534,6 +544,19 @@ def stop_runtime() -> dict[str, Any]:
 def get_run(run_id: str) -> dict[str, Any]:
     try:
         return manager.get_run(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown run '{run_id}'.") from exc
+
+
+@app.get("/api/runs/{run_id}/status")
+def get_run_status(run_id: str) -> dict[str, Any]:
+    """Lightweight status check; never pulls state_snapshot or events.
+
+    Used by the frontend SSE-fallback poller to avoid re-recovering full
+    run state on every poll tick.
+    """
+    try:
+        return manager.get_run_status(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Unknown run '{run_id}'.") from exc
 

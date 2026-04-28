@@ -7,6 +7,7 @@ import type {
   MicrosoftAuthStatus,
   OutboundEmailLogTableValidationResult,
   ProjectFile,
+  ProjectFileContent,
   ProviderDiagnosticsResult,
   ProviderPreflightResult,
   RunDocument,
@@ -149,6 +150,16 @@ export async function deleteProjectFile(graphId: string, fileId: string): Promis
   }
 }
 
+export async function fetchProjectFileContent(graphId: string, fileId: string): Promise<ProjectFileContent> {
+  const response = await fetch(`${API_BASE_URL}/api/graphs/${graphId}/files/${fileId}/content`, {
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to load project file content."));
+  }
+  return (await response.json()) as ProjectFileContent;
+}
+
 export async function fetchEditorCatalog(): Promise<EditorCatalog> {
   const response = await fetch(`${API_BASE_URL}/api/editor/catalog`);
   if (!response.ok) {
@@ -206,7 +217,7 @@ export async function previewSpreadsheetRows(config: {
   file_format: string;
   sheet_name?: string | null;
   header_row_index: number;
-  start_row_index: number;
+  start_row_index: number | string | null;
   empty_row_policy: string;
 }): Promise<SpreadsheetPreviewResult> {
   const response = await fetch(`${API_BASE_URL}/api/editor/data/spreadsheet/preview`, {
@@ -533,6 +544,29 @@ export async function fetchRun(runId: string): Promise<RunState> {
     throw new Error("Failed to load run state.");
   }
   return normalizeRunState((await response.json()) as RunState) as RunState;
+}
+
+export interface RunStatusSummary {
+  run_id: string;
+  graph_id: string | null;
+  status: string | null;
+  status_reason: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  agent_id: string | null;
+  agent_name: string | null;
+  parent_run_id: string | null;
+  runtime_instance_id: string | null;
+  last_heartbeat_at: string | null;
+  is_terminal: boolean;
+}
+
+export async function fetchRunStatus(runId: string): Promise<RunStatusSummary> {
+  const response = await fetch(`${API_BASE_URL}/api/runs/${runId}/status`);
+  if (!response.ok) {
+    throw new Error("Failed to load run status.");
+  }
+  return (await response.json()) as RunStatusSummary;
 }
 
 export function eventStreamUrl(runId: string): string {

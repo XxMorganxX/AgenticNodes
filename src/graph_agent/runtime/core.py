@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
 import os
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
@@ -37,6 +37,7 @@ from graph_agent.runtime.apollo_email_lookup import (
     ApolloLookupError,
     build_apollo_email_cache_entry,
     build_apollo_email_lookup_cache_info,
+    build_apollo_person_summary,
     determine_apollo_lookup_status,
     extract_apollo_email,
     extract_apollo_lookup_fields,
@@ -60,6 +61,12 @@ from graph_agent.runtime.linkedin_profile_fetch import (
     write_cached_linkedin_profile,
     write_linkedin_profile_workspace_copy,
     workspace_cache_relative_path,
+)
+from graph_agent.runtime.python_script_runner import (
+    DEFAULT_SCRIPT_TIMEOUT_SECONDS,
+    PYTHON_SCRIPT_RUNNER_MODE,
+    PYTHON_SCRIPT_RUNNER_PROVIDER_ID,
+    run_script as run_python_script,
 )
 from graph_agent.runtime.runtime_normalizer import (
     RuntimeFieldExtractorConfig,
@@ -120,6 +127,20 @@ def utc_now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+def _coerce_start_row_index(raw: Any) -> int:
+    if raw is None:
+        return SPREADSHEET_FIRST_DATA_ROW_INDEX
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            raise SpreadsheetParseError("Starting row index is required.")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise SpreadsheetParseError("Starting row index must be a whole number.") from None
+    return value
+
+
 API_TOOL_CALL_HANDLE_ID = "api-tool-call"
 API_MESSAGE_HANDLE_ID = "api-message"
 NO_TOOL_CALL_MESSAGE = "No Tool Call Made"
@@ -161,6 +182,7 @@ SUPABASE_ROW_WRITE_PROVIDER_ID = "core.supabase_row_write"
 SUPABASE_ROW_WRITE_MODE = "supabase_row_write"
 OUTBOUND_EMAIL_LOGGER_PROVIDER_ID = "core.outbound_email_logger"
 OUTBOUND_EMAIL_LOGGER_MODE = "outbound_email_logger"
+MISSING_RECIPIENT_SENTINEL_EMAIL = "missing-recipient@graph-agent.invalid"
 SPREADSHEET_MATRIX_DECISION_MODE = "spreadsheet_matrix_decision"
 CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body"
 CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if"
@@ -226,6 +248,94 @@ def _coerce_int(value: Any, *, default: int, minimum: int | None = None) -> int:
     if minimum is not None:
         return max(resolved, minimum)
     return resolved
+
+
+def _coerce_structured_payload_field_aliases(value: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            return ()
+    if not isinstance(value, Mapping):
+        return ()
+    rows: list[tuple[str, tuple[str, ...]]] = []
+    for raw_key, raw_aliases in value.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        if isinstance(raw_aliases, str):
+            iterable: Sequence[Any] = [raw_aliases]
+        elif isinstance(raw_aliases, Sequence):
+            iterable = raw_aliases
+        else:
+            continue
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for entry in iterable:
+            text = str(entry or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            cleaned.append(text)
+        if cleaned:
+            rows.append((key, tuple(cleaned)))
+    return tuple(rows)
+
+
+_VALID_SEARCH_SECTIONS = ("payload", "metadata", "artifacts")
+
+
+def _coerce_structured_payload_search_section(
+    value: Any, *, default: str = "payload"
+) -> str:
+    text = str(value or "").strip().lower()
+    if text in _VALID_SEARCH_SECTIONS:
+        return text
+    return default
+
+
+def _coerce_structured_payload_field_search_scopes(
+    value: Any,
+) -> tuple[tuple[str, str], ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            return ()
+    if not isinstance(value, Mapping):
+        return ()
+    rows: list[tuple[str, str]] = []
+    for raw_key, raw_scope in value.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        if isinstance(raw_scope, str):
+            section = _coerce_structured_payload_search_section(raw_scope)
+            rows.append((key, section))
+            continue
+        # Tolerate the legacy {"metadata": bool, "artifacts": bool} shape briefly written
+        # to disk during the previous iteration of this feature.
+        if isinstance(raw_scope, Mapping):
+            sm = _coerce_bool(raw_scope.get("metadata"), default=True)
+            sa = _coerce_bool(raw_scope.get("artifacts"), default=True)
+            if sm and not sa:
+                rows.append((key, "metadata"))
+            elif sa and not sm:
+                rows.append((key, "artifacts"))
+            else:
+                rows.append((key, "payload"))
+            continue
+    return tuple(rows)
 
 
 def _sanitize_workspace_path_suffix(value: str, *, fallback: str = "iteration") -> str:
@@ -2348,12 +2458,13 @@ class DataNode(BaseNode):
             )
         sheet_name = str(resolved.get("sheet_name", "") or "").strip()
         empty_row_policy = str(resolved.get("empty_row_policy", "skip") or "skip").strip().lower() or "skip"
+        start_row_index = _coerce_start_row_index(resolved.get("start_row_index"))
         return {
             "file_format": file_format,
             "file_path": file_path,
             "sheet_name": sheet_name,
             "header_row_index": SPREADSHEET_HEADER_ROW_INDEX,
-            "start_row_index": SPREADSHEET_FIRST_DATA_ROW_INDEX,
+            "start_row_index": start_row_index,
             "empty_row_policy": empty_row_policy,
         }
 
@@ -2449,6 +2560,86 @@ class DataNode(BaseNode):
             },
         )
 
+    def _execute_python_script_runner(self, context: NodeContext) -> NodeExecutionResult:
+        resolved = context.resolve_graph_env_value(dict(self.config))
+        script_file_id = str(resolved.get("script_file_id", "") or "").strip()
+        script_path = str(resolved.get("script_path", "") or "").strip()
+        script_file_name = str(resolved.get("script_file_name", "") or "").strip()
+        try:
+            timeout_seconds = float(resolved.get("timeout_seconds") or DEFAULT_SCRIPT_TIMEOUT_SECONDS)
+        except (TypeError, ValueError):
+            timeout_seconds = float(DEFAULT_SCRIPT_TIMEOUT_SECONDS)
+        if timeout_seconds <= 0:
+            timeout_seconds = float(DEFAULT_SCRIPT_TIMEOUT_SECONDS)
+
+        if not script_path:
+            return NodeExecutionResult(
+                status="failed",
+                error={
+                    "type": "python_script_not_hydrated",
+                    "message": (
+                        "Python script runner is missing a resolved script path. "
+                        "Select a .py project file and re-run."
+                    ),
+                    "script_file_id": script_file_id,
+                },
+                summary="Python script runner has no script selected.",
+            )
+
+        payload_source = context.resolve_binding(self.config.get("input_binding"))
+        if isinstance(payload_source, Mapping) and "schema_version" in payload_source and "payload" in payload_source:
+            payload_value = payload_source.get("payload")
+        else:
+            payload_value = payload_source
+        if payload_value is None:
+            payload_value = {}
+        try:
+            payload_json = json.dumps(payload_value, default=str)
+        except (TypeError, ValueError):
+            payload_json = "{}"
+
+        result = run_python_script(
+            script_path,
+            payload_json=payload_json,
+            timeout_seconds=timeout_seconds,
+        )
+
+        summary_label = script_file_name or Path(script_path).name
+        if result.success:
+            summary = f"Script '{summary_label}' reported success."
+        elif result.timed_out:
+            summary = f"Script '{summary_label}' timed out after {int(timeout_seconds)}s."
+        else:
+            summary = f"Script '{summary_label}' reported failure (exit {result.exit_code})."
+
+        envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload=result.to_dict(),
+            errors=[result.error] if result.error else [],
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "data_mode": PYTHON_SCRIPT_RUNNER_MODE,
+                "provider_id": self.provider_id,
+                "script_file_id": script_file_id,
+                "script_file_name": script_file_name,
+                "script_path": result.script_path,
+                "timeout_seconds": int(timeout_seconds),
+                "exit_code": result.exit_code,
+                "timed_out": result.timed_out,
+                "duration_ms": result.duration_ms,
+            },
+        )
+
+        return NodeExecutionResult(
+            status="success" if result.success else "failed",
+            output=envelope.to_dict(),
+            error=result.error,
+            summary=summary,
+        )
+
     def _execute_write_text_file(self, context: NodeContext) -> NodeExecutionResult:
         configured_relative_path = str(self.config.get("relative_path", "response.txt") or "response.txt").strip() or "response.txt"
         relative_path = _resolve_write_text_file_relative_path(configured_relative_path, context=context)
@@ -2536,7 +2727,8 @@ class DataNode(BaseNode):
             "email": str(resolved.get("email", "") or "").strip(),
             "twitter_url": str(resolved.get("twitter_url", "") or "").strip(),
             "conversation": str(resolved.get("conversation", "") or "").strip(),
-            "reveal_personal_emails": _coerce_bool(resolved.get("reveal_personal_emails"), default=False),
+            "reveal_personal_emails": _coerce_bool(resolved.get("reveal_personal_emails"), default=True),
+            "reveal_phone_number": _coerce_bool(resolved.get("reveal_phone_number"), default=False),
             "use_cache": _coerce_bool(resolved.get("use_cache"), default=True),
             "force_refresh": _coerce_bool(resolved.get("force_refresh"), default=False),
             "workspace_cache_path_template": str(
@@ -2578,6 +2770,7 @@ class DataNode(BaseNode):
             if value:
                 merged[key] = value
         merged["reveal_personal_emails"] = bool(config.get("reveal_personal_emails", False))
+        merged["reveal_phone_number"] = bool(config.get("reveal_phone_number", False))
         return ApolloEmailLookupRequest.from_mapping(merged)
 
     def _build_apollo_email_lookup_envelope(
@@ -2597,11 +2790,16 @@ class DataNode(BaseNode):
         }
         if shared_cache_file is not None:
             artifacts["shared_cache_file"] = dict(shared_cache_file)
+        summary_payload = build_apollo_person_summary(
+            apollo_payload,
+            resolved_email=resolved_email,
+            lookup_status=lookup_status,
+        )
         return MessageEnvelope(
             schema_version="1.0",
             from_node_id=self.id,
             from_category=self.category.value,
-            payload=dict(apollo_payload),
+            payload=summary_payload,
             artifacts=artifacts,
             metadata={
                 "contract": "data_envelope",
@@ -2973,6 +3171,13 @@ class DataNode(BaseNode):
             template_json=str(resolved.get("template_json", "{}") or "{}").strip() or "{}",
             case_sensitive=_coerce_bool(resolved.get("case_sensitive"), default=False),
             max_matches_per_field=_coerce_int(resolved.get("max_matches_per_field"), default=25, minimum=1),
+            field_aliases=_coerce_structured_payload_field_aliases(resolved.get("field_aliases")),
+            default_search_section=_coerce_structured_payload_search_section(
+                resolved.get("default_search_section"), default="payload"
+            ),
+            field_search_scopes=_coerce_structured_payload_field_search_scopes(
+                resolved.get("field_search_scopes")
+            ),
         )
 
     def _structured_payload_builder_source_value(self, context: NodeContext) -> Any:
@@ -2986,13 +3191,64 @@ class DataNode(BaseNode):
             source_value = _parse_json_object_or_array(source_value.get("payload"))
         return source_value
 
-    def _structured_payload_builder_source_roots(self, context: NodeContext) -> tuple[Any, ...]:
-        source_value = self._structured_payload_builder_source_value(context)
-        return (source_value,)
+    def _structured_payload_builder_labeled_source_roots(
+        self,
+        context: NodeContext,
+    ) -> tuple[tuple[str, Any], ...]:
+        """Return all derived source roots labeled by kind (``payload``/``metadata``/``artifacts``).
+
+        Always returns the full unfiltered set; per-field/global scope filtering happens
+        downstream in ``build_structured_payload`` so per-entry overrides can take effect.
+        """
+        raw_value = context.resolve_binding(None)
+        if raw_value is None:
+            raw_value = context.resolve_binding(self.config.get("input_binding"))
+        raw_value = _parse_json_object_or_array(raw_value)
+
+        metadata_roots: list[Any] = []
+        artifacts_roots: list[Any] = []
+        primary: Any = raw_value
+        for _ in range(8):
+            if _is_message_envelope_like(primary):
+                metadata_roots.append(_parse_json_object_or_array(primary.get("metadata")))
+                artifacts_roots.append(_parse_json_object_or_array(primary.get("artifacts")))
+                primary = _parse_json_object_or_array(primary.get("payload"))
+                continue
+            if isinstance(primary, Mapping) and "payload" in primary:
+                primary = _parse_json_object_or_array(primary.get("payload"))
+                continue
+            break
+
+        labeled: list[tuple[str, Any]] = []
+        seen_ids: set[int] = set()
+
+        def add(kind: str, candidate: Any) -> None:
+            if candidate is None:
+                return
+            if isinstance(candidate, Mapping) and len(candidate) == 0:
+                return
+            if isinstance(candidate, list) and len(candidate) == 0:
+                return
+            identifier = id(candidate)
+            if identifier in seen_ids:
+                return
+            seen_ids.add(identifier)
+            labeled.append((kind, candidate))
+
+        add("payload", primary)
+        for candidate in metadata_roots:
+            add("metadata", candidate)
+        for candidate in artifacts_roots:
+            add("artifacts", candidate)
+        if not labeled:
+            labeled.append(("payload", primary))
+        return tuple(labeled)
 
     def _execute_structured_payload_builder(self, context: NodeContext) -> NodeExecutionResult:
         resolved_config = self._structured_payload_builder_config(context)
-        source_roots = self._structured_payload_builder_source_roots(context)
+        labeled_roots = self._structured_payload_builder_labeled_source_roots(context)
+        source_roots = tuple(value for _, value in labeled_roots)
+        source_root_kinds = tuple(kind for kind, _ in labeled_roots)
         try:
             template = parse_structured_payload_template(resolved_config.template_json)
         except ValueError as exc:
@@ -3007,6 +3263,10 @@ class DataNode(BaseNode):
             source_roots,
             case_sensitive=resolved_config.case_sensitive,
             max_matches_per_field=resolved_config.max_matches_per_field,
+            field_aliases=dict(resolved_config.field_aliases) if resolved_config.field_aliases else None,
+            source_root_kinds=source_root_kinds,
+            field_search_scopes=dict(resolved_config.field_search_scopes) if resolved_config.field_search_scopes else None,
+            default_search_section=resolved_config.default_search_section,
         )
         envelope = MessageEnvelope(
             schema_version="1.0",
@@ -3030,6 +3290,7 @@ class DataNode(BaseNode):
                 "unresolved_field_count": len(result.unresolved_paths),
                 "case_sensitive": resolved_config.case_sensitive,
                 "max_matches_per_field": resolved_config.max_matches_per_field,
+                "default_search_section": resolved_config.default_search_section,
             },
         )
         summary = (
@@ -3610,10 +3871,13 @@ class DataNode(BaseNode):
             }
         if self.provider_id == STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID or mode == STRUCTURED_PAYLOAD_BUILDER_MODE:
             resolved_config = self._structured_payload_builder_config(context)
-            source_roots = self._structured_payload_builder_source_roots(context)
+            labeled_roots = self._structured_payload_builder_labeled_source_roots(context)
+            source_roots = tuple(value for _, value in labeled_roots)
+            source_root_kinds = tuple(kind for kind, _ in labeled_roots)
             preview: dict[str, Any] = {
                 "case_sensitive": resolved_config.case_sensitive,
                 "max_matches_per_field": resolved_config.max_matches_per_field,
+                "default_search_section": resolved_config.default_search_section,
             }
             try:
                 template = parse_structured_payload_template(resolved_config.template_json)
@@ -3626,11 +3890,24 @@ class DataNode(BaseNode):
                 source_roots,
                 case_sensitive=resolved_config.case_sensitive,
                 max_matches_per_field=resolved_config.max_matches_per_field,
+                field_aliases=dict(resolved_config.field_aliases) if resolved_config.field_aliases else None,
+                source_root_kinds=source_root_kinds,
+                field_search_scopes=dict(resolved_config.field_search_scopes) if resolved_config.field_search_scopes else None,
+                default_search_section=resolved_config.default_search_section,
             )
             preview["template"] = template
+            preview["source_roots"] = list(source_roots)
+            preview["source_root_kinds"] = list(source_root_kinds)
             preview["payload_preview"] = result.payload
             preview["filled_paths"] = list(result.filled_paths)
             preview["unresolved_paths"] = list(result.unresolved_paths)
+            preview["field_matches"] = list(result.field_matches)
+            if resolved_config.field_aliases:
+                preview["field_aliases"] = {
+                    field: list(aliases) for field, aliases in resolved_config.field_aliases
+                }
+            if resolved_config.field_search_scopes:
+                preview["field_search_scopes"] = dict(resolved_config.field_search_scopes)
             return preview
         if self.provider_id == APOLLO_EMAIL_LOOKUP_PROVIDER_ID or mode == APOLLO_EMAIL_LOOKUP_MODE:
             resolved_config = self._apollo_email_lookup_config(context)
@@ -3835,6 +4112,8 @@ class DataNode(BaseNode):
             return self._execute_structured_payload_builder(context)
         if self.provider_id == APOLLO_EMAIL_LOOKUP_PROVIDER_ID or mode == APOLLO_EMAIL_LOOKUP_MODE:
             return self._execute_apollo_email_lookup(context)
+        if self.provider_id == PYTHON_SCRIPT_RUNNER_PROVIDER_ID or mode == PYTHON_SCRIPT_RUNNER_MODE:
+            return self._execute_python_script_runner(context)
         if self.provider_id == LINKEDIN_PROFILE_FETCH_PROVIDER_ID or mode == LINKEDIN_PROFILE_FETCH_MODE:
             return self._execute_linkedin_profile_fetch(context)
         if self.provider_id == RUNTIME_NORMALIZER_PROVIDER_ID or mode == RUNTIME_NORMALIZER_MODE:
@@ -3949,12 +4228,13 @@ class ControlFlowNode(BaseNode):
             )
         sheet_name = str(resolved.get("sheet_name", "") or "").strip()
         empty_row_policy = str(resolved.get("empty_row_policy", "skip") or "skip").strip().lower() or "skip"
+        start_row_index = _coerce_start_row_index(resolved.get("start_row_index"))
         return {
             "file_format": file_format,
             "file_path": file_path,
             "sheet_name": sheet_name,
             "header_row_index": SPREADSHEET_HEADER_ROW_INDEX,
-            "start_row_index": SPREADSHEET_FIRST_DATA_ROW_INDEX,
+            "start_row_index": start_row_index,
             "empty_row_policy": empty_row_policy,
         }
 
@@ -4208,6 +4488,23 @@ class ControlFlowNode(BaseNode):
             )
 
         iterator_state = self._supabase_table_rows_iterator_state(result, watermark=watermark)
+        warnings: list[dict[str, Any]] = []
+        if result.truncated:
+            warnings.append(
+                {
+                    "type": "supabase_iterator_row_cap_reached",
+                    "message": (
+                        f"Supabase iterator stopped after {result.row_count} rows from table "
+                        f"'{result.table_name}' (cap: {result.max_rows}). Increase "
+                        "GRAPH_AGENT_SUPABASE_MAX_ITERATOR_ROWS or narrow filters/select."
+                    ),
+                    "table_name": result.table_name,
+                    "schema": result.schema,
+                    "row_count": result.row_count,
+                    "max_rows": result.max_rows,
+                    "include_previously_processed_rows": result.include_previously_processed_rows,
+                }
+            )
         summary_envelope = MessageEnvelope(
             schema_version="1.0",
             from_node_id=self.id,
@@ -4219,6 +4516,8 @@ class ControlFlowNode(BaseNode):
                 "cursor_column": result.cursor_column,
                 "row_id_column": result.row_id_column,
                 "include_previously_processed_rows": result.include_previously_processed_rows,
+                "truncated": result.truncated,
+                "max_rows": result.max_rows,
             },
             artifacts={
                 "supabase_request_urls": list(result.request_urls),
@@ -4235,6 +4534,9 @@ class ControlFlowNode(BaseNode):
                 "row_id_column": result.row_id_column,
                 "include_previously_processed_rows": result.include_previously_processed_rows,
                 "total_rows": result.row_count,
+                "truncated": result.truncated,
+                "max_rows": result.max_rows,
+                "warnings": warnings,
             },
         )
 
@@ -4246,13 +4548,18 @@ class ControlFlowNode(BaseNode):
                 run_id=context.state.run_id,
             )
 
+        summary_text = (
+            f"Prepared {result.row_count} Supabase row(s) from table '{result.table_name}'"
+            + (f" (capped at {result.max_rows})." if result.truncated else ".")
+        )
         return NodeExecutionResult(
             status="success",
             output=summary_envelope.to_dict(),
-            summary=f"Prepared {result.row_count} Supabase row(s) from table '{result.table_name}'.",
+            summary=summary_text,
             metadata={
                 "iterator_state": iterator_state,
                 "control_flow_handle_id": CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
+                "warnings": warnings,
                 "_internal": {
                     "iterator_envelopes": self._supabase_table_row_envelopes(result),
                     "iterator_type": "supabase_table_rows",
@@ -6783,6 +7090,11 @@ def _outlook_template_variables(payload: Any) -> dict[str, Any]:
 
 def _extract_outlook_recipient_value(payload: Any) -> Any | None:
     if isinstance(payload, Mapping):
+        metadata = payload.get("metadata")
+        if isinstance(metadata, Mapping):
+            metadata_email = metadata.get("resolved_email")
+            if metadata_email:
+                return metadata_email
         nested_payload = payload.get("payload")
         nested_candidate = _extract_outlook_recipient_value(nested_payload)
         if nested_candidate is not None:
@@ -6791,7 +7103,7 @@ def _extract_outlook_recipient_value(payload: Any) -> Any | None:
             candidate = payload.get(key)
             if candidate is not None:
                 return candidate
-        for key in ("recipient", "contact"):
+        for key in ("recipient", "contact", "person"):
             nested_candidate = _extract_outlook_recipient_value(payload.get(key))
             if nested_candidate is not None:
                 return nested_candidate
@@ -7204,13 +7516,14 @@ class OutlookDraftOutputNode(OutputNode):
         provider_message_id = str(raw_provider_payload.get("id", draft.draft_id) or draft.draft_id or "").strip()
         internet_message_id = str(raw_provider_payload.get("internetMessageId", "") or "").strip()
         conversation_id = str(raw_provider_payload.get("conversationId", "") or "").strip()
-        primary_recipient = str(draft.to_recipients[0] if draft.to_recipients else "").strip()
-        if not primary_recipient:
-            raise SupabaseDataError(
-                "Outbound email logger requires at least one draft recipient email address.",
-                error_type="missing_outbound_email_log_recipient",
-                details={"node_id": binding.node_id},
-            )
+        original_to_recipients = list(draft.to_recipients) if draft.to_recipients else []
+        primary_recipient = str(draft.to_recipients[0] if draft.to_recipients else "").strip().lower()
+        recipient_missing = not primary_recipient
+        if recipient_missing:
+            # Track the draft anyway with a non-deliverable sentinel so the outbound log
+            # has a record of every draft attempt. `.invalid` is RFC 6761 reserved and is
+            # guaranteed not to resolve, so this can never accidentally route real mail.
+            primary_recipient = MISSING_RECIPIENT_SENTINEL_EMAIL
 
         generation_prompt = _generation_prompt_capture_from_value(source_value)
         metadata_extra = {
@@ -7221,11 +7534,12 @@ class OutlookDraftOutputNode(OutputNode):
             "internet_message_id": internet_message_id,
             "conversation_id": conversation_id,
             "recipient_email": primary_recipient,
-            "to_recipients": draft.to_recipients,
+            "to_recipients": original_to_recipients,
             "mailbox_account": auth_status.account_username,
             "draft_created_at": draft.created_at or utc_now_iso(),
             "run_id": context.state.run_id,
             "graph_id": context.state.graph_id,
+            "recipient_missing": recipient_missing,
         }
         if generation_prompt is not None:
             metadata_extra["generation_prompt"] = generation_prompt
@@ -7259,11 +7573,14 @@ class OutlookDraftOutputNode(OutputNode):
             "run_id": context.state.run_id,
             "graph_id": context.state.graph_id,
             "logger_node_id": binding.node_id,
-            "to_recipients": list(draft.to_recipients),
+            "to_recipients": original_to_recipients,
             "web_link": draft.web_link,
             "last_modified_at": draft.last_modified_at,
             "source_payload": payload,
         }
+        if recipient_missing:
+            metadata["recipient_missing"] = True
+            metadata["recipient_substitution"] = primary_recipient
         metadata.update(self._render_outbound_email_logger_metadata(context, binding, metadata_extra))
         if generation_prompt is not None:
             metadata["generation_prompt"] = generation_prompt
@@ -7315,6 +7632,7 @@ class OutlookDraftOutputNode(OutputNode):
             "row_count": result.row_count,
             "inserted_row": result.inserted_row,
             "written_columns": sorted(result.inserted_row.keys()),
+            "recipient_missing": recipient_missing,
         }
 
     def _write_outbound_email_log_row(
@@ -7367,11 +7685,82 @@ class OutlookDraftOutputNode(OutputNode):
             and "source_run_id" in message
         )
 
+    def _build_skipped_draft_relative_path(self, context: NodeContext) -> str:
+        iteration_context = context.current_iteration_context()
+        iteration_id = str(iteration_context.get("iteration_id", "") or "").strip()
+        if iteration_id:
+            suffix = _sanitize_workspace_path_suffix(iteration_id)
+        else:
+            row_index = iteration_context.get("iterator_row_index")
+            if isinstance(row_index, int) and row_index > 0:
+                suffix = f"row-{row_index}"
+            else:
+                suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        node_suffix = _sanitize_workspace_path_suffix(self.id, fallback="outlook-draft")
+        return f"outputs/skipped-drafts/{node_suffix}-{suffix}.json"
+
+    def _record_skipped_invalid_recipient(
+        self,
+        context: NodeContext,
+        payload: Any,
+        exc: ValueError,
+    ) -> NodeExecutionResult:
+        reason = str(exc)
+        skipped_record: dict[str, Any] = {
+            "delivery_status": "draft_skipped_invalid_recipient",
+            "reason": reason,
+            "node_id": self.id,
+            "graph_id": context.state.graph_id,
+            "run_id": context.state.run_id,
+            "agent_id": context.state.agent_id,
+            "skipped_at": datetime.now(timezone.utc).isoformat(),
+            "source_payload": payload,
+        }
+        relative_path = self._build_skipped_draft_relative_path(context)
+        try:
+            content = json.dumps(skipped_record, indent=2, default=str, sort_keys=True)
+        except TypeError:
+            content = json.dumps({**skipped_record, "source_payload": str(payload)}, indent=2, default=str, sort_keys=True)
+        skipped_file_record: dict[str, Any] | None = None
+        try:
+            skipped_file_record = write_agent_workspace_text_file(
+                context.state.run_id,
+                context.state.agent_id,
+                relative_path,
+                content,
+            )
+        except Exception:  # noqa: BLE001
+            skipped_file_record = None
+        output_payload: dict[str, Any] = {
+            "delivery_status": "draft_skipped_invalid_recipient",
+            "reason": reason,
+            "to_recipients": [],
+            "subject": "",
+            "body": "",
+            "source_payload": payload,
+            "skipped_draft_file": skipped_file_record,
+        }
+        return NodeExecutionResult(
+            status="success",
+            output=output_payload,
+            summary=f"Skipped Outlook draft (invalid recipient): {reason}",
+            metadata={
+                "outlook_draft_saved": False,
+                "outlook_draft_skipped": True,
+                "outlook_draft_skipped_reason": "invalid_recipient",
+                "outbound_email_logged": False,
+                "outbound_email_log_skipped": False,
+            },
+        )
+
     def execute(self, context: NodeContext) -> NodeExecutionResult:
         source_binding = self.config.get("source_binding")
         source_value = _output_source_value_for_prompt_capture(context, source_binding)
         payload = _payload_from_bound_value(source_value)
-        recipients = self._resolved_to_recipients(context, payload)
+        try:
+            recipients = self._resolved_to_recipients(context, payload)
+        except ValueError as exc:
+            return self._record_skipped_invalid_recipient(context, payload, exc)
         subject = self._render_subject(context, payload)
         body = self._render_body(payload)
         logger_binding = self._outbound_email_logger_binding(context)
@@ -7448,12 +7837,14 @@ class OutlookDraftOutputNode(OutputNode):
                 )
         access_token = auth_service.acquire_access_token()
         draft_client = context.services.outlook_draft_client or OutlookDraftClient()
+        signature = str(self.config.get("signature", "") or "")
         try:
             draft = draft_client.create_draft(
                 access_token=access_token,
                 to_recipients=recipients,
                 subject=subject,
                 body=body,
+                signature=signature,
             )
         except Exception as exc:  # noqa: BLE001
             if dedupe_store is not None and dedupe_scope is not None:
@@ -7530,7 +7921,13 @@ class OutlookDraftOutputNode(OutputNode):
                 scope=dedupe_scope,
                 output_payload=output_payload,
             )
-        summary = f"Saved Outlook draft for {', '.join(draft.to_recipients)}." if draft.to_recipients else "Saved Outlook draft."
+        recipient_missing_logged = bool(logged_outbound_email and logged_outbound_email.get("recipient_missing"))
+        if draft.to_recipients:
+            summary = f"Saved Outlook draft for {', '.join(draft.to_recipients)}."
+        elif recipient_missing_logged:
+            summary = "Saved Outlook draft (no recipient attached; logged with sentinel address)."
+        else:
+            summary = "Saved Outlook draft."
         return NodeExecutionResult(
             status="success",
             output=output_payload,
@@ -7540,6 +7937,7 @@ class OutlookDraftOutputNode(OutputNode):
                 "outlook_draft_deduped": False,
                 "outbound_email_logged": bool(logged_outbound_email and not logged_outbound_email.get("skipped")),
                 "outbound_email_log_skipped": bool(logged_outbound_email and logged_outbound_email.get("skipped")),
+                "outbound_email_recipient_missing": recipient_missing_logged,
             },
         )
 
@@ -7768,6 +8166,23 @@ class GraphDefinition:
             if connection_id and self.get_supabase_connection(connection_id) is None:
                 raise GraphValidationError(
                     f"Node '{node.id}' references unknown Supabase connection '{connection_id}'."
+                )
+
+        for node in self.nodes.values():
+            if node.provider_id != PYTHON_SCRIPT_RUNNER_PROVIDER_ID:
+                continue
+            script_file_id = str(node.config.get("script_file_id", "") or "").strip()
+            if not script_file_id:
+                raise GraphValidationError(
+                    f"Python script runner '{node.id}' requires a script_file_id."
+                )
+            try:
+                timeout_value = float(node.config.get("timeout_seconds") or DEFAULT_SCRIPT_TIMEOUT_SECONDS)
+            except (TypeError, ValueError):
+                timeout_value = 0.0
+            if timeout_value <= 0:
+                raise GraphValidationError(
+                    f"Python script runner '{node.id}' requires timeout_seconds > 0."
                 )
 
         standard_edge_counts: dict[str, int] = {}

@@ -147,14 +147,145 @@ function formatResolvedPromptMessages(messages: ResolvedPromptMessage[]): string
     .join("\n\n");
 }
 
+type CapturedResolvedPromptEntry = {
+  input: unknown;
+  runId: string | null;
+  responseMode: string;
+};
+
+const capturedResolvedPrompts = new Map<string, CapturedResolvedPromptEntry>();
+
+function capturedResolvedPromptKey(graphId: string, nodeId: string): string {
+  return `${graphId}:${nodeId}`;
+}
+
+type StructuredPayloadSearchSection = "payload" | "metadata" | "artifacts";
+
+const STRUCTURED_PAYLOAD_SEARCH_SECTIONS: StructuredPayloadSearchSection[] = [
+  "payload",
+  "metadata",
+  "artifacts",
+];
+
+function normalizeStructuredPayloadSearchSection(
+  value: unknown,
+  fallback: StructuredPayloadSearchSection = "payload",
+): StructuredPayloadSearchSection {
+  const text = String(value ?? "").trim().toLowerCase();
+  if ((STRUCTURED_PAYLOAD_SEARCH_SECTIONS as string[]).includes(text)) {
+    return text as StructuredPayloadSearchSection;
+  }
+  return fallback;
+}
+
 type StructuredPayloadTemplateEntry = {
   id: string;
   key: string;
   value: string;
+  searchKeys: string[];
+  searchSection: StructuredPayloadSearchSection;
 };
 
-function parseStructuredPayloadTemplateEntries(value: unknown): StructuredPayloadTemplateEntry[] {
+function parseStructuredPayloadFieldAliases(value: unknown): Record<string, string[]> {
+  if (!value) return {};
+  let raw: unknown = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return {};
+    try {
+      raw = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, string[]> = {};
+  for (const [key, entry] of Object.entries(raw as Record<string, unknown>)) {
+    if (!key) continue;
+    if (Array.isArray(entry)) {
+      out[key] = entry.map((item) => String(item ?? "").trim()).filter((item) => item.length > 0);
+    } else if (typeof entry === "string") {
+      const text = entry.trim();
+      out[key] = text ? [text] : [];
+    }
+  }
+  return out;
+}
+
+function parseStructuredPayloadFieldSearchScopes(
+  value: unknown,
+): Record<string, StructuredPayloadSearchSection> {
+  if (!value) return {};
+  let raw: unknown = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return {};
+    try {
+      raw = JSON.parse(trimmed);
+    } catch {
+      return {};
+    }
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, StructuredPayloadSearchSection> = {};
+  for (const [key, entry] of Object.entries(raw as Record<string, unknown>)) {
+    if (!key) continue;
+    if (typeof entry === "string") {
+      out[key] = normalizeStructuredPayloadSearchSection(entry);
+      continue;
+    }
+    // Tolerate the legacy {metadata:bool, artifacts:bool} shape.
+    if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+      const obj = entry as Record<string, unknown>;
+      const sm = obj.metadata !== false;
+      const sa = obj.artifacts !== false;
+      if (sm && !sa) out[key] = "metadata";
+      else if (sa && !sm) out[key] = "artifacts";
+      else out[key] = "payload";
+    }
+  }
+  return out;
+}
+
+function serializeStructuredPayloadFieldAliases(entries: StructuredPayloadTemplateEntry[]): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const entry of entries) {
+    const key = entry.key.trim();
+    if (!key) continue;
+    const cleaned = entry.searchKeys.map((value) => value.trim()).filter((value) => value.length > 0);
+    if (cleaned.length > 0) {
+      out[key] = Array.from(new Set(cleaned));
+    }
+  }
+  return out;
+}
+
+function serializeStructuredPayloadFieldSearchScopes(
+  entries: StructuredPayloadTemplateEntry[],
+  defaultSection: StructuredPayloadSearchSection,
+): Record<string, StructuredPayloadSearchSection> {
+  const out: Record<string, StructuredPayloadSearchSection> = {};
+  for (const entry of entries) {
+    const key = entry.key.trim();
+    if (!key) continue;
+    // Only persist explicit deviations from the global default to keep the
+    // graph document minimal.
+    if (entry.searchSection !== defaultSection) {
+      out[key] = entry.searchSection;
+    }
+  }
+  return out;
+}
+
+function parseStructuredPayloadTemplateEntries(
+  value: unknown,
+  fieldAliases: unknown,
+  fieldSearchScopes: unknown,
+  defaultSection: StructuredPayloadSearchSection,
+): StructuredPayloadTemplateEntry[] {
   const raw = String(value ?? "").trim();
+  const aliases = parseStructuredPayloadFieldAliases(fieldAliases);
+  const scopes = parseStructuredPayloadFieldSearchScopes(fieldSearchScopes);
   if (!raw) {
     return [];
   }
@@ -172,6 +303,8 @@ function parseStructuredPayloadTemplateEntries(value: unknown): StructuredPayloa
           : entryValue == null
             ? ""
             : JSON.stringify(entryValue),
+      searchKeys: aliases[key] ?? [],
+      searchSection: scopes[key] ?? defaultSection,
     }));
   } catch {
     return [];
@@ -779,13 +912,35 @@ export function ProviderDetailsModal({
     }),
     [callableMcpToolNames, contextBuilderPromptVariables, graph.graph_id, mcpToolContextBlock, mcpToolContextPrompt, mcpToolGuidance, mcpToolGuidanceBlock, node.id, promptContextToolSummaries],
   );
-  const lastRuntimeInput = isModelNode ? runState?.node_inputs?.[node.id] : null;
+  const currentRuntimeInput = isModelNode ? runState?.node_inputs?.[node.id] : null;
+  const currentRuntimeResponseMode =
+    isRecord(currentRuntimeInput) && typeof currentRuntimeInput.response_mode === "string"
+      ? currentRuntimeInput.response_mode
+      : "";
+  const resolvedPromptCacheKey = capturedResolvedPromptKey(graph.graph_id, node.id);
+  useEffect(() => {
+    if (!isModelNode || currentRuntimeInput == null) {
+      return;
+    }
+    capturedResolvedPrompts.set(resolvedPromptCacheKey, {
+      input: currentRuntimeInput,
+      runId: runState?.run_id ?? null,
+      responseMode: currentRuntimeResponseMode,
+    });
+  }, [isModelNode, resolvedPromptCacheKey, currentRuntimeInput, currentRuntimeResponseMode, runState?.run_id]);
+  const cachedResolvedPrompt = isModelNode
+    ? capturedResolvedPrompts.get(resolvedPromptCacheKey) ?? null
+    : null;
+  const isShowingCachedPrompt = currentRuntimeInput == null && cachedResolvedPrompt != null;
+  const lastRuntimeInput = currentRuntimeInput ?? cachedResolvedPrompt?.input ?? null;
   const lastResolvedPromptMessages = resolvedPromptMessagesFromRuntimeInput(lastRuntimeInput);
   const lastResolvedPromptText = formatResolvedPromptMessages(lastResolvedPromptMessages);
-  const lastResolvedPromptResponseMode =
-    isRecord(lastRuntimeInput) && typeof lastRuntimeInput.response_mode === "string"
-      ? lastRuntimeInput.response_mode
-      : "";
+  const lastResolvedPromptResponseMode = isShowingCachedPrompt
+    ? cachedResolvedPrompt?.responseMode ?? ""
+    : currentRuntimeResponseMode;
+  const lastResolvedPromptRunId = isShowingCachedPrompt
+    ? cachedResolvedPrompt?.runId ?? null
+    : runState?.run_id ?? null;
   const lastResolvedPromptEmptyText = runState
     ? "This API node has not started in the latest run yet."
     : "Run the graph to see the fully populated prompt from this API node.";
@@ -957,13 +1112,32 @@ export function ProviderDetailsModal({
       return;
     }
     const incomingTemplateJson = String(node.config.template_json ?? "");
-    const incomingMarker = `${node.id}::${incomingTemplateJson}`;
+    const incomingAliasesJson = JSON.stringify(node.config.field_aliases ?? null);
+    const incomingScopesJson = JSON.stringify(node.config.field_search_scopes ?? null);
+    const incomingDefaultSection = normalizeStructuredPayloadSearchSection(
+      node.config.default_search_section,
+    );
+    const incomingMarker = `${node.id}::${incomingTemplateJson}::${incomingAliasesJson}::${incomingScopesJson}::${incomingDefaultSection}`;
     if (lastWrittenStructuredPayloadTemplateJsonRef.current === incomingMarker) {
       return;
     }
     lastWrittenStructuredPayloadTemplateJsonRef.current = incomingMarker;
-    setStructuredPayloadTemplateDraftEntries(parseStructuredPayloadTemplateEntries(incomingTemplateJson));
-  }, [isStructuredPayloadBuilderNode, node.config.template_json, node.id]);
+    setStructuredPayloadTemplateDraftEntries(
+      parseStructuredPayloadTemplateEntries(
+        incomingTemplateJson,
+        node.config.field_aliases,
+        node.config.field_search_scopes,
+        incomingDefaultSection,
+      ),
+    );
+  }, [
+    isStructuredPayloadBuilderNode,
+    node.config.template_json,
+    node.config.field_aliases,
+    node.config.field_search_scopes,
+    node.config.default_search_section,
+    node.id,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1058,8 +1232,18 @@ export function ProviderDetailsModal({
   function updateStructuredPayloadTemplateEntries(entries: StructuredPayloadTemplateEntry[]) {
     setStructuredPayloadTemplateDraftEntries(entries);
     const serialized = serializeStructuredPayloadTemplateEntries(entries);
-    lastWrittenStructuredPayloadTemplateJsonRef.current = `${node.id}::${serialized}`;
-    updateProviderConfig("template_json", serialized);
+    const aliases = serializeStructuredPayloadFieldAliases(entries);
+    const defaultSection = normalizeStructuredPayloadSearchSection(
+      node.config.default_search_section,
+    );
+    const scopes = serializeStructuredPayloadFieldSearchScopes(entries, defaultSection);
+    lastWrittenStructuredPayloadTemplateJsonRef.current = `${node.id}::${serialized}::${JSON.stringify(aliases)}::${JSON.stringify(scopes)}::${defaultSection}`;
+    updateNodeConfig((currentConfig) => ({
+      ...currentConfig,
+      template_json: serialized,
+      field_aliases: aliases,
+      field_search_scopes: scopes,
+    }));
   }
 
   function updateResponseSchemaText(nextText: string) {
@@ -2626,6 +2810,10 @@ export function ProviderDetailsModal({
                                 id: `template-entry-new-${structuredPayloadTemplateEntries.length + 1}`,
                                 key: "",
                                 value: "",
+                                searchKeys: [],
+                                searchSection: normalizeStructuredPayloadSearchSection(
+                                  node.config.default_search_section,
+                                ),
                               },
                             ])
                           }
@@ -2657,7 +2845,7 @@ export function ProviderDetailsModal({
                                 </div>
                               </div>
                               <label>
-                                Key
+                                Output Key
                                 <input
                                   value={entry.key}
                                   placeholder="email"
@@ -2671,6 +2859,7 @@ export function ProviderDetailsModal({
                                     )
                                   }
                                 />
+                                <small>Name used in the output payload.</small>
                               </label>
                               <label>
                                 Value
@@ -2687,6 +2876,69 @@ export function ProviderDetailsModal({
                                     )
                                   }
                                 />
+                              </label>
+                              <label>
+                                Search Keys
+                                <textarea
+                                  rows={Math.max(2, entry.searchKeys.length + 1)}
+                                  value={entry.searchKeys.join("\n")}
+                                  placeholder={"resolved_email\nwork_email"}
+                                  onChange={(event) =>
+                                    updateStructuredPayloadTemplateEntries(
+                                      structuredPayloadTemplateEntries.map((candidate) =>
+                                        candidate.id === entry.id
+                                          ? { ...candidate, searchKeys: event.target.value.split(/\r?\n/) }
+                                          : candidate,
+                                      ),
+                                    )
+                                  }
+                                  onBlur={(event) =>
+                                    updateStructuredPayloadTemplateEntries(
+                                      structuredPayloadTemplateEntries.map((candidate) =>
+                                        candidate.id === entry.id
+                                          ? {
+                                              ...candidate,
+                                              searchKeys: event.target.value
+                                                .split(/\r?\n/)
+                                                .map((value) => value.trim())
+                                                .filter((value) => value.length > 0),
+                                            }
+                                          : candidate,
+                                      ),
+                                    )
+                                  }
+                                />
+                                <small>
+                                  Optional. One key per line — matcher tries each in addition to the Output Key.
+                                  Use this when the source payload uses a different name (e.g. <code>resolved_email</code>).
+                                </small>
+                              </label>
+                              <label>
+                                Search Section
+                                <select
+                                  value={entry.searchSection}
+                                  onChange={(event) =>
+                                    updateStructuredPayloadTemplateEntries(
+                                      structuredPayloadTemplateEntries.map((candidate) =>
+                                        candidate.id === entry.id
+                                          ? {
+                                              ...candidate,
+                                              searchSection: normalizeStructuredPayloadSearchSection(
+                                                event.target.value,
+                                              ),
+                                            }
+                                          : candidate,
+                                      ),
+                                    )
+                                  }
+                                >
+                                  <option value="payload">Payload</option>
+                                  <option value="metadata">Metadata</option>
+                                  <option value="artifacts">Artifacts</option>
+                                </select>
+                                <small>
+                                  Which section of the upstream MessageEnvelope this entry searches.
+                                </small>
                               </label>
                             </div>
                           ))}
@@ -3088,8 +3340,8 @@ export function ProviderDetailsModal({
                     <div className="tool-details-modal-preview-header">
                       <strong>Last Run Resolved Prompt</strong>
                       <span>
-                        {lastResolvedPromptResponseMode
-                          ? `From run ${runState?.run_id ?? "unknown"} with response mode ${lastResolvedPromptResponseMode}.`
+                        {lastResolvedPromptText
+                          ? `From run ${lastResolvedPromptRunId ?? "unknown"}${lastResolvedPromptResponseMode ? ` with response mode ${lastResolvedPromptResponseMode}` : ""}${isShowingCachedPrompt ? " (last captured; persists across runs until this node starts again)" : ""}.`
                           : "Shows the populated prompt captured the last time this API node started."}
                       </span>
                     </div>

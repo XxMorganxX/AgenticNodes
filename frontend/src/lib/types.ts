@@ -396,6 +396,8 @@ export type RunDocument = {
   error?: string | null;
 };
 
+export type ProjectFileSource = "upload" | "scripts";
+
 export type ProjectFile = {
   file_id: string;
   graph_id: string;
@@ -405,6 +407,18 @@ export type ProjectFile = {
   storage_path: string;
   status: string;
   created_at: string;
+  error?: string | null;
+  source?: ProjectFileSource;
+};
+
+export type ProjectFileContent = {
+  file_id: string;
+  graph_id: string;
+  name: string;
+  mime_type: string;
+  size_bytes: number;
+  content: string;
+  truncated: boolean;
   error?: string | null;
 };
 

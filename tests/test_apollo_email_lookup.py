@@ -383,7 +383,12 @@ class ApolloEmailLookupTests(unittest.TestCase):
         self.assertEqual(fetch_mock.call_count, 1)
         self.assertEqual(first_state.status, "completed")
         self.assertEqual(second_state.status, "completed")
-        self.assertEqual(first_state.final_output["person"]["email"], "taylor@example.com")
+        # Envelope payload is now a flat summary, not the raw Apollo response.
+        self.assertEqual(first_state.final_output["email"], "taylor@example.com")
+        self.assertEqual(first_state.final_output["lookup_status"], "matched")
+        self.assertEqual(first_state.final_output["name"], "Taylor Doe")
+        self.assertEqual(first_state.final_output["organization"]["name"], "Example Co")
+        self.assertNotIn("person", first_state.final_output)
         self.assertEqual(first_state.node_outputs["apollo"]["metadata"]["cache_status"], "miss")
         self.assertEqual(second_state.node_outputs["apollo"]["metadata"]["cache_status"], "hit")
         self.assertEqual(second_state.node_outputs["apollo"]["metadata"]["lookup_status"], "matched")
@@ -546,6 +551,94 @@ class ApolloEmailLookupTests(unittest.TestCase):
         self.assertEqual(state.terminal_error["type"], "apollo_http_error")
         shared_cache_path = workspace_root.parent / "cache" / "apollo-email" / f"{cache_info.cache_key}.json"
         self.assertFalse(shared_cache_path.exists())
+
+    def test_envelope_payload_is_simplified_career_and_contact_summary(self) -> None:
+        graph = GraphDefinition.from_dict(apollo_graph_payload("apollo-summary-shape"))
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+        workspace_root = Path(tempfile.mkdtemp()) / ".graph-agent" / "runs"
+        rich_response = {
+            "person": {
+                "id": "person-xyz",
+                "name": "Taylor Doe",
+                "first_name": "Taylor",
+                "last_name": "Doe",
+                "email": "taylor@example.com",
+                "title": "Senior Software Engineer",
+                "headline": "Senior Software Engineer at OpenAI",
+                "seniority": "senior",
+                "departments": ["engineering"],
+                "linkedin_url": "https://www.linkedin.com/in/taylor-doe/",
+                "twitter_url": "https://twitter.com/taylor",
+                "city": "San Francisco",
+                "state": "California",
+                "country": "United States",
+                "photo_url": "https://example.com/photo.png",  # should be dropped
+                "intent_strength": 0.42,  # should be dropped
+                "organization": {
+                    "id": "org-1",
+                    "name": "OpenAI",
+                    "primary_domain": "openai.com",
+                    "website_url": "https://openai.com",
+                    "industry": "Software",
+                    "estimated_num_employees": 500,  # should be dropped
+                },
+                "contact": {
+                    "email": "taylor@example.com",
+                    "phone_numbers": [{"sanitized_number": "+15551234567"}],
+                },
+            },
+            "organization": {"name": "OpenAI"},
+            "breadcrumbs": [{"label": "noisy"}],
+        }
+
+        with patch.dict(
+            "os.environ",
+            {"GRAPH_AGENT_WORKSPACE_DIR": str(workspace_root), "APOLLO_API_KEY": "live-key"},
+            clear=False,
+        ):
+            with patch(
+                "graph_agent.runtime.core.fetch_apollo_person_match_live",
+                return_value=rich_response,
+            ):
+                state = runtime.run(
+                    graph,
+                    {"name": "Taylor Doe", "domain": "openai.com"},
+                    run_id="run-apollo-summary",
+                    agent_id="agent-alpha",
+                )
+
+        self.assertEqual(state.status, "completed")
+        payload = state.final_output
+        self.assertEqual(payload["email"], "taylor@example.com")
+        self.assertEqual(payload["name"], "Taylor Doe")
+        self.assertEqual(payload["first_name"], "Taylor")
+        self.assertEqual(payload["last_name"], "Doe")
+        self.assertEqual(payload["title"], "Senior Software Engineer")
+        self.assertEqual(payload["headline"], "Senior Software Engineer at OpenAI")
+        self.assertEqual(payload["seniority"], "senior")
+        self.assertEqual(payload["departments"], ["engineering"])
+        self.assertEqual(payload["linkedin_url"], "https://www.linkedin.com/in/taylor-doe/")
+        self.assertEqual(payload["twitter_url"], "https://twitter.com/taylor")
+        self.assertEqual(payload["city"], "San Francisco")
+        self.assertEqual(payload["country"], "United States")
+        self.assertEqual(payload["phone_numbers"], ["+15551234567"])
+        self.assertEqual(payload["lookup_status"], "matched")
+        self.assertEqual(
+            payload["organization"],
+            {
+                "name": "OpenAI",
+                "domain": "openai.com",
+                "website_url": "https://openai.com",
+                "industry": "Software",
+            },
+        )
+        # Noisy fields are stripped from the envelope payload.
+        self.assertNotIn("person", payload)
+        self.assertNotIn("breadcrumbs", payload)
+        self.assertNotIn("photo_url", payload)
+        self.assertNotIn("intent_strength", payload)
+        self.assertNotIn("estimated_num_employees", payload["organization"])
 
     def test_missing_apollo_api_key_error_includes_attempted_key_and_env_var(self) -> None:
         graph = GraphDefinition.from_dict(

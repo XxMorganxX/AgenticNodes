@@ -12,7 +12,7 @@ from uuid import uuid4
 
 DEFAULT_RUN_DOCUMENT_UPLOAD_DIR = Path(__file__).resolve().parents[3] / ".graph-agent" / "uploads"
 DOCUMENT_EXCERPT_LIMIT = 1200
-SUPPORTED_DOCUMENT_EXTENSIONS = {".csv", ".json", ".md", ".markdown", ".pdf", ".txt", ".xlsx"}
+SUPPORTED_DOCUMENT_EXTENSIONS = {".csv", ".json", ".md", ".markdown", ".pdf", ".py", ".txt", ".xlsx"}
 SAFE_FILENAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -140,7 +140,7 @@ def _ingest_single_document(document: Mapping[str, Any], storage_root: Path) -> 
     storage_path = storage_root / f"{document_id}-{safe_name}"
     storage_path.write_bytes(raw_bytes)
     try:
-        text_content = _extract_document_text(name, raw_bytes)
+        text_content = extract_document_text(name, raw_bytes)
         status = "ready"
         error = None
     except RunDocumentIngestionError as exc:
@@ -161,13 +161,13 @@ def _ingest_single_document(document: Mapping[str, Any], storage_root: Path) -> 
     )
 
 
-def _extract_document_text(name: str, raw_bytes: bytes) -> str:
+def extract_document_text(name: str, raw_bytes: bytes) -> str:
     extension = Path(name).suffix.strip().lower()
     if extension not in SUPPORTED_DOCUMENT_EXTENSIONS:
         raise RunDocumentIngestionError(
             "Unsupported document type. Upload .txt, .md, .markdown, .json, .csv, .xlsx, or .pdf files."
         )
-    if extension in {".txt", ".md", ".markdown"}:
+    if extension in {".txt", ".md", ".markdown", ".py"}:
         return raw_bytes.decode("utf-8-sig", errors="replace").strip()
     if extension == ".json":
         return _normalize_json_text(raw_bytes)

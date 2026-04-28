@@ -19,9 +19,35 @@ if str(SRC) not in sys.path:
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.providers.base import ModelProvider, ModelRequest, ModelResponse, ProviderPreflightResult
 from graph_agent.providers.outlook import OutlookDraftClient, OutlookDraftResult
-from graph_agent.runtime.core import GraphDefinition
+from graph_agent.runtime.core import GraphDefinition, _extract_outlook_recipient_value
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.microsoft_auth import MicrosoftAuthStatus
+
+
+class OutlookRecipientExtractionTests(unittest.TestCase):
+    def test_extracts_email_from_apollo_payload_shape(self) -> None:
+        apollo_payload = {
+            "person": {
+                "id": "person-123",
+                "name": "Peter Mocarski",
+                "email": "peterm@anthropic.com",
+                "email_status": "verified",
+                "contact": {},
+                "personal_emails": [],
+            },
+            "organization": {"name": "Anthropic"},
+        }
+        self.assertEqual(_extract_outlook_recipient_value(apollo_payload), "peterm@anthropic.com")
+
+    def test_prefers_envelope_metadata_resolved_email(self) -> None:
+        envelope = {
+            "payload": {"person": {"email": "stale@example.com"}},
+            "metadata": {"resolved_email": "fresh@example.com"},
+        }
+        self.assertEqual(_extract_outlook_recipient_value(envelope), "fresh@example.com")
+
+    def test_returns_none_when_no_recipient_anywhere(self) -> None:
+        self.assertIsNone(_extract_outlook_recipient_value({"person": {}, "organization": {}}))
 
 
 class FakeOutlookDraftClient:
@@ -35,6 +61,7 @@ class FakeOutlookDraftClient:
         to_recipients: list[str],
         subject: str,
         body: str,
+        signature: str = "",
     ) -> OutlookDraftResult:
         self.calls.append(
             {
@@ -42,12 +69,13 @@ class FakeOutlookDraftClient:
                 "to_recipients": list(to_recipients),
                 "subject": subject,
                 "body": body,
+                "signature": signature,
             }
         )
         return OutlookDraftResult(
             draft_id="draft-123",
             subject=subject,
-            body=body,
+            body=f"{body}\n\n{signature}".strip() if signature else body,
             to_recipients=list(to_recipients),
             web_link="https://outlook.office.com/mail/draft-123",
             created_at="2026-04-10T12:00:00Z",
@@ -811,11 +839,40 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertEqual(fake_client.calls[0]["to_recipients"], ["alex@example.com", "taylor@example.com"])
         self.assertEqual(fake_client.calls[0]["subject"], "Follow-up for outlook-draft-agent")
         self.assertEqual(fake_client.calls[0]["body"], "Draft this exact email body.")
+        self.assertEqual(fake_client.calls[0]["signature"], "")
         self.assertEqual(state.node_outputs["draft"]["delivery_status"], "draft_saved")
         self.assertEqual(state.node_outputs["draft"]["draft_id"], "draft-123")
         self.assertEqual(state.node_outputs["draft"]["account_username"], "morgan@example.com")
         self.assertEqual(state.final_output["subject"], "Follow-up for outlook-draft-agent")
         self.assertEqual(state.final_output["body"], "Draft this exact email body.")
+
+    def test_outlook_draft_node_appends_signature_from_config(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph_payload = build_outlook_draft_graph_payload()
+        draft_node = graph_payload["nodes"][1]
+        assert isinstance(draft_node, dict)
+        draft_node["config"] = {
+            **draft_node["config"],
+            "signature": "Best,\nMorgan",
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        state = runtime.run(graph, "Draft this exact email body.")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(fake_client.calls[0]["signature"], "Best,\nMorgan")
+        self.assertEqual(state.node_outputs["draft"]["body"], "Draft this exact email body.\n\nBest,\nMorgan")
+        self.assertEqual(state.final_output["body"], "Draft this exact email body.\n\nBest,\nMorgan")
 
     def test_outlook_draft_node_allows_optional_fields_when_toggles_are_disabled(self) -> None:
         fake_client = FakeOutlookDraftClient()
@@ -982,6 +1039,66 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertEqual(fake_client.calls[0]["to_recipients"], ["sam@example.com"])
         self.assertEqual(state.final_output["to_recipients"], ["sam@example.com"])
 
+    def test_outlook_draft_node_skips_invalid_recipient_and_writes_payload_file(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph_payload = build_outlook_draft_graph_payload()
+        draft_node = graph_payload["nodes"][1]
+        assert isinstance(draft_node, dict)
+        draft_node["config"] = {
+            "to": "{email}",
+            "subject": "Hello",
+            "require_to": True,
+            "require_subject": True,
+            "require_body": True,
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        row_payload = {
+            "email": "no_email",
+            "name": "Skipped Sam",
+            "body": "Body text that will not be drafted.",
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            with patch.dict(
+                os.environ,
+                {"GRAPH_AGENT_WORKSPACE_DIR": temp_dir},
+                clear=False,
+            ):
+                state = runtime.run(graph, row_payload, run_id="run-outlook-skip-invalid")
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(len(fake_client.calls), 0)
+            self.assertEqual(fake_auth.acquire_calls, 0)
+            self.assertEqual(
+                state.final_output["delivery_status"],
+                "draft_skipped_invalid_recipient",
+            )
+            self.assertEqual(state.final_output["to_recipients"], [])
+            self.assertIn("no_email", state.final_output["reason"])
+            self.assertEqual(state.final_output["source_payload"], row_payload)
+            file_record = state.final_output["skipped_draft_file"]
+            self.assertIsInstance(file_record, dict)
+            self.assertTrue(file_record["path"].startswith("outputs/skipped-drafts/"))
+
+            workspace_dir = Path(temp_dir) / "run-outlook-skip-invalid" / "agents" / "default" / "workspace"
+            written_files = list(workspace_dir.rglob("*.json"))
+            self.assertEqual(len(written_files), 1)
+            written = json.loads(written_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(written["delivery_status"], "draft_skipped_invalid_recipient")
+            self.assertEqual(written["source_payload"], row_payload)
+            self.assertIn("no_email", written["reason"])
+
     def test_outlook_client_uses_draft_endpoint_only(self) -> None:
         with OutlookHttpStubServer() as server_url:
             client = OutlookDraftClient(api_base_url=server_url)
@@ -1008,6 +1125,107 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertEqual(request["body"]["subject"], "Quarterly update")
         self.assertEqual(request["body"]["body"]["contentType"], "Text")
         self.assertEqual(request["body"]["body"]["content"], "Please review the attached progress summary.")
+
+    def test_outlook_client_retries_on_timeout_and_succeeds(self) -> None:
+        from graph_agent.providers import outlook as outlook_module
+
+        sleep_calls: list[float] = []
+        urlopen_calls: list[object] = []
+
+        class _FakeResponse:
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+
+            def __enter__(self) -> "_FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self._body
+
+        def fake_urlopen(request: object, timeout: float = 0.0) -> _FakeResponse:  # noqa: ANN001
+            urlopen_calls.append(request)
+            if len(urlopen_calls) <= 2:
+                raise TimeoutError("The read operation timed out")
+            return _FakeResponse(
+                json.dumps(
+                    {
+                        "id": "draft-retry",
+                        "subject": "Retry subject",
+                        "webLink": "https://outlook.office.com/mail/draft-retry",
+                        "createdDateTime": "2026-04-26T10:00:00Z",
+                        "lastModifiedDateTime": "2026-04-26T10:00:00Z",
+                    }
+                ).encode("utf-8")
+            )
+
+        with patch.object(outlook_module.urllib_request, "urlopen", side_effect=fake_urlopen):
+            with patch.object(outlook_module.time, "sleep", side_effect=sleep_calls.append):
+                client = OutlookDraftClient(retry_backoff_seconds=0.1)
+                result = client.create_draft(
+                    access_token="graph-token",
+                    to_recipients=["alex@example.com"],
+                    subject="Retry subject",
+                    body="Retry body.",
+                )
+
+        self.assertEqual(result.draft_id, "draft-retry")
+        self.assertEqual(len(urlopen_calls), 3)
+        self.assertEqual(sleep_calls, [0.1, 0.2])
+
+    def test_outlook_client_raises_after_exhausting_retries_on_timeout(self) -> None:
+        from graph_agent.providers import outlook as outlook_module
+
+        sleep_calls: list[float] = []
+        urlopen_calls: list[object] = []
+
+        def always_timeout(request: object, timeout: float = 0.0) -> None:  # noqa: ANN001
+            urlopen_calls.append(request)
+            raise TimeoutError("The read operation timed out")
+
+        with patch.object(outlook_module.urllib_request, "urlopen", side_effect=always_timeout):
+            with patch.object(outlook_module.time, "sleep", side_effect=sleep_calls.append):
+                client = OutlookDraftClient(retry_backoff_seconds=0.1, max_retries=2)
+                with self.assertRaises(RuntimeError) as ctx:
+                    client.create_draft(
+                        access_token="graph-token",
+                        to_recipients=["alex@example.com"],
+                        subject="Subject",
+                        body="Body.",
+                    )
+
+        self.assertEqual(len(urlopen_calls), 3)
+        self.assertEqual(sleep_calls, [0.1, 0.2])
+        self.assertIn("timed out after 3 attempts", str(ctx.exception))
+
+    def test_outlook_client_retries_on_socket_timeout(self) -> None:
+        import socket as socket_module
+
+        from graph_agent.providers import outlook as outlook_module
+
+        sleep_calls: list[float] = []
+        urlopen_calls: list[object] = []
+
+        def always_socket_timeout(request: object, timeout: float = 0.0) -> None:  # noqa: ANN001
+            urlopen_calls.append(request)
+            raise socket_module.timeout("The read operation timed out")
+
+        with patch.object(outlook_module.urllib_request, "urlopen", side_effect=always_socket_timeout):
+            with patch.object(outlook_module.time, "sleep", side_effect=sleep_calls.append):
+                client = OutlookDraftClient(retry_backoff_seconds=0.1, max_retries=2)
+                with self.assertRaises(RuntimeError) as ctx:
+                    client.create_draft(
+                        access_token="graph-token",
+                        to_recipients=["alex@example.com"],
+                        subject="Subject",
+                        body="Body.",
+                    )
+
+        self.assertEqual(len(urlopen_calls), 3)
+        self.assertEqual(sleep_calls, [0.1, 0.2])
+        self.assertIn("timed out after 3 attempts", str(ctx.exception))
 
     def test_outlook_draft_node_logs_outbound_email_row_when_logger_is_bound(self) -> None:
         fake_client = FakeOutlookDraftClient()
@@ -1193,7 +1411,7 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertEqual(state.final_output["outbound_email_log"]["table_name"], "outbound_email_messages")
         self.assertTrue(state.node_outputs["draft"]["outbound_email_log"])
 
-    def test_outlook_draft_node_skips_outbound_email_log_when_recipient_is_missing(self) -> None:
+    def test_outlook_draft_node_logs_outbound_email_with_sentinel_when_recipient_is_missing(self) -> None:
         fake_client = FakeOutlookDraftClient()
         fake_auth = FakeMicrosoftAuthService()
         self.services.outlook_draft_client = fake_client
@@ -1225,17 +1443,25 @@ class OutlookDraftNodeTests(unittest.TestCase):
             },
             clear=False,
         ):
-            state = runtime.run(graph, "", run_id="run-outlook-log-skip")
+            state = runtime.run(graph, "", run_id="run-outlook-log-missing-recipient")
 
         self.assertEqual(state.status, "completed")
         self.assertEqual(len(fake_client.calls), 1)
         self.assertEqual(fake_client.calls[0]["to_recipients"], [])
         self.assertEqual(state.final_output["to_recipients"], [])
-        self.assertEqual(state.final_output["outbound_email_log"]["reason"], "missing_recipient_email")
-        self.assertTrue(state.final_output["outbound_email_log"]["skipped"])
-        self.assertEqual(state.final_output["outbound_email_log"]["table_name"], "outbound_email_messages")
-        self.assertEqual(_SupabaseEmailLogStubHandler.last_path, "/rest/v1/")
-        self.assertIsNone(_SupabaseEmailLogStubHandler.last_json_body)
+
+        outbound_log = state.final_output["outbound_email_log"]
+        self.assertNotIn("skipped", outbound_log)
+        self.assertTrue(outbound_log["recipient_missing"])
+        self.assertEqual(outbound_log["table_name"], "outbound_email_messages")
+
+        self.assertIsInstance(_SupabaseEmailLogStubHandler.last_json_body, dict)
+        row = _SupabaseEmailLogStubHandler.last_json_body
+        assert isinstance(row, dict)
+        self.assertEqual(row["recipient_email"], "missing-recipient@graph-agent.invalid")
+        self.assertTrue(row["metadata"]["recipient_missing"])
+        self.assertEqual(row["metadata"]["recipient_substitution"], "missing-recipient@graph-agent.invalid")
+        self.assertEqual(row["metadata"]["to_recipients"], [])
 
     def test_outlook_draft_node_dedupes_spreadsheet_rows_across_reruns(self) -> None:
         fake_client = FakeOutlookDraftClient()
