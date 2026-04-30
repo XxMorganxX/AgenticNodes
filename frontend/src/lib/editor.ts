@@ -1,6 +1,6 @@
 import dagre from "dagre";
 
-import { DEFAULT_NEW_GRAPH_EMAIL_ROUTING_MODE, resolveEmailRoutingMode } from "./emailTableRouting";
+import { DEFAULT_NEW_GRAPH_EMAIL_ROUTING_MODE, resolveEmailRoutingMode, syncEmailTableSuffixEnvVar } from "./emailTableRouting";
 import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "./spreadsheetMatrixPrompt";
 import { DEFAULT_GRAPH_ENV_VARS, getGraphEnvVars } from "./graphEnv";
 import { isTestEnvironment } from "./graphDocuments";
@@ -1230,12 +1230,12 @@ function normalizeAgent(agent: AgentDefinition): AgentDefinition {
 
 export function normalizeGraphDocument(graph: GraphDocument): GraphDocument {
   if (!isTestEnvironment(graph)) {
-    return normalizeGraph(graph);
+    return syncEmailTableSuffixEnvVar(normalizeGraph(graph));
   }
-  return {
+  return syncEmailTableSuffixEnvVar({
     ...graph,
     agents: graph.agents.map((agent) => normalizeAgent(agent)),
-  };
+  });
 }
 
 export function defaultConditionalCondition(edgeId: string): GraphEdge["condition"] {

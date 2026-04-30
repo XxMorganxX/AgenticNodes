@@ -21,7 +21,16 @@ def _is_transient_supabase_delegate_error(exc: BaseException) -> bool:
         return True
     if isinstance(exc, RuntimeError):
         msg = str(exc)
-        return msg.startswith("Supabase run store request timed out") or "Supabase run store network error" in msg
+        return (
+            msg.startswith("Supabase run store request timed out")
+            or "Supabase run store network error" in msg
+            or "HTTP 521" in msg
+            or "HTTP 503" in msg
+            or '"status":521' in msg
+            or '"code":"PGRST002"' in msg
+            or '"code":"57014"' in msg
+            or "canceling statement due to statement timeout" in msg
+        )
     return False
 
 
@@ -31,6 +40,16 @@ class RunStore(Protocol):
     def append_event(self, run_id: str, event: dict[str, Any]) -> None: ...
 
     def write_state(self, run_id: str, state: dict[str, Any]) -> None: ...
+
+    def write_iteration_snapshot(
+        self,
+        run_id: str,
+        state: dict[str, Any],
+        *,
+        iteration_index: int,
+        iterator_node_id: str,
+        prompt_map: dict[str, dict[str, Any]],
+    ) -> None: ...
 
     def load_manifest(self, run_id: str) -> dict[str, Any] | None: ...
 
@@ -59,6 +78,46 @@ class CompositeRunStore:
     def write_state(self, run_id: str, state: dict[str, Any]) -> None:
         self.primary.write_state(run_id, state)
         self._fan_out("write_state", run_id, state, run_id=run_id)
+
+    def write_iteration_snapshot(
+        self,
+        run_id: str,
+        state: dict[str, Any],
+        *,
+        iteration_index: int,
+        iterator_node_id: str,
+        prompt_map: dict[str, dict[str, Any]],
+    ) -> None:
+        self.primary.write_iteration_snapshot(
+            run_id,
+            state,
+            iteration_index=iteration_index,
+            iterator_node_id=iterator_node_id,
+            prompt_map=prompt_map,
+        )
+        for store in self.mirrors:
+            try:
+                store.write_iteration_snapshot(
+                    run_id,
+                    state,
+                    iteration_index=iteration_index,
+                    iterator_node_id=iterator_node_id,
+                    prompt_map=prompt_map,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if _is_transient_supabase_delegate_error(exc):
+                    LOGGER.warning(
+                        "Mirrored iteration-snapshot write failed (transient): store=%s run_id=%r — %s",
+                        type(store).__name__,
+                        run_id,
+                        exc,
+                    )
+                    continue
+                LOGGER.exception(
+                    "Mirrored iteration-snapshot write failed: store=%s run_id=%r",
+                    type(store).__name__,
+                    run_id,
+                )
 
     def load_manifest(self, run_id: str) -> dict[str, Any] | None:
         return self.primary.load_manifest(run_id)
@@ -124,6 +183,25 @@ _DEFAULT_MIRROR_RUN_BATCH_SIZE = 10
 # Must exceed worst-case Supabase HTTP timeout so terminal flushes don't give up early.
 _DEFAULT_MIRROR_FLUSH_TIMEOUT_SECONDS = max(35.0, float(SUPABASE_RUN_STORE_REQUEST_TIMEOUT_SECONDS) + 25.0)
 
+# Lifecycle events kept in the Supabase mirror when lean_events is on. Per-node
+# events (node.started, node.completed, edge.selected, condition.evaluated, etc.)
+# stay on the filesystem primary only; the system+user prompts they would carry
+# are still surfaced via runs.metadata.prompt_traces.
+_LEAN_MIRROR_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "run.started",
+        "run.completed",
+        "run.failed",
+        "run.cancelled",
+        "run.interrupted",
+        "agent.run.started",
+        "agent.run.completed",
+        "agent.run.failed",
+        "agent.run.cancelled",
+        "agent.run.interrupted",
+    }
+)
+
 
 def _read_positive_int_env(name: str, default: int) -> int:
     raw = str(os.environ.get(name, "") or "").strip()
@@ -177,8 +255,10 @@ class AsyncBatchingRunStoreMirror:
         event_batch_size: int | None = None,
         run_batch_size: int | None = None,
         flush_timeout_seconds: float | None = None,
+        lean_events: bool = False,
     ) -> None:
         self.delegate = delegate
+        self.lean_events = bool(lean_events)
         self.flush_interval_seconds = (
             float(flush_interval_ms) / 1000.0
             if flush_interval_ms is not None
@@ -217,6 +297,9 @@ class AsyncBatchingRunStoreMirror:
         self._pending_initializations: deque[dict[str, Any]] = deque()
         self._pending_events: deque[tuple[str, dict[str, Any]]] = deque()
         self._pending_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._pending_iteration_snapshots: deque[
+            tuple[str, dict[str, Any], int, str, dict[str, dict[str, Any]]]
+        ] = deque()
         self._processing = False
         self._closing = False
         self._closed = False
@@ -235,6 +318,8 @@ class AsyncBatchingRunStoreMirror:
 
     def append_event(self, run_id: str, event: dict[str, Any]) -> None:
         normalized = normalize_runtime_event_dict(event)
+        if self.lean_events and str(normalized.get("event_type") or "") not in _LEAN_MIRROR_EVENT_TYPES:
+            return
         if self._queue_write("event", run_id=run_id, payload=normalized):
             return
         self._log_passthrough_failure("append_event", run_id=run_id, payload=normalized)
@@ -244,6 +329,29 @@ class AsyncBatchingRunStoreMirror:
         if self._queue_write("state", run_id=run_id, payload=snapshot):
             return
         self._log_passthrough_failure("write_state", run_id=run_id, payload=snapshot)
+
+    def write_iteration_snapshot(
+        self,
+        run_id: str,
+        state: dict[str, Any],
+        *,
+        iteration_index: int,
+        iterator_node_id: str,
+        prompt_map: dict[str, dict[str, Any]],
+    ) -> None:
+        snapshot = normalize_runtime_state_snapshot(state) or deepcopy(state)
+        with self._lock:
+            if self._closed or self._closing:
+                self._fallback_iteration_write(
+                    run_id, snapshot, iteration_index, iterator_node_id, prompt_map
+                )
+                return
+            self._pending_iteration_snapshots.append(
+                (run_id, snapshot, iteration_index, iterator_node_id, dict(prompt_map))
+            )
+            if self._should_wake_locked():
+                self._wake_event.set()
+            self._lock.notify_all()
 
     def load_manifest(self, run_id: str) -> dict[str, Any] | None:
         return self.delegate.load_manifest(run_id)
@@ -325,11 +433,17 @@ class AsyncBatchingRunStoreMirror:
             len(self._pending_initializations) >= self.run_batch_size
             or len(self._pending_events) >= self.event_batch_size
             or len(self._pending_states) >= self.run_batch_size
+            or len(self._pending_iteration_snapshots) >= self.run_batch_size
             or self._closing
         )
 
     def _has_pending_locked(self) -> bool:
-        return bool(self._pending_initializations or self._pending_events or self._pending_states)
+        return bool(
+            self._pending_initializations
+            or self._pending_events
+            or self._pending_states
+            or self._pending_iteration_snapshots
+        )
 
     def _worker_loop(self) -> None:
         while True:
@@ -359,10 +473,16 @@ class AsyncBatchingRunStoreMirror:
                 while self._pending_states and len(state_batch) < self.run_batch_size:
                     run_id, state = self._pending_states.popitem(last=False)
                     state_batch.append((run_id, state))
+                iteration_batch: list[
+                    tuple[str, dict[str, Any], int, str, dict[str, dict[str, Any]]]
+                ] = []
+                while self._pending_iteration_snapshots and len(iteration_batch) < self.run_batch_size:
+                    iteration_batch.append(self._pending_iteration_snapshots.popleft())
                 self._processing = True
             self._write_initialize_batch(initialize_batch)
             self._write_event_batch(event_batch)
             self._write_state_batch(state_batch)
+            self._write_iteration_batch(iteration_batch)
             with self._lock:
                 self._processing = self._has_pending_locked()
                 self._lock.notify_all()
@@ -431,6 +551,19 @@ class AsyncBatchingRunStoreMirror:
                     self.delegate.write_state(run_id, state)
         except Exception as exc:  # noqa: BLE001
             if _is_transient_supabase_delegate_error(exc):
+                if callable(write_batch) and len(items) > 1:
+                    recovered = self._write_states_individually_after_batch_failure(items, exc)
+                    if recovered > 0:
+                        LOGGER.warning(
+                            "Async run-store mirror recovered %d/%d state writes after transient batch failure "
+                            "(delegate=%s): %s",
+                            recovered,
+                            len(items),
+                            type(self.delegate).__name__,
+                            exc,
+                        )
+                    if recovered == len(items):
+                        return
                 LOGGER.warning(
                     "Async run-store mirror dropped state batch after transient delegate failure "
                     "(delegate=%s, count=%d): %s",
@@ -443,6 +576,94 @@ class AsyncBatchingRunStoreMirror:
                 "Async run-store mirror dropped state batch after delegate failure (delegate=%s, count=%d).",
                 type(self.delegate).__name__,
                 len(items),
+            )
+
+    def _write_states_individually_after_batch_failure(
+        self,
+        items: list[tuple[str, dict[str, Any]]],
+        batch_error: BaseException,
+    ) -> int:
+        recovered = 0
+        for run_id, state in items:
+            try:
+                self.delegate.write_state(run_id, state)
+                recovered += 1
+            except Exception as exc:  # noqa: BLE001
+                if _is_transient_supabase_delegate_error(exc):
+                    LOGGER.warning(
+                        "Async run-store mirror dropped state write after transient delegate failure "
+                        "(delegate=%s, run_id=%r): %s",
+                        type(self.delegate).__name__,
+                        run_id,
+                        exc,
+                    )
+                    continue
+                LOGGER.exception(
+                    "Async run-store mirror dropped state write after delegate failure "
+                    "(delegate=%s, run_id=%r); original batch error was: %s",
+                    type(self.delegate).__name__,
+                    run_id,
+                    batch_error,
+                )
+        return recovered
+
+    def _write_iteration_batch(
+        self,
+        items: list[tuple[str, dict[str, Any], int, str, dict[str, dict[str, Any]]]],
+    ) -> None:
+        if not items:
+            return
+        for run_id, state, iteration_index, iterator_node_id, prompt_map in items:
+            try:
+                self.delegate.write_iteration_snapshot(
+                    run_id,
+                    state,
+                    iteration_index=iteration_index,
+                    iterator_node_id=iterator_node_id,
+                    prompt_map=prompt_map,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if _is_transient_supabase_delegate_error(exc):
+                    LOGGER.warning(
+                        "Async run-store mirror dropped iteration write after transient delegate failure "
+                        "(delegate=%s, run_id=%r, iteration_index=%d): %s",
+                        type(self.delegate).__name__,
+                        run_id,
+                        iteration_index,
+                        exc,
+                    )
+                    continue
+                LOGGER.exception(
+                    "Async run-store mirror dropped iteration write after delegate failure "
+                    "(delegate=%s, run_id=%r, iteration_index=%d).",
+                    type(self.delegate).__name__,
+                    run_id,
+                    iteration_index,
+                )
+
+    def _fallback_iteration_write(
+        self,
+        run_id: str,
+        state: dict[str, Any],
+        iteration_index: int,
+        iterator_node_id: str,
+        prompt_map: dict[str, dict[str, Any]],
+    ) -> None:
+        try:
+            self.delegate.write_iteration_snapshot(
+                run_id,
+                state,
+                iteration_index=iteration_index,
+                iterator_node_id=iterator_node_id,
+                prompt_map=prompt_map,
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.exception(
+                "Async run-store mirror fallback iteration write failed after close "
+                "(delegate=%s, run_id=%r, iteration_index=%d).",
+                type(self.delegate).__name__,
+                run_id,
+                iteration_index,
             )
 
     def _log_passthrough_failure(self, method_name: str, *, run_id: str, payload: dict[str, Any]) -> None:
@@ -466,18 +687,24 @@ def build_default_run_store() -> RunStore:
         supabase_store = SupabaseRunStore.from_env()
         mirror_disabled = _read_bool_env("GRAPH_AGENT_RUN_STORE_MIRROR_DISABLED", False)
         supabase_primary = _read_bool_env("GRAPH_AGENT_RUN_STORE_SUPABASE_PRIMARY", False)
+        # Lean defaults to ON in mirror mode (filesystem keeps full fidelity locally),
+        # forced OFF when Supabase is the primary recovery target.
+        lean_mirror = _read_bool_env("GRAPH_AGENT_RUN_STORE_SUPABASE_LEAN", True) and not supabase_primary
+        # Re-pin the supabase store's lean_snapshot to match the resolved mode so
+        # _build_run_row stays consistent regardless of how from_env() resolved it.
+        supabase_store._lean_snapshot = lean_mirror
 
         # Legacy: Supabase is the only persistence/query target (still wrapped in AsyncBatchingRunStoreMirror by default).
         if supabase_primary:
             if mirror_disabled:
                 return supabase_store
-            return AsyncBatchingRunStoreMirror(supabase_store)
+            return AsyncBatchingRunStoreMirror(supabase_store, lean_events=lean_mirror)
 
         # Default: durable local filesystem + async mirror to Supabase (mirroring drops do not lose local runs).
         fs_store = FilesystemRunStore()
         if mirror_disabled:
             return CompositeRunStore(fs_store, supabase_store)
-        return CompositeRunStore(fs_store, AsyncBatchingRunStoreMirror(supabase_store))
+        return CompositeRunStore(fs_store, AsyncBatchingRunStoreMirror(supabase_store, lean_events=lean_mirror))
     has_url = any(os.environ.get(name, "").strip() for name in _SUPABASE_URL_ENV_VARS)
     has_key = any(os.environ.get(name, "").strip() for name in _SUPABASE_KEY_ENV_VARS)
     if has_url and has_key:

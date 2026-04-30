@@ -61,6 +61,7 @@ export type GraphCanvasNodeData = {
   onToggleTooltip: (nodeId: string) => void;
   onOpenToolDetails: (nodeId: string) => void;
   onOpenProviderDetails: (nodeId: string) => void;
+  onOpenDiscordTriggerConfig: (nodeId: string) => void;
   onToggleExecutorRetries: (nodeId: string) => void;
   onToggleSupabaseIteratorIncludeProcessedRows: (nodeId: string) => void;
   onOpenPromptBlockDetails: (nodeId: string) => void;
@@ -235,6 +236,7 @@ function GraphCanvasNodeComponent({
     onToggleTooltip,
     onOpenToolDetails,
     onOpenProviderDetails,
+    onOpenDiscordTriggerConfig,
     onToggleExecutorRetries,
     onToggleSupabaseIteratorIncludeProcessedRows,
     onOpenPromptBlockDetails,
@@ -265,6 +267,7 @@ function GraphCanvasNodeComponent({
   const isOutboundEmailLogger = isOutboundEmailLoggerNode(node);
   const isSupabaseNode = isSupabaseSqlNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger;
   const isOutlookDraftNode = node.provider_id === "end.outlook_draft";
+  const isDiscordStartNode = node.kind === "input" && node.provider_id === "start.discord_message";
   const displayLabel = providedDisplayLabel ?? getNodeInstanceLabel(graph, node);
   const resolvedSupabaseBinding = isSupabaseNode ? resolveSupabaseBinding(graph, node.config as Record<string, unknown>) : null;
   const supabaseConnectionOptions = isSupabaseNode ? getSupabaseConnectionSelectOptions(graph, node.config as Record<string, unknown>) : [];
@@ -998,6 +1001,21 @@ function GraphCanvasNodeComponent({
                 : isPromptBlockNode(node)
                   ? "More Info"
                   : "Provider Info"}
+            </button>
+          </div>
+        ) : null}
+        {!preview && isDiscordStartNode ? (
+          <div className="graph-node-card-actions" aria-hidden="false">
+            <button
+              type="button"
+              className="secondary-button graph-node-card-button"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                onOpenDiscordTriggerConfig(node.id);
+              }}
+            >
+              Configure Trigger
             </button>
           </div>
         ) : null}

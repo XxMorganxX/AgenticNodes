@@ -67,6 +67,28 @@ class FilesystemRunStore:
         normalized_state = normalize_runtime_state_snapshot(state) or dict(state)
         self._write_json(run_dir / "state.json", normalized_state)
 
+    def write_iteration_snapshot(
+        self,
+        run_id: str,
+        state: Mapping[str, Any],
+        *,
+        iteration_index: int,
+        iterator_node_id: str,
+        prompt_map: dict[str, dict[str, Any]],
+    ) -> None:
+        run_dir = self._run_dir(run_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "run_id": run_id,
+            "iteration_index": int(iteration_index),
+            "iterator_node_id": str(iterator_node_id),
+            "prompt_map": dict(prompt_map),
+            "captured_at": utc_now_iso(),
+        }
+        with (run_dir / "iterations.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, sort_keys=True))
+            handle.write("\n")
+
     def load_manifest(self, run_id: str) -> dict[str, Any] | None:
         manifest_path = self._run_dir(run_id) / "manifest.json"
         if not manifest_path.exists():

@@ -91,6 +91,7 @@ class FakeOutlookDraftClient:
 class FakeMicrosoftAuthService:
     def __init__(self) -> None:
         self.acquire_calls = 0
+        self.failures_before_success = 0
 
     def connection_status(self) -> MicrosoftAuthStatus:
         return MicrosoftAuthStatus(
@@ -105,6 +106,8 @@ class FakeMicrosoftAuthService:
 
     def acquire_access_token(self, *, scopes=None) -> str:  # noqa: ANN001
         self.acquire_calls += 1
+        if self.acquire_calls <= self.failures_before_success:
+            raise TimeoutError("The read operation timed out")
         return "graph-token"
 
 
@@ -845,6 +848,32 @@ class OutlookDraftNodeTests(unittest.TestCase):
         self.assertEqual(state.node_outputs["draft"]["account_username"], "morgan@example.com")
         self.assertEqual(state.final_output["subject"], "Follow-up for outlook-draft-agent")
         self.assertEqual(state.final_output["body"], "Draft this exact email body.")
+
+    def test_outlook_draft_node_retries_access_token_timeout(self) -> None:
+        from graph_agent.runtime import core as core_module
+
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        fake_auth.failures_before_success = 2
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph = GraphDefinition.from_dict(build_outlook_draft_graph_payload())
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        sleep_calls: list[float] = []
+        with patch.object(core_module.time, "sleep", side_effect=sleep_calls.append):
+            state = runtime.run(graph, "Draft this exact email body.")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(fake_auth.acquire_calls, 3)
+        self.assertEqual(sleep_calls, [1.0, 2.0])
+        self.assertEqual(len(fake_client.calls), 1)
 
     def test_outlook_draft_node_appends_signature_from_config(self) -> None:
         fake_client = FakeOutlookDraftClient()

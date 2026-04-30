@@ -37,6 +37,7 @@ import { insertTokenAtEnd, listPromptBlockAvailableVariables, PROMPT_BLOCK_START
 import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "../lib/spreadsheetMatrixPrompt";
 import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
 import { useRenderDiagnostics } from "../lib/dragDiagnostics";
+import { DISCORD_BOT_TOKEN_ENV_KEY, DiscordTriggerModal } from "./DiscordTriggerModal";
 import { StructuredPayloadBuilderLearnMoreModal } from "./StructuredPayloadBuilderLearnMoreModal";
 import type {
   EditorCatalog,
@@ -577,6 +578,7 @@ export function GraphInspector({
   const [isSpreadsheetPreviewLoading, setIsSpreadsheetPreviewLoading] = useState(false);
   const [contextBuilderPreviewFormatted, setContextBuilderPreviewFormatted] = useState(true);
   const [isStructuredPayloadBuilderLearnMoreOpen, setIsStructuredPayloadBuilderLearnMoreOpen] = useState(false);
+  const [isDiscordTriggerModalOpen, setIsDiscordTriggerModalOpen] = useState(false);
   const [structuredPayloadTemplateDraftEntries, setStructuredPayloadTemplateDraftEntries] = useState<StructuredPayloadTemplateEntry[]>([]);
 
   if (!graph) {
@@ -1140,6 +1142,18 @@ export function GraphInspector({
     const isManualStartNode =
       selectedNode.kind === "input" &&
       (selectedNode.provider_id === "start.manual_run" || selectedNode.provider_id === "core.input");
+    const startNodeProviderDefinition =
+      selectedNode.kind === "input"
+        ? catalog?.node_providers?.find((provider) => provider.provider_id === selectedNode.provider_id) ?? null
+        : null;
+    const startNodeTriggerMode = startNodeProviderDefinition?.trigger_mode ?? "immediate";
+    const startNodeListenerTransport = startNodeProviderDefinition?.listener_transport ?? null;
+    const startNodeTriggerBadgeLabel =
+      startNodeTriggerMode === "listener"
+        ? startNodeListenerTransport === "inbound_webhook"
+          ? "Listener / Inbound (needs Cloudflare)"
+          : "Listener / Outbound"
+        : "Immediate";
     const isContextBuilderNode = selectedNode.kind === "data" && selectedNode.provider_id === CONTEXT_BUILDER_PROVIDER_ID;
     const isPromptBlockDataNode = selectedNode.kind === "data" && selectedNode.provider_id === PROMPT_BLOCK_PROVIDER_ID;
     const isWriteTextFileNode = selectedNode.kind === "data" && selectedNode.provider_id === WRITE_TEXT_FILE_PROVIDER_ID;
@@ -1446,6 +1460,15 @@ export function GraphInspector({
           ) : null}
           {selectedNode.kind === "input" ? (
             <>
+              <div className="contract-card">
+                <strong>Trigger Mode</strong>
+                <span>{startNodeTriggerBadgeLabel}</span>
+                {startNodeListenerTransport === "inbound_webhook" ? (
+                  <span>
+                    Inbound webhooks require a Cloudflare tunnel. Configure one in the Environment panel.
+                  </span>
+                ) : null}
+              </div>
               <label>
                 Start Trigger
                 <input value={isDiscordStartNode ? "discord_message" : "manual_run"} readOnly />
@@ -1458,84 +1481,27 @@ export function GraphInspector({
                 </div>
               ) : null}
               {isDiscordStartNode ? (
-                <>
-                  <label>
-                    Discord Bot Token Env Var
-                    <input
-                      value={String(selectedNode.config.discord_bot_token_env_var ?? "{DISCORD_BOT_TOKEN}")}
-                      placeholder="{DISCORD_BOT_TOKEN}"
-                      onChange={(event) =>
-                        onGraphChange(
-                          updateNode(graph, selectedNode.id, (node) => ({
-                            ...node,
-                            config: {
-                              ...node.config,
-                              trigger_mode: "discord_message",
-                              discord_bot_token_env_var: event.target.value,
-                            },
-                          })),
-                        )
-                      }
-                    />
-                  </label>
-                  <label>
-                    Discord Channel ID
-                    <input
-                      value={String(selectedNode.config.discord_channel_id ?? "")}
-                      placeholder="123456789012345678"
-                      onChange={(event) =>
-                        onGraphChange(
-                          updateNode(graph, selectedNode.id, (node) => ({
-                            ...node,
-                            config: {
-                              ...node.config,
-                              trigger_mode: "discord_message",
-                              discord_channel_id: event.target.value,
-                            },
-                          })),
-                        )
-                      }
-                    />
-                  </label>
-                  <label className="checkbox-option">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(selectedNode.config.ignore_bot_messages ?? true)}
-                      onChange={(event) =>
-                        onGraphChange(
-                          updateNode(graph, selectedNode.id, (node) => ({
-                            ...node,
-                            config: {
-                              ...node.config,
-                              trigger_mode: "discord_message",
-                              ignore_bot_messages: event.target.checked,
-                            },
-                          })),
-                        )
-                      }
-                    />
-                    <span>Ignore bot-authored messages</span>
-                  </label>
-                  <label className="checkbox-option">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(selectedNode.config.ignore_self_messages ?? true)}
-                      onChange={(event) =>
-                        onGraphChange(
-                          updateNode(graph, selectedNode.id, (node) => ({
-                            ...node,
-                            config: {
-                              ...node.config,
-                              trigger_mode: "discord_message",
-                              ignore_self_messages: event.target.checked,
-                            },
-                          })),
-                        )
-                      }
-                    />
-                    <span>Ignore this bot's own messages</span>
-                  </label>
-                </>
+                <div className="contract-card">
+                  <strong>Discord Trigger</strong>
+                  <span>
+                    Channel: <code>{String(selectedNode.config.discord_channel_id ?? "") || "(not set)"}</code>
+                  </span>
+                  <span>
+                    Bot token:{" "}
+                    {(() => {
+                      const envValue = String(graph.env_vars?.[DISCORD_BOT_TOKEN_ENV_KEY] ?? "");
+                      const hasGraphValue = envValue && envValue !== DISCORD_BOT_TOKEN_ENV_KEY;
+                      return hasGraphValue ? "set in graph env vars" : `read from .env (${DISCORD_BOT_TOKEN_ENV_KEY})`;
+                    })()}
+                  </span>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => setIsDiscordTriggerModalOpen(true)}
+                  >
+                    Configure Discord Trigger…
+                  </button>
+                </div>
               ) : null}
             </>
           ) : null}
@@ -4018,7 +3984,7 @@ export function GraphInspector({
                     LinkedIn Data Directory
                     <input
                       value={String(selectedNode.config.linkedin_data_dir ?? "")}
-                      placeholder="/Users/.../Desktop/Linkedin Data"
+                      placeholder="{LINKEDIN_DATA_DIR}"
                       onChange={(event) =>
                         onGraphChange(
                           updateNode(graph, selectedNode.id, (node) => ({
@@ -4032,6 +3998,7 @@ export function GraphInspector({
                         )
                       }
                     />
+                    <small>Use {"{LINKEDIN_DATA_DIR}"} and set that env var per machine for portable graphs.</small>
                   </label>
                   <label>
                     Session State Path
@@ -4768,6 +4735,72 @@ export function GraphInspector({
             graph={graph}
             node={selectedNode}
             onClose={() => setIsStructuredPayloadBuilderLearnMoreOpen(false)}
+          />
+        ) : null}
+        {isDiscordTriggerModalOpen && isDiscordStartNode ? (
+          <DiscordTriggerModal
+            botToken={(() => {
+              const stored = String(graph.env_vars?.[DISCORD_BOT_TOKEN_ENV_KEY] ?? "");
+              return stored === DISCORD_BOT_TOKEN_ENV_KEY ? "" : stored;
+            })()}
+            channelId={String(selectedNode.config.discord_channel_id ?? "")}
+            ignoreBotMessages={Boolean(selectedNode.config.ignore_bot_messages ?? true)}
+            ignoreSelfMessages={Boolean(selectedNode.config.ignore_self_messages ?? true)}
+            graphEnvVars={graph.env_vars ?? {}}
+            onChangeBotToken={(value) => {
+              const next = updateNode(graph, selectedNode.id, (node) => ({
+                ...node,
+                config: {
+                  ...node.config,
+                  trigger_mode: "discord_message",
+                  discord_bot_token_env_var: `{${DISCORD_BOT_TOKEN_ENV_KEY}}`,
+                },
+              }));
+              onGraphChange({
+                ...next,
+                env_vars: {
+                  ...(next.env_vars ?? {}),
+                  [DISCORD_BOT_TOKEN_ENV_KEY]: value,
+                },
+              });
+            }}
+            onChangeChannelId={(value) =>
+              onGraphChange(
+                updateNode(graph, selectedNode.id, (node) => ({
+                  ...node,
+                  config: {
+                    ...node.config,
+                    trigger_mode: "discord_message",
+                    discord_channel_id: value,
+                  },
+                })),
+              )
+            }
+            onChangeIgnoreBotMessages={(value) =>
+              onGraphChange(
+                updateNode(graph, selectedNode.id, (node) => ({
+                  ...node,
+                  config: {
+                    ...node.config,
+                    trigger_mode: "discord_message",
+                    ignore_bot_messages: value,
+                  },
+                })),
+              )
+            }
+            onChangeIgnoreSelfMessages={(value) =>
+              onGraphChange(
+                updateNode(graph, selectedNode.id, (node) => ({
+                  ...node,
+                  config: {
+                    ...node.config,
+                    trigger_mode: "discord_message",
+                    ignore_self_messages: value,
+                  },
+                })),
+              )
+            }
+            onClose={() => setIsDiscordTriggerModalOpen(false)}
           />
         ) : null}
       </>

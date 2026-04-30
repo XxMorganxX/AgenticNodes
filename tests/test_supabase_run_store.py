@@ -21,7 +21,7 @@ if str(SRC) not in sys.path:
 from graph_agent.api.graph_store import GraphStore
 from graph_agent.api.manager import GraphRunManager
 from graph_agent.api.run_log_store import RunLogStore
-from graph_agent.api.run_store import AsyncBatchingRunStoreMirror, build_default_run_store
+from graph_agent.api.run_store import AsyncBatchingRunStoreMirror, _is_transient_supabase_delegate_error, build_default_run_store
 from graph_agent.api.run_state_reducer import apply_single_run_event, build_run_state
 from graph_agent.api.supabase_run_store import SupabaseRunStore
 from graph_agent.examples.tool_schema_repair import build_example_graph_payload, build_example_services
@@ -191,6 +191,46 @@ class SupabaseStubServer:
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=2)
+
+
+class BatchTimeoutRunStore:
+    def __init__(self) -> None:
+        self.batch_calls = 0
+        self.state_writes: list[tuple[str, dict[str, object]]] = []
+
+    def initialize_run(self, state: dict[str, object]) -> None:
+        return
+
+    def append_event(self, run_id: str, event: dict[str, object]) -> None:
+        return
+
+    def write_state(self, run_id: str, state: dict[str, object]) -> None:
+        self.state_writes.append((run_id, dict(state)))
+
+    def write_states_batch(self, items: list[tuple[str, dict[str, object]]]) -> None:
+        self.batch_calls += 1
+        raise RuntimeError(
+            'Supabase run store request failed: 500 {"code":"57014","details":null,'
+            '"hint":null,"message":"canceling statement due to statement timeout"}'
+        )
+
+    def load_manifest(self, run_id: str) -> dict[str, object] | None:
+        return None
+
+    def load_events(self, run_id: str) -> list[dict[str, object]]:
+        return []
+
+    def load_state(self, run_id: str) -> dict[str, object] | None:
+        return None
+
+    def recover_run_state(self, run_id: str) -> dict[str, object] | None:
+        return None
+
+    def list_runs(self, *, graph_id: str | None = None, limit: int = 50) -> list[dict[str, object]]:
+        return []
+
+    def close(self, timeout_seconds: float | None = None) -> None:
+        return
 
 
 def wait_for_run_completion(manager: GraphRunManager, run_id: str, timeout_seconds: float = 5.0) -> dict[str, object]:
@@ -419,6 +459,54 @@ class SupabaseRunStoreTests(unittest.TestCase):
                 ["prompt_a", "prompt_b"],
             )
 
+    def test_write_iteration_snapshot_writes_phase_iteration_row_with_prompt_map(self) -> None:
+        with SupabaseStubServer() as url:
+            store = SupabaseRunStore(url=url, service_role_key="test-key")
+            state = build_run_state("run-iter", "graph-1", {"prompt": "hi"})
+            store.initialize_run(state)
+            prompt_map = {
+                "model_a": {
+                    "system_prompt": "Sys A",
+                    "user_prompt": "User A1",
+                    "messages": [{"role": "user", "content": "User A1"}],
+                    "prompt_name": "prompt_a",
+                },
+            }
+            store.write_iteration_snapshot(
+                "run-iter",
+                state,
+                iteration_index=2,
+                iterator_node_id="sheet",
+                prompt_map=prompt_map,
+            )
+
+            iteration_requests = [
+                row
+                for batch in _SupabaseStubHandler.run_requests
+                for row in batch
+                if row.get("phase") == "iteration"
+            ]
+            self.assertEqual(len(iteration_requests), 1)
+            row = iteration_requests[0]
+            self.assertEqual(row["run_id"], "run-iter")
+            metadata = row["metadata"]
+            assert isinstance(metadata, dict)
+            self.assertIn("iteration", metadata)
+            iteration_block = metadata["iteration"]
+            self.assertEqual(iteration_block["index"], 2)
+            self.assertEqual(iteration_block["iterator_node_id"], "sheet")
+            self.assertIn("model_a", iteration_block["prompt_map"])
+            self.assertEqual(
+                iteration_block["prompt_map"]["model_a"]["user_prompt"], "User A1"
+            )
+
+            started_phases = [
+                row.get("phase")
+                for batch in _SupabaseStubHandler.run_requests
+                for row in batch
+            ]
+            self.assertIn("started", started_phases)
+
     def test_append_events_batch_preserves_per_run_sequence_numbers(self) -> None:
         with SupabaseStubServer() as url:
             store = SupabaseRunStore(url=url, service_role_key="test-key")
@@ -525,6 +613,101 @@ class SupabaseRunStoreTests(unittest.TestCase):
             self.assertEqual(len(_SupabaseStubHandler.event_requests[0]), 2)
             self.assertEqual(sum(len(batch) for batch in _SupabaseStubHandler.run_requests), 2)
             self.assertEqual(_SupabaseStubHandler.runs["run-1"]["status"], "completed")
+
+    def test_lean_async_mirror_drops_non_terminal_events(self) -> None:
+        with SupabaseStubServer() as url:
+            mirror = AsyncBatchingRunStoreMirror(
+                SupabaseRunStore(url=url, service_role_key="test-key", lean_snapshot=True),
+                flush_interval_ms=5000,
+                event_batch_size=100,
+                run_batch_size=25,
+                flush_timeout_seconds=1.0,
+                lean_events=True,
+            )
+            state = build_run_state("run-lean-mirror", "graph-lean", {"prompt": "hello"})
+            mirror.initialize_run(state)
+            for event_type, summary in (
+                ("node.started", "node started"),
+                ("node.completed", "node done"),
+                ("edge.selected", "edge picked"),
+                ("condition.evaluated", "branch picked"),
+            ):
+                mirror.append_event(
+                    "run-lean-mirror",
+                    {
+                        "event_type": event_type,
+                        "summary": summary,
+                        "payload": {"node_id": "node-a"},
+                        "run_id": "run-lean-mirror",
+                        "timestamp": "2026-04-02T00:00:01Z",
+                        "agent_id": None,
+                        "parent_run_id": None,
+                    },
+                )
+            mirror.append_event(
+                "run-lean-mirror",
+                {
+                    "event_type": "run.completed",
+                    "summary": "all done",
+                    "payload": {"final_output": {"ok": True}},
+                    "run_id": "run-lean-mirror",
+                    "timestamp": "2026-04-02T00:00:02Z",
+                    "agent_id": None,
+                    "parent_run_id": None,
+                },
+            )
+            mirror.flush()
+            mirror.close()
+
+            persisted = _SupabaseStubHandler.events.get("run-lean-mirror", [])
+            self.assertEqual(
+                [row["event_type"] for row in persisted],
+                ["run.completed"],
+            )
+
+    def test_statement_timeout_is_transient_supabase_mirror_error(self) -> None:
+        exc = RuntimeError(
+            'Supabase run store request failed: 500 {"code":"57014","details":null,'
+            '"hint":null,"message":"canceling statement due to statement timeout"}'
+        )
+
+        self.assertTrue(_is_transient_supabase_delegate_error(exc))
+
+    def test_supabase_gateway_failures_are_transient_mirror_errors(self) -> None:
+        cloudflare_exc = RuntimeError(
+            'Supabase run store request failed: 521 {"type":"https://developers.cloudflare.com/support/'
+            'troubleshooting/http-status-codes/cloudflare-5xx-errors/error-521/","status":521}'
+        )
+        postgrest_cache_exc = RuntimeError(
+            'Supabase run store request failed: 503 {"code":"PGRST002","details":null,'
+            '"hint":null,"message":"Could not query the database for the schema cache. Retrying."}'
+        )
+
+        self.assertTrue(_is_transient_supabase_delegate_error(cloudflare_exc))
+        self.assertTrue(_is_transient_supabase_delegate_error(postgrest_cache_exc))
+
+    def test_async_mirror_retries_state_batch_individually_after_statement_timeout(self) -> None:
+        delegate = BatchTimeoutRunStore()
+        mirror = AsyncBatchingRunStoreMirror(
+            delegate,
+            flush_interval_ms=5000,
+            event_batch_size=100,
+            run_batch_size=25,
+            flush_timeout_seconds=1.0,
+        )
+        state_1 = build_run_state("run-1", "graph-1", {"prompt": "one"})
+        state_2 = build_run_state("run-2", "graph-1", {"prompt": "two"})
+        try:
+            with self.assertLogs("graph_agent.api.run_store", level="WARNING") as logs:
+                mirror.write_state("run-1", state_1)
+                mirror.write_state("run-2", state_2)
+                mirror.flush()
+        finally:
+            mirror.close()
+
+        self.assertEqual(delegate.batch_calls, 1)
+        self.assertEqual([run_id for run_id, _ in delegate.state_writes], ["run-1", "run-2"])
+        self.assertIn("recovered 2/2 state writes", "\n".join(logs.output))
 
     def test_direct_supabase_store_append_event_remains_synchronous(self) -> None:
         with SupabaseStubServer() as url:
@@ -1074,6 +1257,138 @@ class SupabaseRunStoreTests(unittest.TestCase):
             select_clause = _single_query_value(run_get_queries[0], "select")
             self.assertIn("state_snapshot", select_clause)
             self.assertIn("graph_id", select_clause)
+
+    def test_lean_snapshot_strips_heavy_fields_but_keeps_recovery_metadata(self) -> None:
+        with SupabaseStubServer() as url:
+            store = SupabaseRunStore(
+                url=url,
+                service_role_key="test-key",
+                lean_snapshot=True,
+            )
+            state = build_run_state("run-lean", "graph-lean", {"prompt": "hello"})
+            state["status"] = "completed"
+            state["status_reason"] = "ok"
+            state["runtime_instance_id"] = "rt-1"
+            state["last_heartbeat_at"] = "2026-04-02T00:00:01Z"
+            state["node_statuses"] = {"node-a": "completed"}
+            state["iterator_states"] = {"iter-1": {"index": 0}}
+            state["loop_regions"] = {"loop-1": {"iterations": 1}}
+            state["documents"] = [{"id": "doc-1"}]
+            state["node_outputs"] = {"node-a": {"payload": "x" * 1024}}
+            state["node_inputs"] = {"node-a": {"payload": "y" * 1024}}
+            state["node_errors"] = {"node-a": None}
+            state["edge_outputs"] = {"edge-a": {"payload": "z" * 1024}}
+            state["event_history"] = [{"event_type": "node.started"}] * 50
+            state["transition_history"] = [{"from": "a", "to": "b"}] * 50
+
+            store.write_state("run-lean", state)
+
+            row = _SupabaseStubHandler.runs["run-lean"]
+            snapshot = row["state_snapshot"]
+            assert isinstance(snapshot, dict)
+            for stripped_key in (
+                "node_outputs",
+                "node_inputs",
+                "node_errors",
+                "edge_outputs",
+                "event_history",
+                "transition_history",
+                "visit_counts",
+                "transition_count",
+                "event_count",
+            ):
+                self.assertNotIn(stripped_key, snapshot, msg=f"{stripped_key} should be stripped in lean mode")
+            for kept_key in (
+                "node_statuses",
+                "iterator_states",
+                "loop_regions",
+                "documents",
+                "status_reason",
+                "runtime_instance_id",
+                "last_heartbeat_at",
+            ):
+                self.assertIn(kept_key, snapshot, msg=f"{kept_key} must survive slim_state_snapshot")
+
+    def test_lean_snapshot_preserves_prompt_traces_metadata(self) -> None:
+        with SupabaseStubServer() as url:
+            store = SupabaseRunStore(
+                url=url,
+                service_role_key="test-key",
+                lean_snapshot=True,
+            )
+            state = build_run_state("run-lean-prompts", "graph-lean", {"prompt": "hello"})
+            state["node_outputs"] = {
+                "model_a": {
+                    "schema_version": "1.0",
+                    "from_node_id": "model_a",
+                    "from_category": "model",
+                    "payload": "first",
+                    "artifacts": {
+                        "request_messages": [
+                            {"role": "system", "content": "Prompt A"},
+                            {"role": "user", "content": "Input A"},
+                        ],
+                        "system_prompt": "Prompt A",
+                        "user_prompt": "Input A",
+                    },
+                    "metadata": {
+                        "contract": "message_envelope",
+                        "node_kind": "model",
+                        "prompt_name": "prompt_a",
+                    },
+                }
+            }
+            store.write_state("run-lean-prompts", state)
+
+            row = _SupabaseStubHandler.runs["run-lean-prompts"]
+            row_metadata = row["metadata"]
+            assert isinstance(row_metadata, dict)
+            self.assertEqual(row_metadata["prompt_trace_count"], 1)
+            self.assertEqual(row_metadata["latest_system_prompt"], "Prompt A")
+            self.assertEqual(row_metadata["latest_user_prompt"], "Input A")
+            self.assertEqual(row_metadata["prompt_traces"][0]["prompt_name"], "prompt_a")
+            # The slim snapshot itself must NOT carry the heavy node_outputs payload
+            # (prompt_traces above is the only durable trace of those prompts).
+            self.assertNotIn("node_outputs", row["state_snapshot"])
+
+    def test_lean_snapshot_recovers_via_event_replay(self) -> None:
+        with SupabaseStubServer() as url:
+            store = SupabaseRunStore(
+                url=url,
+                service_role_key="test-key",
+                lean_snapshot=True,
+            )
+            state = build_run_state("run-lean-recover", "graph-lean", {"prompt": "hello"})
+            state["status"] = "completed"
+            state["node_outputs"] = {"node-a": "ignored-after-slim"}
+            store.initialize_run(state)
+            store.append_event(
+                "run-lean-recover",
+                {
+                    "event_type": "run.started",
+                    "summary": "started",
+                    "payload": {},
+                    "run_id": "run-lean-recover",
+                    "timestamp": "2026-04-02T00:00:00Z",
+                },
+            )
+            store.append_event(
+                "run-lean-recover",
+                {
+                    "event_type": "node.completed",
+                    "summary": "node-a done",
+                    "payload": {"node_id": "node-a", "output": {"answer": "ok"}, "error": None},
+                    "run_id": "run-lean-recover",
+                    "timestamp": "2026-04-02T00:00:01Z",
+                },
+            )
+            store.write_state("run-lean-recover", state)
+
+            recovered = store.recover_run_state("run-lean-recover")
+            assert recovered is not None
+            self.assertEqual(recovered["graph_id"], "graph-lean")
+            # node_outputs must come from event replay, not from the slimmed snapshot.
+            self.assertEqual(recovered["node_outputs"]["node-a"], {"answer": "ok"})
 
     def test_load_events_since_sequence_filters_by_sequence_number(self) -> None:
         with SupabaseStubServer() as url:

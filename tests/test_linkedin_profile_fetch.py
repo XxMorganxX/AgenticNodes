@@ -216,7 +216,55 @@ class LinkedInProfileFetchTests(unittest.TestCase):
         )
         self.assertEqual(provider["default_config"]["mode"], "linkedin_profile_fetch")
         self.assertEqual(provider["default_config"]["url_field"], "url")
+        self.assertEqual(provider["default_config"]["linkedin_data_dir"], "{LINKEDIN_DATA_DIR}")
         self.assertTrue(provider["default_config"]["use_cache"])
+
+    def test_runtime_resolves_linkedin_data_dir_from_machine_env(self) -> None:
+        graph = GraphDefinition.from_dict(
+            linkedin_graph_payload(
+                "linkedin-env-dir-graph",
+                node_config={
+                    "linkedin_data_dir": "{LINKEDIN_DATA_DIR}",
+                    "session_state_path": "{LINKEDIN_SESSION_STATE_PATH}",
+                    "use_cache": False,
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+        workspace_root = Path(tempfile.mkdtemp()) / ".graph-agent" / "runs"
+        machine_data_dir = str(Path(tempfile.mkdtemp()) / "Linkedin Data")
+        machine_session_path = str(Path(machine_data_dir) / ".auth" / "linkedin-storage-state.json")
+        profile_payload = sample_profile("Taylor Env")
+
+        with patch.dict(
+            "os.environ",
+            {
+                "GRAPH_AGENT_WORKSPACE_DIR": str(workspace_root),
+                "LINKEDIN_DATA_DIR": machine_data_dir,
+                "LINKEDIN_SESSION_STATE_PATH": machine_session_path,
+            },
+            clear=False,
+        ):
+            with patch(
+                "graph_agent.runtime.core.fetch_linkedin_profile_live",
+                return_value={
+                    "extracted": profile_payload,
+                    "final_page_url": "https://www.linkedin.com/in/taylor-env/",
+                    "storage_state_path": machine_session_path,
+                },
+            ) as fetch_mock:
+                state = runtime.run(
+                    graph,
+                    "https://www.linkedin.com/in/taylor-env/",
+                    run_id="run-linkedin-env-dir",
+                    agent_id="agent-alpha",
+                )
+
+        self.assertEqual(state.status, "completed")
+        fetch_mock.assert_called_once()
+        self.assertEqual(fetch_mock.call_args.kwargs["linkedin_data_dir"], machine_data_dir)
+        self.assertEqual(fetch_mock.call_args.kwargs["session_state_path"], machine_session_path)
 
     def test_runtime_reuses_shared_cache_across_runs_and_accepts_both_input_shapes(self) -> None:
         graph = GraphDefinition.from_dict(linkedin_graph_payload())

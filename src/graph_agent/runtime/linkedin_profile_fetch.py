@@ -283,7 +283,15 @@ def fetch_linkedin_profile_live(
     navigation_timeout_ms: int = 45000,
     page_settle_ms: int = 3000,
 ) -> dict[str, Any]:
-    data_dir = Path(str(linkedin_data_dir or "").strip()).expanduser()
+    raw_data_dir = str(linkedin_data_dir or "").strip()
+    if not raw_data_dir:
+        raise LinkedInFetchError(
+            "linkedin_fetch_assets_missing",
+            "LinkedIn data directory is not configured.",
+            details={"linkedin_data_dir": ""},
+        )
+
+    data_dir = Path(raw_data_dir).expanduser()
     if not data_dir.exists() or not data_dir.is_dir():
         raise LinkedInFetchError(
             "linkedin_fetch_assets_missing",

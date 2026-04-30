@@ -1,4 +1,5 @@
 import type {
+  DiscordTokenPreflightResult,
   EditorCatalog,
   GraphDocument,
   McpServerDraft,
@@ -310,6 +311,23 @@ export async function verifySupabaseAuth(config: {
   return (await response.json()) as SupabaseAuthVerificationResult;
 }
 
+export async function preflightDiscordToken(config: {
+  env_var_name: string;
+  graph_env_vars?: Record<string, string>;
+}): Promise<DiscordTokenPreflightResult> {
+  const response = await fetch(`${API_BASE_URL}/api/editor/triggers/discord/preflight`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to preflight Discord token."));
+  }
+  return (await response.json()) as DiscordTokenPreflightResult;
+}
+
 export async function fetchMicrosoftAuthStatus(): Promise<MicrosoftAuthStatus> {
   const response = await fetch(`${API_BASE_URL}/api/editor/integrations/microsoft/status`, {
     cache: "no-store",
@@ -476,6 +494,29 @@ export async function setMcpToolEnabled(toolName: string, enabled: boolean): Pro
     throw new Error(await response.text());
   }
   return (await response.json()) as ToolDefinition;
+}
+
+export async function startListenerSession(graphId: string): Promise<string> {
+  const response = await fetch(`${API_BASE_URL}/api/graphs/${graphId}/listen`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to start listening session."));
+  }
+  const payload = (await response.json()) as { run_id: string };
+  return payload.run_id;
+}
+
+export async function stopListenerSession(runId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/runs/${runId}/listen`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(await readFetchErrorMessage(response, "Failed to stop listening session."));
+  }
 }
 
 export async function startRun(graphId: string, input: string, options?: StartRunOptions): Promise<string> {

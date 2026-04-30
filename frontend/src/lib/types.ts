@@ -102,6 +102,10 @@ export type ProviderConfigOptionDefinition = {
   label: string;
 };
 
+export type TriggerMode = "immediate" | "listener";
+
+export type ListenerTransport = "outbound_socket" | "inbound_webhook";
+
 export type NodeProviderDefinition = {
   provider_id: string;
   display_name: string;
@@ -114,6 +118,8 @@ export type NodeProviderDefinition = {
   model_provider_name?: string | null;
   default_config?: Record<string, unknown>;
   config_fields?: ProviderConfigFieldDefinition[];
+  trigger_mode?: TriggerMode;
+  listener_transport?: ListenerTransport | null;
 };
 
 export type ToolDefinition = {
@@ -364,6 +370,18 @@ export type SupabaseAuthVerificationResult = {
     server_name: string;
     server_version: string;
   };
+};
+
+export type DiscordTokenPreflightResult = {
+  token_resolved: boolean;
+  resolved_env_var_name: string;
+  source: "process_env" | "graph_env_vars" | "none";
+};
+
+export type CloudflareConfig = {
+  tunnel_token_env_var: string;
+  public_hostname: string;
+  token_configured: boolean;
 };
 
 export type MicrosoftAuthStatus = {

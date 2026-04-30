@@ -253,20 +253,45 @@ class DiscordTriggerTests(unittest.TestCase):
         self.assertEqual(payload["message_id"], "message-99")
         self.assertIn("raw_event", payload)
 
-    def test_manager_starts_discord_run_for_matching_channel_messages(self) -> None:
+    def test_listener_session_routes_discord_message_to_child_run(self) -> None:
         store, temp_dir = build_isolated_store(self.services)
         self.addCleanup(temp_dir.cleanup)
         store.create_graph(build_discord_graph_payload())
         manager = GraphRunManager(services=self.services, store=store, discord_service=FakeDiscordService())
 
         with patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "discord-token"}, clear=False):
+            session_run_id = manager.start_listener_session("discord-agent")
             run_ids = manager.handle_discord_message(build_discord_message())
 
         self.assertEqual(len(run_ids), 1)
+        self.assertNotEqual(run_ids[0], session_run_id)
         run_state = wait_for_run_completion(manager, run_ids[0])
         self.assertEqual(run_state["status"], "completed")
+        self.assertEqual(run_state["parent_run_id"], session_run_id)
         self.assertEqual(run_state["input_payload"]["source"], "discord_message")
         self.assertEqual(run_state["input_payload"]["channel_id"], "channel-123")
+
+    def test_listener_session_resolves_token_from_graph_env_value(self) -> None:
+        store, temp_dir = build_isolated_store(self.services)
+        self.addCleanup(temp_dir.cleanup)
+        graph = build_discord_graph_payload()
+        graph["env_vars"] = {"DISCORD_BOT_TOKEN": "graph-env-token"}
+        store.create_graph(graph)
+        fake_service = FakeDiscordService()
+        manager = GraphRunManager(services=self.services, store=store, discord_service=fake_service)
+
+        manager.start_listener_session("discord-agent")
+
+        self.assertEqual(fake_service.started_tokens, ["graph-env-token"])
+
+    def test_handle_discord_message_drops_when_no_session_active(self) -> None:
+        store, temp_dir = build_isolated_store(self.services)
+        self.addCleanup(temp_dir.cleanup)
+        store.create_graph(build_discord_graph_payload())
+        manager = GraphRunManager(services=self.services, store=store, discord_service=FakeDiscordService())
+
+        run_ids = manager.handle_discord_message(build_discord_message())
+        self.assertEqual(run_ids, [])
 
     def test_bot_messages_are_ignored_by_default(self) -> None:
         store, temp_dir = build_isolated_store(self.services)
@@ -291,7 +316,7 @@ class DiscordTriggerTests(unittest.TestCase):
         self.assertEqual(run_state["status"], "completed")
         self.assertEqual(run_state["input_payload"], "Run from the existing editor flow.")
 
-    def test_background_service_uses_graph_env_referenced_discord_token(self) -> None:
+    def test_listener_does_not_boot_until_first_activate(self) -> None:
         store, temp_dir = build_isolated_store(self.services)
         self.addCleanup(temp_dir.cleanup)
         store.create_graph(build_discord_graph_payload())
@@ -300,6 +325,8 @@ class DiscordTriggerTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "discord-token"}, clear=False):
             manager.start_background_services()
+            self.assertEqual(fake_service.started_tokens, [])
+            manager.start_listener_session("discord-agent")
 
         self.assertEqual(fake_service.started_tokens, ["discord-token"])
 

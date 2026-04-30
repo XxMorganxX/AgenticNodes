@@ -129,6 +129,8 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
             node_kind="input",
             description="Starts a graph from an incoming Discord channel message handled by the configured bot.",
             capabilities=["discord channel trigger", "bot event listener", "message payload capture"],
+            trigger_mode="listener",
+            listener_transport="outbound_socket",
         )
     )
     node_providers.register(
@@ -622,7 +624,7 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 "mode": "linkedin_profile_fetch",
                 "input_binding": {"type": "input_payload"},
                 "url_field": "url",
-                "linkedin_data_dir": "/Users/morgannstuart/Desktop/Linkedin Data",
+                "linkedin_data_dir": "{LINKEDIN_DATA_DIR}",
                 "session_state_path": "",
                 "headless": False,
                 "navigation_timeout_ms": 45000,

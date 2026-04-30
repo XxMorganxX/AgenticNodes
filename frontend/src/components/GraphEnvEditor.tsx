@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { fetchMicrosoftAuthStatus, verifySupabaseAuth } from "../lib/api";
+import { fetchCloudflareConfig } from "../lib/cloudflare";
 import { getGraphEnvVars, NON_PERSISTED_GRAPH_ENV_KEYS, STANDARD_GRAPH_ENV_FIELDS, sanitizeGraphEnvVars } from "../lib/graphEnv";
 import { saveSessionSupabaseSchema } from "../lib/sessionSupabaseSchema";
-import type { GraphDocument, MicrosoftAuthStatus, SupabaseAuthVerificationResult } from "../lib/types";
+import type { CloudflareConfig, GraphDocument, MicrosoftAuthStatus, SupabaseAuthVerificationResult } from "../lib/types";
 import { collectReferencedSupabaseConnectionIds, getSupabaseConnectionById, getSupabaseConnections, managedSupabaseEnvKeys } from "../lib/supabaseConnections";
+import { CloudflareTunnelModal } from "./CloudflareTunnelModal";
 import { MicrosoftAuthModal } from "./MicrosoftAuthModal";
 import { SupabaseConnectionsModal } from "./SupabaseConnectionsModal";
 
@@ -12,6 +14,7 @@ type GraphEnvEditorProps = {
   graph: GraphDocument | null;
   onGraphChange: (graph: GraphDocument) => void;
   onMicrosoftAuthChanged?: () => void | Promise<void>;
+  onCloudflareConfigChanged?: () => void | Promise<void>;
 };
 
 function EnvFieldLabel({
@@ -102,7 +105,15 @@ function disconnectedMicrosoftAuthStatus(): MicrosoftAuthStatus {
   };
 }
 
-export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }: GraphEnvEditorProps) {
+function emptyCloudflareConfig(): CloudflareConfig {
+  return {
+    tunnel_token_env_var: "CLOUDFLARE_TUNNEL_TOKEN",
+    public_hostname: "",
+    token_configured: false,
+  };
+}
+
+export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged, onCloudflareConfigChanged }: GraphEnvEditorProps) {
   const [newEnvKey, setNewEnvKey] = useState("");
   const [newEnvValue, setNewEnvValue] = useState("");
   const [revealedEnvKeys, setRevealedEnvKeys] = useState<Record<string, boolean>>({});
@@ -115,6 +126,9 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
   const [supabaseBatchVerificationError, setSupabaseBatchVerificationError] = useState<string | null>(null);
   const [microsoftAuthStatus, setMicrosoftAuthStatus] = useState<MicrosoftAuthStatus>(disconnectedMicrosoftAuthStatus());
   const [microsoftAuthError, setMicrosoftAuthError] = useState<string | null>(null);
+  const [cloudflareModalOpen, setCloudflareModalOpen] = useState(false);
+  const [cloudflareConfig, setCloudflareConfig] = useState<CloudflareConfig>(emptyCloudflareConfig());
+  const [cloudflareError, setCloudflareError] = useState<string | null>(null);
   const autoVerifiedGraphKeysRef = useRef<Set<string>>(new Set());
 
   const envVars = useMemo(() => getGraphEnvVars(graph), [graph]);
@@ -178,6 +192,25 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
       .catch((error: Error) => {
         if (!cancelled) {
           setMicrosoftAuthError(error.message);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchCloudflareConfig()
+      .then((config) => {
+        if (!cancelled) {
+          setCloudflareConfig(config);
+          setCloudflareError(null);
+        }
+      })
+      .catch((error: Error) => {
+        if (!cancelled) {
+          setCloudflareError(error.message);
         }
       });
     return () => {
@@ -357,6 +390,38 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
         {microsoftAuthError ? <div className="env-supabase-launcher-error">{microsoftAuthError}</div> : null}
       </div>
 
+      <div className="env-supabase-launcher">
+        <div className="env-supabase-launcher-copy">
+          <div className="env-supabase-launcher-heading">
+            <strong>Cloudflare Tunnel</strong>
+            <span className={`env-integration-status${cloudflareConfig.token_configured ? " is-ready" : ""}`}>
+              {cloudflareConfig.token_configured ? "Token detected" : "Not configured"}
+            </span>
+          </div>
+          <p>
+            Required for inbound-webhook listener start nodes. The tunnel token stays in your <code>.env</code>; only the env-var name and public hostname are recorded here.
+          </p>
+        </div>
+        <div className="env-supabase-launcher-actions">
+          <button
+            type="button"
+            className="primary-button env-supabase-launcher-button"
+            onClick={() => setCloudflareModalOpen(true)}
+          >
+            {cloudflareConfig.public_hostname ? "Manage Cloudflare Tunnel" : "Configure Cloudflare Tunnel"}
+          </button>
+        </div>
+        <div className="env-supabase-launcher-meta">
+          {cloudflareConfig.public_hostname ? (
+            <span className="env-integration-status is-ready">{cloudflareConfig.public_hostname}</span>
+          ) : null}
+          {cloudflareConfig.tunnel_token_env_var ? (
+            <span className="env-integration-status">{cloudflareConfig.tunnel_token_env_var}</span>
+          ) : null}
+        </div>
+        {cloudflareError ? <div className="env-supabase-launcher-error">{cloudflareError}</div> : null}
+      </div>
+
       <div className="env-tiles">
         {visibleStandardFields.map((field) => (
           <div key={field.key} className="env-tile">
@@ -531,6 +596,17 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged }:
             void onMicrosoftAuthChanged?.();
           }}
           onClose={() => setMicrosoftAuthModalOpen(false)}
+        />
+      ) : null}
+      {cloudflareModalOpen ? (
+        <CloudflareTunnelModal
+          initialConfig={cloudflareConfig}
+          onConfigChange={(next) => {
+            setCloudflareConfig(next);
+            setCloudflareError(null);
+            void onCloudflareConfigChanged?.();
+          }}
+          onClose={() => setCloudflareModalOpen(false)}
         />
       ) : null}
     </>

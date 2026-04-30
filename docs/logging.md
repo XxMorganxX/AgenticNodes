@@ -79,6 +79,26 @@ Compatibility rules for `runtime.v1`:
 - reducer-critical payload keys stay stable within v1
 - renaming an event, removing a payload key, or changing event meaning requires a new schema version or a compatibility adapter
 
+## Iterator row capture
+
+Iterator nodes (`core.spreadsheet_rows`, `core.supabase_table_rows`, etc.) reset the `node_outputs` of every downstream node between rows. Without a checkpoint, the resolved `system_prompt`/`user_prompt`/`messages` for each prior iteration are lost by the time the run terminates. To preserve them:
+
+- The engine emits `node.iterator.row_completed` at the end of each iteration body, before the next iteration's reset. Payload: `node_id`, `iterator_node_id`, `iteration_index` (1-based), `total_rows`, `downstream_node_ids`, and a `prompt_map` keyed by downstream node id with `{system_prompt, user_prompt, messages, prompt_name}` per node.
+- Skipped when the iteration triggers run termination (failed/cancelled/output-node completion), since the existing terminal flush covers that snapshot.
+- The manager translates each `node.iterator.row_completed` into a separate `runs` row via `RunStore.write_iteration_snapshot`. The new row has `phase='iteration'` and the same `run_id` as the parent run. The schema already supports multiple rows per `run_id` (see `supabase/run_events_schema.sql`).
+- For symmetry, `initialize_run` now writes `phase='started'` and terminal flushes write `phase='ended'`.
+- The filesystem run store appends per-iteration captures to `.logs/runs/<run_id>/iterations.jsonl`.
+
+## Lean Supabase mirror
+
+When `GRAPH_AGENT_RUN_STORE_SUPABASE_LEAN=1` (the default whenever Supabase is the async mirror, not the primary), the mirror writes a slimmer payload to keep storage costs bounded:
+
+- `run_events` only receives `run.*` and `agent.run.*` lifecycle events. Per-node events (`node.started`, `node.completed`, `edge.selected`, `condition.evaluated`, `retry.triggered`) and their multi-agent `agent.node.*` variants are dropped at the mirror boundary.
+- `runs.state_snapshot` is filtered down to the keys `_merge_snapshot_metadata` reads back during recovery (status fields, `node_statuses`, `iterator_states`, `loop_regions`, `documents`, plus run identifiers). Heavy fields — `node_outputs`, `node_inputs`, `event_history`, `transition_history`, `node_errors`, `edge_outputs` — are stripped.
+- `runs.metadata.prompt_traces` is preserved verbatim. The system + user prompts captured per api/provider node are extracted from the full state *before* slimming, so per-run prompt audit data still lands on the run row.
+
+The filesystem run store under `.logs/runs/` keeps the full event log and full `RunState` regardless of the lean flag, so local replay and SSE are unaffected. Lean mode is forced off when `GRAPH_AGENT_RUN_STORE_SUPABASE_PRIMARY=1` (Supabase becomes the sole recovery target and needs the full stream).
+
 ## Why This Matters
 
 Graph systems can be non-deterministic even when the graph structure is static. A stable event model makes it possible to reason about the exact path a run took and why it took it.

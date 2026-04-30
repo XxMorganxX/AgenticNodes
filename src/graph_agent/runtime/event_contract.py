@@ -14,6 +14,7 @@ BASE_RUNTIME_EVENT_TYPES = (
     "node.completed",
     "node.iterator.updated",
     "node.iterator.config_patch",
+    "node.iterator.row_completed",
     "edge.selected",
     "condition.evaluated",
     "retry.triggered",
@@ -21,6 +22,9 @@ BASE_RUNTIME_EVENT_TYPES = (
     "run.failed",
     "run.cancelled",
     "run.interrupted",
+    "listener.session.started",
+    "listener.event.received",
+    "listener.session.stopped",
 )
 AGENT_WRAPPED_RUNTIME_EVENT_TYPES = tuple(f"agent.{event_type}" for event_type in BASE_RUNTIME_EVENT_TYPES)
 SUPPORTED_RUNTIME_EVENT_TYPES = (*BASE_RUNTIME_EVENT_TYPES, *AGENT_WRAPPED_RUNTIME_EVENT_TYPES)
@@ -56,6 +60,14 @@ REDUCER_CRITICAL_PAYLOAD_FIELDS: dict[str, tuple[str, ...]] = {
         "iterator_row_index",
         "iterator_total_rows",
         "iteration_id",
+    ),
+    "node.iterator.row_completed": (
+        "node_id",
+        "iterator_node_id",
+        "iteration_index",
+        "total_rows",
+        "downstream_node_ids",
+        "prompt_map",
     ),
     "edge.selected": ("id", "source_id", "target_id", "source_handle_id"),
     "run.completed": ("final_output", "terminal_node_id"),

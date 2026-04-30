@@ -26,6 +26,58 @@ def _read_request_timeout_seconds() -> float:
     return value if value > 0 else 10.0
 
 
+def _read_lean_snapshot_default() -> bool:
+    raw = os.environ.get("GRAPH_AGENT_RUN_STORE_SUPABASE_LEAN", "").strip().lower()
+    if not raw:
+        return True
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+# Keys retained when GRAPH_AGENT_RUN_STORE_SUPABASE_LEAN is on. The list is the
+# union of fields _merge_snapshot_metadata reads back during recover_run_state
+# plus stable run identifiers and final-output fields. Keep this in sync with
+# _merge_snapshot_metadata above when the recovery contract changes.
+_SLIM_SNAPSHOT_KEYS: tuple[str, ...] = (
+    "run_id",
+    "graph_id",
+    "agent_id",
+    "agent_name",
+    "parent_run_id",
+    "status",
+    "status_reason",
+    "started_at",
+    "ended_at",
+    "runtime_instance_id",
+    "last_heartbeat_at",
+    "current_node_id",
+    "current_edge_id",
+    "input_payload",
+    "final_output",
+    "terminal_error",
+    "node_statuses",
+    "iterator_states",
+    "loop_regions",
+    "documents",
+)
+
+
+def _slim_state_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        return {}
+    slim: dict[str, Any] = {key: state[key] for key in _SLIM_SNAPSHOT_KEYS if key in state}
+    agent_runs = state.get("agent_runs")
+    if isinstance(agent_runs, dict) and agent_runs:
+        slim["agent_runs"] = {
+            agent_id: _slim_state_snapshot(child) if isinstance(child, dict) else child
+            for agent_id, child in agent_runs.items()
+        }
+    return slim
+
+
 _REQUEST_TIMEOUT_SECONDS = _read_request_timeout_seconds()
 # HTTP read/connect timeout used by urllib (mirrors tune flush waits relative to this).
 SUPABASE_RUN_STORE_REQUEST_TIMEOUT_SECONDS = float(_REQUEST_TIMEOUT_SECONDS)
@@ -257,12 +309,14 @@ class SupabaseRunStore:
         schema: str = "public",
         runs_table: str = "runs",
         events_table: str = "run_events",
+        lean_snapshot: bool | None = None,
     ) -> None:
         self.url = url.rstrip("/")
         self.service_role_key = service_role_key.strip()
         self.schema = schema
         self.runs_table = runs_table
         self.events_table = events_table
+        self._lean_snapshot = _read_lean_snapshot_default() if lean_snapshot is None else bool(lean_snapshot)
         self._sequence_lock = Lock()
         self._sequence_cache: dict[str, int] = {}
         self._unsupported_columns_lock = Lock()
@@ -288,7 +342,12 @@ class SupabaseRunStore:
                 "GRAPH_AGENT_SUPABASE_SERVICE_ROLE_KEY, SUPABASE_SERVICE_ROLE_KEY, "
                 "or SUPABASE_SECRET_KEY) in the process environment."
             )
-        return cls(url=url, service_role_key=service_role_key, schema=schema)
+        return cls(
+            url=url,
+            service_role_key=service_role_key,
+            schema=schema,
+            lean_snapshot=_read_lean_snapshot_default(),
+        )
 
     def initialize_run(self, state: dict[str, Any]) -> None:
         self.initialize_runs_batch([state])
@@ -302,7 +361,10 @@ class SupabaseRunStore:
     def initialize_runs_batch(self, states: list[dict[str, Any]]) -> None:
         if not states:
             return
-        rows = [self._build_run_row(state, created_at=utc_now_iso()) for state in states]
+        rows = [
+            self._build_run_row(state, created_at=utc_now_iso(), phase="started")
+            for state in states
+        ]
         self._upsert_runs(rows)
         with self._sequence_lock:
             for state in states:
@@ -357,8 +419,35 @@ class SupabaseRunStore:
     def write_states_batch(self, items: list[tuple[str, dict[str, Any]]]) -> None:
         if not items:
             return
-        rows = [self._build_run_row(state) for _, state in items]
+        rows = [self._build_run_row(state, phase="ended") for _, state in items]
         self._upsert_runs(rows)
+
+    def write_iteration_snapshot(
+        self,
+        run_id: str,
+        state: dict[str, Any],
+        *,
+        iteration_index: int,
+        iterator_node_id: str,
+        prompt_map: dict[str, dict[str, Any]],
+    ) -> None:
+        iteration_meta = {
+            "iteration": {
+                "index": int(iteration_index),
+                "iterator_node_id": str(iterator_node_id),
+                "prompt_map": dict(prompt_map),
+            }
+        }
+        row = self._build_run_row(
+            state,
+            created_at=utc_now_iso(),
+            phase="iteration",
+            metadata_extra=iteration_meta,
+        )
+        # Force the run_id we were called with so a state missing/mismatched
+        # run_id can't strand the iteration row under the wrong key.
+        row["run_id"] = run_id
+        self._upsert_runs([row])
 
     # Tight column lists keep Supabase egress down: callers that only need
     # the manifest must NOT trigger a fetch of the (potentially MB-sized)
@@ -543,9 +632,25 @@ class SupabaseRunStore:
             "metadata": _event_row_metadata(event),
         }
 
-    def _build_run_row(self, state: dict[str, Any], *, created_at: str | None = None) -> dict[str, Any]:
+    def _build_run_row(
+        self,
+        state: dict[str, Any],
+        *,
+        created_at: str | None = None,
+        phase: str | None = None,
+        metadata_extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         normalized_state = normalize_runtime_state_snapshot(state) or state
-        return {
+        # Extract prompt_traces from the FULL state before any slimming so the
+        # system+user prompts captured on api/provider node outputs survive
+        # even when state_snapshot is slimmed.
+        metadata = _run_row_metadata(normalized_state)
+        if metadata_extra:
+            metadata = {**metadata, **metadata_extra}
+        state_snapshot = (
+            _slim_state_snapshot(normalized_state) if self._lean_snapshot else normalized_state
+        )
+        row: dict[str, Any] = {
             "run_id": normalized_state.get("run_id"),
             "graph_id": normalized_state.get("graph_id"),
             "agent_id": normalized_state.get("agent_id"),
@@ -562,10 +667,13 @@ class SupabaseRunStore:
             "terminal_error": normalized_state.get("terminal_error"),
             "current_node_id": normalized_state.get("current_node_id"),
             "current_edge_id": normalized_state.get("current_edge_id"),
-            "state_snapshot": normalized_state,
-            "metadata": _run_row_metadata(normalized_state),
+            "state_snapshot": state_snapshot,
+            "metadata": metadata,
             "created_at": created_at or normalized_state.get("started_at") or utc_now_iso(),
         }
+        if phase is not None:
+            row["phase"] = phase
+        return row
 
     def _table_path(self, table_name: str) -> str:
         return f"/rest/v1/{table_name}"

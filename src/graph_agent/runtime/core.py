@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import socket
+import time
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
@@ -248,6 +250,25 @@ def _coerce_int(value: Any, *, default: int, minimum: int | None = None) -> int:
     if minimum is not None:
         return max(resolved, minimum)
     return resolved
+
+
+def _coerce_float(value: Any, *, default: float, minimum: float | None = None) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        resolved = float(str(value).strip()) if isinstance(value, str) else float(value)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        return max(resolved, minimum)
+    return resolved
+
+
+def _is_timeout_like_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    message = str(exc).lower()
+    return "timed out" in message or "timeout" in message
 
 
 def _coerce_structured_payload_field_aliases(value: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -670,6 +691,8 @@ DEFAULT_GRAPH_ENV_VARS = {
     "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
     "DISCORD_BOT_TOKEN": "DISCORD_BOT_TOKEN",
     "APOLLO_API_KEY": "APOLLO_API_KEY",
+    "LINKEDIN_DATA_DIR": "LINKEDIN_DATA_DIR",
+    "EMAIL_TABLE_SUFFIX": "_dev",
 }
 DEFAULT_SUPABASE_URL_ENV_VAR = "GRAPH_AGENT_SUPABASE_URL"
 DEFAULT_SUPABASE_KEY_ENV_VAR = "GRAPH_AGENT_SUPABASE_SECRET_KEY"
@@ -747,6 +770,24 @@ def _normalize_graph_env_vars(payload: Mapping[str, Any] | None) -> dict[str, st
 
 def _resolve_graph_env_string(value: str, env_vars: Mapping[str, str]) -> str:
     return GRAPH_ENV_REFERENCE_PATTERN.sub(lambda match: env_vars.get(match.group(1), match.group(0)), value)
+
+
+def _resolve_graph_filesystem_path(value: Any, env_vars: Mapping[str, str]) -> str:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return ""
+
+    def _replace_reference(match: re.Match[str]) -> str:
+        name = str(match.group(1) or "")
+        graph_value = str(env_vars.get(name, "") or "").strip()
+        if graph_value and graph_value != name:
+            return graph_value
+        process_value = str(os.environ.get(name, "") or "").strip()
+        if process_value:
+            return process_value
+        return match.group(0)
+
+    return os.path.expandvars(GRAPH_ENV_REFERENCE_PATTERN.sub(_replace_reference, raw_value)).strip()
 
 
 def _slugify_context_builder_placeholder(value: Any, *, fallback: str = "source") -> str:
@@ -851,7 +892,7 @@ def resolve_graph_env_reference_name(value: Any, env_vars: Mapping[str, str], *,
 
 
 def resolve_graph_process_env(value: str, env_vars: Mapping[str, str]) -> str:
-    env_var_name = resolve_graph_env_var_name(value, env_vars)
+    env_var_name = resolve_graph_env_reference_name(value, env_vars)
     if not env_var_name:
         return ""
     process_value = os.environ.get(env_var_name, "")
@@ -2954,8 +2995,8 @@ class DataNode(BaseNode):
         resolved = context.resolve_graph_env_value(dict(self.config))
         return {
             "url_field": str(resolved.get("url_field", "url") or "url").strip() or "url",
-            "linkedin_data_dir": str(resolved.get("linkedin_data_dir", "") or "").strip(),
-            "session_state_path": str(resolved.get("session_state_path", "") or "").strip(),
+            "linkedin_data_dir": _resolve_graph_filesystem_path(self.raw_config.get("linkedin_data_dir", ""), context.graph_env_vars()),
+            "session_state_path": _resolve_graph_filesystem_path(self.raw_config.get("session_state_path", ""), context.graph_env_vars()),
             "headless": _coerce_bool(resolved.get("headless"), default=False),
             "navigation_timeout_ms": _coerce_int(resolved.get("navigation_timeout_ms"), default=45000, minimum=1000),
             "page_settle_ms": _coerce_int(resolved.get("page_settle_ms"), default=3000, minimum=0),
@@ -7274,6 +7315,19 @@ class OutlookDraftOutputNode(OutputNode):
     def _auth_service(self, context: NodeContext) -> MicrosoftAuthService:
         return context.services.microsoft_auth_service or MicrosoftAuthService()
 
+    def _acquire_access_token(self, auth_service: MicrosoftAuthService) -> str:
+        max_retries = _coerce_int(self.config.get("auth_max_retries"), default=2, minimum=0)
+        backoff_seconds = _coerce_float(self.config.get("auth_retry_backoff_seconds"), default=1.0, minimum=0.0)
+        attempt = 0
+        while True:
+            try:
+                return auth_service.acquire_access_token()
+            except Exception as exc:  # noqa: BLE001
+                if not _is_timeout_like_exception(exc) or attempt >= max_retries:
+                    raise
+                time.sleep(backoff_seconds * (2 ** attempt))
+                attempt += 1
+
     def _require_to(self) -> bool:
         return bool(self.config.get("require_to", True))
 
@@ -7835,7 +7889,7 @@ class OutlookDraftOutputNode(OutputNode):
                         "outbound_email_log_skipped": False,
                     },
                 )
-        access_token = auth_service.acquire_access_token()
+        access_token = self._acquire_access_token(auth_service)
         draft_client = context.services.outlook_draft_client or OutlookDraftClient()
         signature = str(self.config.get("signature", "") or "")
         try:

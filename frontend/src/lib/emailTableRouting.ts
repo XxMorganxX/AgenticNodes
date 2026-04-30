@@ -134,11 +134,41 @@ export function emailRoutingModeLabel(mode: EmailRoutingMode): string {
   return mode === "production" ? "Production tables" : "Development tables";
 }
 
+export const EMAIL_TABLE_SUFFIX_ENV_VAR_KEY = "EMAIL_TABLE_SUFFIX";
+
+export function emailTableSuffixForMode(mode: EmailRoutingMode): string {
+  return mode === "production" ? "" : "_dev";
+}
+
+function withEmailTableSuffixEnvVar(
+  envVars: Record<string, string> | undefined,
+  mode: EmailRoutingMode,
+): Record<string, string> {
+  return {
+    ...(envVars ?? {}),
+    [EMAIL_TABLE_SUFFIX_ENV_VAR_KEY]: emailTableSuffixForMode(mode),
+  };
+}
+
+export function syncEmailTableSuffixEnvVar(graph: GraphDocument): GraphDocument {
+  const mode = resolveEmailRoutingMode(graph);
+  const desired = emailTableSuffixForMode(mode);
+  const current = graph.env_vars?.[EMAIL_TABLE_SUFFIX_ENV_VAR_KEY];
+  if (current === desired) {
+    return graph;
+  }
+  return {
+    ...graph,
+    env_vars: withEmailTableSuffixEnvVar(graph.env_vars, mode),
+  };
+}
+
 export function applyEmailRoutingMode(graph: GraphDocument, mode: EmailRoutingMode): GraphDocument {
   if (isTestEnvironmentDocument(graph)) {
     return {
       ...graph,
       email_routing_mode: mode,
+      env_vars: withEmailTableSuffixEnvVar(graph.env_vars, mode),
       agents: graph.agents.map((agent) => ({
         ...agent,
         nodes: agent.nodes.map((node) => retargetNode(node, mode)),
@@ -148,6 +178,7 @@ export function applyEmailRoutingMode(graph: GraphDocument, mode: EmailRoutingMo
   return {
     ...graph,
     email_routing_mode: mode,
+    env_vars: withEmailTableSuffixEnvVar(graph.env_vars, mode),
     nodes: graph.nodes.map((node) => retargetNode(node, mode)),
   };
 }

@@ -14,10 +14,12 @@ export const DEFAULT_GRAPH_ENV_VARS: Record<string, string> = {
   ANTHROPIC_API_KEY: "ANTHROPIC_API_KEY",
   DISCORD_BOT_TOKEN: "DISCORD_BOT_TOKEN",
   APOLLO_API_KEY: "APOLLO_API_KEY",
+  LINKEDIN_DATA_DIR: "LINKEDIN_DATA_DIR",
   GRAPH_AGENT_SUPABASE_URL: "",
   GRAPH_AGENT_SUPABASE_SECRET_KEY: "",
   SUPABASE_PROJECT_REF: "",
   SUPABASE_ACCESS_TOKEN: "",
+  EMAIL_TABLE_SUFFIX: "_dev",
 };
 
 export const STANDARD_GRAPH_ENV_FIELDS: readonly StandardGraphEnvField[] = [
@@ -41,6 +43,12 @@ export const STANDARD_GRAPH_ENV_FIELDS: readonly StandardGraphEnvField[] = [
     label: "Apollo API Key Reference",
     placeholder: "APOLLO_API_KEY",
     tooltipText: "Used automatically by Apollo Email Lookup nodes. Set this once in Environment instead of per node.",
+  },
+  {
+    key: "LINKEDIN_DATA_DIR",
+    label: "LinkedIn Data Directory Reference",
+    placeholder: "LINKEDIN_DATA_DIR",
+    tooltipText: "Used by LinkedIn Profile Fetch nodes. Set this as a machine-local environment variable so graphs stay portable.",
   },
   {
     key: "GRAPH_AGENT_SUPABASE_URL",

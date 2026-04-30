@@ -906,6 +906,94 @@ pre {
   text-transform: uppercase;
 }
 
+.listener-session-panel {
+  display: grid;
+  gap: 0.65rem;
+  font-size: 0.85rem;
+}
+
+.listener-session-status,
+.listener-session-meta {
+  margin: 0;
+  color: #c2c8e7;
+}
+
+.listener-session-children {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.listener-session-children ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 0.3rem;
+  max-height: 14rem;
+  overflow-y: auto;
+}
+
+.listener-session-children li {
+  display: block;
+}
+
+.listener-session-child-run {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.04);
+  color: #e5e7ff;
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.35rem;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 0.78rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.listener-session-child-run:hover,
+.listener-session-child-run.is-selected {
+  border-color: rgba(142, 154, 255, 0.45);
+  background: rgba(142, 154, 255, 0.14);
+}
+
+.listener-session-children-time {
+  color: #8d93c5;
+  font-size: 0.72rem;
+}
+
+.listener-session-child-details {
+  display: grid;
+  gap: 0.45rem;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0.5rem;
+  padding: 0.65rem;
+  background: rgba(8, 10, 24, 0.35);
+}
+
+.listener-session-child-details-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  color: #aeb6e8;
+  font-size: 0.78rem;
+}
+
+.listener-session-child-details pre {
+  max-height: 14rem;
+  overflow: auto;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #e9ecff;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
 .mosaic-documents {
   max-height: 24.5rem;
   overflow-y: auto;
@@ -6202,6 +6290,35 @@ pre {
   letter-spacing: 0.03em;
 }
 
+.provider-trigger-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  border: 1px solid transparent;
+}
+
+.provider-trigger-badge--immediate {
+  border-color: rgba(148, 163, 184, 0.45);
+  background: rgba(148, 163, 184, 0.16);
+  color: #e2e8f0;
+}
+
+.provider-trigger-badge--listener-outbound {
+  border-color: rgba(96, 165, 250, 0.45);
+  background: rgba(59, 130, 246, 0.16);
+  color: #cfe5ff;
+}
+
+.provider-trigger-badge--listener-inbound {
+  border-color: rgba(251, 191, 36, 0.5);
+  background: rgba(251, 191, 36, 0.16);
+  color: #fde68a;
+}
+
 @media (max-width: 980px) {
   .provider-details-node-layout,
   .provider-details-overview-layout,
@@ -7673,6 +7790,40 @@ pre {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.9rem;
+}
+
+.discord-token-status {
+  margin-top: 0.6rem;
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  line-height: 1.35;
+  border: 1px solid transparent;
+}
+
+.discord-token-status code {
+  font-size: 0.8rem;
+  padding: 0.05rem 0.3rem;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 4px;
+}
+
+.discord-token-status--ok {
+  background: rgba(46, 160, 92, 0.16);
+  border-color: rgba(46, 160, 92, 0.45);
+  color: #b6f0c8;
+}
+
+.discord-token-status--warning {
+  background: rgba(220, 130, 50, 0.16);
+  border-color: rgba(220, 130, 50, 0.5);
+  color: #f4cc9b;
+}
+
+.discord-token-status--neutral {
+  background: rgba(99, 106, 150, 0.18);
+  border-color: rgba(99, 106, 150, 0.45);
+  color: #c9d0f7;
 }
 
 .supabase-auth-modal-label-with-hint {

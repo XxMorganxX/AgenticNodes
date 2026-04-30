@@ -1,4 +1,14 @@
-import type { AgentDefinition, GraphDefinition, GraphDocument, RunState, RuntimeEvent, TestEnvironmentDefinition } from "./types";
+import type {
+  AgentDefinition,
+  EditorCatalog,
+  GraphDefinition,
+  GraphDocument,
+  GraphNode,
+  NodeProviderDefinition,
+  RunState,
+  RuntimeEvent,
+  TestEnvironmentDefinition,
+} from "./types";
 
 function isDefaultEnvPlaceholder(key: string, value: string): boolean {
   const normalizedKey = String(key ?? "").trim();
@@ -28,6 +38,16 @@ function mergeEnvVars(...envGroups: Array<Record<string, string> | undefined>): 
 
 export function isTestEnvironment(graph: GraphDocument | null | undefined): graph is TestEnvironmentDefinition {
   return Boolean(graph && "agents" in graph && Array.isArray(graph.agents));
+}
+
+// Mirrors backend `TestEnvironmentDefinition.is_multi_agent`. Use this for UI/run-mode
+// decisions; `isTestEnvironment` is now a shape predicate that matches every document
+// the API returns and no longer discriminates single-graph vs multi-agent intent.
+export function isMultiAgent(graph: GraphDocument | null | undefined): graph is TestEnvironmentDefinition {
+  if (!isTestEnvironment(graph)) {
+    return false;
+  }
+  return graph.graph_type === "test_environment" || graph.agents.length > 1;
 }
 
 export function getDefaultAgentId(graph: GraphDocument | null | undefined): string | null {
@@ -150,6 +170,44 @@ export function getSelectedRunFilesRequest(
     runId: selectedRun?.run_id ?? fallbackRunId,
     agentId: null,
   };
+}
+
+export function getStartNode(graph: GraphDefinition | null | undefined): GraphNode | null {
+  if (!graph) {
+    return null;
+  }
+  return graph.nodes.find((node) => node.id === graph.start_node_id) ?? null;
+}
+
+export function findNodeProvider(
+  catalog: EditorCatalog | null | undefined,
+  graph: GraphDefinition | null | undefined,
+  providerId: string | null | undefined,
+): NodeProviderDefinition | null {
+  if (!providerId) {
+    return null;
+  }
+  const fromGraph = (graph?.node_providers ?? []).find((provider) => provider.provider_id === providerId);
+  if (fromGraph) {
+    return fromGraph;
+  }
+  const fromCatalog = (catalog?.node_providers ?? []).find((provider) => provider.provider_id === providerId);
+  return fromCatalog ?? null;
+}
+
+export function getListenerStartProvider(
+  graph: GraphDefinition | null | undefined,
+  catalog: EditorCatalog | null | undefined,
+): NodeProviderDefinition | null {
+  const startNode = getStartNode(graph);
+  if (!startNode) {
+    return null;
+  }
+  const provider = findNodeProvider(catalog, graph, startNode.provider_id);
+  if (!provider || provider.trigger_mode !== "listener") {
+    return null;
+  }
+  return provider;
 }
 
 export function filterEventsForAgent(

@@ -425,6 +425,126 @@ class SpreadsheetRowTests(unittest.TestCase):
         self.assertIsInstance(state.final_output, str)
         self.assertIn("Portland", state.final_output)
 
+    def test_iterator_emits_row_completed_event_per_iteration(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "rows.csv"
+            with csv_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["city", "temperature"])
+                writer.writerow(["Seattle", "58"])
+                writer.writerow(["Portland", "62"])
+
+            services = build_example_services()
+            services.model_providers["spreadsheet_echo"] = SpreadsheetEchoProvider()
+            runtime = GraphRuntime(
+                services=services,
+                max_steps=services.config["max_steps"],
+                max_visits_per_node=services.config["max_visits_per_node"],
+            )
+            graph_payload = {
+                "graph_id": "spreadsheet-row-iter-capture-graph",
+                "name": "Iterator Row Capture",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "sheet",
+                        "kind": "control_flow_unit",
+                        "category": "control_flow_unit",
+                        "label": "Spreadsheet Rows",
+                        "provider_id": "core.spreadsheet_rows",
+                        "provider_label": "Spreadsheet Rows",
+                        "config": {
+                            "mode": "spreadsheet_rows",
+                            "file_format": "csv",
+                            "file_path": str(csv_path),
+                            "sheet_name": "",
+                            "header_row_index": 1,
+                            "start_row_index": 2,
+                            "empty_row_policy": "skip",
+                        },
+                        "position": {"x": 100, "y": 0},
+                    },
+                    {
+                        "id": "model",
+                        "kind": "model",
+                        "category": "api",
+                        "label": "Model",
+                        "provider_id": "core.api",
+                        "provider_label": "API Call Node",
+                        "model_provider_name": "spreadsheet_echo",
+                        "prompt_name": "spreadsheet_prompt",
+                        "config": {
+                            "provider_name": "spreadsheet_echo",
+                            "prompt_name": "spreadsheet_prompt",
+                            "system_prompt": "Process the current spreadsheet row.",
+                            "user_message_template": "{input_payload}",
+                            "response_mode": "message",
+                        },
+                        "position": {"x": 220, "y": 0},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "model"}},
+                        "position": {"x": 340, "y": 0},
+                    },
+                ],
+                "edges": [
+                    {"id": "e1", "source_id": "start", "target_id": "sheet", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e2", "source_id": "sheet", "target_id": "model", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "e3", "source_id": "model", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+            graph = GraphDefinition.from_dict(graph_payload)
+            graph.validate_against_services(services)
+
+            state = runtime.run(graph, {"request": "Process rows"}, run_id="iter-capture-test")
+
+        self.assertEqual(state.status, "completed")
+        row_events = [
+            event
+            for event in state.event_history
+            if event.event_type == "node.iterator.row_completed"
+        ]
+        self.assertEqual(len(row_events), 2)
+        self.assertEqual(
+            [event.payload.get("iteration_index") for event in row_events],
+            [1, 2],
+        )
+        for event in row_events:
+            self.assertEqual(event.payload.get("iterator_node_id"), "sheet")
+            self.assertEqual(event.payload.get("total_rows"), 2)
+            prompt_map = event.payload.get("prompt_map")
+            self.assertIsInstance(prompt_map, dict)
+            self.assertIn("model", prompt_map)
+            entry = prompt_map["model"]
+            self.assertEqual(entry["system_prompt"], "Process the current spreadsheet row.")
+            self.assertEqual(entry["prompt_name"], "spreadsheet_prompt")
+            self.assertIsInstance(entry["messages"], list)
+            self.assertTrue(any(m.get("role") == "user" for m in entry["messages"]))
+        self.assertIn("Seattle", row_events[0].payload["prompt_map"]["model"]["user_prompt"])
+        self.assertIn("Portland", row_events[1].payload["prompt_map"]["model"]["user_prompt"])
+        self.assertNotEqual(
+            row_events[0].payload["prompt_map"]["model"]["user_prompt"],
+            row_events[1].payload["prompt_map"]["model"]["user_prompt"],
+        )
+
     def test_model_completed_events_include_iteration_and_session_ids_per_row(self) -> None:
         with TemporaryDirectory() as temp_dir:
             csv_path = Path(temp_dir) / "rows.csv"

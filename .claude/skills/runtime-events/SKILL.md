@@ -127,6 +127,35 @@ configured run store (`GRAPH_AGENT_RUN_STORE`) persists events.
 3. Document in `docs/logging.md` and bump this skill's reducer-critical
    keys table if relevant.
 
+## Iterator row capture
+
+Iterator nodes (`core.spreadsheet_rows`, `core.supabase_table_rows`) pop downstream `node_outputs` between rows, so per-iteration resolved prompts are gone by run termination. The engine emits `node.iterator.row_completed` at each iteration boundary (after the sub-graph drain, before the next reset) with payload `{node_id, iterator_node_id, iteration_index, total_rows, downstream_node_ids, prompt_map}`. `prompt_map` is keyed by node id with `{system_prompt, user_prompt, messages, prompt_name}` per downstream model node.
+
+The manager handler routes that event to `RunStore.write_iteration_snapshot`, which writes an extra `runs` row with `phase='iteration'`, the same `run_id`, and the prompt map nested under `metadata.iteration`. `initialize_run` now writes `phase='started'` and terminal flushes write `phase='ended'`. Skipped when the iteration triggers run termination (terminal flush covers it). Filesystem store appends to `.logs/runs/<run_id>/iterations.jsonl`.
+
+## Lean Supabase mirror
+
+When `GRAPH_AGENT_RUN_STORE_SUPABASE_LEAN=1` (default in mirror mode), the
+async Supabase mirror only forwards `run.*` and `agent.run.*` lifecycle events
+to `run_events`. Per-node events (`node.started`, `node.completed`,
+`edge.selected`, `condition.evaluated`, `retry.triggered`) are dropped at the
+mirror boundary — the filesystem run store under `.logs/runs/` keeps the full
+event log for replay and SSE.
+
+`runs.state_snapshot` is also slimmed: only the keys that
+`_merge_snapshot_metadata` consumes during recovery survive (status fields,
+`node_statuses`, `iterator_states`, `loop_regions`, `documents`, plus run
+identifiers). `node_outputs`, `node_inputs`, `event_history`,
+`transition_history`, `node_errors`, and `edge_outputs` are stripped before
+upload.
+
+Prompt traces are unaffected: `_run_row_metadata` still extracts system+user
+prompts per api/provider node into `runs.metadata.prompt_traces` *before*
+slimming, so per-run prompt audit data persists.
+
+Forced off when `GRAPH_AGENT_RUN_STORE_SUPABASE_PRIMARY=1` because Supabase is
+the only recovery target in that mode and needs the full event stream + state.
+
 ## Common pitfalls
 
 - Mutating state from inside a node — breaks replay.

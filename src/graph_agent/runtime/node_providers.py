@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
+
+
+TriggerMode = Literal["immediate", "listener"]
+ListenerTransport = Literal["outbound_socket", "inbound_webhook"]
 
 
 class NodeCategory(str, Enum):
@@ -60,6 +64,8 @@ class NodeProviderDefinition:
     model_provider_name: str | None = None
     default_config: dict[str, Any] = field(default_factory=dict)
     config_fields: list[ProviderConfigFieldDefinition] = field(default_factory=list)
+    trigger_mode: TriggerMode = "immediate"
+    listener_transport: ListenerTransport | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)

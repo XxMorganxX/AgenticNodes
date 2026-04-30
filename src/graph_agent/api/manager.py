@@ -17,6 +17,7 @@ from threading import Event, Lock, Thread
 from typing import Any, Iterator
 from uuid import uuid4
 
+from graph_agent.api.cloudflare_store import CloudflareConfigStore
 from graph_agent.api.graph_store import GraphStore
 from graph_agent.api.project_files import ProjectFileStore
 from graph_agent.api.run_store import (
@@ -30,9 +31,11 @@ from graph_agent.api.run_store import (
 from graph_agent.api.run_state_reducer import apply_event, build_run_state
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.providers.discord import DiscordMessageEvent, DiscordTriggerService, normalize_discord_message_payload
+from graph_agent.providers.triggers import TriggerService
 from graph_agent.runtime.core import (
     GraphDefinition,
     RUN_EVENT_BACKLOG_LIMIT,
+    resolve_graph_env_reference_name,
     resolve_graph_env_var_name,
     resolve_graph_process_env,
     utc_now_iso,
@@ -94,6 +97,10 @@ STATE_FLUSH_EVENT_TYPES = {
     "agent.run.failed",
     "agent.run.cancelled",
     "agent.run.interrupted",
+}
+ITERATION_SNAPSHOT_EVENT_TYPES = {
+    "node.iterator.row_completed",
+    "agent.node.iterator.row_completed",
 }
 BUNDLED_MCP_TEMPLATE_PATH = Path(__file__).resolve().with_name("mcp_server_templates.json")
 DEFAULT_MCP_TEMPLATE_DIR = Path(__file__).resolve().parents[3] / ".graph-agent" / "mcp-server-templates"
@@ -238,6 +245,67 @@ class RunControl:
     thread: Thread | None = None
 
 
+class _DiscordTriggerAdapter:
+    """Adapts a DiscordTriggerService (or test fake exposing start/stop) to the
+    TriggerService protocol so the manager can drive every listener uniformly.
+
+    Holds a graph_id refcount so the underlying socket only stays alive while
+    at least one listening session is active. Token is resolved lazily on the
+    first activate() call."""
+
+    name = "discord"
+
+    def __init__(self, service: Any, token_provider: Any) -> None:
+        self._service = service
+        self._token_provider = token_provider
+        self._active_graph_ids: set[str] = set()
+        self._lock = Lock()
+
+    def activate(self, graph_id: str) -> None:
+        normalized = str(graph_id or "").strip()
+        if not normalized:
+            return
+        with self._lock:
+            should_start = not self._active_graph_ids
+            self._active_graph_ids.add(normalized)
+        if not should_start:
+            return
+        try:
+            token = self._token_provider(normalized)
+        except TypeError:
+            # Back-compat for older zero-arg providers.
+            token = self._token_provider()  # type: ignore[call-arg]
+        if not token:
+            with self._lock:
+                self._active_graph_ids.discard(normalized)
+            raise RuntimeError(
+                f"No Discord bot token available for graph '{normalized}'; "
+                "set DISCORD_BOT_TOKEN in the environment or this graph's env vars."
+            )
+        try:
+            self._service.start(token)
+        except RuntimeError:
+            with self._lock:
+                self._active_graph_ids.discard(normalized)
+            LOGGER.exception("Unable to start Discord trigger service.")
+            raise
+
+    def deactivate(self, graph_id: str) -> None:
+        normalized = str(graph_id or "").strip()
+        with self._lock:
+            if normalized not in self._active_graph_ids:
+                return
+            self._active_graph_ids.discard(normalized)
+            should_stop = not self._active_graph_ids
+        if should_stop:
+            self._service.stop()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._active_graph_ids.clear()
+        self._service.stop()
+
+
 class GraphRunManager:
     def __init__(
         self,
@@ -248,6 +316,7 @@ class GraphRunManager:
         run_log_store: RunStore | None = None,
         discord_service: DiscordTriggerService | None = None,
         project_file_store: ProjectFileStore | None = None,
+        cloudflare_config_store: CloudflareConfigStore | None = None,
     ) -> None:
         self._services = services or build_example_services(include_user_mcp_servers=True)
         self._store = store or GraphStore(self._services)
@@ -262,7 +331,15 @@ class GraphRunManager:
         self._run_store_override_run_ids: dict[int, set[str]] = {}
         self._supabase_run_store_announced: set[tuple[str, str, str]] = set()
         self._project_file_store = project_file_store or ProjectFileStore()
+        self._cloudflare_config_store = cloudflare_config_store or CloudflareConfigStore()
         self._discord_service = discord_service or DiscordTriggerService(self.handle_discord_message)
+        self._discord_adapter = _DiscordTriggerAdapter(self._discord_service, self._resolve_discord_service_token)
+        self._trigger_services: list[TriggerService] = [self._discord_adapter]
+        self._trigger_services_by_provider_id: dict[str, TriggerService] = {
+            DISCORD_START_PROVIDER_ID: self._discord_adapter,
+        }
+        self._active_sessions: dict[str, str] = {}
+        self._listener_session_metadata: dict[str, dict[str, Any]] = {}
         self._runtime_instance_id = str(uuid4())
         self._heartbeat_interval_seconds = _read_interval_env("GRAPH_AGENT_RUN_HEARTBEAT_INTERVAL_SECONDS", 1.0)
         self._heartbeat_timeout_seconds = _read_interval_env("GRAPH_AGENT_RUN_HEARTBEAT_TIMEOUT_SECONDS", 5.0)
@@ -288,7 +365,6 @@ class GraphRunManager:
 
     def create_graph(self, graph_payload: dict[str, Any]) -> dict[str, Any]:
         graph = self._store.create_graph(graph_payload)
-        self._sync_discord_service()
         return self._decorate_graph(graph)
 
     def update_graph(self, graph_id: str, graph_payload: dict[str, Any]) -> dict[str, Any]:
@@ -298,13 +374,13 @@ class GraphRunManager:
         next_graph_id = str(graph.get("graph_id") or graph_id)
         if previous_graph_id != next_graph_id:
             self._project_file_store.rename_graph(previous_graph_id, next_graph_id)
-        self._sync_discord_service()
+            self._recheck_active_sessions(previous_graph_id)
         return self._decorate_graph(graph)
 
     def delete_graph(self, graph_id: str) -> None:
         self._store.delete_graph(graph_id)
         self._project_file_store.delete_graph(graph_id)
-        self._sync_discord_service()
+        self._recheck_active_sessions(graph_id)
 
     def get_catalog(self) -> dict[str, Any]:
         return {
@@ -859,9 +935,22 @@ class GraphRunManager:
         agent_ids: list[str] | None = None,
         documents: list[dict[str, Any]] | None = None,
         graph_env_vars: dict[str, str] | None = None,
+        *,
+        _parent_run_id: str | None = None,
     ) -> str:
         self._start_heartbeat_loop()
         document = load_graph_document(self._store.get_graph(graph_id))
+        if _parent_run_id is None and not document.is_multi_agent:
+            graph = document.as_graph()
+            start_provider_id = graph.start_node().provider_id
+            try:
+                provider_def = self._services.node_provider_registry.get(start_provider_id)
+            except KeyError:
+                provider_def = None
+            if provider_def is not None and provider_def.trigger_mode == "listener":
+                raise ValueError(
+                    f"graph '{graph_id}' requires a listener session, not a manual run"
+                )
         if isinstance(graph_env_vars, dict):
             document.env_vars.update(
                 {
@@ -898,6 +987,7 @@ class GraphRunManager:
                     execution_node_ids=_execution_node_ids_for_graph(graph),
                     agent_id=default_agent.agent_id,
                     agent_name=default_agent.name,
+                    parent_run_id=_parent_run_id,
                 )
             states_to_initialize = [self._run_states[run_id], *self._run_states[run_id]["agent_runs"].values()]
 
@@ -935,6 +1025,216 @@ class GraphRunManager:
                 control.thread = thread
         thread.start()
         return run_id
+
+    def start_listener_session(self, graph_id: str) -> str:
+        """Open a listener session for a listener-mode graph.
+
+        Boots the matching trigger service if it's the first session for that
+        graph. The returned run_id stays alive (status='listening') until the
+        SSE stream disconnects or stop_listener_session is called.
+        """
+        self._start_heartbeat_loop()
+        document = load_graph_document(self._store.get_graph(graph_id))
+        if document.is_multi_agent:
+            raise ValueError(
+                f"graph '{graph_id}' is a multi-agent environment; listener sessions are single-agent only."
+            )
+        graph = document.as_graph()
+        start_provider_id = graph.start_node().provider_id
+        try:
+            provider_def = self._services.node_provider_registry.get(start_provider_id)
+        except KeyError as exc:
+            raise ValueError(f"graph '{graph_id}' uses unknown start provider '{start_provider_id}'.") from exc
+        if provider_def.trigger_mode != "listener":
+            raise ValueError(
+                f"graph '{graph_id}' is not in listener mode; use start_run instead."
+            )
+        trigger_service = self._trigger_services_by_provider_id.get(start_provider_id)
+        if trigger_service is None:
+            raise ValueError(
+                f"no trigger service registered for provider '{start_provider_id}'."
+            )
+
+        with self._lock:
+            existing = self._active_sessions.get(graph_id)
+            if existing is not None:
+                return existing
+
+        document.validate_against_services(self._services)
+        run_id = str(uuid4())
+        with self._lock:
+            self._run_controls[run_id] = RunControl(run_id=run_id, cancel_event=Event())
+            self._event_backlog[run_id] = []
+            self._subscribers.setdefault(run_id, [])
+            state = self._build_run_state(
+                run_id,
+                graph_id,
+                None,
+                documents=[],
+                execution_node_ids=_execution_node_ids_for_graph(graph),
+                agent_id=document.agents[0].agent_id,
+                agent_name=document.agents[0].name,
+            )
+            state["status"] = "listening"
+            state["started_at"] = utc_now_iso()
+            self._run_states[run_id] = state
+            self._active_sessions[graph_id] = run_id
+            self._listener_session_metadata[run_id] = {
+                "graph_id": graph_id,
+                "provider_id": start_provider_id,
+                "trigger_service": trigger_service,
+            }
+
+        run_store = self._select_run_store_for_document(document)
+        self._register_run_store_for_states([state], run_store)
+        self._run_store_for(run_id).initialize_run(state)
+        self._touch_run_liveness(run_id)
+
+        self._record_event(
+            run_id,
+            {
+                "event_type": "run.started",
+                "summary": f"Listener session started for '{graph.name}'.",
+                "payload": {"graph_id": graph_id, "graph_name": graph.name},
+                "run_id": run_id,
+                "timestamp": utc_now_iso(),
+                "agent_id": None,
+                "parent_run_id": None,
+            },
+        )
+
+        try:
+            trigger_service.activate(graph_id)
+        except Exception as exc:
+            with self._lock:
+                self._active_sessions.pop(graph_id, None)
+                self._listener_session_metadata.pop(run_id, None)
+            self._record_event(
+                run_id,
+                {
+                    "event_type": "run.failed",
+                    "summary": f"Listener for '{graph.name}' failed to start.",
+                    "payload": {
+                        "error": {
+                            "type": "listener_activation_failed",
+                            "message": str(exc),
+                        },
+                        "final_output": None,
+                    },
+                    "run_id": run_id,
+                    "timestamp": utc_now_iso(),
+                    "agent_id": None,
+                    "parent_run_id": None,
+                },
+            )
+            self._close_streams(run_id)
+            self._release_run_control(run_id)
+            raise
+
+        # Trigger is live — flip the run into "listening" so consumers (UI,
+        # SSE clients) see the ready state, then announce the session.
+        with self._lock:
+            session_state = self._run_states.get(run_id)
+            if session_state is not None:
+                session_state["status"] = "listening"
+                self._run_states[run_id] = session_state
+
+        self._record_event(
+            run_id,
+            {
+                "event_type": "listener.session.started",
+                "summary": f"Listener for '{graph.name}' is active.",
+                "payload": {
+                    "graph_id": graph_id,
+                    "provider_id": start_provider_id,
+                    "listener_transport": provider_def.listener_transport,
+                },
+                "run_id": run_id,
+                "timestamp": utc_now_iso(),
+                "agent_id": None,
+                "parent_run_id": None,
+            },
+        )
+        return run_id
+
+    def stop_listener_session(self, run_id: str, *, reason: str = "client_disconnected") -> None:
+        with self._lock:
+            metadata = self._listener_session_metadata.pop(run_id, None)
+            if metadata is None:
+                return
+            graph_id = str(metadata.get("graph_id") or "")
+            if graph_id and self._active_sessions.get(graph_id) == run_id:
+                self._active_sessions.pop(graph_id, None)
+        trigger_service = metadata.get("trigger_service")
+        if trigger_service is not None and graph_id:
+            try:
+                trigger_service.deactivate(graph_id)
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Failed to deactivate trigger for graph %r.", graph_id)
+        self._record_event(
+            run_id,
+            {
+                "event_type": "listener.session.stopped",
+                "summary": f"Listener session stopped ({reason}).",
+                "payload": {"graph_id": graph_id, "reason": reason},
+                "run_id": run_id,
+                "timestamp": utc_now_iso(),
+                "agent_id": None,
+                "parent_run_id": None,
+            },
+        )
+        terminal_event_type = "run.cancelled" if reason == "user_initiated" else "run.completed"
+        self._record_event(
+            run_id,
+            {
+                "event_type": terminal_event_type,
+                "summary": f"Listener session terminated ({reason}).",
+                "payload": {"final_output": None}
+                if terminal_event_type == "run.completed"
+                else {"error": {"type": "listener_session_stopped", "message": reason}},
+                "run_id": run_id,
+                "timestamp": utc_now_iso(),
+                "agent_id": None,
+                "parent_run_id": None,
+            },
+        )
+        self._close_streams(run_id)
+        self._release_run_control(run_id)
+
+    def is_listening_session(self, run_id: str) -> bool:
+        with self._lock:
+            return run_id in self._listener_session_metadata
+
+    def _listener_session_provider_id(self, run_id: str) -> str | None:
+        with self._lock:
+            metadata = self._listener_session_metadata.get(run_id)
+            if metadata is None:
+                return None
+            return str(metadata.get("provider_id") or "") or None
+
+    def _start_child_run(self, parent_run_id: str, graph_id: str, payload: Any) -> str | None:
+        try:
+            child_run_id = self.start_run(graph_id, payload, _parent_run_id=parent_run_id)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception(
+                "Failed to start listener-driven child run for graph %r (parent %r).",
+                graph_id,
+                parent_run_id,
+            )
+            return None
+        self._record_event(
+            parent_run_id,
+            {
+                "event_type": "listener.event.received",
+                "summary": "Listener event spawned a child run.",
+                "payload": {"graph_id": graph_id, "child_run_id": child_run_id},
+                "run_id": parent_run_id,
+                "timestamp": utc_now_iso(),
+                "agent_id": None,
+                "parent_run_id": None,
+            },
+        )
+        return child_run_id
 
     def _run_store_for(self, run_id: str) -> RunStore:
         normalized_run_id = str(run_id or "").strip()
@@ -1096,7 +1396,6 @@ class GraphRunManager:
                 "Unable to reconcile persisted runs during startup; continuing without startup reconciliation: %s",
                 exc,
             )
-        self._sync_discord_service()
         if self._services.mcp_server_manager is not None:
             self._services.mcp_server_manager.start_auto_boot()
 
@@ -1105,7 +1404,7 @@ class GraphRunManager:
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=self._heartbeat_interval_seconds + 1.0)
             self._heartbeat_thread = None
-        self._discord_service.stop()
+        self._stop_trigger_services()
         if self._services.mcp_server_manager is not None:
             self._services.mcp_server_manager.shutdown_all(preserve_desired_running=True)
         for store in self._drain_override_stores():
@@ -1132,7 +1431,7 @@ class GraphRunManager:
                 if bool(server.get("running"))
             ]
 
-        self._discord_service.stop()
+        self._stop_trigger_services()
         if self._services.mcp_server_manager is not None:
             self._services.mcp_server_manager.shutdown_all(preserve_desired_running=False)
 
@@ -1144,16 +1443,78 @@ class GraphRunManager:
             "discord_stopped": True,
         }
 
+    def _recheck_active_sessions(self, graph_id: str) -> None:
+        """Deactivate any listener sessions whose graph no longer matches the
+        listener provider — currently this means a graph was deleted while a
+        session was active. We close the session as if the SSE stream had
+        dropped: trigger service is deactivated, run is recorded cancelled."""
+        normalized = str(graph_id or "").strip()
+        if not normalized:
+            return
+        with self._lock:
+            session_run_id = self._active_sessions.get(normalized)
+        if not session_run_id:
+            return
+        try:
+            graph_payload = self._store.get_graph(normalized)
+        except KeyError:
+            graph_payload = None
+        provider_id: str | None = None
+        if graph_payload is not None:
+            try:
+                document = load_graph_document(graph_payload)
+                if not document.is_multi_agent:
+                    provider_id = document.as_graph().start_node().provider_id
+            except Exception:  # noqa: BLE001
+                provider_id = None
+        if provider_id == self._listener_session_provider_id(session_run_id):
+            return
+        try:
+            self.stop_listener_session(session_run_id, reason="graph_removed")
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed to stop stale listener session %r.", session_run_id)
+
+    def _stop_trigger_services(self) -> None:
+        for svc in self._trigger_services:
+            try:
+                svc.stop()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Failed to stop trigger service '%s'.", getattr(svc, "name", "unknown"))
+
+    def get_cloudflare_config(self) -> dict[str, Any]:
+        config = self._cloudflare_config_store.get()
+        token_env_var = config.get("tunnel_token_env_var", "")
+        token_value = os.environ.get(str(token_env_var), "") if token_env_var else ""
+        return {
+            **config,
+            "token_configured": bool(str(token_value).strip()),
+        }
+
+    def set_cloudflare_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._cloudflare_config_store.set(payload)
+        return self.get_cloudflare_config()
+
+    def clear_cloudflare_config(self) -> dict[str, Any]:
+        self._cloudflare_config_store.clear()
+        return self.get_cloudflare_config()
+
     def handle_discord_message(self, message: DiscordMessageEvent) -> list[str]:
         run_ids: list[str] = []
         input_payload = normalize_discord_message_payload(message)
         for graph in self._iter_discord_trigger_graphs():
             if not self._graph_matches_discord_message(graph, message):
                 continue
-            try:
-                run_ids.append(self.start_run(graph.graph_id, dict(input_payload)))
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Failed to start Discord-triggered run for graph '%s'.", graph.graph_id)
+            with self._lock:
+                session_run_id = self._active_sessions.get(graph.graph_id)
+            if not session_run_id:
+                LOGGER.debug(
+                    "Dropping Discord message for graph %r: no active listener session.",
+                    graph.graph_id,
+                )
+                continue
+            child_run_id = self._start_child_run(session_run_id, graph.graph_id, dict(input_payload))
+            if child_run_id is not None:
+                run_ids.append(child_run_id)
         return run_ids
 
     def _execute_run(
@@ -1403,12 +1764,15 @@ class GraphRunManager:
         event = normalize_runtime_event_dict(event)
         encoded = json.dumps(event)
         should_flush_state = event["event_type"] in STATE_FLUSH_EVENT_TYPES
+        is_iteration_snapshot = event["event_type"] in ITERATION_SNAPSHOT_EVENT_TYPES
         store = self._run_store_for(run_id)
         child_store: RunStore | None = None
         parent_snapshot: dict[str, Any] | None = None
         child_run_id: str | None = None
         child_event: dict[str, Any] | None = None
         child_snapshot: dict[str, Any] | None = None
+        parent_iteration_snapshot: dict[str, Any] | None = None
+        child_iteration_snapshot: dict[str, Any] | None = None
         with self._lock:
             backlog = self._event_backlog.setdefault(run_id, [])
             backlog.append(event)
@@ -1419,6 +1783,8 @@ class GraphRunManager:
                 self._run_states[run_id] = next_state
                 if should_flush_state:
                     parent_snapshot = deepcopy(next_state)
+                if is_iteration_snapshot:
+                    parent_iteration_snapshot = deepcopy(next_state)
                 if event["event_type"].startswith("agent."):
                     payload = event.get("payload", {})
                     agent_id = str(event.get("agent_id") or payload.get("agent_id") or "")
@@ -1433,6 +1799,8 @@ class GraphRunManager:
                         }
                         if should_flush_state:
                             child_snapshot = deepcopy(agent_state)
+                        if is_iteration_snapshot:
+                            child_iteration_snapshot = deepcopy(agent_state)
             subscribers = list(self._subscribers.get(run_id, []))
 
         store.append_event(run_id, event)
@@ -1444,6 +1812,16 @@ class GraphRunManager:
         if child_run_id is not None and child_snapshot is not None:
             child_store = self._run_store_for(child_run_id)
             child_store.write_state(child_run_id, child_snapshot)
+        if is_iteration_snapshot:
+            self._dispatch_iteration_snapshot(
+                event=event,
+                run_id=run_id,
+                store=store,
+                parent_snapshot=parent_iteration_snapshot,
+                child_run_id=child_run_id,
+                child_store=child_store,
+                child_snapshot=child_iteration_snapshot,
+            )
         if should_flush_state:
             flush_run_store(store)
             if child_store is not None and child_store is not store:
@@ -1481,6 +1859,72 @@ class GraphRunManager:
                     subscriber.put_nowait(encoded)
                 except Full:
                     pass
+
+    def _dispatch_iteration_snapshot(
+        self,
+        *,
+        event: dict[str, Any],
+        run_id: str,
+        store: RunStore,
+        parent_snapshot: dict[str, Any] | None,
+        child_run_id: str | None,
+        child_store: RunStore | None,
+        child_snapshot: dict[str, Any] | None,
+    ) -> None:
+        payload = event.get("payload", {}) or {}
+        prompt_map_raw = payload.get("prompt_map")
+        if not isinstance(prompt_map_raw, dict) or not prompt_map_raw:
+            return
+        try:
+            iteration_index = int(payload.get("iteration_index") or 0)
+        except (TypeError, ValueError):
+            iteration_index = 0
+        if iteration_index <= 0:
+            return
+        iterator_node_id = str(
+            payload.get("iterator_node_id") or payload.get("node_id") or ""
+        )
+        if not iterator_node_id:
+            return
+        prompt_map = {
+            str(node_id): dict(per_node)
+            for node_id, per_node in prompt_map_raw.items()
+            if isinstance(per_node, dict)
+        }
+        if not prompt_map:
+            return
+
+        if parent_snapshot is not None:
+            try:
+                store.write_iteration_snapshot(
+                    run_id,
+                    parent_snapshot,
+                    iteration_index=iteration_index,
+                    iterator_node_id=iterator_node_id,
+                    prompt_map=prompt_map,
+                )
+            except Exception:  # noqa: BLE001
+                LOGGER.exception(
+                    "Failed to persist iteration snapshot to parent run store (run_id=%r, iteration_index=%d).",
+                    run_id,
+                    iteration_index,
+                )
+        if child_run_id and child_snapshot is not None:
+            target_child_store = child_store or self._run_store_for(child_run_id)
+            try:
+                target_child_store.write_iteration_snapshot(
+                    child_run_id,
+                    child_snapshot,
+                    iteration_index=iteration_index,
+                    iterator_node_id=iterator_node_id,
+                    prompt_map=prompt_map,
+                )
+            except Exception:  # noqa: BLE001
+                LOGGER.exception(
+                    "Failed to persist iteration snapshot to child run store (child_run_id=%r, iteration_index=%d).",
+                    child_run_id,
+                    iteration_index,
+                )
 
     def _discard_run_id_from_override_locked(self, store_id: int, run_id: str) -> None:
         run_ids = self._run_store_override_run_ids.get(store_id)
@@ -1837,20 +2281,25 @@ class GraphRunManager:
             return False
         return True
 
-    def _sync_discord_service(self) -> None:
-        token = self._resolve_discord_service_token()
-        if not token:
-            self._discord_service.stop()
-            return
-        try:
-            self._discord_service.start(token)
-        except RuntimeError:
-            LOGGER.exception("Unable to start Discord trigger service.")
-
-    def _resolve_discord_service_token(self) -> str:
+    def _resolve_discord_service_token(self, graph_id: str | None = None) -> str:
+        if graph_id:
+            try:
+                document = load_graph_document(self._store.get_graph(graph_id))
+            except Exception:  # noqa: BLE001
+                return ""
+            if document.is_multi_agent:
+                return ""
+            graph = document.as_graph()
+            if graph.start_node().provider_id != DISCORD_START_PROVIDER_ID:
+                return ""
+            config = graph.start_node_config()
+            return resolve_graph_process_env(
+                str(config.get("discord_bot_token_env_var", "{DISCORD_BOT_TOKEN}") or "{DISCORD_BOT_TOKEN}"),
+                graph.env_vars,
+            ).strip()
         tokens: set[str] = set()
         for graph in self._iter_discord_trigger_graphs():
-            config = graph.resolved_start_node_config()
+            config = graph.start_node_config()
             token = resolve_graph_process_env(
                 str(config.get("discord_bot_token_env_var", "{DISCORD_BOT_TOKEN}") or "{DISCORD_BOT_TOKEN}"),
                 graph.env_vars,
@@ -1863,6 +2312,31 @@ class GraphRunManager:
             LOGGER.warning("Multiple Discord bot tokens are configured across graphs; Discord triggers are disabled.")
             return ""
         return next(iter(tokens))
+
+    def preflight_discord_token(
+        self,
+        env_var_name: str,
+        graph_env_vars: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        env_vars = graph_env_vars or {}
+        raw = str(env_var_name or "{DISCORD_BOT_TOKEN}").strip() or "{DISCORD_BOT_TOKEN}"
+        resolved_name = resolve_graph_env_reference_name(raw, env_vars)
+        process_value = os.environ.get(resolved_name, "") if resolved_name else ""
+        graph_value = str(env_vars.get(resolved_name, "") or "").strip() if resolved_name else ""
+        if str(process_value).strip():
+            source = "process_env"
+            token_resolved = True
+        elif graph_value and graph_value != resolved_name:
+            source = "graph_env_vars"
+            token_resolved = True
+        else:
+            source = "none"
+            token_resolved = False
+        return {
+            "token_resolved": token_resolved,
+            "resolved_env_var_name": resolved_name,
+            "source": source,
+        }
 
     def _build_environment_run_state(
         self,

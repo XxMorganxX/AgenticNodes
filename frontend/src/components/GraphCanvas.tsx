@@ -20,6 +20,7 @@ import { GraphCanvasNode } from "./GraphCanvasNode";
 import type { GraphCanvasNodeData } from "./GraphCanvasNode";
 import { ContextBuilderPayloadModal } from "./ContextBuilderPayloadModal";
 import { ConditionDetailsModal } from "./ConditionDetailsModal";
+import { DISCORD_BOT_TOKEN_ENV_KEY, DiscordTriggerModal } from "./DiscordTriggerModal";
 import { ConditionResultsModal } from "./ConditionResultsModal";
 import { DisplayResponseModal } from "./DisplayResponseModal";
 import { PromptBlockDetailsModal } from "./PromptBlockDetailsModal";
@@ -982,6 +983,7 @@ export function GraphCanvas({
   const [promptBlockDetailsNodeId, setPromptBlockDetailsNodeId] = useState<string | null>(null);
   const [displayResponseNodeId, setDisplayResponseNodeId] = useState<string | null>(null);
   const [contextBuilderPayloadNodeId, setContextBuilderPayloadNodeId] = useState<string | null>(null);
+  const [discordTriggerNodeId, setDiscordTriggerNodeId] = useState<string | null>(null);
   const [tooltipNodeId, setTooltipNodeId] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>("add");
@@ -1161,6 +1163,10 @@ export function GraphCanvas({
   const providerDetailsNode = useMemo(
     () => graph?.nodes.find((node) => node.id === providerDetailsNodeId && node.provider_id !== "core.logic_conditions") ?? null,
     [graph, providerDetailsNodeId],
+  );
+  const discordTriggerNode = useMemo(
+    () => graph?.nodes.find((node) => node.id === discordTriggerNodeId && node.provider_id === "start.discord_message") ?? null,
+    [graph, discordTriggerNodeId],
   );
   const conditionDetailsNode = useMemo(
     () => graph?.nodes.find((node) => node.id === conditionDetailsNodeId && node.provider_id === "core.logic_conditions") ?? null,
@@ -1992,6 +1998,14 @@ export function GraphCanvas({
       setDisplayResponseNodeId(null);
       setConditionResultsNodeId(null);
       setContextBuilderPayloadNodeId(nodeId);
+    },
+    [onSelectionChange],
+  );
+
+  const handleOpenDiscordTriggerConfig = useCallback(
+    (nodeId: string) => {
+      onSelectionChange(nodeId, null);
+      setDiscordTriggerNodeId(nodeId);
     },
     [onSelectionChange],
   );
@@ -3982,6 +3996,7 @@ export function GraphCanvas({
                 onToggleTooltip: handleToggleTooltip,
                 onOpenToolDetails: handleOpenToolDetails,
                 onOpenProviderDetails: handleOpenProviderDetails,
+                onOpenDiscordTriggerConfig: handleOpenDiscordTriggerConfig,
                 onToggleExecutorRetries: handleToggleExecutorRetries,
                 onToggleSupabaseIteratorIncludeProcessedRows: handleToggleSupabaseIteratorIncludeProcessedRows,
                 onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
@@ -4091,6 +4106,7 @@ export function GraphCanvas({
         previousData.onToggleTooltip === handleToggleTooltip &&
         previousData.onOpenToolDetails === handleOpenToolDetails &&
         previousData.onOpenProviderDetails === handleOpenProviderDetails &&
+        previousData.onOpenDiscordTriggerConfig === handleOpenDiscordTriggerConfig &&
         previousData.onToggleExecutorRetries === handleToggleExecutorRetries &&
         previousData.onToggleSupabaseIteratorIncludeProcessedRows === handleToggleSupabaseIteratorIncludeProcessedRows &&
         previousData.onOpenPromptBlockDetails === handleOpenPromptBlockDetails &&
@@ -4124,6 +4140,7 @@ export function GraphCanvas({
               onToggleTooltip: handleToggleTooltip,
               onOpenToolDetails: handleOpenToolDetails,
               onOpenProviderDetails: handleOpenProviderDetails,
+              onOpenDiscordTriggerConfig: handleOpenDiscordTriggerConfig,
               onToggleExecutorRetries: handleToggleExecutorRetries,
               onToggleSupabaseIteratorIncludeProcessedRows: handleToggleSupabaseIteratorIncludeProcessedRows,
               onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
@@ -5438,6 +5455,72 @@ export function GraphCanvas({
           runtimeView={contextBuilderModalRuntime}
           onGraphChange={onGraphChange}
           onClose={() => setContextBuilderPayloadNodeId(null)}
+        />
+      ) : null}
+      {discordTriggerNode && graph ? (
+        <DiscordTriggerModal
+          botToken={(() => {
+            const stored = String(graph.env_vars?.[DISCORD_BOT_TOKEN_ENV_KEY] ?? "");
+            return stored === DISCORD_BOT_TOKEN_ENV_KEY ? "" : stored;
+          })()}
+          channelId={String(discordTriggerNode.config.discord_channel_id ?? "")}
+          ignoreBotMessages={Boolean(discordTriggerNode.config.ignore_bot_messages ?? true)}
+          ignoreSelfMessages={Boolean(discordTriggerNode.config.ignore_self_messages ?? true)}
+          graphEnvVars={graph.env_vars ?? {}}
+          onChangeBotToken={(value: string) => {
+            const next = updateNode(graph, discordTriggerNode.id, (node) => ({
+              ...node,
+              config: {
+                ...node.config,
+                trigger_mode: "discord_message",
+                discord_bot_token_env_var: `{${DISCORD_BOT_TOKEN_ENV_KEY}}`,
+              },
+            }));
+            onGraphChange({
+              ...next,
+              env_vars: {
+                ...(next.env_vars ?? {}),
+                [DISCORD_BOT_TOKEN_ENV_KEY]: value,
+              },
+            });
+          }}
+          onChangeChannelId={(value) =>
+            onGraphChange(
+              updateNode(graph, discordTriggerNode.id, (node) => ({
+                ...node,
+                config: {
+                  ...node.config,
+                  trigger_mode: "discord_message",
+                  discord_channel_id: value,
+                },
+              })),
+            )
+          }
+          onChangeIgnoreBotMessages={(value) =>
+            onGraphChange(
+              updateNode(graph, discordTriggerNode.id, (node) => ({
+                ...node,
+                config: {
+                  ...node.config,
+                  trigger_mode: "discord_message",
+                  ignore_bot_messages: value,
+                },
+              })),
+            )
+          }
+          onChangeIgnoreSelfMessages={(value) =>
+            onGraphChange(
+              updateNode(graph, discordTriggerNode.id, (node) => ({
+                ...node,
+                config: {
+                  ...node.config,
+                  trigger_mode: "discord_message",
+                  ignore_self_messages: value,
+                },
+              })),
+            )
+          }
+          onClose={() => setDiscordTriggerNodeId(null)}
         />
       ) : null}
     </div>

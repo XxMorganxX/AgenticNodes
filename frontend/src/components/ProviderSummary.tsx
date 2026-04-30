@@ -76,6 +76,37 @@ function isPassThroughSideEffect(provider: NodeProviderDefinition): boolean {
   return provider.produces_side_effects === true && provider.preserves_input_payload === true;
 }
 
+type TriggerBadge = {
+  label: string;
+  hint: string;
+  modifier: "immediate" | "listener-outbound" | "listener-inbound";
+};
+
+function describeStartTrigger(provider: NodeProviderDefinition): TriggerBadge | null {
+  if (provider.category !== "start") {
+    return null;
+  }
+  if (provider.trigger_mode === "listener") {
+    if (provider.listener_transport === "inbound_webhook") {
+      return {
+        label: "Listener · Inbound",
+        hint: "Webhook listener — requires Cloudflare tunnel.",
+        modifier: "listener-inbound",
+      };
+    }
+    return {
+      label: "Listener · Outbound",
+      hint: "Background socket listener — no public URL needed.",
+      modifier: "listener-outbound",
+    };
+  }
+  return {
+    label: "Immediate",
+    hint: "Runs only when invoked explicitly (e.g. Run button).",
+    modifier: "immediate",
+  };
+}
+
 function groupProviders(providers: NodeProviderDefinition[]): Array<[string, NodeProviderDefinition[]]> {
   const grouped = new Map<string, NodeProviderDefinition[]>();
 
@@ -369,6 +400,7 @@ export function ProviderSummary({
                 {categoryProviders.map((provider) => {
                   const isHotbarFavorite = hotbarFavorites[provider.category] === provider.provider_id;
                   const showPassThroughNote = isPassThroughSideEffect(provider);
+                  const triggerBadge = describeStartTrigger(provider);
                   return (
                     <section
                       key={provider.provider_id}
@@ -424,6 +456,14 @@ export function ProviderSummary({
                             <strong>{provider.display_name}</strong>
                           </div>
                           <p>{compactDescription(provider.description)}.</p>
+                          {triggerBadge ? (
+                            <div className="provider-behavior-note">
+                              <span className={`provider-trigger-badge provider-trigger-badge--${triggerBadge.modifier}`}>
+                                {triggerBadge.label}
+                              </span>
+                              <span>{triggerBadge.hint}</span>
+                            </div>
+                          ) : null}
                           {showPassThroughNote ? (
                             <div className="provider-behavior-note">
                               <span className="provider-behavior-badge">Pass-through effect</span>
@@ -448,6 +488,14 @@ export function ProviderSummary({
                             <strong>{provider.display_name}</strong>
                           </div>
                           <p>{provider.description}</p>
+                          {triggerBadge ? (
+                            <div className="provider-behavior-note">
+                              <span className={`provider-trigger-badge provider-trigger-badge--${triggerBadge.modifier}`}>
+                                {triggerBadge.label}
+                              </span>
+                              <span>{triggerBadge.hint}</span>
+                            </div>
+                          ) : null}
                           {showPassThroughNote ? (
                             <div className="provider-behavior-note">
                               <span className="provider-behavior-badge">Pass-through effect</span>

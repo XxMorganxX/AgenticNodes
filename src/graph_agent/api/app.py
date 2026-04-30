@@ -87,6 +87,11 @@ class SupabaseRuntimeStatusRequest(BaseModel):
     graph_env_vars: Optional[dict[str, str]] = None
 
 
+class DiscordTokenPreflightRequest(BaseModel):
+    env_var_name: str = "{DISCORD_BOT_TOKEN}"
+    graph_env_vars: Optional[dict[str, str]] = None
+
+
 class OutboundEmailLogTableValidationRequest(BaseModel):
     supabase_url_env_var: str = "GRAPH_AGENT_SUPABASE_URL"
     supabase_key_env_var: str = "GRAPH_AGENT_SUPABASE_SECRET_KEY"
@@ -339,6 +344,11 @@ def inspect_supabase_runtime(request: SupabaseRuntimeStatusRequest) -> dict[str,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/editor/triggers/discord/preflight")
+def preflight_discord_token(request: DiscordTokenPreflightRequest) -> dict[str, Any]:
+    return manager.preflight_discord_token(request.env_var_name, request.graph_env_vars)
+
+
 @app.post("/api/editor/data/supabase/outbound-email-log/validate")
 def validate_outbound_email_log_table(request: OutboundEmailLogTableValidationRequest) -> dict[str, Any]:
     try:
@@ -379,6 +389,29 @@ def disconnect_microsoft_auth() -> dict[str, Any]:
         return manager.disconnect_microsoft_auth()
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class CloudflareConfigRequest(BaseModel):
+    tunnel_token_env_var: Optional[str] = None
+    public_hostname: Optional[str] = None
+
+
+@app.get("/api/editor/integrations/cloudflare")
+def get_cloudflare_config() -> dict[str, Any]:
+    return manager.get_cloudflare_config()
+
+
+@app.put("/api/editor/integrations/cloudflare")
+def set_cloudflare_config(request: CloudflareConfigRequest) -> dict[str, Any]:
+    try:
+        return manager.set_cloudflare_config(request.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/editor/integrations/cloudflare")
+def clear_cloudflare_config() -> dict[str, Any]:
+    return manager.clear_cloudflare_config()
 
 
 @app.post("/api/editor/documents/upload")
@@ -530,6 +563,27 @@ def start_run(graph_id: str, request: RunRequest) -> dict[str, str]:
     return {"run_id": run_id}
 
 
+@app.post("/api/graphs/{graph_id}/listen")
+def start_listener_session(graph_id: str) -> dict[str, str]:
+    try:
+        run_id = manager.start_listener_session(graph_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown graph '{graph_id}'.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"run_id": run_id}
+
+
+@app.delete("/api/runs/{run_id}/listen")
+def stop_listener_session(run_id: str) -> dict[str, str]:
+    if not manager.is_listening_session(run_id):
+        raise HTTPException(status_code=404, detail=f"No active listener session '{run_id}'.")
+    manager.stop_listener_session(run_id, reason="user_initiated")
+    return {"stopped": run_id}
+
+
 @app.post("/api/runtime/reset")
 def reset_runtime() -> dict[str, Any]:
     return manager.reset_runtime()
@@ -606,5 +660,12 @@ def stream_run_events(run_id: str) -> StreamingResponse:
                 yield f"data: {item}\n\n"
         finally:
             manager.unsubscribe(run_id, queue)
+            if manager.is_listening_session(run_id):
+                try:
+                    manager.stop_listener_session(run_id, reason="client_disconnected")
+                except Exception:  # noqa: BLE001
+                    logging.getLogger(__name__).exception(
+                        "Failed to stop listener session %r on SSE disconnect.", run_id
+                    )
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

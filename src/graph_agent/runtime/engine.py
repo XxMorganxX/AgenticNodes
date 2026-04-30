@@ -26,6 +26,7 @@ from graph_agent.runtime.core import (
     RuntimeEvent,
     RuntimeServices,
     TransitionRecord,
+    generation_prompt_capture_from_value,
 )
 
 
@@ -308,6 +309,41 @@ class GraphRuntime:
             iterator_payload,
         )
 
+    def _emit_iterator_row_completed(
+        self,
+        state: RunState,
+        *,
+        iterator_node_id: str,
+        iteration_index: int,
+        total_rows: int,
+        downstream_node_ids: set[str],
+    ) -> None:
+        prompt_map: dict[str, dict[str, Any]] = {}
+        for node_id in downstream_node_ids:
+            capture = generation_prompt_capture_from_value(state.node_outputs.get(node_id))
+            if capture is None:
+                continue
+            prompt_map[node_id] = {
+                "system_prompt": capture.get("system_prompt", ""),
+                "user_prompt": capture.get("user_prompt", ""),
+                "messages": capture.get("messages", []),
+                "prompt_name": capture.get("prompt_name", ""),
+            }
+        payload = {
+            "node_id": iterator_node_id,
+            "iterator_node_id": iterator_node_id,
+            "iteration_index": iteration_index,
+            "total_rows": total_rows,
+            "downstream_node_ids": sorted(downstream_node_ids),
+            "prompt_map": prompt_map,
+        }
+        self.emit(
+            state,
+            "node.iterator.row_completed",
+            f"Captured iteration {iteration_index} of {total_rows} for node '{iterator_node_id}'.",
+            payload,
+        )
+
     def _collect_downstream_node_ids(self, graph: GraphDefinition, iterator_node_id: str) -> set[str]:
         downstream: set[str] = set()
         queue: deque[str] = deque([iterator_node_id])
@@ -568,6 +604,13 @@ class GraphRuntime:
                 return terminal_state
             if terminal_state is not None and terminal_state.status in {"failed", "cancelled"}:
                 return terminal_state
+            self._emit_iterator_row_completed(
+                state,
+                iterator_node_id=node.id,
+                iteration_index=row_index,
+                total_rows=total_rows,
+                downstream_node_ids=downstream_node_ids,
+            )
         if on_completed is not None:
             try:
                 on_completed()
