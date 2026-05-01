@@ -73,6 +73,9 @@ class GraphStore:
         existing_ids = set(self._merged_graphs())
         if normalized_graph["graph_id"] in existing_ids:
             raise ValueError(f"Graph '{normalized_graph['graph_id']}' already exists.")
+        payload["deleted_graph_ids"] = [
+            graph_id for graph_id in payload["deleted_graph_ids"] if graph_id != normalized_graph["graph_id"]
+        ]
         payload["graphs"].append(normalized_graph)
         self._save_user_all(payload)
         return deepcopy(normalized_graph)
@@ -96,22 +99,27 @@ class GraphStore:
         if not updated:
             payload["graphs"].append(normalized_graph)
 
+        payload["deleted_graph_ids"] = [
+            deleted_graph_id
+            for deleted_graph_id in payload["deleted_graph_ids"]
+            if deleted_graph_id != normalized_graph["graph_id"]
+        ]
         self._save_user_all(payload)
         return deepcopy(normalized_graph)
 
     def delete_graph(self, graph_id: str) -> None:
+        if graph_id not in self._merged_graphs():
+            raise KeyError(graph_id)
+
         payload = self._load_user_all()
         next_graphs = [graph for graph in payload["graphs"] if graph["graph_id"] != graph_id]
-        if len(next_graphs) != len(payload["graphs"]):
-            payload["graphs"] = next_graphs
-            self._save_user_all(payload)
-            return
-
         if graph_id in self._bundled_graph_ids():
-            raise ValueError(f"Cannot delete built-in graph '{graph_id}'.")
+            deleted_graph_ids = set(payload["deleted_graph_ids"])
+            deleted_graph_ids.add(graph_id)
+            payload["deleted_graph_ids"] = sorted(deleted_graph_ids)
 
-        if len(next_graphs) == len(payload["graphs"]):
-            raise KeyError(graph_id)
+        payload["graphs"] = next_graphs
+        self._save_user_all(payload)
 
     def catalog(self) -> dict[str, Any]:
         if self._catalog_cache is None:
@@ -140,7 +148,7 @@ class GraphStore:
     def _ensure_user_store(self) -> None:
         if self.path.exists():
             return
-        self._save_user_all({"graphs": []})
+        self._save_user_all({"graphs": [], "deleted_graph_ids": []})
 
     def _load_bundled_all(self) -> dict[str, Any]:
         payload = json.loads(self.bundled_path.read_text())
@@ -159,12 +167,31 @@ class GraphStore:
                 _sanitize_graph_payload(graph)
                 for graph in payload.get("graphs", [])
                 if isinstance(graph, dict)
-            ]
+            ],
+            "deleted_graph_ids": [
+                str(graph_id).strip()
+                for graph_id in payload.get("deleted_graph_ids", [])
+                if str(graph_id).strip()
+            ],
         }
 
     def _save_user_all(self, payload: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps({"graphs": [_sanitize_graph_payload(graph) for graph in payload.get("graphs", [])]}, indent=2))
+        self.path.write_text(
+            json.dumps(
+                {
+                    "graphs": [_sanitize_graph_payload(graph) for graph in payload.get("graphs", [])],
+                    "deleted_graph_ids": sorted(
+                        {
+                            str(graph_id).strip()
+                            for graph_id in payload.get("deleted_graph_ids", [])
+                            if str(graph_id).strip()
+                        }
+                    ),
+                },
+                indent=2,
+            )
+        )
         self._invalidate_caches()
 
     def _sanitize_user_store(self) -> None:
@@ -172,7 +199,14 @@ class GraphStore:
             payload = json.loads(self.path.read_text())
         except (FileNotFoundError, OSError, json.JSONDecodeError):
             return
-        sanitized = {"graphs": [_sanitize_graph_payload(graph) for graph in payload.get("graphs", []) if isinstance(graph, dict)]}
+        sanitized = {
+            "graphs": [_sanitize_graph_payload(graph) for graph in payload.get("graphs", []) if isinstance(graph, dict)],
+            "deleted_graph_ids": [
+                str(graph_id).strip()
+                for graph_id in payload.get("deleted_graph_ids", [])
+                if str(graph_id).strip()
+            ],
+        }
         if sanitized != payload:
             self._save_user_all(sanitized)
 
@@ -181,8 +215,11 @@ class GraphStore:
 
     def _merged_graphs(self) -> dict[str, dict[str, Any]]:
         if self._merged_graphs_cache is None:
+            deleted_graph_ids = set(self._load_user_all()["deleted_graph_ids"])
             merged = {
-                graph["graph_id"]: load_graph_document(graph).to_dict() for graph in self._load_bundled_all()["graphs"]
+                graph["graph_id"]: load_graph_document(graph).to_dict()
+                for graph in self._load_bundled_all()["graphs"]
+                if graph["graph_id"] not in deleted_graph_ids
             }
             for graph in self._load_user_all()["graphs"]:
                 merged[graph["graph_id"]] = load_graph_document(graph).to_dict()

@@ -62,6 +62,7 @@ export type GraphCanvasNodeData = {
   onOpenToolDetails: (nodeId: string) => void;
   onOpenProviderDetails: (nodeId: string) => void;
   onOpenDiscordTriggerConfig: (nodeId: string) => void;
+  onOpenCronScheduleConfig: (nodeId: string) => void;
   onToggleExecutorRetries: (nodeId: string) => void;
   onToggleSupabaseIteratorIncludeProcessedRows: (nodeId: string) => void;
   onOpenPromptBlockDetails: (nodeId: string) => void;
@@ -237,6 +238,7 @@ function GraphCanvasNodeComponent({
     onOpenToolDetails,
     onOpenProviderDetails,
     onOpenDiscordTriggerConfig,
+    onOpenCronScheduleConfig,
     onToggleExecutorRetries,
     onToggleSupabaseIteratorIncludeProcessedRows,
     onOpenPromptBlockDetails,
@@ -268,6 +270,7 @@ function GraphCanvasNodeComponent({
   const isSupabaseNode = isSupabaseSqlNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger;
   const isOutlookDraftNode = node.provider_id === "end.outlook_draft";
   const isDiscordStartNode = node.kind === "input" && node.provider_id === "start.discord_message";
+  const isCronStartNode = node.kind === "input" && node.provider_id === "start.cron_schedule";
   const displayLabel = providedDisplayLabel ?? getNodeInstanceLabel(graph, node);
   const resolvedSupabaseBinding = isSupabaseNode ? resolveSupabaseBinding(graph, node.config as Record<string, unknown>) : null;
   const supabaseConnectionOptions = isSupabaseNode ? getSupabaseConnectionSelectOptions(graph, node.config as Record<string, unknown>) : [];
@@ -1016,6 +1019,21 @@ function GraphCanvasNodeComponent({
               }}
             >
               Configure Trigger
+            </button>
+          </div>
+        ) : null}
+        {!preview && isCronStartNode ? (
+          <div className="graph-node-card-actions" aria-hidden="false">
+            <button
+              type="button"
+              className="secondary-button graph-node-card-button"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                onOpenCronScheduleConfig(node.id);
+              }}
+            >
+              Configure Schedule
             </button>
           </div>
         ) : null}

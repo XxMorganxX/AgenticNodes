@@ -3,11 +3,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AgentRunSwimlanes } from "./components/AgentRunSwimlanes";
 import { DocumentPreviewModal } from "./components/DocumentPreviewModal";
 import { GraphCanvas } from "./components/GraphCanvas";
+import { GraphDeleteConfirmModal } from "./components/GraphDeleteConfirmModal";
 import { GraphEnvEditor } from "./components/GraphEnvEditor";
 import { McpServerModal } from "./components/McpServerModal";
 import { ProductionRunConfirmModal } from "./components/ProductionRunConfirmModal";
 import { RunFilesExplorerModal } from "./components/RunFilesExplorerModal";
 import { UserPreferencesModal } from "./components/UserPreferencesModal";
+import { WorkflowRemoveConfirmModal } from "./components/WorkflowRemoveConfirmModal";
 import {
   bootMcpServer,
   createMcpServer,
@@ -75,6 +77,7 @@ import type { PersistedRunSnapshot } from "./lib/runSnapshots";
 import { isTerminalRuntimeEvent, normalizeRunState, normalizeRuntimeEvent } from "./lib/runtimeEvents";
 import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedRunProjection } from "./lib/runVisualization";
 import type {
+  AgentDefinition,
   EditorCatalog,
   GraphDefinition,
   GraphDocument,
@@ -88,6 +91,7 @@ import type {
   RunState,
   RuntimeEvent,
   SupabaseConnectionDefinition,
+  TestEnvironmentDefinition,
   ToolDefinition,
 } from "./lib/types";
 import { getUserPreferences, resetUserPreferences, saveUserPreferences } from "./lib/userPreferences";
@@ -100,6 +104,135 @@ const DEFAULT_TEST_ENVIRONMENT_ID = "test-environment";
 const ENVIRONMENT_AGENT_SELECTION_STORAGE_KEY = "agentic-nodes-environment-agent-selection";
 const SELECTED_AGENT_ID_STORAGE_KEY = "agentic-nodes-selected-agent-id";
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
+
+type GraphDeleteTarget = {
+  graph_id: string;
+  name: string;
+};
+
+type WorkflowRemoveTarget = {
+  agent_id: string;
+  name: string;
+};
+
+function getGraphDisplayName(graph: Pick<GraphDocument, "graph_id" | "name">): string {
+  return graph.name.trim() || graph.graph_id;
+}
+
+function createAgentId(existingAgentIds: Set<string>): string {
+  const baseId = `agent-${Date.now()}`;
+  if (!existingAgentIds.has(baseId)) {
+    return baseId;
+  }
+  let suffix = 2;
+  while (existingAgentIds.has(`${baseId}-${suffix}`)) {
+    suffix += 1;
+  }
+  return `${baseId}-${suffix}`;
+}
+
+function graphToAgent(graph: GraphDefinition): AgentDefinition {
+  return {
+    agent_id: createAgentId(new Set()),
+    name: graph.name.trim() || "Agent 1",
+    description: graph.description,
+    version: graph.version,
+    start_node_id: graph.start_node_id,
+    env_vars: {},
+    nodes: graph.nodes,
+    edges: graph.edges,
+  };
+}
+
+function createBlankAgent(agentName: string, existingAgentIds: Set<string>): AgentDefinition {
+  return {
+    agent_id: createAgentId(existingAgentIds),
+    name: agentName.trim() || `Agent ${existingAgentIds.size + 1}`,
+    description: "",
+    version: "1.0",
+    start_node_id: "",
+    env_vars: {},
+    nodes: [],
+    edges: [],
+  };
+}
+
+function addAgentToDocument(graph: GraphDocument, agentName: string): { graph: TestEnvironmentDefinition; agentId: string } {
+  if (isTestEnvironment(graph)) {
+    const existingAgentIds = new Set(graph.agents.map((agent) => agent.agent_id));
+    const newAgent = createBlankAgent(agentName, existingAgentIds);
+    return {
+      graph: {
+        ...graph,
+        graph_type: "test_environment",
+        agents: [...graph.agents, newAgent],
+      },
+      agentId: newAgent.agent_id,
+    };
+  }
+
+  const firstAgent = graphToAgent(graph);
+  const existingAgentIds = new Set([firstAgent.agent_id]);
+  const newAgent = createBlankAgent(agentName, existingAgentIds);
+  return {
+    graph: {
+      graph_id: graph.graph_id,
+      name: graph.name,
+      description: graph.description,
+      version: graph.version,
+      graph_type: "test_environment",
+      email_routing_mode: graph.email_routing_mode,
+      default_input: graph.default_input,
+      env_vars: graph.env_vars,
+      supabase_connections: graph.supabase_connections,
+      default_supabase_connection_id: graph.default_supabase_connection_id,
+      run_store_supabase_connection_id: graph.run_store_supabase_connection_id,
+      agents: [firstAgent, newAgent],
+      node_providers: graph.node_providers,
+    },
+    agentId: newAgent.agent_id,
+  };
+}
+
+function removeAgentFromDocument(graph: GraphDocument, agentId: string): { graph: GraphDocument; selectedAgentId: string | null } | null {
+  if (!isTestEnvironment(graph)) {
+    return null;
+  }
+  const nextAgents = graph.agents.filter((agent) => agent.agent_id !== agentId);
+  if (nextAgents.length === graph.agents.length) {
+    return null;
+  }
+  if (nextAgents.length === 1) {
+    const [agent] = nextAgents;
+    return {
+      graph: {
+        graph_id: graph.graph_id,
+        name: graph.name,
+        description: graph.description,
+        version: graph.version,
+        graph_type: "graph",
+        email_routing_mode: graph.email_routing_mode,
+        default_input: graph.default_input,
+        env_vars: { ...(graph.env_vars ?? {}), ...(agent.env_vars ?? {}) },
+        supabase_connections: graph.supabase_connections,
+        default_supabase_connection_id: graph.default_supabase_connection_id,
+        run_store_supabase_connection_id: graph.run_store_supabase_connection_id,
+        start_node_id: agent.start_node_id,
+        nodes: agent.nodes,
+        edges: agent.edges,
+        node_providers: graph.node_providers,
+      },
+      selectedAgentId: null,
+    };
+  }
+  return {
+    graph: {
+      ...graph,
+      agents: nextAgents,
+    },
+    selectedAgentId: nextAgents[0]?.agent_id ?? null,
+  };
+}
 
 function graphNodes(graph: GraphDocument): GraphDefinition["nodes"] {
   return isTestEnvironment(graph) ? graph.agents.flatMap((agent) => agent.nodes) : graph.nodes;
@@ -1124,6 +1257,12 @@ export default function App() {
   const [isStoppingRuntime, setIsStoppingRuntime] = useState(false);
   const [isResettingRuntime, setIsResettingRuntime] = useState(false);
   const [productionRunConfirmOpen, setProductionRunConfirmOpen] = useState(false);
+  const [deleteGraphTarget, setDeleteGraphTarget] = useState<GraphDeleteTarget | null>(null);
+  const [isDeletingGraph, setIsDeletingGraph] = useState(false);
+  const [workflowRemoveTarget, setWorkflowRemoveTarget] = useState<WorkflowRemoveTarget | null>(null);
+  const [isRenamingGraph, setIsRenamingGraph] = useState(false);
+  const [graphNameDraft, setGraphNameDraft] = useState("");
+  const [graphNameError, setGraphNameError] = useState<string | null>(null);
   const [mcpPendingKey, setMcpPendingKey] = useState<string | null>(null);
   const [mcpPanelOpen, setMcpPanelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2051,6 +2190,12 @@ export default function App() {
   }, [selectedAgentId]);
 
   useEffect(() => {
+    setIsRenamingGraph(false);
+    setGraphNameDraft(draftGraph?.name ?? "");
+    setGraphNameError(null);
+  }, [draftGraph?.graph_id, selectedGraphId]);
+
+  useEffect(() => {
     if (!hasUnsavedChanges || isSaving) {
       return;
     }
@@ -2185,6 +2330,7 @@ export default function App() {
     clearPersistedGraphEnvVars(draftGraphEnvStorageKey());
     clearPersistedSupabaseConnectionState(draftGraphEnvStorageKey());
     clearSessionSupabaseSchema({ graph_id: draftGraphEnvStorageKey() });
+    setDeleteGraphTarget(null);
     const blankGraph = createBlankGraph();
     clearLiveRunState();
     setSelectedGraphId("");
@@ -2198,18 +2344,30 @@ export default function App() {
     setError(null);
   }
 
-  async function handleDeleteGraph() {
+  function handleRequestDeleteGraph() {
     if (!selectedGraphId) {
       handleCreateGraph();
       return;
     }
+    const selectedGraph = draftGraph?.graph_id === selectedGraphId
+      ? draftGraph
+      : graphs.find((graph) => graph.graph_id === selectedGraphId);
+    setDeleteGraphTarget({
+      graph_id: selectedGraphId,
+      name: selectedGraph ? getGraphDisplayName(selectedGraph) : selectedGraphId,
+    });
+    setError(null);
+  }
+
+  async function handleDeleteGraph(target: GraphDeleteTarget) {
+    setIsDeletingGraph(true);
     try {
-      cancelPersistedRunSnapshot(selectedGraphId);
-      clearPersistedRunSnapshot(selectedGraphId);
-      clearPersistedGraphEnvVars(selectedGraphId);
-      clearPersistedSupabaseConnectionState(selectedGraphId);
-      clearSessionSupabaseSchema({ graph_id: selectedGraphId });
-      await deleteGraph(selectedGraphId);
+      cancelPersistedRunSnapshot(target.graph_id);
+      clearPersistedRunSnapshot(target.graph_id);
+      clearPersistedGraphEnvVars(target.graph_id);
+      clearPersistedSupabaseConnectionState(target.graph_id);
+      clearSessionSupabaseSchema({ graph_id: target.graph_id });
+      await deleteGraph(target.graph_id);
       const loadedGraphs = await fetchGraphs();
       setGraphs(loadedGraphs);
       if (loadedGraphs.length > 0) {
@@ -2226,10 +2384,13 @@ export default function App() {
       }
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
+      setDeleteGraphTarget(null);
       setError(null);
     } catch (deleteError) {
       const message = deleteError instanceof Error ? deleteError.message : "Unable to delete graph.";
       setError(message);
+    } finally {
+      setIsDeletingGraph(false);
     }
   }
 
@@ -2459,6 +2620,85 @@ export default function App() {
     void persistPendingGraphInBackground();
   }, [persistPendingGraphInBackground]);
 
+  function applyDraftGraphName(nextName: string) {
+    if (!draftGraph) {
+      return;
+    }
+    setDraftGraph({
+      ...draftGraph,
+      name: nextName,
+    });
+  }
+
+  function beginGraphRename() {
+    setGraphNameDraft(draftGraph?.name ?? "");
+    setGraphNameError(null);
+    setIsRenamingGraph(true);
+  }
+
+  function cancelGraphRename() {
+    setGraphNameDraft(draftGraph?.name ?? "");
+    setGraphNameError(null);
+    setIsRenamingGraph(false);
+  }
+
+  function commitGraphRename() {
+    const nextName = graphNameDraft.trim();
+    if (!nextName) {
+      setGraphNameError("Grouping name is required.");
+      return;
+    }
+    applyDraftGraphName(nextName);
+    setGraphNameDraft(nextName);
+    setGraphNameError(null);
+    setIsRenamingGraph(false);
+  }
+
+  function handleCreateAgent(agentName: string) {
+    if (!draftGraph) {
+      return;
+    }
+    const result = addAgentToDocument(draftGraph, agentName);
+    setDraftGraph(result.graph);
+    setSelectedAgentId(result.agentId);
+    setSelectedNodeId(null);
+    setSelectedEdgeId(null);
+    setVisualizerResetVersion((current) => current + 1);
+    setError(null);
+  }
+
+  function handleRequestRemoveAgent(agentId: string) {
+    if (!isTestEnvironment(draftGraph)) {
+      return;
+    }
+    const targetAgent = draftGraph.agents.find((agent) => agent.agent_id === agentId);
+    if (!targetAgent) {
+      return;
+    }
+    setWorkflowRemoveTarget({
+      agent_id: targetAgent.agent_id,
+      name: targetAgent.name.trim() || targetAgent.agent_id,
+    });
+  }
+
+  function handleConfirmRemoveAgent() {
+    if (!draftGraph || !workflowRemoveTarget) {
+      return;
+    }
+    const result = removeAgentFromDocument(draftGraph, workflowRemoveTarget.agent_id);
+    if (!result) {
+      setWorkflowRemoveTarget(null);
+      return;
+    }
+    setDraftGraph(result.graph);
+    setSelectedAgentId(result.selectedAgentId);
+    setSelectedNodeId(null);
+    setSelectedEdgeId(null);
+    setWorkflowRemoveTarget(null);
+    setVisualizerResetVersion((current) => current + 1);
+    setError(null);
+  }
+
   function handleFormatGraph(nodeDimensions: Record<string, GraphLayoutNodeDimensions>) {
     if (!canvasGraph) {
       return;
@@ -2523,8 +2763,8 @@ export default function App() {
                       : isRunning
                         ? "Running..."
                         : isEnvironment
-                          ? "Run Environment"
-                          : "Run Graph"}
+                          ? "Run Grouping"
+                          : "Run Workflow"}
                   </button>
                   <button
                     type="button"
@@ -2535,7 +2775,7 @@ export default function App() {
                     {isStoppingRuntime ? "Stopping..." : "Stop Runtime"}
                   </button>
                   <button type="button" className="secondary-button" onClick={handleCreateGraph}>
-                    New Agent
+                    New Grouping
                   </button>
                   <button type="button" className="secondary-button" onClick={() => void saveCurrentGraph()} disabled={!draftGraph || isSaving}>
                     {isSaving ? "Saving..." : "Save"}
@@ -2549,8 +2789,8 @@ export default function App() {
                   <button type="button" className="danger-button" onClick={() => void handleResetRuntime()} disabled={isStoppingRuntime || isResettingRuntime}>
                     {isResettingRuntime ? "Resetting..." : "Reset Runtime"}
                   </button>
-                  <button type="button" className="danger-button" onClick={() => void handleDeleteGraph()} disabled={!draftGraph}>
-                    Delete
+                  <button type="button" className="danger-button" onClick={handleRequestDeleteGraph} disabled={!draftGraph || isDeletingGraph}>
+                    {isDeletingGraph ? "Deleting..." : "Delete"}
                   </button>
                 </div>
                 <div className="mosaic-title-toggle-row">
@@ -2596,26 +2836,69 @@ export default function App() {
               </div>
 
               <div className="mosaic-tile panel mosaic-graph">
-                <label>
-                  Graph
-                  <select
-                    value={selectedGraphId || "__draft__"}
-                    onChange={(event) => {
-                      if (event.target.value === "__draft__") {
-                        handleCreateGraph();
-                        return;
-                      }
-                      setSelectedGraphId(event.target.value);
-                    }}
-                  >
-                    {!selectedGraphId ? <option value="__draft__">Unsaved Draft</option> : null}
-                    {graphs.map((graph) => (
-                      <option key={graph.graph_id} value={graph.graph_id}>
-                        {graph.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <section className="graph-name-editor" aria-label="Grouping selector">
+                  <div className="graph-name-editor-label">Grouping</div>
+                  {isRenamingGraph ? (
+                    <div className="graph-name-editor-edit">
+                      <input
+                        type="text"
+                        value={graphNameDraft}
+                        onChange={(event) => {
+                          setGraphNameDraft(event.target.value);
+                          if (graphNameError) {
+                            setGraphNameError(null);
+                          }
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            commitGraphRename();
+                          }
+                          if (event.key === "Escape") {
+                            event.preventDefault();
+                            cancelGraphRename();
+                          }
+                        }}
+                        disabled={!draftGraph || isSaving}
+                        placeholder="Name this grouping"
+                        autoFocus
+                      />
+                      <div className="graph-name-editor-actions">
+                        <button type="button" className="secondary-button" onClick={cancelGraphRename} disabled={isSaving}>
+                          Cancel
+                        </button>
+                        <button type="button" className="primary-button" onClick={commitGraphRename} disabled={!draftGraph || isSaving}>
+                          Save Name
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="graph-name-editor-display">
+                      <select
+                        value={selectedGraphId || "__draft__"}
+                        onChange={(event) => {
+                          if (event.target.value === "__draft__") {
+                            handleCreateGraph();
+                            return;
+                          }
+                          setSelectedGraphId(event.target.value);
+                        }}
+                      >
+                        {!selectedGraphId ? <option value="__draft__">Unsaved Draft</option> : null}
+                        {graphs.map((graph) => (
+                          <option key={graph.graph_id} value={graph.graph_id}>
+                            {graph.name}
+                          </option>
+                        ))}
+                      </select>
+                      <button type="button" className="secondary-button" onClick={beginGraphRename} disabled={!draftGraph || isSaving}>
+                        Rename
+                      </button>
+                    </div>
+                  )}
+                  {graphNameError ? <p className="error-text graph-name-editor-error">{graphNameError}</p> : null}
+                  {hasUnsavedChanges ? <p className="graph-name-editor-hint">Use Save to persist changes.</p> : null}
+                </section>
               </div>
 
               <div className="mosaic-tile panel mosaic-env">
@@ -2686,7 +2969,7 @@ export default function App() {
                 ) : (
                   <label className="mosaic-execution-input">
                     Input
-                    <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={7} />
+                    <textarea value={input} onChange={(event) => setInput(event.target.value)} rows={2} />
                   </label>
                 )}
               </div>
@@ -2848,12 +3131,9 @@ export default function App() {
                 {runDocumentError ? <p className="error-text">{runDocumentError}</p> : null}
               </div>
 
-              <div className="mosaic-tile panel mosaic-files">
+              <div className="mosaic-tile panel mosaic-files mosaic-project-files">
                 <div className="mosaic-section-heading">
                   <span className="mosaic-section-kicker">Workspace</span>
-                </div>
-
-                <section className="workspace-subsection">
                   <div className="execution-documents-header">
                     <strong>Project Files</strong>
                     <span>
@@ -2861,6 +3141,7 @@ export default function App() {
                       {projectFiles.length !== readyProjectFiles.length ? ` / ${projectFiles.length} total` : ""}
                     </span>
                   </div>
+                </div>
                   <p className="workspace-subsection-intro">
                     Reusable files attached to this project. Uploads are per-graph; files in <code>scripts/</code> on disk are shared across every graph.
                   </p>
@@ -2945,9 +3226,9 @@ export default function App() {
                     <p>No project files yet. Upload from the Inputs tile or drop a .py file in scripts/.</p>
                   )}
                   {projectFileError ? <p className="error-text">{projectFileError}</p> : null}
-                </section>
+              </div>
 
-                <section className="workspace-subsection">
+              <div className="mosaic-tile panel mosaic-files mosaic-agent-files">
                   <div className="execution-files-header">
                     <div className="execution-documents-header">
                       <strong>Agent Files</strong>
@@ -3053,7 +3334,6 @@ export default function App() {
                 )}
                   {runFilesError ? <p className="error-text">{runFilesError}</p> : null}
                   {runFileContentError ? <p className="error-text">{runFileContentError}</p> : null}
-                </section>
               </div>
             </div>
           </div>
@@ -3076,13 +3356,15 @@ export default function App() {
                 ? "Stop Listening"
                 : "Start Listening"
               : isEnvironment
-                ? "Run Environment"
-                : "Run Graph"
+                ? "Run Grouping"
+                : "Run Workflow"
           }
           focusedAgentName={isEnvironment ? (environmentRunSummary?.focusedAgentName ?? null) : null}
           focusedAgentStatus={isEnvironment ? focusedRunSummary.status : null}
           environmentAgents={isEnvironment ? agentRunLanes : []}
           selectedAgentId={selectedAgentId}
+          onCreateAgent={handleCreateAgent}
+          onRequestRemoveAgent={handleRequestRemoveAgent}
           onSelectAgent={(agentId) => {
             setSelectedAgentId(agentId);
             setSelectedNodeId(null);
@@ -3168,6 +3450,18 @@ export default function App() {
           }}
         />
       ) : null}
+      {deleteGraphTarget ? (
+        <GraphDeleteConfirmModal
+          graphName={deleteGraphTarget.name}
+          isDeleting={isDeletingGraph}
+          onClose={() => {
+            if (!isDeletingGraph) {
+              setDeleteGraphTarget(null);
+            }
+          }}
+          onConfirm={() => void handleDeleteGraph(deleteGraphTarget)}
+        />
+      ) : null}
       {documentPreview ? (
         <DocumentPreviewModal
           title={documentPreview.title}
@@ -3177,6 +3471,13 @@ export default function App() {
           error={documentPreview.error}
           truncated={documentPreview.truncated}
           onClose={() => setDocumentPreview(null)}
+        />
+      ) : null}
+      {workflowRemoveTarget ? (
+        <WorkflowRemoveConfirmModal
+          workflowName={workflowRemoveTarget.name}
+          onClose={() => setWorkflowRemoveTarget(null)}
+          onConfirm={handleConfirmRemoveAgent}
         />
       ) : null}
       {mcpPanelOpen ? (

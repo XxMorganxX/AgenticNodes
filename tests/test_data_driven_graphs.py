@@ -527,7 +527,7 @@ class DataDrivenGraphTests(unittest.TestCase):
             self.assertNotIn("editable-agent", remaining_ids)
             self.assertIn("tool-schema-repair", remaining_ids)
 
-    def test_graph_store_keeps_built_in_graphs_and_uses_local_overrides(self) -> None:
+    def test_graph_store_deletes_built_in_graphs_from_user_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = GraphStore(self.services, path=Path(directory) / "graphs.json")
 
@@ -539,7 +539,10 @@ class DataDrivenGraphTests(unittest.TestCase):
             self.assertEqual(store.get_graph("tool-schema-repair")["name"], "Local Sample Override")
 
             store.delete_graph("tool-schema-repair")
-            self.assertEqual(store.get_graph("tool-schema-repair")["name"], "Tool Schema Repair Example")
+            remaining_ids = {graph["graph_id"] for graph in store.list_graphs()}
+            self.assertNotIn("tool-schema-repair", remaining_ids)
+            with self.assertRaises(KeyError):
+                store.get_graph("tool-schema-repair")
 
     def test_envelope_display_node_shows_input_envelope_and_preserves_payload(self) -> None:
         payload: dict[str, Any] = {

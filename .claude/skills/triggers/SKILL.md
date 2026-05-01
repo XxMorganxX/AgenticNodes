@@ -22,18 +22,19 @@ Mapping today:
 |---|---|---|
 | `start.manual_run` / `core.input` | immediate | — |
 | `start.discord_message` | listener | outbound_socket |
+| `start.cron_schedule` | listener | — |
 
 ## Where the runtime branches on this
 
 - `src/graph_agent/providers/triggers.py` — `TriggerService` Protocol
-  (`name`, `sync()`, `stop()`).
+  (`name`, `activate(graph_id)`, `deactivate(graph_id)`, `stop()`).
+- `src/graph_agent/providers/cron.py` — internal cron scheduler service for
+  `start.cron_schedule`; fires child runs while a listener session is active.
 - `src/graph_agent/api/manager.py`:
   - `_DiscordTriggerAdapter` — adapts `DiscordTriggerService` to the protocol.
   - `self._trigger_services` — list of adapters the manager iterates.
-  - `_sync_trigger_services()` / `_stop_trigger_services()` — the central
-    lifecycle hooks called from `start_background_services()`,
-    `stop_background_services()`, `reset_runtime()`, and the three graph
-    mutation sites (`create_graph`, `update_graph`, `delete_graph`).
+  - `start_listener_session()` / `stop_listener_session()` — activate and
+    deactivate the right trigger service for the graph's start provider.
 
 When you add a new listener kind (e.g. `start.webhook`):
 

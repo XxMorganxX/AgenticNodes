@@ -30,6 +30,7 @@ from graph_agent.api.run_store import (
 )
 from graph_agent.api.run_state_reducer import apply_event, build_run_state
 from graph_agent.examples.tool_schema_repair import build_example_services
+from graph_agent.providers.cron import CRON_START_PROVIDER_ID, CronSchedule, CronTriggerService
 from graph_agent.providers.discord import DiscordMessageEvent, DiscordTriggerService, normalize_discord_message_payload
 from graph_agent.providers.triggers import TriggerService
 from graph_agent.runtime.core import (
@@ -55,6 +56,7 @@ from graph_agent.tools.mcp import McpServerDefinition
 
 
 LOGGER = logging.getLogger(__name__)
+DISCORD_START_PROVIDER_ID = "start.discord_message"
 
 
 def _iter_supabase_run_stores(store: Any) -> Iterator[Any]:
@@ -83,7 +85,6 @@ def _iter_supabase_run_stores(store: Any) -> Iterator[Any]:
         yield from _iter_supabase_run_stores(delegate)
 
 
-DISCORD_START_PROVIDER_ID = "start.discord_message"
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
 SPREADSHEET_NODE_PROVIDER_IDS = {"core.spreadsheet_rows", "core.spreadsheet_matrix_decision"}
 SPREADSHEET_FILE_SUFFIXES = {".csv", ".xlsx"}
@@ -315,6 +316,7 @@ class GraphRunManager:
         run_store: RunStore | None = None,
         run_log_store: RunStore | None = None,
         discord_service: DiscordTriggerService | None = None,
+        cron_service: CronTriggerService | None = None,
         project_file_store: ProjectFileStore | None = None,
         cloudflare_config_store: CloudflareConfigStore | None = None,
     ) -> None:
@@ -334,9 +336,15 @@ class GraphRunManager:
         self._cloudflare_config_store = cloudflare_config_store or CloudflareConfigStore()
         self._discord_service = discord_service or DiscordTriggerService(self.handle_discord_message)
         self._discord_adapter = _DiscordTriggerAdapter(self._discord_service, self._resolve_discord_service_token)
-        self._trigger_services: list[TriggerService] = [self._discord_adapter]
+        self._cron_service = cron_service or CronTriggerService(
+            self._resolve_cron_schedule,
+            self.handle_cron_schedule,
+            poll_interval_seconds=_read_interval_env("GRAPH_AGENT_CRON_POLL_INTERVAL_SECONDS", 15.0),
+        )
+        self._trigger_services: list[TriggerService] = [self._discord_adapter, self._cron_service]
         self._trigger_services_by_provider_id: dict[str, TriggerService] = {
             DISCORD_START_PROVIDER_ID: self._discord_adapter,
+            CRON_START_PROVIDER_ID: self._cron_service,
         }
         self._active_sessions: dict[str, str] = {}
         self._listener_session_metadata: dict[str, dict[str, Any]] = {}
@@ -1498,6 +1506,17 @@ class GraphRunManager:
         self._cloudflare_config_store.clear()
         return self.get_cloudflare_config()
 
+    def handle_cron_schedule(self, graph_id: str, input_payload: dict[str, Any]) -> str | None:
+        normalized = str(graph_id or "").strip()
+        if not normalized:
+            return None
+        with self._lock:
+            session_run_id = self._active_sessions.get(normalized)
+        if not session_run_id:
+            LOGGER.debug("Dropping cron schedule fire for graph %r: no active listener session.", normalized)
+            return None
+        return self._start_child_run(session_run_id, normalized, dict(input_payload))
+
     def handle_discord_message(self, message: DiscordMessageEvent) -> list[str]:
         run_ids: list[str] = []
         input_payload = normalize_discord_message_payload(message)
@@ -2280,6 +2299,28 @@ class GraphRunManager:
         if _as_bool(config.get("ignore_self_messages"), True) and message.author_is_self:
             return False
         return True
+
+    def _resolve_cron_schedule(self, graph_id: str) -> CronSchedule | None:
+        normalized = str(graph_id or "").strip()
+        if not normalized:
+            return None
+        try:
+            document = load_graph_document(self._store.get_graph(normalized))
+        except Exception:  # noqa: BLE001
+            return None
+        if document.is_multi_agent:
+            return None
+        graph = document.as_graph()
+        if graph.start_node().provider_id != CRON_START_PROVIDER_ID:
+            return None
+        config = graph.resolved_start_node_config()
+        return CronSchedule(
+            graph_id=graph.graph_id,
+            cron_expression=str(config.get("cron_expression", "0 9 * * *") or "0 9 * * *").strip(),
+            timezone=str(config.get("timezone", "UTC") or "UTC").strip(),
+            prompt=str(config.get("prompt", "") or ""),
+            enabled=_as_bool(config.get("enabled"), True),
+        )
 
     def _resolve_discord_service_token(self, graph_id: str | None = None) -> str:
         if graph_id:

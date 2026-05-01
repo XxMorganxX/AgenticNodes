@@ -158,9 +158,9 @@ export function UserPreferencesModal({
 
           <div className="preferences-shortcut-card">
             <div className="preferences-shortcut-copy">
-              <strong>Save Graph</strong>
+              <strong>Save Grouping</strong>
               <span>
-                Press a shortcut to save the current graph and override the browser save action. Leave the field empty to disable it.
+                Press a shortcut to save the current grouping and override the browser save action. Leave the field empty to disable it.
               </span>
             </div>
             <input
@@ -171,7 +171,7 @@ export function UserPreferencesModal({
               onChange={handleSaveGraphShortcutChange}
               onKeyDown={handleSaveGraphShortcutKeyDown}
               spellCheck={false}
-              aria-label="Save graph shortcut"
+              aria-label="Save grouping shortcut"
             />
           </div>
 
@@ -179,7 +179,7 @@ export function UserPreferencesModal({
             <div className="preferences-shortcut-copy">
               <strong>Run Agent</strong>
               <span>
-                Press a shortcut to run the current graph or environment and override the browser refresh action. Leave the field empty to disable it.
+                Press a shortcut to run the current workflow or grouping and override the browser refresh action. Leave the field empty to disable it.
               </span>
             </div>
             <input
@@ -190,7 +190,7 @@ export function UserPreferencesModal({
               onChange={handleRunGraphShortcutChange}
               onKeyDown={handleRunGraphShortcutKeyDown}
               spellCheck={false}
-              aria-label="Run graph shortcut"
+              aria-label="Run workflow shortcut"
             />
           </div>
 

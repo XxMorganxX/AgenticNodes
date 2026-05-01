@@ -20,6 +20,7 @@ import { GraphCanvasNode } from "./GraphCanvasNode";
 import type { GraphCanvasNodeData } from "./GraphCanvasNode";
 import { ContextBuilderPayloadModal } from "./ContextBuilderPayloadModal";
 import { ConditionDetailsModal } from "./ConditionDetailsModal";
+import { CronScheduleModal } from "./CronScheduleModal";
 import { DISCORD_BOT_TOKEN_ENV_KEY, DiscordTriggerModal } from "./DiscordTriggerModal";
 import { ConditionResultsModal } from "./ConditionResultsModal";
 import { DisplayResponseModal } from "./DisplayResponseModal";
@@ -105,6 +106,8 @@ type GraphCanvasProps = {
   environmentAgents?: AgentRunLane[];
   selectedAgentId?: string | null;
   onSelectAgent?: (agentId: string) => void;
+  onCreateAgent?: (agentName: string) => void;
+  onRequestRemoveAgent?: (agentId: string) => void;
   runProjection?: FocusedRunProjection | null;
   runSummary?: FocusedRunSummary | null;
   eventGroups?: FocusedEventGroup[];
@@ -946,12 +949,14 @@ export function GraphCanvas({
   events,
   activeRunId,
   isRunning,
-  runButtonLabel = "Run Graph",
+  runButtonLabel = "Run Workflow",
   focusedAgentName = null,
   focusedAgentStatus = null,
   environmentAgents = [],
   selectedAgentId = null,
   onSelectAgent,
+  onCreateAgent,
+  onRequestRemoveAgent,
   runProjection = null,
   runSummary,
   eventGroups = [],
@@ -984,6 +989,7 @@ export function GraphCanvas({
   const [displayResponseNodeId, setDisplayResponseNodeId] = useState<string | null>(null);
   const [contextBuilderPayloadNodeId, setContextBuilderPayloadNodeId] = useState<string | null>(null);
   const [discordTriggerNodeId, setDiscordTriggerNodeId] = useState<string | null>(null);
+  const [cronScheduleNodeId, setCronScheduleNodeId] = useState<string | null>(null);
   const [tooltipNodeId, setTooltipNodeId] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<DrawerTab>("add");
@@ -1167,6 +1173,10 @@ export function GraphCanvas({
   const discordTriggerNode = useMemo(
     () => graph?.nodes.find((node) => node.id === discordTriggerNodeId && node.provider_id === "start.discord_message") ?? null,
     [graph, discordTriggerNodeId],
+  );
+  const cronScheduleNode = useMemo(
+    () => graph?.nodes.find((node) => node.id === cronScheduleNodeId && node.provider_id === "start.cron_schedule") ?? null,
+    [graph, cronScheduleNodeId],
   );
   const conditionDetailsNode = useMemo(
     () => graph?.nodes.find((node) => node.id === conditionDetailsNodeId && node.provider_id === "core.logic_conditions") ?? null,
@@ -2006,6 +2016,14 @@ export function GraphCanvas({
     (nodeId: string) => {
       onSelectionChange(nodeId, null);
       setDiscordTriggerNodeId(nodeId);
+    },
+    [onSelectionChange],
+  );
+
+  const handleOpenCronScheduleConfig = useCallback(
+    (nodeId: string) => {
+      onSelectionChange(nodeId, null);
+      setCronScheduleNodeId(nodeId);
     },
     [onSelectionChange],
   );
@@ -3997,6 +4015,7 @@ export function GraphCanvas({
                 onOpenToolDetails: handleOpenToolDetails,
                 onOpenProviderDetails: handleOpenProviderDetails,
                 onOpenDiscordTriggerConfig: handleOpenDiscordTriggerConfig,
+                onOpenCronScheduleConfig: handleOpenCronScheduleConfig,
                 onToggleExecutorRetries: handleToggleExecutorRetries,
                 onToggleSupabaseIteratorIncludeProcessedRows: handleToggleSupabaseIteratorIncludeProcessedRows,
                 onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
@@ -4107,6 +4126,7 @@ export function GraphCanvas({
         previousData.onOpenToolDetails === handleOpenToolDetails &&
         previousData.onOpenProviderDetails === handleOpenProviderDetails &&
         previousData.onOpenDiscordTriggerConfig === handleOpenDiscordTriggerConfig &&
+        previousData.onOpenCronScheduleConfig === handleOpenCronScheduleConfig &&
         previousData.onToggleExecutorRetries === handleToggleExecutorRetries &&
         previousData.onToggleSupabaseIteratorIncludeProcessedRows === handleToggleSupabaseIteratorIncludeProcessedRows &&
         previousData.onOpenPromptBlockDetails === handleOpenPromptBlockDetails &&
@@ -4141,6 +4161,7 @@ export function GraphCanvas({
               onOpenToolDetails: handleOpenToolDetails,
               onOpenProviderDetails: handleOpenProviderDetails,
               onOpenDiscordTriggerConfig: handleOpenDiscordTriggerConfig,
+              onOpenCronScheduleConfig: handleOpenCronScheduleConfig,
               onToggleExecutorRetries: handleToggleExecutorRetries,
               onToggleSupabaseIteratorIncludeProcessedRows: handleToggleSupabaseIteratorIncludeProcessedRows,
               onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
@@ -4214,6 +4235,8 @@ export function GraphCanvas({
     handleChangeSpreadsheetStartRowIndex,
     handleSelectPythonScriptFile,
     handleToggleExecutorRetries,
+    handleOpenCronScheduleConfig,
+    handleOpenDiscordTriggerConfig,
     handleOpenToolDetails,
     handleToggleTooltip,
     isConnecting,
@@ -4832,7 +4855,7 @@ export function GraphCanvas({
   }, [catalog]);
 
   if (!graph) {
-    return <div className="panel empty-panel">No graph selected.</div>;
+    return <div className="panel empty-panel">No grouping selected.</div>;
   }
 
   return (
@@ -4921,18 +4944,18 @@ export function GraphCanvas({
         </div>
       </div>
       <div className="graph-workspace">
-        {environmentAgents.length > 0 ? (
-          <EnvironmentAgentMenu
-            agents={environmentAgents}
-            selectedAgentId={selectedAgentId}
-            open={agentMenuOpen}
-            onToggle={() => setAgentMenuOpen((previous) => !previous)}
-            onSelectAgent={(agentId) => {
-              onSelectAgent?.(agentId);
-              setAgentMenuOpen(false);
-            }}
-          />
-        ) : null}
+        <EnvironmentAgentMenu
+          agents={environmentAgents}
+          selectedAgentId={selectedAgentId}
+          open={agentMenuOpen}
+          onToggle={() => setAgentMenuOpen((previous) => !previous)}
+          onSelectAgent={(agentId) => {
+            onSelectAgent?.(agentId);
+            setAgentMenuOpen(false);
+          }}
+          onCreateAgent={onCreateAgent}
+          onRequestRemoveAgent={onRequestRemoveAgent}
+        />
         <div
           ref={canvasRef}
           className={`graph-canvas${drawerOpen ? " graph-canvas--drawer-open" : ""}${isProviderDragActive || isSavedNodeDragActive ? " is-drop-target" : ""}${isConnecting ? " is-connecting" : ""}${pendingPlacement ? " is-placing-node" : ""}${draftConnection ? " is-routing-wire" : ""}${junctionDrag ? " is-dragging-junction" : ""}${waypointDrag ? " is-dragging-waypoint" : ""}${isNodeDragActive ? " is-dragging-node" : ""}${marqueeSelection ? " is-marquee-selecting" : ""}`}
@@ -5521,6 +5544,53 @@ export function GraphCanvas({
             )
           }
           onClose={() => setDiscordTriggerNodeId(null)}
+        />
+      ) : null}
+      {cronScheduleNode && graph ? (
+        <CronScheduleModal
+          cronExpression={String(cronScheduleNode.config.cron_expression ?? "0 9 * * *")}
+          timezone={String(cronScheduleNode.config.timezone ?? "UTC")}
+          prompt={String(cronScheduleNode.config.prompt ?? "")}
+          onChangeCronExpression={(value) =>
+            onGraphChange(
+              updateNode(graph, cronScheduleNode.id, (node) => ({
+                ...node,
+                config: {
+                  ...node.config,
+                  trigger_mode: "cron_schedule",
+                  cron_expression: value,
+                  input_binding: node.config.input_binding ?? { type: "input_payload" },
+                },
+              })),
+            )
+          }
+          onChangeTimezone={(value) =>
+            onGraphChange(
+              updateNode(graph, cronScheduleNode.id, (node) => ({
+                ...node,
+                config: {
+                  ...node.config,
+                  trigger_mode: "cron_schedule",
+                  timezone: value,
+                  input_binding: node.config.input_binding ?? { type: "input_payload" },
+                },
+              })),
+            )
+          }
+          onChangePrompt={(value) =>
+            onGraphChange(
+              updateNode(graph, cronScheduleNode.id, (node) => ({
+                ...node,
+                config: {
+                  ...node.config,
+                  trigger_mode: "cron_schedule",
+                  prompt: value,
+                  input_binding: node.config.input_binding ?? { type: "input_payload" },
+                },
+              })),
+            )
+          }
+          onClose={() => setCronScheduleNodeId(null)}
         />
       ) : null}
     </div>

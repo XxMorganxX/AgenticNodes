@@ -135,6 +135,45 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="start.cron_schedule",
+            display_name="Cron Schedule Start",
+            category=NodeCategory.START,
+            node_kind="input",
+            description="Starts a graph on a cron schedule and passes a configured prompt as the input payload.",
+            capabilities=["cron schedule trigger", "time-based listener", "prompt payload capture"],
+            default_config={
+                "trigger_mode": "cron_schedule",
+                "cron_expression": "0 9 * * *",
+                "timezone": "UTC",
+                "prompt": "",
+                "input_binding": {"type": "input_payload"},
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="cron_expression",
+                    label="Cron Expression",
+                    help_text="Five-field cron expression: minute hour day-of-month month day-of-week.",
+                    placeholder="0 9 * * *",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="timezone",
+                    label="Timezone",
+                    help_text="IANA timezone used to evaluate the cron expression.",
+                    placeholder="UTC",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="prompt",
+                    label="Prompt",
+                    help_text="Prompt included in input_payload.prompt when the schedule fires.",
+                    placeholder="Describe the task this scheduled run should perform.",
+                ),
+            ],
+            trigger_mode="listener",
+            listener_transport=None,
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.input",
             display_name="Core Input Node (Legacy)",
             category=NodeCategory.START,

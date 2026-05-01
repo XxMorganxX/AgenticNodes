@@ -120,6 +120,15 @@ function defaultStartConfig(provider: NodeProviderDefinition): GraphNode["config
       input_binding: { type: "input_payload" },
     };
   }
+  if (provider.provider_id === "start.cron_schedule") {
+    return {
+      trigger_mode: "cron_schedule",
+      cron_expression: "0 9 * * *",
+      timezone: "UTC",
+      prompt: "",
+      input_binding: { type: "input_payload" },
+    };
+  }
   return {
     trigger_mode: "manual_run",
     input_binding: { type: "input_payload" },
@@ -184,7 +193,7 @@ export function syncModelNodeWithProvider(modelNode: GraphNode, providerNode: Gr
 export function createBlankGraph(): GraphDefinition {
   return {
     graph_id: `agent-${Date.now()}`,
-    name: "Untitled Agent",
+    name: "Untitled Grouping",
     description: "",
     version: "1.0",
     email_routing_mode: DEFAULT_NEW_GRAPH_EMAIL_ROUTING_MODE,

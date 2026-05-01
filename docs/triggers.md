@@ -30,20 +30,28 @@ Today's start-node inventory:
 | `start.manual_run` | `immediate` | — |
 | `core.input` (legacy alias) | `immediate` | — |
 | `start.discord_message` | `listener` | `outbound_socket` |
+| `start.cron_schedule` | `listener` | — |
 
 ## How the runtime uses these fields
 
 `GraphRunManager` owns a list of `TriggerService` objects (`src/graph_agent/providers/triggers.py`).
-Each service exposes `sync()` and `stop()`:
+Each service exposes `activate(graph_id)`, `deactivate(graph_id)`, and `stop()`:
 
-- `sync()` — reconcile the service against the current set of graphs. Called on
-  startup and whenever a graph is created, updated, or deleted.
+- `activate(graph_id)` — start or register the transport/timer for an active
+  listener session.
+- `deactivate(graph_id)` — unregister the graph when its listener session ends.
 - `stop()` — release any long-lived resources (sockets, threads, subprocesses).
 
-Today the only service is the Discord listener (wrapped by `_DiscordTriggerAdapter`
-in `src/graph_agent/api/manager.py`). When `start.webhook` lands as the second
-listener kind, it slots into this list with no further changes to the lifecycle
-plumbing.
+Today the services are the Discord listener (wrapped by `_DiscordTriggerAdapter`
+in `src/graph_agent/api/manager.py`) and the internal cron scheduler
+(`CronTriggerService` in `src/graph_agent/providers/cron.py`). When
+`start.webhook` lands, it slots into this list with no further changes to the
+lifecycle plumbing.
+
+`start.cron_schedule` is listener-mode even though it does not use a network
+transport. A listener session keeps the schedule active; each due cron fire
+starts a child run with input payload fields such as `source="cron_schedule"`,
+`prompt`, `cron_expression`, `timezone`, `scheduled_for`, and `fired_at`.
 
 ## Inbound listeners require a public URL — Cloudflare
 

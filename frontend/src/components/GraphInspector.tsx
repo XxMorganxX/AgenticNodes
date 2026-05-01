@@ -1134,6 +1134,7 @@ export function GraphInspector({
     const executorFollowUpResponseMode =
       selectedNode.kind === "mcp_tool_executor" ? String(selectedNode.config.response_mode ?? "auto") : "auto";
     const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
+    const isCronStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.cron_schedule";
     const isDiscordEndNode = selectedNode.kind === "output" && selectedNode.provider_id === "end.discord_message";
     const isOutlookDraftEndNode = selectedNode.kind === "output" && selectedNode.provider_id === "end.outlook_draft";
     const microsoftAuthStatus = catalog?.microsoft_auth ?? null;
@@ -1471,7 +1472,7 @@ export function GraphInspector({
               </div>
               <label>
                 Start Trigger
-                <input value={isDiscordStartNode ? "discord_message" : "manual_run"} readOnly />
+                <input value={isDiscordStartNode ? "discord_message" : isCronStartNode ? "cron_schedule" : "manual_run"} readOnly />
               </label>
               {isManualStartNode ? (
                 <div className="contract-card">
@@ -1501,6 +1502,18 @@ export function GraphInspector({
                   >
                     Configure Discord Trigger…
                   </button>
+                </div>
+              ) : null}
+              {isCronStartNode ? (
+                <div className="contract-card">
+                  <strong>Cron Schedule</strong>
+                  <span>
+                    Schedule: <code>{String(selectedNode.config.cron_expression ?? "") || "(not set)"}</code>
+                  </span>
+                  <span>
+                    Timezone: <code>{String(selectedNode.config.timezone ?? "UTC") || "UTC"}</code>
+                  </span>
+                  <span>When the schedule fires, the prompt is available as input_payload.prompt.</span>
                 </div>
               ) : null}
             </>

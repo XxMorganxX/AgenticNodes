@@ -113,7 +113,7 @@ export async function deleteGraph(graphId: string): Promise<void> {
     method: "DELETE",
   });
   if (!response.ok) {
-    throw new Error("Failed to delete graph.");
+    throw new Error(await readFetchErrorMessage(response, "Failed to delete grouping."));
   }
 }
 
