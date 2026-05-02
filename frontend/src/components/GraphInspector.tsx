@@ -33,6 +33,7 @@ import {
 } from "../lib/contextBuilderBindings";
 import { getModelContextBuilderPromptVariables } from "../lib/contextBuilderPromptVariables";
 import { getNodeInstanceLabel } from "../lib/nodeInstanceLabels";
+import { buildWebhookTriggerUrls } from "../lib/webhookUrls";
 import { insertTokenAtEnd, listPromptBlockAvailableVariables, PROMPT_BLOCK_STARTERS, renderPromptBlockPreview } from "../lib/promptBlockEditor";
 import { SPREADSHEET_MATRIX_RECOMMENDED_USER_MESSAGE_TEMPLATE } from "../lib/spreadsheetMatrixPrompt";
 import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
@@ -57,6 +58,8 @@ type GraphInspectorProps = {
   runState: RunState | null;
   selectedNodeId: string | null;
   selectedEdgeId: string | null;
+  /** True while Start Listening is active for a graph whose start node is start.webhook */
+  isWebhookListenerSessionActive?: boolean;
   onGraphChange: (graph: GraphDefinition) => void;
   onOpenProviderDetails?: (nodeId: string) => void;
   onSaveNode?: (node: GraphNode) => void;
@@ -557,6 +560,7 @@ export function GraphInspector({
   runState,
   selectedNodeId,
   selectedEdgeId,
+  isWebhookListenerSessionActive = false,
   onGraphChange,
   onOpenProviderDetails,
   onSaveNode,
@@ -580,6 +584,15 @@ export function GraphInspector({
   const [isStructuredPayloadBuilderLearnMoreOpen, setIsStructuredPayloadBuilderLearnMoreOpen] = useState(false);
   const [isDiscordTriggerModalOpen, setIsDiscordTriggerModalOpen] = useState(false);
   const [structuredPayloadTemplateDraftEntries, setStructuredPayloadTemplateDraftEntries] = useState<StructuredPayloadTemplateEntry[]>([]);
+  const [webhookCopyKind, setWebhookCopyKind] = useState<"local" | "public" | null>(null);
+
+  useEffect(() => {
+    if (!webhookCopyKind) {
+      return;
+    }
+    const timer = window.setTimeout(() => setWebhookCopyKind(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [webhookCopyKind]);
 
   if (!graph) {
     return (
@@ -1135,6 +1148,9 @@ export function GraphInspector({
       selectedNode.kind === "mcp_tool_executor" ? String(selectedNode.config.response_mode ?? "auto") : "auto";
     const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
     const isCronStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.cron_schedule";
+    const isWebhookStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.webhook";
+    const webhookPathSegment = isWebhookStartNode ? String(selectedNode.config.webhook_path_slug ?? "").trim() : "";
+    const webhookTriggerUrls = buildWebhookTriggerUrls(webhookPathSegment, catalog?.cloudflare?.public_hostname);
     const isDiscordEndNode = selectedNode.kind === "output" && selectedNode.provider_id === "end.discord_message";
     const isOutlookDraftEndNode = selectedNode.kind === "output" && selectedNode.provider_id === "end.outlook_draft";
     const microsoftAuthStatus = catalog?.microsoft_auth ?? null;
@@ -1466,13 +1482,32 @@ export function GraphInspector({
                 <span>{startNodeTriggerBadgeLabel}</span>
                 {startNodeListenerTransport === "inbound_webhook" ? (
                   <span>
-                    Inbound webhooks require a Cloudflare tunnel. Configure one in the Environment panel.
+                    Use a Cloudflare tunnel (Environment panel) for HTTPS URLs reachable from the internet.
+                    {catalog?.webhook_ingress_enabled === false ? (
+                      <>
+                        {" "}
+                        Requests from <strong>localhost</strong> and <strong>private LAN</strong> IPs still work;
+                        set <code>GRAPH_AGENT_WEBHOOK_INGRESS_ENABLED=1</code> only if public internet callers should
+                        trigger this graph.
+                      </>
+                    ) : null}
                   </span>
                 ) : null}
               </div>
               <label>
                 Start Trigger
-                <input value={isDiscordStartNode ? "discord_message" : isCronStartNode ? "cron_schedule" : "manual_run"} readOnly />
+                <input
+                  value={
+                    isDiscordStartNode
+                      ? "discord_message"
+                      : isCronStartNode
+                        ? "cron_schedule"
+                        : isWebhookStartNode
+                          ? "webhook"
+                          : "manual_run"
+                  }
+                  readOnly
+                />
               </label>
               {isManualStartNode ? (
                 <div className="contract-card">
@@ -1514,6 +1549,81 @@ export function GraphInspector({
                     Timezone: <code>{String(selectedNode.config.timezone ?? "UTC") || "UTC"}</code>
                   </span>
                   <span>When the schedule fires, the prompt is available as input_payload.prompt.</span>
+                </div>
+              ) : null}
+              {isWebhookStartNode ? (
+                <div className="contract-card">
+                  <strong>HTTP Webhook — URL to hit</strong>
+                  {catalog?.webhook_ingress_enabled === false ? (
+                    <span>
+                      Without <code>GRAPH_AGENT_WEBHOOK_INGRESS_ENABLED=1</code>, only clients on this machine or your
+                      private network can POST to the URLs below; enable the env var for internet-facing webhooks.
+                    </span>
+                  ) : null}
+                  <span>
+                    Path segment: <code>{webhookPathSegment || "(not set — edit node config)"}</code>
+                  </span>
+                  <span>
+                    Verification: <code>{String(selectedNode.config.verification_mode ?? "none")}</code>
+                  </span>
+                  {webhookPathSegment.length === 0 ? (
+                    <span>Set the path segment on this start node so the URL below can be formed.</span>
+                  ) : (
+                    <>
+                      <span>
+                        <strong>Same machine / this browser</strong> — requests go through the UI origin (Vite proxies{" "}
+                        <code>/api</code> to the backend in dev):
+                      </span>
+                      <div className="inspector-webhook-url-row">
+                        <code className="inspector-webhook-url">{webhookTriggerUrls.localUrl}</code>
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() =>
+                            void navigator.clipboard.writeText(webhookTriggerUrls.localUrl).then(
+                              () => setWebhookCopyKind("local"),
+                              () => undefined,
+                            )
+                          }
+                        >
+                          {webhookCopyKind === "local" ? "Copied" : "Copy"}
+                        </button>
+                      </div>
+                      {webhookTriggerUrls.publicUrl ? (
+                        <>
+                          <span>
+                            <strong>Internet</strong> — use this when calling through your Cloudflare tunnel (phones,
+                            servers, SaaS webhooks):
+                          </span>
+                          <div className="inspector-webhook-url-row">
+                            <code className="inspector-webhook-url">{webhookTriggerUrls.publicUrl}</code>
+                            <button
+                              type="button"
+                              className="secondary-button"
+                              onClick={() =>
+                                void navigator.clipboard.writeText(webhookTriggerUrls.publicUrl!).then(
+                                  () => setWebhookCopyKind("public"),
+                                  () => undefined,
+                                )
+                              }
+                            >
+                              {webhookCopyKind === "public" ? "Copied" : "Copy"}
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <span>
+                          Add <strong>public hostname</strong> under Environment → Cloudflare Tunnel to show the HTTPS URL
+                          for callers outside this machine.
+                        </span>
+                      )}
+                      <span className={isWebhookListenerSessionActive ? "inspector-webhook-listening" : undefined}>
+                        {isWebhookListenerSessionActive
+                          ? "Listening — this URL is armed and waiting for an HTTP request (POST or GET). Click Stop Listening when you are done."
+                          : "Press Start Listening in the toolbar to register this URL and wait for requests. Until then, hits may not start this graph."}
+                      </span>
+                    </>
+                  )}
                 </div>
               ) : null}
             </>

@@ -8327,6 +8327,11 @@ class GraphDefinition:
                     f"Node '{node.id}' uses provider '{node.provider_id}' for kind "
                     f"'{provider_definition.node_kind}', but the node kind is '{node.kind}'."
                 )
+            if str(node.provider_id) == "start.webhook":
+                from graph_agent.providers.webhook import normalize_webhook_slug, validate_webhook_slug
+
+                slug = normalize_webhook_slug(node.raw_config.get("webhook_path_slug"))
+                validate_webhook_slug(slug)
             contract = get_category_contract(node.category)
             if not contract.produced_outputs:
                 raise GraphValidationError(f"Node category '{node.category.value}' is missing a contract.")

@@ -174,6 +174,108 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="start.webhook",
+            display_name="Webhook Start",
+            category=NodeCategory.START,
+            node_kind="input",
+            description=(
+                "Starts a graph when an HTTP request hits /api/webhooks/{slug} during an active listener session. "
+                "Requires Cloudflare tunnel for public ingress."
+            ),
+            capabilities=[
+                "http webhook trigger",
+                "inbound listener",
+                "hmac or shared-secret verification",
+                "optional event filtering",
+            ],
+            default_config={
+                "trigger_mode": "webhook",
+                "webhook_path_slug": "",
+                "http_methods": ["POST"],
+                "verification_mode": "none",
+                "webhook_secret_env_var": "{WEBHOOK_SECRET}",
+                "webhook_shared_secret_header": "X-Webhook-Secret",
+                "signature_header": "X-Signature",
+                "signature_prefix": "",
+                "event_type_json_path": "",
+                "event_type_allowlist": "",
+                "prompt": "",
+                "input_binding": {"type": "input_payload"},
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="webhook_path_slug",
+                    label="Webhook path slug",
+                    help_text="URL segment after /api/webhooks/ — letters, digits, underscores, hyphens; 4–128 chars. Must be unique across all graphs.",
+                    placeholder="my-integration-hook",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="http_methods",
+                    label="HTTP methods",
+                    input_type="text",
+                    help_text='Comma-separated allowlist, e.g. "POST" or "POST, PUT".',
+                    placeholder="POST",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="verification_mode",
+                    label="Verification",
+                    input_type="select",
+                    help_text="none = accept any caller (dev only). shared_secret = header or Bearer token. hmac_sha256 = hex HMAC-SHA256 of raw body.",
+                    options=[
+                        ProviderConfigOptionDefinition(value="none", label="None (insecure)"),
+                        ProviderConfigOptionDefinition(value="shared_secret", label="Shared secret (header or Bearer)"),
+                        ProviderConfigOptionDefinition(value="hmac_sha256", label="HMAC-SHA256 (hex digest header)"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(
+                    key="webhook_secret_env_var",
+                    label="Secret env-var placeholder",
+                    help_text="Graph env resolves {NAME}; process env fills secrets. Required when verification is not none.",
+                    placeholder="{WEBHOOK_SECRET}",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="webhook_shared_secret_header",
+                    label="Shared-secret header name",
+                    help_text="Case-insensitive header that must match the resolved secret (shared_secret mode).",
+                    placeholder="X-Webhook-Secret",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="signature_header",
+                    label="HMAC signature header",
+                    help_text="Header containing the hex digest (hmac_sha256 mode).",
+                    placeholder="X-Signature",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="signature_prefix",
+                    label="Signature prefix strip",
+                    help_text="Optional prefix removed before comparing hex digest (e.g. sha256=).",
+                    placeholder="",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="event_type_json_path",
+                    label="Event filter JSON path",
+                    help_text="Optional dot path into JSON body (e.g. type or hook.type). Leave empty to disable filtering.",
+                    placeholder="type",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="event_type_allowlist",
+                    label="Event allowlist",
+                    help_text="Comma-separated values; if set with JSON path, only matching events start a run.",
+                    placeholder="push, ping",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="prompt",
+                    label="Prompt (merged)",
+                    help_text="Optional string merged into input_payload.prompt alongside webhook body.",
+                    placeholder="",
+                ),
+            ],
+            trigger_mode="listener",
+            listener_transport="inbound_webhook",
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.input",
             display_name="Core Input Node (Legacy)",
             category=NodeCategory.START,

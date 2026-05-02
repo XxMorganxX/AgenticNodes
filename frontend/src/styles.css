@@ -922,6 +922,46 @@ pre {
   color: #c2c8e7;
 }
 
+.listener-session-endpoints {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.55rem 0.65rem;
+  border-radius: 0.45rem;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(8, 10, 24, 0.35);
+}
+
+.listener-session-endpoint-block {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.listener-session-endpoint-slug {
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: #aeb6e8;
+}
+
+.listener-session-endpoint-line {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.listener-session-endpoint-label {
+  font-size: 0.72rem;
+  color: #8d93c5;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+}
+
+.listener-session-endpoint-hint {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #8d93c5;
+  line-height: 1.35;
+}
+
 .listener-session-children {
   display: grid;
   gap: 0.4rem;
@@ -6602,6 +6642,30 @@ pre {
   background: #1a1b2e;
   border: 1px solid #2e2f48;
   color: #8486a5;
+}
+
+.inspector-webhook-url-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: flex-start;
+}
+
+.inspector-webhook-url {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+  padding: 0.35rem 0.5rem;
+  border-radius: 8px;
+  background: rgba(22, 23, 38, 0.95);
+  border: 1px solid rgba(94, 95, 140, 0.45);
+  color: #e8eaff;
+  font-size: 0.85rem;
+}
+
+.inspector-webhook-listening {
+  color: #a8e6cf;
+  font-weight: 600;
 }
 
 .runtime-field-list {

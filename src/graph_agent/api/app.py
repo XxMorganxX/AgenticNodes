@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from graph_agent.api.manager import GraphRunManager
+from graph_agent.providers.webhook import WebhookHttpError
 
 
 _log_level_name = os.environ.get("GRAPH_AGENT_LOG_LEVEL", "").strip().upper()
@@ -582,6 +583,31 @@ def stop_listener_session(run_id: str) -> dict[str, str]:
         raise HTTPException(status_code=404, detail=f"No active listener session '{run_id}'.")
     manager.stop_listener_session(run_id, reason="user_initiated")
     return {"stopped": run_id}
+
+
+@app.api_route("/api/webhooks/{slug}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+async def inbound_webhook(slug: str, request: Request) -> dict[str, Any]:
+    body = await request.body()
+    headers_list = list(request.scope.get("headers") or [])
+    query = str(request.url.query) if request.url.query else ""
+    try:
+        peer_host = request.client.host if request.client else None
+        result = manager.handle_inbound_webhook(
+            slug,
+            request.method,
+            request.url.path,
+            query,
+            headers_list,
+            body,
+            client_host=peer_host,
+        )
+    except WebhookHttpError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    if result.get("filtered"):
+        return {"accepted": False, "filtered": True}
+    if result.get("preflight"):
+        return {"ok": True}
+    return {"accepted": True, "run_id": result["run_id"]}
 
 
 @app.post("/api/runtime/reset")

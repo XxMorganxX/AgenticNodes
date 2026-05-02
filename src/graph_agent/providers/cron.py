@@ -21,6 +21,8 @@ class CronSchedule:
     timezone: str
     prompt: str
     enabled: bool = True
+    """When set, cron listener runs only this agent swimlane inside a test_environment."""
+    listener_agent_id: str | None = None
 
     @property
     def fingerprint(self) -> tuple[str, str, str, bool]:
@@ -34,7 +36,7 @@ def normalize_cron_schedule_payload(
     fired_at: datetime | None = None,
 ) -> dict[str, Any]:
     fired_at = fired_at or datetime.now(UTC)
-    return {
+    payload: dict[str, Any] = {
         "source": "cron_schedule",
         "graph_id": schedule.graph_id,
         "prompt": schedule.prompt,
@@ -43,6 +45,9 @@ def normalize_cron_schedule_payload(
         "scheduled_for": scheduled_for.astimezone(UTC).isoformat(),
         "fired_at": fired_at.astimezone(UTC).isoformat(),
     }
+    if schedule.listener_agent_id:
+        payload["listener_agent_id"] = schedule.listener_agent_id
+    return payload
 
 
 def next_cron_fire_after(expression: str, timezone_name: str, after: datetime | None = None) -> datetime:

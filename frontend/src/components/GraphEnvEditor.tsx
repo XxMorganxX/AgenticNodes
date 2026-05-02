@@ -110,6 +110,8 @@ function emptyCloudflareConfig(): CloudflareConfig {
     tunnel_token_env_var: "CLOUDFLARE_TUNNEL_TOKEN",
     public_hostname: "",
     token_configured: false,
+    tunnel_state: "stopped",
+    tunnel_ref_count: 0,
   };
 }
 
@@ -397,6 +399,15 @@ export function GraphEnvEditor({ graph, onGraphChange, onMicrosoftAuthChanged, o
             <span className={`env-integration-status${cloudflareConfig.token_configured ? " is-ready" : ""}`}>
               {cloudflareConfig.token_configured ? "Token detected" : "Not configured"}
             </span>
+            {cloudflareConfig.tunnel_state === "running" ? (
+              <span className="env-integration-status is-ready">Tunnel running</span>
+            ) : cloudflareConfig.tunnel_state === "failed" ? (
+              <span className="env-integration-status">Tunnel failed</span>
+            ) : cloudflareConfig.tunnel_state === "starting" ? (
+              <span className="env-integration-status">Tunnel starting</span>
+            ) : (
+              <span className="env-integration-status">Tunnel stopped</span>
+            )}
           </div>
           <p>
             Required for inbound-webhook listener start nodes. The tunnel token stays in your <code>.env</code>; only the env-var name and public hostname are recorded here.

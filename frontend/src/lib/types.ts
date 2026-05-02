@@ -254,6 +254,9 @@ export type EditorCatalog = {
   tools: ToolDefinition[];
   connection_rules: ConnectionRule[];
   contracts: Record<string, CategoryContract>;
+  cloudflare?: CloudflareConfig;
+  /** When false, the API rejects /api/webhooks and cannot start inbound-webhook listener sessions. */
+  webhook_ingress_enabled?: boolean;
   provider_statuses?: Record<string, ProviderPreflightResult>;
   microsoft_auth?: MicrosoftAuthStatus | null;
   mcp_servers?: McpServerStatus[];
@@ -378,10 +381,20 @@ export type DiscordTokenPreflightResult = {
   source: "process_env" | "graph_env_vars" | "none";
 };
 
+export type CloudflareTunnelRuntimeState = "stopped" | "starting" | "running" | "failed";
+
 export type CloudflareConfig = {
   tunnel_token_env_var: string;
   public_hostname: string;
   token_configured: boolean;
+  /** Managed cloudflared subprocess — present when API exposes tunnel runtime fields */
+  tunnel_state?: CloudflareTunnelRuntimeState;
+  tunnel_pid?: number | null;
+  tunnel_ref_count?: number;
+  tunnel_active_graph_ids?: string[];
+  tunnel_last_error?: string | null;
+  tunnel_last_exit_code?: number | null;
+  tunnel_log_tail?: string[];
 };
 
 export type MicrosoftAuthStatus = {

@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 from graph_agent.api.cloudflare_store import CloudflareConfigStore
+from graph_agent.api.cloudflare_tunnel import CloudflareTunnelManager
 from graph_agent.api.graph_store import GraphStore
 from graph_agent.api.project_files import ProjectFileStore
 from graph_agent.api.run_store import (
@@ -33,6 +35,20 @@ from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.providers.cron import CRON_START_PROVIDER_ID, CronSchedule, CronTriggerService
 from graph_agent.providers.discord import DiscordMessageEvent, DiscordTriggerService, normalize_discord_message_payload
 from graph_agent.providers.triggers import TriggerService
+from graph_agent.providers.webhook import (
+    WEBHOOK_START_PROVIDER_ID,
+    WebhookHttpError,
+    WebhookStartResolved,
+    WebhookTriggerService,
+    build_webhook_child_payload,
+    filter_webhook_log_headers,
+    normalize_webhook_slug,
+    parse_body_for_storage,
+    parse_event_type_allowlist,
+    parse_http_methods,
+    passes_event_filter,
+    verify_webhook_request,
+)
 from graph_agent.runtime.core import (
     GraphDefinition,
     RUN_EVENT_BACKLOG_LIMIT,
@@ -57,6 +73,23 @@ from graph_agent.tools.mcp import McpServerDefinition
 
 LOGGER = logging.getLogger(__name__)
 DISCORD_START_PROVIDER_ID = "start.discord_message"
+
+# CronTriggerService activation keys for environment listener agents are ``env_graph_id`` +
+# unit separator + ``agent_id`` so multiple cron schedules can arm independently.
+LISTENER_MULTI_KEY_SEP = "\x1f"
+
+
+def _split_listener_scope_key(graph_id: str) -> tuple[str, str | None]:
+    """Split cron composite keys; plain ids behave like single-graph cron."""
+    s = str(graph_id or "").strip()
+    if LISTENER_MULTI_KEY_SEP in s:
+        left, right = s.split(LISTENER_MULTI_KEY_SEP, 1)
+        return left.strip(), right.strip() or None
+    return s, None
+
+
+def _cron_listener_activation_key(env_graph_id: str, agent_id: str) -> str:
+    return f"{env_graph_id}{LISTENER_MULTI_KEY_SEP}{agent_id}"
 
 
 def _iter_supabase_run_stores(store: Any) -> Iterator[Any]:
@@ -136,6 +169,55 @@ def _read_interval_env(name: str, default: float) -> float:
         return max(float(raw), 0.1)
     except ValueError:
         return default
+
+
+def _webhook_ingress_enabled() -> bool:
+    """When True, accept webhook HTTP from any client IP and start Cloudflare for public URLs.
+
+    When False (default), only loopback, RFC1918 private, and link-local client addresses may POST
+    to ``/api/webhooks``; internet-facing callers must opt in with this flag.
+    """
+    return _as_bool(os.environ.get("GRAPH_AGENT_WEBHOOK_INGRESS_ENABLED"), False)
+
+
+def _parse_peer_ip_for_webhook_trust(host: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if host is None:
+        return None
+    raw = str(host).strip()
+    if not raw:
+        return None
+    if raw.startswith("[") and "]" in raw:
+        raw = raw[1 : raw.index("]")]
+    if "%" in raw:
+        raw = raw.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(raw)
+    except ValueError:
+        return None
+
+
+def _peer_ip_is_trusted_local_webhook(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Loopback, site-local private space, and link-local — typical lab/LAN callers."""
+    if addr.is_loopback:
+        return True
+    if addr.is_private:
+        return True
+    if addr.is_link_local:
+        return True
+    return False
+
+
+def _webhook_request_allowed_without_external_ingress(client_host: str | None) -> bool:
+    addr = _parse_peer_ip_for_webhook_trust(client_host)
+    if addr is None:
+        return False
+    return _peer_ip_is_trusted_local_webhook(addr)
+
+
+def _webhook_ingress_allows_client(client_host: str | None) -> bool:
+    if _webhook_ingress_enabled():
+        return True
+    return _webhook_request_allowed_without_external_ingress(client_host)
 
 
 def _execution_node_ids_for_graph(graph: GraphDefinition) -> list[str]:
@@ -319,6 +401,7 @@ class GraphRunManager:
         cron_service: CronTriggerService | None = None,
         project_file_store: ProjectFileStore | None = None,
         cloudflare_config_store: CloudflareConfigStore | None = None,
+        cloudflare_tunnel: CloudflareTunnelManager | None = None,
     ) -> None:
         self._services = services or build_example_services(include_user_mcp_servers=True)
         self._store = store or GraphStore(self._services)
@@ -334,6 +417,7 @@ class GraphRunManager:
         self._supabase_run_store_announced: set[tuple[str, str, str]] = set()
         self._project_file_store = project_file_store or ProjectFileStore()
         self._cloudflare_config_store = cloudflare_config_store or CloudflareConfigStore()
+        self._cloudflare_tunnel = cloudflare_tunnel or CloudflareTunnelManager(self._cloudflare_config_store)
         self._discord_service = discord_service or DiscordTriggerService(self.handle_discord_message)
         self._discord_adapter = _DiscordTriggerAdapter(self._discord_service, self._resolve_discord_service_token)
         self._cron_service = cron_service or CronTriggerService(
@@ -341,10 +425,16 @@ class GraphRunManager:
             self.handle_cron_schedule,
             poll_interval_seconds=_read_interval_env("GRAPH_AGENT_CRON_POLL_INTERVAL_SECONDS", 15.0),
         )
-        self._trigger_services: list[TriggerService] = [self._discord_adapter, self._cron_service]
+        self._webhook_trigger = WebhookTriggerService(self._resolve_webhook_slug_for_graph)
+        self._trigger_services: list[TriggerService] = [
+            self._discord_adapter,
+            self._cron_service,
+            self._webhook_trigger,
+        ]
         self._trigger_services_by_provider_id: dict[str, TriggerService] = {
             DISCORD_START_PROVIDER_ID: self._discord_adapter,
             CRON_START_PROVIDER_ID: self._cron_service,
+            WEBHOOK_START_PROVIDER_ID: self._webhook_trigger,
         }
         self._active_sessions: dict[str, str] = {}
         self._listener_session_metadata: dict[str, dict[str, Any]] = {}
@@ -393,6 +483,8 @@ class GraphRunManager:
     def get_catalog(self) -> dict[str, Any]:
         return {
             **self._store.catalog(),
+            "cloudflare": self.get_cloudflare_config(),
+            "webhook_ingress_enabled": _webhook_ingress_enabled(),
             "provider_statuses": self._get_provider_statuses(),
             "microsoft_auth": (
                 self._services.microsoft_auth_service.connection_status().to_dict()
@@ -984,6 +1076,11 @@ class GraphRunManager:
                     selected_agents or [],
                     documents=normalized_documents,
                 )
+                if _parent_run_id is not None:
+                    # Listener-spawned child runs: UI + SSE stay subscribed to the listener session id
+                    # (`_parent_run_id`). Agent events must also be recorded there so swimlanes and
+                    # parent state reducers see `agent.*` events (see `_relay_agent_runtime_event`).
+                    self._run_states[run_id]["listener_session_run_id"] = str(_parent_run_id).strip()
             else:
                 default_agent = document.agents[0]
                 graph = document.as_graph()
@@ -1043,25 +1140,40 @@ class GraphRunManager:
         """
         self._start_heartbeat_loop()
         document = load_graph_document(self._store.get_graph(graph_id))
+        listener_rows: list[tuple[AgentDefinition, str]] = []
         if document.is_multi_agent:
-            raise ValueError(
-                f"graph '{graph_id}' is a multi-agent environment; listener sessions are single-agent only."
-            )
-        graph = document.as_graph()
-        start_provider_id = graph.start_node().provider_id
+            listener_rows = self._iter_environment_listener_agents(document)
+            if not listener_rows:
+                raise ValueError(
+                    "This environment has no listener-mode start node. "
+                    "Set at least one agent to Webhook, Discord, or Cron start to enable Listen."
+                )
+            for _agent, start_pid in listener_rows:
+                if start_pid not in self._trigger_services_by_provider_id:
+                    raise ValueError(f"no trigger service registered for provider '{start_pid}'.")
+            graph = self._agent_environment_graph(document, listener_rows[0][0])
+            start_provider_id = listener_rows[0][1]
+        else:
+            graph = document.as_graph()
+            start_provider_id = graph.start_node().provider_id
         try:
             provider_def = self._services.node_provider_registry.get(start_provider_id)
         except KeyError as exc:
             raise ValueError(f"graph '{graph_id}' uses unknown start provider '{start_provider_id}'.") from exc
-        if provider_def.trigger_mode != "listener":
-            raise ValueError(
-                f"graph '{graph_id}' is not in listener mode; use start_run instead."
-            )
-        trigger_service = self._trigger_services_by_provider_id.get(start_provider_id)
-        if trigger_service is None:
-            raise ValueError(
-                f"no trigger service registered for provider '{start_provider_id}'."
-            )
+        if not document.is_multi_agent:
+            if provider_def.trigger_mode != "listener":
+                raise ValueError(
+                    f"graph '{graph_id}' is not in listener mode; use start_run instead."
+                )
+            trigger_service = self._trigger_services_by_provider_id.get(start_provider_id)
+            if trigger_service is None:
+                raise ValueError(
+                    f"no trigger service registered for provider '{start_provider_id}'."
+                )
+            listener_transport = provider_def.listener_transport
+        else:
+            trigger_service = None
+            listener_transport = "mixed"
 
         with self._lock:
             existing = self._active_sessions.get(graph_id)
@@ -1069,41 +1181,95 @@ class GraphRunManager:
                 return existing
 
         document.validate_against_services(self._services)
+
+        webhook_slugs: list[str] = []
+        cron_agents: list[AgentDefinition] = []
+        has_discord = False
+        if document.is_multi_agent:
+            for agent, pid in listener_rows:
+                agent_graph = self._agent_environment_graph(document, agent)
+                if pid == WEBHOOK_START_PROVIDER_ID:
+                    cfg = agent_graph.resolved_start_node_config()
+                    webhook_slugs.append(normalize_webhook_slug(cfg.get("webhook_path_slug")))
+                elif pid == CRON_START_PROVIDER_ID:
+                    cron_agents.append(agent)
+                elif pid == DISCORD_START_PROVIDER_ID:
+                    has_discord = True
+            needs_cloudflare = bool(webhook_slugs)
+        else:
+            needs_cloudflare = listener_transport == "inbound_webhook"
+
+        # Public internet path: optional Cloudflare when external ingress is enabled. Local / private
+        # LAN HTTP still works when the flag is off (see _webhook_ingress_allows_client).
+        acquire_cloudflare_tunnel = needs_cloudflare and _webhook_ingress_enabled()
+        if acquire_cloudflare_tunnel:
+            try:
+                self._cloudflare_tunnel.acquire_for_inbound_webhook(graph_id)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Cloudflare tunnel required for inbound-webhook listener could not start "
+                    f"({exc}). Ensure CLOUDFLARE_TUNNEL_TOKEN (or your configured env-var) is set, "
+                    "cloudflared is installed on PATH, and tunnel credentials are valid."
+                ) from exc
         run_id = str(uuid4())
         with self._lock:
             self._run_controls[run_id] = RunControl(run_id=run_id, cancel_event=Event())
             self._event_backlog[run_id] = []
             self._subscribers.setdefault(run_id, [])
-            state = self._build_run_state(
-                run_id,
-                graph_id,
-                None,
-                documents=[],
-                execution_node_ids=_execution_node_ids_for_graph(graph),
-                agent_id=document.agents[0].agent_id,
-                agent_name=document.agents[0].name,
-            )
-            state["status"] = "listening"
-            state["started_at"] = utc_now_iso()
+            if document.is_multi_agent:
+                state = self._build_environment_listener_session_state(run_id, document)
+            else:
+                state = self._build_run_state(
+                    run_id,
+                    graph_id,
+                    None,
+                    documents=[],
+                    execution_node_ids=_execution_node_ids_for_graph(graph),
+                    agent_id=document.agents[0].agent_id,
+                    agent_name=document.agents[0].name,
+                )
+                state["status"] = "listening"
+                state["started_at"] = utc_now_iso()
             self._run_states[run_id] = state
             self._active_sessions[graph_id] = run_id
-            self._listener_session_metadata[run_id] = {
+            metadata: dict[str, Any] = {
                 "graph_id": graph_id,
                 "provider_id": start_provider_id,
-                "trigger_service": trigger_service,
+                "listener_transport": listener_transport,
             }
+            if document.is_multi_agent:
+                metadata["multi_listener"] = True
+                metadata["activations"] = {
+                    "webhook_slugs": bool(webhook_slugs),
+                    "cron_agent_ids": [a.agent_id for a in cron_agents],
+                    "discord": has_discord,
+                    "cloudflare_webhook": acquire_cloudflare_tunnel,
+                }
+                metadata["trigger_service"] = None
+            else:
+                metadata["trigger_service"] = trigger_service
+            self._listener_session_metadata[run_id] = metadata
 
         run_store = self._select_run_store_for_document(document)
-        self._register_run_store_for_states([state], run_store)
-        self._run_store_for(run_id).initialize_run(state)
+        if document.is_multi_agent:
+            agent_states = list(state.get("agent_runs", {}).values()) if isinstance(state.get("agent_runs"), dict) else []
+            states_to_initialize = [state, *agent_states]
+        else:
+            states_to_initialize = [state]
+        self._register_run_store_for_states(states_to_initialize, run_store)
+        for init_state in states_to_initialize:
+            rid = str(init_state.get("run_id") or "").strip()
+            if rid:
+                self._run_store_for(rid).initialize_run(init_state)
         self._touch_run_liveness(run_id)
 
+        listener_display_name = document.name if document.is_multi_agent else graph.name
         self._record_event(
             run_id,
             {
                 "event_type": "run.started",
-                "summary": f"Listener session started for '{graph.name}'.",
-                "payload": {"graph_id": graph_id, "graph_name": graph.name},
+                "summary": f"Listener session started for '{listener_display_name}'.",
+                "payload": {"graph_id": graph_id, "graph_name": listener_display_name},
                 "run_id": run_id,
                 "timestamp": utc_now_iso(),
                 "agent_id": None,
@@ -1112,8 +1278,43 @@ class GraphRunManager:
         )
 
         try:
-            trigger_service.activate(graph_id)
+            if document.is_multi_agent:
+                activated_cron_keys: list[str] = []
+                try:
+                    if webhook_slugs:
+                        self._webhook_trigger.register_slugs(graph_id, webhook_slugs)
+                    for agent in cron_agents:
+                        ck = _cron_listener_activation_key(graph_id, agent.agent_id)
+                        self._cron_service.activate(ck)
+                        activated_cron_keys.append(ck)
+                    if has_discord:
+                        self._discord_adapter.activate(graph_id)
+                except Exception:
+                    if has_discord:
+                        try:
+                            self._discord_adapter.deactivate(graph_id)
+                        except Exception:  # noqa: BLE001
+                            LOGGER.exception("Discord trigger rollback failed for graph %r.", graph_id)
+                    for ck in reversed(activated_cron_keys):
+                        try:
+                            self._cron_service.deactivate(ck)
+                        except Exception:  # noqa: BLE001
+                            LOGGER.exception("Cron trigger rollback failed for key %r.", ck)
+                    if webhook_slugs:
+                        try:
+                            self._webhook_trigger.deactivate(graph_id)
+                        except Exception:  # noqa: BLE001
+                            LOGGER.exception("Webhook trigger rollback failed for graph %r.", graph_id)
+                    raise
+            else:
+                assert trigger_service is not None
+                trigger_service.activate(graph_id)
         except Exception as exc:
+            if acquire_cloudflare_tunnel:
+                try:
+                    self._cloudflare_tunnel.release_for_inbound_webhook(graph_id)
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Failed to release Cloudflare tunnel for graph %r after listener failure.", graph_id)
             with self._lock:
                 self._active_sessions.pop(graph_id, None)
                 self._listener_session_metadata.pop(run_id, None)
@@ -1121,7 +1322,7 @@ class GraphRunManager:
                 run_id,
                 {
                     "event_type": "run.failed",
-                    "summary": f"Listener for '{graph.name}' failed to start.",
+                    "summary": f"Listener for '{listener_display_name}' failed to start.",
                     "payload": {
                         "error": {
                             "type": "listener_activation_failed",
@@ -1147,16 +1348,23 @@ class GraphRunManager:
                 session_state["status"] = "listening"
                 self._run_states[run_id] = session_state
 
+        session_started_payload: dict[str, Any] = {
+            "graph_id": graph_id,
+            "provider_id": start_provider_id,
+            "listener_transport": provider_def.listener_transport if not document.is_multi_agent else "mixed",
+        }
+        if document.is_multi_agent:
+            session_started_payload["listeners"] = {
+                "webhook": bool(webhook_slugs),
+                "cron_agents": len(cron_agents),
+                "discord": has_discord,
+            }
         self._record_event(
             run_id,
             {
                 "event_type": "listener.session.started",
-                "summary": f"Listener for '{graph.name}' is active.",
-                "payload": {
-                    "graph_id": graph_id,
-                    "provider_id": start_provider_id,
-                    "listener_transport": provider_def.listener_transport,
-                },
+                "summary": f"Listener for '{listener_display_name}' is active.",
+                "payload": session_started_payload,
                 "run_id": run_id,
                 "timestamp": utc_now_iso(),
                 "agent_id": None,
@@ -1174,11 +1382,39 @@ class GraphRunManager:
             if graph_id and self._active_sessions.get(graph_id) == run_id:
                 self._active_sessions.pop(graph_id, None)
         trigger_service = metadata.get("trigger_service")
-        if trigger_service is not None and graph_id:
+        listener_transport = metadata.get("listener_transport")
+        if metadata.get("multi_listener"):
+            act = metadata.get("activations") or {}
             try:
-                trigger_service.deactivate(graph_id)
+                self._webhook_trigger.deactivate(graph_id)
             except Exception:  # noqa: BLE001
-                LOGGER.exception("Failed to deactivate trigger for graph %r.", graph_id)
+                LOGGER.exception("Failed to deactivate webhook trigger slugs for graph %r.", graph_id)
+            for aid in act.get("cron_agent_ids", []):
+                try:
+                    self._cron_service.deactivate(_cron_listener_activation_key(graph_id, str(aid)))
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Failed to deactivate cron trigger for graph %r agent %r.", graph_id, aid)
+            if act.get("discord"):
+                try:
+                    self._discord_adapter.deactivate(graph_id)
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Failed to deactivate Discord trigger for graph %r.", graph_id)
+            if act.get("cloudflare_webhook") and graph_id:
+                try:
+                    self._cloudflare_tunnel.release_for_inbound_webhook(graph_id)
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Failed to release Cloudflare tunnel for graph %r.", graph_id)
+        else:
+            if trigger_service is not None and graph_id:
+                try:
+                    trigger_service.deactivate(graph_id)
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Failed to deactivate trigger for graph %r.", graph_id)
+            if listener_transport == "inbound_webhook" and graph_id:
+                try:
+                    self._cloudflare_tunnel.release_for_inbound_webhook(graph_id)
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Failed to release Cloudflare tunnel for graph %r.", graph_id)
         self._record_event(
             run_id,
             {
@@ -1220,9 +1456,16 @@ class GraphRunManager:
                 return None
             return str(metadata.get("provider_id") or "") or None
 
-    def _start_child_run(self, parent_run_id: str, graph_id: str, payload: Any) -> str | None:
+    def _start_child_run(
+        self,
+        parent_run_id: str,
+        graph_id: str,
+        payload: Any,
+        *,
+        agent_ids: list[str] | None = None,
+    ) -> str | None:
         try:
-            child_run_id = self.start_run(graph_id, payload, _parent_run_id=parent_run_id)
+            child_run_id = self.start_run(graph_id, payload, agent_ids=agent_ids, _parent_run_id=parent_run_id)
         except Exception:  # noqa: BLE001
             LOGGER.exception(
                 "Failed to start listener-driven child run for graph %r (parent %r).",
@@ -1230,12 +1473,15 @@ class GraphRunManager:
                 parent_run_id,
             )
             return None
+        event_payload: dict[str, Any] = {"graph_id": graph_id, "child_run_id": child_run_id}
+        if agent_ids and len(agent_ids) == 1:
+            event_payload["listener_agent_id"] = agent_ids[0]
         self._record_event(
             parent_run_id,
             {
                 "event_type": "listener.event.received",
                 "summary": "Listener event spawned a child run.",
-                "payload": {"graph_id": graph_id, "child_run_id": child_run_id},
+                "payload": event_payload,
                 "run_id": parent_run_id,
                 "timestamp": utc_now_iso(),
                 "agent_id": None,
@@ -1413,6 +1659,7 @@ class GraphRunManager:
             self._heartbeat_thread.join(timeout=self._heartbeat_interval_seconds + 1.0)
             self._heartbeat_thread = None
         self._stop_trigger_services()
+        self._cloudflare_tunnel.shutdown()
         if self._services.mcp_server_manager is not None:
             self._services.mcp_server_manager.shutdown_all(preserve_desired_running=True)
         for store in self._drain_override_stores():
@@ -1440,6 +1687,7 @@ class GraphRunManager:
             ]
 
         self._stop_trigger_services()
+        self._cloudflare_tunnel.shutdown()
         if self._services.mcp_server_manager is not None:
             self._services.mcp_server_manager.shutdown_all(preserve_desired_running=False)
 
@@ -1471,8 +1719,9 @@ class GraphRunManager:
         if graph_payload is not None:
             try:
                 document = load_graph_document(graph_payload)
-                if not document.is_multi_agent:
-                    provider_id = document.as_graph().start_node().provider_id
+                if document.is_multi_agent:
+                    return
+                provider_id = document.as_graph().start_node().provider_id
             except Exception:  # noqa: BLE001
                 provider_id = None
         if provider_id == self._listener_session_provider_id(session_run_id):
@@ -1493,10 +1742,12 @@ class GraphRunManager:
         config = self._cloudflare_config_store.get()
         token_env_var = config.get("tunnel_token_env_var", "")
         token_value = os.environ.get(str(token_env_var), "") if token_env_var else ""
-        return {
+        merged: dict[str, Any] = {
             **config,
             "token_configured": bool(str(token_value).strip()),
         }
+        merged.update(self._cloudflare_tunnel.get_status())
+        return merged
 
     def set_cloudflare_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._cloudflare_config_store.set(payload)
@@ -1506,21 +1757,215 @@ class GraphRunManager:
         self._cloudflare_config_store.clear()
         return self.get_cloudflare_config()
 
+    def _agent_environment_graph(self, document: TestEnvironmentDefinition, agent: AgentDefinition) -> GraphDefinition:
+        return agent.to_graph(
+            graph_id=document.graph_id,
+            shared_env_vars=document.env_vars,
+            supabase_connections=document.supabase_connections,
+            default_supabase_connection_id=document.default_supabase_connection_id,
+            run_store_supabase_connection_id=document.run_store_supabase_connection_id,
+        )
+
+    def _iter_environment_listener_agents(self, document: TestEnvironmentDefinition) -> list[tuple[AgentDefinition, str]]:
+        rows: list[tuple[AgentDefinition, str]] = []
+        for agent in document.agents:
+            graph = self._agent_environment_graph(document, agent)
+            pid = graph.start_node().provider_id
+            try:
+                prov = self._services.node_provider_registry.get(pid)
+            except KeyError:
+                continue
+            if prov.trigger_mode == "listener":
+                rows.append((agent, pid))
+        return rows
+
+    def _build_environment_listener_session_state(self, run_id: str, document: TestEnvironmentDefinition) -> dict[str, Any]:
+        documents_list: list[dict[str, Any]] = []
+        parent = self._build_run_state(run_id, document.graph_id, None, documents=documents_list)
+        parent["status"] = "listening"
+        parent["started_at"] = utc_now_iso()
+        agent_runs: dict[str, Any] = {}
+        for agent in document.agents:
+            agent_graph = self._agent_environment_graph(document, agent)
+            child_id = str(uuid4())
+            child = self._build_run_state(
+                child_id,
+                document.graph_id,
+                None,
+                documents=documents_list,
+                execution_node_ids=_execution_node_ids_for_graph(agent_graph),
+                agent_id=agent.agent_id,
+                parent_run_id=run_id,
+                agent_name=agent.name,
+            )
+            child["status"] = "listening"
+            agent_runs[agent.agent_id] = child
+        parent["agent_runs"] = agent_runs
+        return parent
+
     def handle_cron_schedule(self, graph_id: str, input_payload: dict[str, Any]) -> str | None:
         normalized = str(graph_id or "").strip()
         if not normalized:
             return None
-        with self._lock:
-            session_run_id = self._active_sessions.get(normalized)
-        if not session_run_id:
-            LOGGER.debug("Dropping cron schedule fire for graph %r: no active listener session.", normalized)
+        env_graph_id, listener_agent_id = _split_listener_scope_key(normalized)
+        if not env_graph_id:
             return None
-        return self._start_child_run(session_run_id, normalized, dict(input_payload))
+        with self._lock:
+            session_run_id = self._active_sessions.get(env_graph_id)
+        if not session_run_id:
+            LOGGER.debug(
+                "Dropping cron schedule fire for graph %r: no active listener session.",
+                env_graph_id,
+            )
+            return None
+        agent_ids = [listener_agent_id] if listener_agent_id else None
+        return self._start_child_run(session_run_id, env_graph_id, dict(input_payload), agent_ids=agent_ids)
+
+    def _resolve_webhook_slug_for_graph(self, graph_id: str) -> str | None:
+        resolved = self._resolve_webhook_start(graph_id)
+        return resolved.slug if resolved is not None else None
+
+    def _resolve_webhook_start(self, graph_id: str, slug_hint: str | None = None) -> WebhookStartResolved | None:
+        normalized = str(graph_id or "").strip()
+        if not normalized:
+            return None
+        try:
+            document = load_graph_document(self._store.get_graph(normalized))
+        except KeyError:
+            return None
+        listener_agent_id: str | None = None
+        if document.is_multi_agent:
+            hint = normalize_webhook_slug(slug_hint) if slug_hint is not None else ""
+            if hint:
+                for agent in document.agents:
+                    ag = self._agent_environment_graph(document, agent)
+                    if ag.start_node().provider_id != WEBHOOK_START_PROVIDER_ID:
+                        continue
+                    cfg = ag.resolved_start_node_config()
+                    if normalize_webhook_slug(cfg.get("webhook_path_slug")) != hint:
+                        continue
+                    graph = ag
+                    listener_agent_id = agent.agent_id
+                    break
+                else:
+                    return None
+            else:
+                matches: list[tuple[AgentDefinition, GraphDefinition]] = []
+                for agent in document.agents:
+                    ag = self._agent_environment_graph(document, agent)
+                    if ag.start_node().provider_id != WEBHOOK_START_PROVIDER_ID:
+                        continue
+                    matches.append((agent, ag))
+                if len(matches) != 1:
+                    return None
+                listener_agent_id = matches[0][0].agent_id
+                graph = matches[0][1]
+        else:
+            graph = document.as_graph()
+            if graph.start_node().provider_id != WEBHOOK_START_PROVIDER_ID:
+                return None
+        cfg = graph.resolved_start_node_config()
+        slug = normalize_webhook_slug(cfg.get("webhook_path_slug"))
+        methods = tuple(parse_http_methods(cfg.get("http_methods")))
+        return WebhookStartResolved(
+            graph_id=document.graph_id,
+            slug=slug,
+            http_methods=methods,
+            verification_mode=str(cfg.get("verification_mode") or "none").strip().lower(),
+            webhook_secret_env_var=str(cfg.get("webhook_secret_env_var") or "{WEBHOOK_SECRET}"),
+            webhook_shared_secret_header=str(cfg.get("webhook_shared_secret_header") or "X-Webhook-Secret"),
+            signature_header=str(cfg.get("signature_header") or "X-Signature"),
+            signature_prefix=str(cfg.get("signature_prefix") or ""),
+            event_type_json_path=str(cfg.get("event_type_json_path") or ""),
+            event_type_allowlist=parse_event_type_allowlist(cfg.get("event_type_allowlist")),
+            prompt=str(cfg.get("prompt") or ""),
+            listener_agent_id=listener_agent_id,
+        )
+
+    def handle_inbound_webhook(
+        self,
+        slug: str,
+        http_method: str,
+        request_path: str,
+        query_string: str,
+        raw_headers: list[tuple[bytes, bytes]],
+        body_bytes: bytes,
+        *,
+        client_host: str | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch an HTTP webhook to an active listener session (child run)."""
+
+        if not _webhook_ingress_allows_client(client_host):
+            raise WebhookHttpError(
+                403,
+                "This request is not from a local or private-network client, and "
+                "GRAPH_AGENT_WEBHOOK_INGRESS_ENABLED is not set. Set it to 1 to allow public "
+                "internet callers, or call this API from this machine (127.0.0.1) or your LAN.",
+            )
+
+        method_up = str(http_method or "").strip().upper() or "GET"
+        graph_id = self._webhook_trigger.resolve_graph_id(slug)
+        if not graph_id:
+            raise WebhookHttpError(404, "Unknown webhook slug or no active listener for this slug.")
+
+        resolved = self._resolve_webhook_start(graph_id, slug)
+        if resolved is None:
+            raise WebhookHttpError(404, "Webhook start node configuration was not found.")
+
+        if method_up == "OPTIONS":
+            return {"ok": True, "preflight": True}
+
+        if method_up not in resolved.http_methods:
+            raise WebhookHttpError(405, f"HTTP method {method_up} is not allowed for this webhook.")
+
+        with self._lock:
+            session_run_id = self._active_sessions.get(graph_id)
+        if not session_run_id:
+            raise WebhookHttpError(503, "No active listener session for this graph; start Listen first.")
+
+        headers_lower = {
+            k.decode("latin-1").lower(): v.decode("latin-1", errors="replace")
+            for k, v in raw_headers
+        }
+
+        document = load_graph_document(self._store.get_graph(graph_id))
+        env_vars = document.env_vars
+
+        try:
+            verify_webhook_request(resolved, env_vars, method_up, headers_lower, body_bytes)
+        except ValueError as exc:
+            raise WebhookHttpError(401, str(exc)) from exc
+
+        content_type = headers_lower.get("content-type")
+        parsed = parse_body_for_storage(body_bytes, content_type)
+        filter_body = parsed if isinstance(parsed, dict) else {}
+        if str(resolved.event_type_json_path or "").strip() and resolved.event_type_allowlist:
+            if not passes_event_filter(resolved, filter_body):
+                return {"ok": True, "filtered": True}
+
+        header_snapshot = filter_webhook_log_headers(headers_lower)
+
+        payload = build_webhook_child_payload(
+            graph_id=graph_id,
+            http_method=method_up,
+            path=request_path,
+            query_string=query_string,
+            header_snapshot=header_snapshot,
+            body_value=parsed,
+            prompt=resolved.prompt,
+            listener_agent_id=resolved.listener_agent_id,
+        )
+
+        child_agent_ids = [resolved.listener_agent_id] if resolved.listener_agent_id else None
+        child_id = self._start_child_run(session_run_id, graph_id, payload, agent_ids=child_agent_ids)
+        if child_id is None:
+            raise WebhookHttpError(500, "Failed to start run from webhook.")
+        return {"ok": True, "run_id": child_id}
 
     def handle_discord_message(self, message: DiscordMessageEvent) -> list[str]:
         run_ids: list[str] = []
         input_payload = normalize_discord_message_payload(message)
-        for graph in self._iter_discord_trigger_graphs():
+        for graph, listener_agent_id in self._iter_discord_trigger_targets():
             if not self._graph_matches_discord_message(graph, message):
                 continue
             with self._lock:
@@ -1531,7 +1976,13 @@ class GraphRunManager:
                     graph.graph_id,
                 )
                 continue
-            child_run_id = self._start_child_run(session_run_id, graph.graph_id, dict(input_payload))
+            agent_ids = [listener_agent_id] if listener_agent_id else None
+            child_run_id = self._start_child_run(
+                session_run_id,
+                graph.graph_id,
+                dict(input_payload),
+                agent_ids=agent_ids,
+            )
             if child_run_id is not None:
                 run_ids.append(child_run_id)
         return run_ids
@@ -1660,17 +2111,20 @@ class GraphRunManager:
             parent_state = self._run_states[parent_run_id]
             child_state = parent_state["agent_runs"][agent.agent_id]
             child_run_id = child_state["run_id"]
+            listener_sid_raw = str(parent_state.get("listener_session_run_id") or "").strip()
+            listener_session_run_id: str | None = listener_sid_raw or None
 
         runtime = GraphRuntime(
             services=self._services,
             max_steps=self._services.config["max_steps"],
             max_visits_per_node=self._services.config["max_visits_per_node"],
             event_listeners=[
-                lambda event, current_agent_id=agent.agent_id, current_agent_name=agent.name: self._record_agent_event(
-                    parent_run_id,
-                    current_agent_id,
-                    current_agent_name,
-                    event.to_dict(),
+                lambda event, current_agent_id=agent.agent_id, current_agent_name=agent.name: self._relay_agent_runtime_event(
+                    environment_run_id=parent_run_id,
+                    listener_session_run_id=listener_session_run_id,
+                    agent_id=current_agent_id,
+                    agent_name=current_agent_name,
+                    event=event.to_dict(),
                 )
             ],
             cancel_requested=lambda current_run_id=parent_run_id: self._cancel_requested(current_run_id),
@@ -2016,6 +2470,24 @@ class GraphRunManager:
         }
         self._record_event(parent_run_id, wrapped_event)
 
+    def _relay_agent_runtime_event(
+        self,
+        *,
+        environment_run_id: str,
+        listener_session_run_id: str | None,
+        agent_id: str,
+        agent_name: str,
+        event: dict[str, Any],
+    ) -> None:
+        """Record agent-scoped runtime events on the child environment run and, when present, on the listener session.
+
+        Webhook/cron/discord children subscribe their SSE to the long-lived listener ``run_id``; without mirroring,
+        multi-agent swimlanes (which merge ``agent.*`` into the listener parent state) stay empty.
+        """
+        self._record_agent_event(environment_run_id, agent_id, agent_name, event)
+        if listener_session_run_id and listener_session_run_id != environment_run_id:
+            self._record_agent_event(listener_session_run_id, agent_id, agent_name, event)
+
     def _close_streams(self, run_id: str) -> None:
         with self._lock:
             subscribers = list(self._subscribers.get(run_id, []))
@@ -2270,21 +2742,29 @@ class GraphRunManager:
         self._catalog_status_cache = (now, provider_statuses)
         return deepcopy(provider_statuses)
 
-    def _iter_discord_trigger_graphs(self) -> list[GraphDefinition]:
-        graphs: list[GraphDefinition] = []
+    def _iter_discord_trigger_targets(self) -> list[tuple[GraphDefinition, str | None]]:
+        """Return (graph, listener_agent_id) for every Discord start; agent id is set for test_environment agents."""
+        targets: list[tuple[GraphDefinition, str | None]] = []
         for graph_payload in self._store.list_graphs():
             try:
                 document = load_graph_document(graph_payload)
                 document.validate_against_services(self._services)
             except Exception:  # noqa: BLE001
-                LOGGER.warning("Skipping invalid graph '%s' while syncing Discord triggers.", graph_payload.get("graph_id"))
+                LOGGER.warning(
+                    "Skipping invalid graph '%s' while syncing Discord triggers.",
+                    graph_payload.get("graph_id"),
+                )
                 continue
             if document.is_multi_agent:
+                for agent in document.agents:
+                    graph = self._agent_environment_graph(document, agent)
+                    if graph.start_node().provider_id == DISCORD_START_PROVIDER_ID:
+                        targets.append((graph, agent.agent_id))
                 continue
             graph = document.as_graph()
             if graph.start_node().provider_id == DISCORD_START_PROVIDER_ID:
-                graphs.append(graph)
-        return graphs
+                targets.append((graph, None))
+        return targets
 
     def _graph_matches_discord_message(self, graph: GraphDefinition, message: DiscordMessageEvent) -> bool:
         start_node = graph.start_node()
@@ -2304,12 +2784,29 @@ class GraphRunManager:
         normalized = str(graph_id or "").strip()
         if not normalized:
             return None
+        env_graph_id, listener_agent_id = _split_listener_scope_key(normalized)
         try:
-            document = load_graph_document(self._store.get_graph(normalized))
+            document = load_graph_document(self._store.get_graph(env_graph_id))
         except Exception:  # noqa: BLE001
             return None
         if document.is_multi_agent:
-            return None
+            if not listener_agent_id:
+                return None
+            agent = next((a for a in document.agents if a.agent_id == listener_agent_id), None)
+            if agent is None:
+                return None
+            graph = self._agent_environment_graph(document, agent)
+            if graph.start_node().provider_id != CRON_START_PROVIDER_ID:
+                return None
+            config = graph.resolved_start_node_config()
+            return CronSchedule(
+                graph_id=graph.graph_id,
+                cron_expression=str(config.get("cron_expression", "0 9 * * *") or "0 9 * * *").strip(),
+                timezone=str(config.get("timezone", "UTC") or "UTC").strip(),
+                prompt=str(config.get("prompt", "") or ""),
+                enabled=_as_bool(config.get("enabled"), True),
+                listener_agent_id=listener_agent_id,
+            )
         graph = document.as_graph()
         if graph.start_node().provider_id != CRON_START_PROVIDER_ID:
             return None
@@ -2329,7 +2826,28 @@ class GraphRunManager:
             except Exception:  # noqa: BLE001
                 return ""
             if document.is_multi_agent:
-                return ""
+                tokens_ma: list[str] = []
+                for agent in document.agents:
+                    graph = self._agent_environment_graph(document, agent)
+                    if graph.start_node().provider_id != DISCORD_START_PROVIDER_ID:
+                        continue
+                    config = graph.start_node_config()
+                    token = resolve_graph_process_env(
+                        str(config.get("discord_bot_token_env_var", "{DISCORD_BOT_TOKEN}") or "{DISCORD_BOT_TOKEN}"),
+                        graph.env_vars,
+                    ).strip()
+                    if token:
+                        tokens_ma.append(token)
+                if not tokens_ma:
+                    return ""
+                uniq_ma = set(tokens_ma)
+                if len(uniq_ma) > 1:
+                    LOGGER.warning(
+                        "Multiple Discord bot tokens on agents in environment %r; using none until unified.",
+                        graph_id,
+                    )
+                    return ""
+                return next(iter(uniq_ma))
             graph = document.as_graph()
             if graph.start_node().provider_id != DISCORD_START_PROVIDER_ID:
                 return ""
@@ -2339,7 +2857,7 @@ class GraphRunManager:
                 graph.env_vars,
             ).strip()
         tokens: set[str] = set()
-        for graph in self._iter_discord_trigger_graphs():
+        for graph, _listener_agent_id in self._iter_discord_trigger_targets():
             config = graph.start_node_config()
             token = resolve_graph_process_env(
                 str(config.get("discord_bot_token_env_var", "{DISCORD_BOT_TOKEN}") or "{DISCORD_BOT_TOKEN}"),

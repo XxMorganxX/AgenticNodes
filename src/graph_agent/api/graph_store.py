@@ -5,8 +5,19 @@ import json
 from pathlib import Path
 from typing import Any
 
-from graph_agent.runtime.core import GraphValidationError, RuntimeServices
-from graph_agent.runtime.documents import load_graph_document
+from graph_agent.providers.webhook import WEBHOOK_START_PROVIDER_ID, normalize_webhook_slug
+from graph_agent.runtime.core import GraphDefinition, GraphValidationError, RuntimeServices
+from graph_agent.runtime.documents import AgentDefinition, TestEnvironmentDefinition, load_graph_document
+
+
+def _environment_agent_graph(document: TestEnvironmentDefinition, agent: AgentDefinition) -> GraphDefinition:
+    return agent.to_graph(
+        graph_id=document.graph_id,
+        shared_env_vars=document.env_vars,
+        supabase_connections=document.supabase_connections,
+        default_supabase_connection_id=document.default_supabase_connection_id,
+        run_store_supabase_connection_id=document.run_store_supabase_connection_id,
+    )
 from graph_agent.runtime.node_providers import DEFAULT_CATEGORY_CONTRACTS, list_connection_rules
 
 
@@ -142,8 +153,55 @@ class GraphStore:
         try:
             graph = load_graph_document(payload)
             graph.validate_against_services(self.services)
+            self._validate_webhook_slug_uniqueness(payload)
         except (GraphValidationError, KeyError, TypeError, ValueError) as exc:
             raise ValueError(str(exc)) from exc
+
+    def _collect_webhook_slugs(self, doc: TestEnvironmentDefinition) -> list[str]:
+        slugs: list[str] = []
+        if doc.is_multi_agent:
+            for agent in doc.agents:
+                graph = _environment_agent_graph(doc, agent)
+                if graph.start_node().provider_id != WEBHOOK_START_PROVIDER_ID:
+                    continue
+                slug = normalize_webhook_slug(graph.start_node().raw_config.get("webhook_path_slug"))
+                if slug:
+                    slugs.append(slug)
+            return slugs
+        graph = doc.as_graph()
+        if graph.start_node().provider_id != WEBHOOK_START_PROVIDER_ID:
+            return slugs
+        slug = normalize_webhook_slug(graph.start_node().raw_config.get("webhook_path_slug"))
+        if slug:
+            slugs.append(slug)
+        return slugs
+
+    def _validate_webhook_slug_uniqueness(self, payload: dict[str, Any]) -> None:
+        try:
+            doc = load_graph_document(payload)
+        except (KeyError, TypeError, ValueError):
+            return
+        current_slugs = self._collect_webhook_slugs(doc)
+        if not current_slugs:
+            return
+        if len(current_slugs) != len(set(current_slugs)):
+            raise ValueError(
+                "Each agent using start.webhook in the same environment must have a distinct webhook_path_slug."
+            )
+        current_id = str(doc.graph_id or "").strip()
+        for gid, gp in self._merged_graphs().items():
+            if gid == current_id:
+                continue
+            try:
+                other = load_graph_document(gp)
+            except (KeyError, TypeError, ValueError):
+                continue
+            for other_slug in self._collect_webhook_slugs(other):
+                if other_slug in current_slugs:
+                    raise ValueError(
+                        f"Webhook path slug '{other_slug}' is already used by graph '{gid}'. "
+                        "Choose a different webhook_path_slug."
+                    )
 
     def _ensure_user_store(self) -> None:
         if self.path.exists():

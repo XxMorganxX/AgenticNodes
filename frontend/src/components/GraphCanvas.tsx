@@ -128,6 +128,8 @@ type GraphCanvasProps = {
   onToggleMcpPanel?: () => void;
   backgroundDragSensitivity?: number;
   onSelectionChange: (nodeId: string | null, edgeId: string | null) => void;
+  /** True while listening for start.webhook */
+  isWebhookListenerSessionActive?: boolean;
 };
 
 type OutboundEmailLoggerEdgeValidationState = {
@@ -977,6 +979,7 @@ export function GraphCanvas({
   onToggleMcpPanel,
   backgroundDragSensitivity = DEFAULT_BACKGROUND_DRAG_SENSITIVITY,
   onSelectionChange,
+  isWebhookListenerSessionActive = false,
 }: GraphCanvasProps) {
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance | null>(null);
   const [editorMessage, setEditorMessage] = useState<string | null>(null);
@@ -1962,6 +1965,8 @@ export function GraphCanvas({
       setDisplayResponseNodeId(null);
       setContextBuilderPayloadNodeId(null);
       setConditionResultsNodeId(null);
+      setDiscordTriggerNodeId(null);
+      setCronScheduleNodeId(null);
       const selectedNode = graph?.nodes.find((node) => node.id === nodeId) ?? null;
       if (selectedNode?.provider_id === "core.logic_conditions") {
         setProviderDetailsNodeId(null);
@@ -5341,6 +5346,7 @@ export function GraphCanvas({
                   runState={runState}
                   selectedNodeId={selectedNodeId}
                   selectedEdgeId={selectedEdgeId}
+                  isWebhookListenerSessionActive={isWebhookListenerSessionActive}
                   onGraphChange={onGraphChange}
                   onOpenProviderDetails={handleOpenProviderDetails}
                   onSaveNode={handleSaveNode}

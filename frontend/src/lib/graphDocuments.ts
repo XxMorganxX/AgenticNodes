@@ -187,12 +187,10 @@ export function findNodeProvider(
   if (!providerId) {
     return null;
   }
-  const fromGraph = (graph?.node_providers ?? []).find((provider) => provider.provider_id === providerId);
-  if (fromGraph) {
-    return fromGraph;
-  }
   const fromCatalog = (catalog?.node_providers ?? []).find((provider) => provider.provider_id === providerId);
-  return fromCatalog ?? null;
+  const fromGraph = (graph?.node_providers ?? []).find((provider) => provider.provider_id === providerId);
+  // Prefer catalog: embedded graph snapshots can omit or stale `trigger_mode` (e.g. listener vs manual).
+  return fromCatalog ?? fromGraph ?? null;
 }
 
 export function getListenerStartProvider(
@@ -208,6 +206,33 @@ export function getListenerStartProvider(
     return null;
   }
   return provider;
+}
+
+/** All `webhook_path_slug` values for agents using `start.webhook` (multi-agent) or the single graph start node. */
+export function getWebhookPathSlugsForDocument(graph: GraphDocument | null | undefined): string[] {
+  if (!graph) {
+    return [];
+  }
+  if (isTestEnvironment(graph)) {
+    const slugs: string[] = [];
+    for (const agent of graph.agents) {
+      const start = agent.nodes.find((node) => node.id === agent.start_node_id) ?? null;
+      if (start?.provider_id === "start.webhook") {
+        const s = String(start.config?.webhook_path_slug ?? "").trim();
+        if (s) {
+          slugs.push(s);
+        }
+      }
+    }
+    return slugs;
+  }
+  const asGraph = graph as GraphDefinition;
+  const start = getStartNode(asGraph);
+  if (start?.provider_id === "start.webhook") {
+    const s = String(start.config?.webhook_path_slug ?? "").trim();
+    return s ? [s] : [];
+  }
+  return [];
 }
 
 export function filterEventsForAgent(

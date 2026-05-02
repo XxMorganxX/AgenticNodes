@@ -17,6 +17,8 @@ function emptyConfig(): CloudflareConfig {
     tunnel_token_env_var: DEFAULT_TOKEN_ENV_VAR,
     public_hostname: "",
     token_configured: false,
+    tunnel_state: "stopped",
+    tunnel_ref_count: 0,
   };
 }
 
@@ -139,6 +141,43 @@ export function CloudflareTunnelModal({ initialConfig, onConfigChange, onClose }
                 ? `Backend sees ${config.tunnel_token_env_var || DEFAULT_TOKEN_ENV_VAR} populated.`
                 : `Set ${config.tunnel_token_env_var || DEFAULT_TOKEN_ENV_VAR} in .env and restart the backend.`}
             </div>
+            <div>
+              <strong>
+                Managed tunnel:{" "}
+                {config.tunnel_state === "running"
+                  ? "Running"
+                  : config.tunnel_state === "starting"
+                    ? "Starting…"
+                    : config.tunnel_state === "failed"
+                      ? "Failed"
+                      : "Stopped"}
+              </strong>
+              {config.tunnel_ref_count != null && config.tunnel_ref_count > 0 ? (
+                <span>
+                  {" "}
+                  ({config.tunnel_ref_count} inbound-webhook listener session{config.tunnel_ref_count === 1 ? "" : "s"})
+                </span>
+              ) : null}
+              {config.tunnel_pid != null && config.tunnel_state === "running" ? (
+                <span>
+                  {" "}
+                  — PID <code>{config.tunnel_pid}</code>
+                </span>
+              ) : null}
+            </div>
+            {config.tunnel_last_error ? (
+              <div className="env-supabase-launcher-error" style={{ marginTop: "0.5rem" }}>
+                {config.tunnel_last_error}
+              </div>
+            ) : null}
+            {config.tunnel_log_tail != null && config.tunnel_log_tail.length > 0 ? (
+              <details style={{ marginTop: "0.5rem" }}>
+                <summary>Recent cloudflared log lines</summary>
+                <pre style={{ whiteSpace: "pre-wrap", fontSize: "0.85rem", marginTop: "0.35rem" }}>
+                  {config.tunnel_log_tail.slice(-20).join("\n")}
+                </pre>
+              </details>
+            ) : null}
             {hasSavedHostname ? (
               <div>
                 Hostname: <code>{config.public_hostname}</code>

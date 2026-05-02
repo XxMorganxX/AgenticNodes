@@ -129,6 +129,26 @@ function defaultStartConfig(provider: NodeProviderDefinition): GraphNode["config
       input_binding: { type: "input_payload" },
     };
   }
+  if (provider.provider_id === "start.webhook") {
+    const suffix =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID().replace(/-/g, "").slice(0, 16)
+        : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+    return {
+      trigger_mode: "webhook",
+      webhook_path_slug: `wh_${suffix}`,
+      http_methods: ["POST"],
+      verification_mode: "none",
+      webhook_secret_env_var: "{WEBHOOK_SECRET}",
+      webhook_shared_secret_header: "X-Webhook-Secret",
+      signature_header: "X-Signature",
+      signature_prefix: "",
+      event_type_json_path: "",
+      event_type_allowlist: "",
+      prompt: "",
+      input_binding: { type: "input_payload" },
+    };
+  }
   return {
     trigger_mode: "manual_run",
     input_binding: { type: "input_payload" },

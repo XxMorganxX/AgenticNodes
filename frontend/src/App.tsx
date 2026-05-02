@@ -52,6 +52,7 @@ import {
   getSelectedRunFilesRequest,
   getSelectedRunId,
   getSelectedRunState,
+  getWebhookPathSlugsForDocument,
   isMultiAgent,
   isTestEnvironment,
   updateSelectedAgentGraph,
@@ -72,6 +73,7 @@ import {
 import { loadPersistedSelectedGraphId, savePersistedSelectedGraphId } from "./lib/persistedSelectedGraph";
 import { getExplicitSupabaseConnections } from "./lib/supabaseConnections";
 import { clearSessionSupabaseSchema } from "./lib/sessionSupabaseSchema";
+import { buildWebhookTriggerUrls } from "./lib/webhookUrls";
 import { clearAllPersistedRunSnapshots, clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
 import type { PersistedRunSnapshot } from "./lib/runSnapshots";
 import { isTerminalRuntimeEvent, normalizeRunState, normalizeRuntimeEvent } from "./lib/runtimeEvents";
@@ -1249,6 +1251,7 @@ export default function App() {
   const [runState, setRunState] = useState<RunState | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [selectedListenerChildRunId, setSelectedListenerChildRunId] = useState<string | null>(null);
+  const [listenerEndpointCopyKey, setListenerEndpointCopyKey] = useState<string | null>(null);
   const [listenerChildRunStates, setListenerChildRunStates] = useState<Record<string, RunState>>({});
   const [listenerChildRunError, setListenerChildRunError] = useState<string | null>(null);
   const [isLoadingListenerChildRun, setIsLoadingListenerChildRun] = useState(false);
@@ -1306,11 +1309,21 @@ export default function App() {
   const persistedGraphIds = useMemo(() => new Set(graphs.map((graph) => graph.graph_id)), [graphs]);
   const isEnvironment = isMultiAgent(draftGraph);
   const listenerStartProvider = useMemo(
-    () => (isEnvironment ? null : getListenerStartProvider(canvasGraph, catalog)),
-    [canvasGraph, catalog, isEnvironment],
+    () => getListenerStartProvider(canvasGraph, catalog),
+    [canvasGraph, catalog],
   );
   const isListenerGraph = listenerStartProvider !== null;
   const isListeningSession = isListenerGraph && isRunning;
+  const isWebhookListenerSessionActive =
+    isListeningSession && listenerStartProvider?.provider_id === "start.webhook";
+  const listenerWebhookEndpoints = useMemo(() => {
+    if (!isListeningSession || !draftGraph) {
+      return [] as Array<{ slug: string; localUrl: string; publicUrl: string | null }>;
+    }
+    const slugs = getWebhookPathSlugsForDocument(draftGraph);
+    const host = catalog?.cloudflare?.public_hostname;
+    return slugs.map((slug) => ({ slug, ...buildWebhookTriggerUrls(slug, host) }));
+  }, [isListeningSession, draftGraph, catalog]);
   const childRunSummaries = useMemo(() => {
     if (!runState) {
       return [] as Array<{ run_id: string; received_at: string; payload: Record<string, unknown> }>;
@@ -2927,6 +2940,65 @@ export default function App() {
                           : "Idle. Click Start Listening to open a session."}
                       </strong>
                     </p>
+                    {listenerWebhookEndpoints.length > 0 ? (
+                      <div className="listener-session-endpoints" aria-live="polite">
+                        <span className="mosaic-section-kicker">Webhook endpoints</span>
+                        {listenerWebhookEndpoints.map((row) => (
+                          <div key={row.slug} className="listener-session-endpoint-block">
+                            {listenerWebhookEndpoints.length > 1 ? (
+                              <div className="listener-session-endpoint-slug">Slug: {row.slug}</div>
+                            ) : null}
+                            <div className="listener-session-endpoint-line">
+                              <span className="listener-session-endpoint-label">Local (this machine / Vite)</span>
+                              <div className="inspector-webhook-url-row">
+                                <code className="inspector-webhook-url">{row.localUrl}</code>
+                                <button
+                                  type="button"
+                                  className="secondary-button"
+                                  onClick={() =>
+                                    void navigator.clipboard
+                                      .writeText(row.localUrl)
+                                      .then(
+                                        () => setListenerEndpointCopyKey(`local:${row.slug}`),
+                                        () => undefined,
+                                      )
+                                  }
+                                >
+                                  {listenerEndpointCopyKey === `local:${row.slug}` ? "Copied" : "Copy"}
+                                </button>
+                              </div>
+                            </div>
+                            {row.publicUrl ? (
+                              <div className="listener-session-endpoint-line">
+                                <span className="listener-session-endpoint-label">Tunneled (HTTPS)</span>
+                                <div className="inspector-webhook-url-row">
+                                  <code className="inspector-webhook-url">{row.publicUrl}</code>
+                                  <button
+                                    type="button"
+                                    className="secondary-button"
+                                    onClick={() =>
+                                      void navigator.clipboard
+                                        .writeText(row.publicUrl!)
+                                        .then(
+                                          () => setListenerEndpointCopyKey(`public:${row.slug}`),
+                                          () => undefined,
+                                        )
+                                    }
+                                  >
+                                    {listenerEndpointCopyKey === `public:${row.slug}` ? "Copied" : "Copy"}
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <p className="listener-session-endpoint-hint">
+                                Add a <strong>public hostname</strong> under Environment → Cloudflare Tunnel to show the
+                                tunneled URL for callers off this machine.
+                              </p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
                     <p className="listener-session-meta">
                       Events received: <strong>{childRunSummaries.length}</strong>
                     </p>
@@ -3393,6 +3465,7 @@ export default function App() {
             setSelectedNodeId(nodeId);
             setSelectedEdgeId(edgeId);
           }}
+          isWebhookListenerSessionActive={isWebhookListenerSessionActive}
         />
       </section>
 
