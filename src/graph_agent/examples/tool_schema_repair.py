@@ -1308,6 +1308,29 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="core.payload_list_iterator",
+            display_name="Payload List Iterator",
+            category=NodeCategory.CONTROL_FLOW_UNIT,
+            node_kind="control_flow_unit",
+            description="Iterates the incoming envelope payload (a list of dictionaries) and runs downstream nodes once per item via the loop-body handle.",
+            capabilities=["payload list iteration", "dict item fan-out", "sequential downstream execution"],
+            default_config={
+                "mode": "payload_list_iterator",
+                "start_index": 0,
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="start_index",
+                    label="Start Index",
+                    input_type="number",
+                    placeholder="0",
+                    help_text="Skip this many items from the start of the list (0 = first item).",
+                ),
+            ],
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.parallel_splitter",
             display_name="Parallel Splitter",
             category=NodeCategory.CONTROL_FLOW_UNIT,
@@ -1391,6 +1414,8 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                 "require_to": True,
                 "require_subject": True,
                 "require_body": True,
+                "reply_to_message_id": "",
+                "reply_mode": "reply",
             },
             config_fields=[
                 ProviderConfigFieldDefinition(
@@ -1409,6 +1434,22 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
                     input_type="textarea",
                     help_text="Optional signature appended to the drafted email body. Plain text and HTML are both supported.",
                     placeholder="Best,\nMorgan",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="reply_to_message_id",
+                    label="Reply To Message Id",
+                    help_text=(
+                        "Optional Microsoft Graph message id to draft as a reply (same value as "
+                        "outbound_email_messages.provider_message_id). When set, an Outbound Email Logger "
+                        "must be bound to this node. Payload may also set reply_to_message_id."
+                    ),
+                    placeholder="{reply_to_message_id}",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="reply_mode",
+                    label="Reply Mode",
+                    help_text="When replying: use reply (sender only) or reply_all.",
+                    placeholder="reply",
                 ),
             ],
         )

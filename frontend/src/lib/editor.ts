@@ -12,6 +12,7 @@ import type { AgentDefinition, EditorCatalog, GraphDefinition, GraphDocument, Gr
 const SPREADSHEET_ROWS_PROVIDER_ID = "core.spreadsheet_rows";
 const SUPABASE_SQL_PROVIDER_ID = "core.supabase_sql";
 const SUPABASE_TABLE_ROWS_PROVIDER_ID = "core.supabase_table_rows";
+const PAYLOAD_LIST_ITERATOR_PROVIDER_ID = "core.payload_list_iterator";
 
 export type GraphLayoutNodeDimensions = {
   width: number;
@@ -173,6 +174,8 @@ function defaultEndConfig(provider: NodeProviderDefinition): GraphNode["config"]
       require_to: true,
       require_subject: true,
       require_body: true,
+      reply_to_message_id: "",
+      reply_mode: "reply",
       ...defaultConfig,
     };
   }
@@ -389,6 +392,16 @@ export function createNodeFromProvider(
         config: {
           mode: "parallel_splitter",
           [PARALLEL_SPLITTER_HANDLE_COUNT_CONFIG_KEY]: 4,
+          ...defaultConfig,
+        },
+      };
+    }
+    if (provider.provider_id === PAYLOAD_LIST_ITERATOR_PROVIDER_ID) {
+      return {
+        ...baseNode,
+        config: {
+          mode: "payload_list_iterator",
+          start_index: 0,
           ...defaultConfig,
         },
       };

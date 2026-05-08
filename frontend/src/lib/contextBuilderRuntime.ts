@@ -89,10 +89,14 @@ export function buildContextBuilderRuntimeView(
   let contextBuilderComplete: boolean | null = null;
   let holdingOutgoing = false;
 
-  const composeCompleted = normalizedEvents.filter(
-    (e) => e.event_type === "node.completed" && e.payload.node_id === node.id,
-  );
-  const lastCompose = composeCompleted[composeCompleted.length - 1];
+  let lastCompose: RuntimeEvent | undefined;
+  for (let i = normalizedEvents.length - 1; i >= 0; i -= 1) {
+    const e = normalizedEvents[i];
+    if (e.event_type === "node.completed" && e.payload.node_id === node.id) {
+      lastCompose = e;
+      break;
+    }
+  }
   if (lastCompose) {
     const meta = lastCompose.payload.metadata;
     if (isRecord(meta)) {

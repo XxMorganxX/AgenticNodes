@@ -48,6 +48,8 @@ export type GraphCanvasNodeData = {
   tooltipGraph?: GraphDefinition | null;
   catalog: EditorCatalog | null;
   runState: RunState | null;
+  /** Digest used by GraphCanvas to reuse node data when only unrelated RunState fields change. */
+  canvasRuntimeToken?: string;
   availableProjectFiles?: ProjectFile[];
   displayLabel?: string;
   runtimeOutput?: unknown;
@@ -71,6 +73,7 @@ export type GraphCanvasNodeData = {
   onOpenConditionResults: (nodeId: string) => void;
   onSelectSpreadsheetFile: (nodeId: string, fileId: string) => void;
   onChangeSpreadsheetStartRowIndex: (nodeId: string, startRowIndex: number | string) => void;
+  onChangePayloadListStartIndex: (nodeId: string, startIndex: number | string) => void;
   onSelectPythonScriptFile: (nodeId: string, fileId: string) => void;
   onSelectSupabaseConnection: (nodeId: string, connectionId: string) => void;
   onHandlePointerDown: (nodeId: string, handleType: "source" | "target", handleId: string | null) => boolean;
@@ -80,6 +83,7 @@ export type GraphCanvasNodeData = {
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
 const SUPABASE_SQL_PROVIDER_ID = "core.supabase_sql";
 const SUPABASE_TABLE_ROWS_PROVIDER_ID = "core.supabase_table_rows";
+const PAYLOAD_LIST_ITERATOR_PROVIDER_ID = "core.payload_list_iterator";
 const SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision";
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
@@ -247,6 +251,7 @@ function GraphCanvasNodeComponent({
     onOpenConditionResults,
     onSelectSpreadsheetFile,
     onChangeSpreadsheetStartRowIndex,
+    onChangePayloadListStartIndex,
     onSelectPythonScriptFile,
     onSelectSupabaseConnection,
     onJunctionPointerDown,
@@ -448,10 +453,14 @@ function GraphCanvasNodeComponent({
   const modelEffectiveResponseMode = isModelNode ? inferModelResponseMode(graph, node) : null;
   const executorConfiguredResponseMode = node.kind === "mcp_tool_executor" ? configuredResponseMode(node) : null;
   const isSpreadsheetRowNode = node.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
+  const isPayloadListIteratorNode = node.provider_id === PAYLOAD_LIST_ITERATOR_PROVIDER_ID;
   const isSpreadsheetMatrixDecisionNode = node.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID;
   const isSpreadsheetBackedNode = isSpreadsheetRowNode || isSpreadsheetMatrixDecisionNode;
   const showsModelToolHandles = isModelNode && !isSpreadsheetMatrixDecisionNode;
-  const spreadsheetIteratorState = isSpreadsheetRowNode || isSupabaseTableRowsNode ? runState?.iterator_states?.[node.id] : undefined;
+  const spreadsheetIteratorState =
+    isSpreadsheetRowNode || isSupabaseTableRowsNode || isPayloadListIteratorNode
+      ? runState?.iterator_states?.[node.id]
+      : undefined;
   const spreadsheetIteratorStatus =
     spreadsheetIteratorState && typeof spreadsheetIteratorState.status === "string" ? spreadsheetIteratorState.status : null;
   const spreadsheetRowSummary = spreadsheetIteratorState != null
@@ -481,6 +490,10 @@ function GraphCanvasNodeComponent({
     typeof node.config.start_row_index === "number" || typeof node.config.start_row_index === "string"
       ? String(node.config.start_row_index)
       : "2";
+  const payloadListStartIndexValue =
+    typeof node.config.start_index === "number" || typeof node.config.start_index === "string"
+      ? String(node.config.start_index)
+      : "0";
   const isPythonScriptRunnerNode = node.provider_id === PYTHON_SCRIPT_RUNNER_PROVIDER_ID;
   const availablePythonScriptFiles = isPythonScriptRunnerNode
     ? availableProjectFiles.filter(isPythonProjectFile)
@@ -832,6 +845,37 @@ function GraphCanvasNodeComponent({
             />
           </div>
         ) : null}
+        {!preview && isPayloadListIteratorNode ? (
+          <div className="graph-node-inline-select-row">
+            <span className="graph-node-inline-toggle-label">Start Index</span>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              className="graph-node-inline-select nodrag"
+              value={payloadListStartIndexValue}
+              aria-label={`List start index (skip leading items) for ${displayLabel}`}
+              onMouseDown={stopInlineControlPropagation}
+              onPointerDown={stopInlineControlPropagation}
+              onClick={stopInlineControlPropagation}
+              onKeyDown={stopInlineControlPropagation}
+              onChange={(event) => {
+                event.stopPropagation();
+                const rawValue = event.target.value;
+                if (rawValue === "") {
+                  onChangePayloadListStartIndex(node.id, "");
+                  return;
+                }
+                const parsed = Number(rawValue);
+                if (Number.isInteger(parsed) && parsed >= 0) {
+                  onChangePayloadListStartIndex(node.id, Math.floor(parsed));
+                  return;
+                }
+                onChangePayloadListStartIndex(node.id, rawValue);
+              }}
+            />
+          </div>
+        ) : null}
         {!preview && isPythonScriptRunnerNode ? (
           <div className="graph-node-inline-select-row">
             <span className="graph-node-inline-toggle-label">Script</span>
@@ -963,7 +1007,7 @@ function GraphCanvasNodeComponent({
             <span className="graph-node-inline-display-hint">Click to expand</span>
           </div>
         ) : null}
-        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isStructuredPayloadBuilderNode || isRuntimeNormalizerNode || isSupabaseSqlNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger || isPythonScriptRunnerNode) ? (
+        {!preview && (node.category === "tool" || node.kind === "model" || isPromptBlockNode(node) || isLogicConditionsNode || isStructuredPayloadBuilderNode || isRuntimeNormalizerNode || isSupabaseSqlNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLogger || isOutlookDraftNode || isPythonScriptRunnerNode) ? (
           <div className="graph-node-card-actions" aria-hidden="false">
             <button
               type="button"
@@ -999,6 +1043,8 @@ function GraphCanvasNodeComponent({
                 : isSupabaseRowWriteNode
                   ? "Learn More"
                 : isOutboundEmailLogger
+                  ? "Learn More"
+                : isOutlookDraftNode
                   ? "Learn More"
                 : isPythonScriptRunnerNode
                   ? "Learn More"
@@ -1173,7 +1219,11 @@ function GraphCanvasNodeComponent({
           />
         </>
       ) : null}
-      {showSourceHandle && isControlFlowUnitNode && (node.provider_id === SPREADSHEET_ROW_PROVIDER_ID || node.provider_id === SUPABASE_TABLE_ROWS_PROVIDER_ID) ? (
+      {showSourceHandle &&
+      isControlFlowUnitNode &&
+      (node.provider_id === SPREADSHEET_ROW_PROVIDER_ID ||
+        node.provider_id === SUPABASE_TABLE_ROWS_PROVIDER_ID ||
+        node.provider_id === PAYLOAD_LIST_ITERATOR_PROVIDER_ID) ? (
         <>
           <div className="graph-node-output-port graph-node-output-port--success" style={controlFlowLoopHandleStyle} aria-hidden="true">
             <span className="graph-node-output-port-label">Loop Body</span>

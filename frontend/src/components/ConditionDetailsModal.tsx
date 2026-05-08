@@ -93,11 +93,26 @@ function humanizePathLabel(path: string): string {
   if (path === "row_data") {
     return "Current spreadsheet row values";
   }
+  if (path === "input_index") {
+    return "Iterator loop position";
+  }
   if (path === "row_index") {
     return "Spreadsheet loop position";
   }
   if (path === "row_number") {
     return "Original spreadsheet row number";
+  }
+  if (path === "item_index") {
+    return "Payload list loop position";
+  }
+  if (path === "item_data") {
+    return "Current payload list item";
+  }
+  if (path === "total_items") {
+    return "Payload list size";
+  }
+  if (path === "source_list_index") {
+    return "Index in original list (0-based)";
   }
   if (path === "sheet_name") {
     return "Spreadsheet sheet name";
@@ -107,6 +122,9 @@ function humanizePathLabel(path: string): string {
   }
   if (path.startsWith("row_data.")) {
     return `Column: ${path.slice("row_data.".length)}`;
+  }
+  if (path.startsWith("item_data.")) {
+    return `Field: ${path.slice("item_data.".length)}`;
   }
   const segments = path.split(".");
   const lastSegment = segments[segments.length - 1] ?? path;
@@ -376,8 +394,11 @@ function fallbackSuggestions(contractLabel: string): PathSuggestion[] {
   if (contractLabel === "data_envelope") {
     return [
       ...base,
+      { path: "input_index", displayLabel: "Iterator loop position", typeLabel: "number", operatorSuggestions: ["equals", "gt", "gte", "lt", "lte"], suggestedValues: [], summary: "1-based position of the current item across any iterator (spreadsheet rows, supabase table rows, payload list).", detail: describeSuggestionDetail("input_index", "number", []) },
       { path: "row_data", displayLabel: "Current spreadsheet row values", typeLabel: "object", operatorSuggestions: ["exists"], suggestedValues: [], summary: "Spreadsheet row payload.", detail: describeSuggestionDetail("row_data", "object", []) },
-      { path: "row_index", displayLabel: "Spreadsheet loop position", typeLabel: "number", operatorSuggestions: ["equals", "gt", "gte", "lt", "lte"], suggestedValues: [], summary: "Current row index.", detail: describeSuggestionDetail("row_index", "number", []) },
+      { path: "row_index", displayLabel: "Spreadsheet loop position", typeLabel: "number", operatorSuggestions: ["equals", "gt", "gte", "lt", "lte"], suggestedValues: [], summary: "Current row index (spreadsheet only). Prefer input_index for iterator-agnostic rules.", detail: describeSuggestionDetail("row_index", "number", []) },
+      { path: "item_data", displayLabel: "Current payload list item", typeLabel: "object", operatorSuggestions: ["exists"], suggestedValues: [], summary: "Per-item dict from a payload list iterator.", detail: describeSuggestionDetail("item_data", "object", []) },
+      { path: "item_index", displayLabel: "Payload list loop position", typeLabel: "number", operatorSuggestions: ["equals", "gt", "gte", "lt", "lte"], suggestedValues: [], summary: "Current item index (payload list iterator only). Prefer input_index for iterator-agnostic rules.", detail: describeSuggestionDetail("item_index", "number", []) },
       { path: "sheet_name", displayLabel: "Sheet name", typeLabel: "string", operatorSuggestions: ["equals", "contains", "exists"], suggestedValues: [], summary: "Spreadsheet sheet name.", detail: describeSuggestionDetail("sheet_name", "string", []) },
     ];
   }
@@ -409,7 +430,8 @@ function buildSpreadsheetSuggestions(preview: SpreadsheetPreviewResult): PathSug
   return [
     { path: "row_data", displayLabel: "Current spreadsheet row values", typeLabel: "object", operatorSuggestions: ["exists"], suggestedValues: [], summary: "Spreadsheet row keyed by header.", detail: describeSuggestionDetail("row_data", "object", []) },
     ...rowDataSuggestions,
-    { path: "row_index", displayLabel: "Spreadsheet loop position", typeLabel: "number", operatorSuggestions: ["equals", "gt", "gte", "lt", "lte"], suggestedValues: [], summary: "Current row index.", detail: describeSuggestionDetail("row_index", "number", []) },
+    { path: "input_index", displayLabel: "Iterator loop position", typeLabel: "number", operatorSuggestions: ["equals", "gt", "gte", "lt", "lte"], suggestedValues: [], summary: "1-based position of the current row across any iterator. Prefer this when sharing a logic-conditions rule between iterators.", detail: describeSuggestionDetail("input_index", "number", []) },
+    { path: "row_index", displayLabel: "Spreadsheet loop position", typeLabel: "number", operatorSuggestions: ["equals", "gt", "gte", "lt", "lte"], suggestedValues: [], summary: "Current row index (spreadsheet alias of input_index).", detail: describeSuggestionDetail("row_index", "number", []) },
     { path: "row_number", displayLabel: "Original spreadsheet row number", typeLabel: "number", operatorSuggestions: ["equals", "gt", "gte", "lt", "lte"], suggestedValues: [], summary: "Original spreadsheet row number.", detail: describeSuggestionDetail("row_number", "number", []) },
     { path: "sheet_name", displayLabel: "Spreadsheet sheet name", typeLabel: "string", operatorSuggestions: ["equals", "contains", "exists"], suggestedValues: preview.sheet_name ? [preview.sheet_name] : [], summary: "Spreadsheet sheet name.", detail: describeSuggestionDetail("sheet_name", "string", preview.sheet_name ? [preview.sheet_name] : []) },
     { path: "source_file", displayLabel: "Spreadsheet source file", typeLabel: "string", operatorSuggestions: ["equals", "contains", "exists"], suggestedValues: [], summary: "Resolved spreadsheet file path.", detail: describeSuggestionDetail("source_file", "string", []) },

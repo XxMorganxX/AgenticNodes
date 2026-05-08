@@ -255,6 +255,7 @@ function serializeStructuredPayloadFieldAliases(entries: StructuredPayloadTempla
 const CONTEXT_BUILDER_PROVIDER_ID = "core.context_builder";
 const SPREADSHEET_ROW_PROVIDER_ID = "core.spreadsheet_rows";
 const SUPABASE_TABLE_ROWS_PROVIDER_ID = "core.supabase_table_rows";
+const PAYLOAD_LIST_ITERATOR_PROVIDER_ID = "core.payload_list_iterator";
 const SPREADSHEET_MATRIX_DECISION_PROVIDER_ID = "core.spreadsheet_matrix_decision";
 const LOGIC_CONDITIONS_PROVIDER_ID = "core.logic_conditions";
 const PARALLEL_SPLITTER_PROVIDER_ID = "core.parallel_splitter";
@@ -1185,6 +1186,7 @@ export function GraphInspector({
     const isControlFlowUnitNode = isControlFlowNode(selectedNode);
     const isSpreadsheetRowNode = isControlFlowUnitNode && selectedNode.provider_id === SPREADSHEET_ROW_PROVIDER_ID;
     const isSupabaseTableRowsNode = isControlFlowUnitNode && selectedNode.provider_id === SUPABASE_TABLE_ROWS_PROVIDER_ID;
+    const isPayloadListIteratorNode = isControlFlowUnitNode && selectedNode.provider_id === PAYLOAD_LIST_ITERATOR_PROVIDER_ID;
     const isSpreadsheetMatrixNode =
       selectedNode.kind === "model" && selectedNode.provider_id === SPREADSHEET_MATRIX_DECISION_PROVIDER_ID;
     const displayedUserMessageTemplate =
@@ -1202,7 +1204,7 @@ export function GraphInspector({
       ? Number.parseInt(String(selectedNode.config[PARALLEL_SPLITTER_HANDLE_COUNT_CONFIG_KEY] ?? "1"), 10) || 1
       : 0;
     const spreadsheetNode = isSpreadsheetRowNode || isSpreadsheetMatrixNode ? selectedNode : null;
-    const iteratorNode = isSpreadsheetRowNode || isSupabaseTableRowsNode ? selectedNode : null;
+    const iteratorNode = isSpreadsheetRowNode || isSupabaseTableRowsNode || isPayloadListIteratorNode ? selectedNode : null;
     const logicConditionConfig = isLogicConditionsNode ? normalizeLogicConditionConfig(selectedNode.config).normalized : null;
     const logicIncomingContractLabel = isLogicConditionsNode ? incomingEdgeContractLabel(graph, selectedNode) : "";
     const spreadsheetIteratorState =
@@ -1867,6 +1869,44 @@ export function GraphInspector({
                       }
                     />
                   </label>
+                  <label>
+                    Reply to message id (Microsoft Graph)
+                    <input
+                      value={String(selectedNode.config.reply_to_message_id ?? "")}
+                      placeholder="{reply_to_message_id}"
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              reply_to_message_id: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    Reply mode
+                    <select
+                      value={String(selectedNode.config.reply_mode ?? "reply")}
+                      onChange={(event) =>
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: {
+                              ...node.config,
+                              reply_mode: event.target.value,
+                            },
+                          })),
+                        )
+                      }
+                    >
+                      <option value="reply">reply</option>
+                      <option value="reply_all">reply_all</option>
+                    </select>
+                  </label>
                   <div className="contract-card">
                     <strong>Draft Behavior</strong>
                     <span>The body comes from the selected Body Source and is stored as plain text in Outlook.</span>
@@ -1876,6 +1916,11 @@ export function GraphInspector({
                     <span>The signature is appended after the body, and switches to HTML mode automatically if either body or signature contains HTML markup.</span>
                     <span>Authentication is handled globally through Microsoft device-code sign-in, not graph env vars.</span>
                     <span>Only the toggled fields are required before saving the draft.</span>
+                    <span>
+                      When <strong>Reply to message id</strong> is set (or the payload includes <code>reply_to_message_id</code>), the draft is created as a thread reply via Microsoft Graph. You must bind an{" "}
+                      <strong>Outbound Email Logger</strong> to this node so the prior row can be resolved by{" "}
+                      <code>provider_message_id</code> and parent/root ids can be logged.
+                    </span>
                   </div>
                 </>
               ) : null}
@@ -3218,6 +3263,74 @@ export function GraphInspector({
                     </button>
                   ) : null}
                 </>
+              ) : isPayloadListIteratorNode ? (
+                <>
+                  <div className="contract-card">
+                    <strong>Payload List Iterator</strong>
+                    <span>Expects the incoming envelope payload to be a list of dictionaries.</span>
+                    <span>Each item is emitted through the `loop-body` handle as `payload.item_data` with `input_index` (the iterator-agnostic 1-based position), `item_index` (alias of `input_index`), and `total_items`.</span>
+                  </div>
+                  <label>
+                    Start index
+                    <input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={String(
+                        typeof selectedNode.config.start_index === "number" || typeof selectedNode.config.start_index === "string"
+                          ? selectedNode.config.start_index
+                          : 0,
+                      )}
+                      onChange={(event) => {
+                        const raw = event.target.value;
+                        if (raw === "") {
+                          onGraphChange(
+                            updateNode(graph, selectedNode.id, (node) => ({
+                              ...node,
+                              config: { ...node.config, mode: "payload_list_iterator", start_index: 0 },
+                            })),
+                          );
+                          return;
+                        }
+                        const parsed = Number.parseInt(raw, 10);
+                        if (!Number.isFinite(parsed) || parsed < 0) {
+                          return;
+                        }
+                        onGraphChange(
+                          updateNode(graph, selectedNode.id, (node) => ({
+                            ...node,
+                            config: { ...node.config, mode: "payload_list_iterator", start_index: Math.floor(parsed) },
+                          })),
+                        );
+                      }}
+                    />
+                    <span>Skip this many items from the start of the list (0 = first item).</span>
+                  </label>
+                  <div className="inspector-meta">
+                    <span>Input: list of dicts on the incoming edge</span>
+                    <span>Output handle: `loop-body`</span>
+                  </div>
+                  {spreadsheetIteratorState ? (
+                    <div className="contract-card">
+                      <strong>Iterator Progress</strong>
+                      <span>Status: {String(spreadsheetIteratorState.status ?? "unknown")}</span>
+                      <span>
+                        Item progress: {String(spreadsheetIteratorState.current_row_index ?? 0)} / {String(spreadsheetIteratorState.total_rows ?? 0)}
+                      </span>
+                      {spreadsheetLoopRegion ? (
+                        <span>
+                          Loop region members: {String(spreadsheetLoopRegion.member_node_ids?.length ?? 0)}
+                          {spreadsheetLoopMemberLabels.length > 0 ? ` (${spreadsheetLoopMemberLabels.join(", ")})` : ""}
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {onOpenProviderDetails ? (
+                    <button type="button" className="secondary-button" onClick={() => onOpenProviderDetails(selectedNode.id)}>
+                      Open Provider Details
+                    </button>
+                  ) : null}
+                </>
               ) : isLogicConditionsNode ? (
                 <>
                   <div className="contract-card">
@@ -3294,7 +3407,7 @@ export function GraphInspector({
                   <div className="contract-card">
                     <strong>Spreadsheet Rows</strong>
                     <span>Reads a CSV or XLSX file, maps each row to a header-keyed dictionary, and runs downstream nodes once per row in strict sequence.</span>
-                    <span>Each row is emitted as `payload.row_data` with `row_index`, `row_number`, `sheet_name`, and `source_file` metadata.</span>
+                    <span>Each row is emitted as `payload.row_data` with `input_index` (iterator-agnostic 1-based position), `row_index` (alias of `input_index`), `row_number`, `sheet_name`, and `source_file` metadata.</span>
                   </div>
                   <label>
                     File Format

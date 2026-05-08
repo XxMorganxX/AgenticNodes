@@ -615,6 +615,10 @@ export function ProviderDetailsModal({
   });
   const node = draftNode;
   const [activeTab, setActiveTab] = useState<ProviderDetailsModalTab>("node");
+  const [outlookDraftLearnMoreOpen, setOutlookDraftLearnMoreOpen] = useState(false);
+  useEffect(() => {
+    setOutlookDraftLearnMoreOpen(false);
+  }, [committedNode.id]);
   const debouncedPreviewNode = useDebouncedValue(node, 150);
   const nodeLabel = getNodeInstanceLabel(graph, node);
   const provider = resolveProviderDefinition(node, catalog);
@@ -661,6 +665,7 @@ export function ProviderDetailsModal({
   const isSupabaseTableRowsNode = node.provider_id === "core.supabase_table_rows";
   const isSupabaseRowWriteNode = node.provider_id === "core.supabase_row_write";
   const isOutboundEmailLoggerNode = node.provider_id === "core.outbound_email_logger";
+  const isOutlookDraftNode = node.provider_id === "end.outlook_draft";
   const isStructuredPayloadBuilderNode = node.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID;
   const isRuntimeNormalizerNode = node.provider_id === RUNTIME_NORMALIZER_PROVIDER_ID;
   const isSupabaseConnectionNode = isSupabaseSqlNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
@@ -1781,6 +1786,82 @@ export function ProviderDetailsModal({
                     </div>
                   ) : null}
                 </section>
+                {isOutlookDraftNode ? (
+                  <section className="provider-details-summary">
+                    <div className="provider-details-summary-header">
+                      <strong>Reply drafts &amp; email log</strong>
+                      <span>Required binding when replying</span>
+                    </div>
+                    <div className="provider-details-outlook-intro">
+                      <p>
+                        Set <strong>Reply to message id</strong> to a Microsoft Graph message id (the same value stored as{" "}
+                        <code>provider_message_id</code> on a prior outbound row), or pass <code>reply_to_message_id</code> in the
+                        incoming payload. The runtime then creates a threaded reply draft via Graph (<code>createReply</code> /{" "}
+                        <code>createReplyAll</code>).
+                      </p>
+                      <p>
+                        <strong>Outbound Email Logger required:</strong> connect the logger to this node with a binding edge so the
+                        prior row can be resolved and <code>parent_outbound_email_id</code> / <code>root_outbound_email_id</code> can
+                        be written for the new draft.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary-button provider-details-learn-more-toggle"
+                      aria-expanded={outlookDraftLearnMoreOpen}
+                      onClick={() => setOutlookDraftLearnMoreOpen((open) => !open)}
+                    >
+                      {outlookDraftLearnMoreOpen ? "Hide details" : "Learn more"}
+                    </button>
+                    {outlookDraftLearnMoreOpen ? (
+                      <div className="tool-details-modal-help provider-details-outlook-learn-more">
+                        <ul>
+                          <li>
+                            <strong>New drafts</strong> use <code>POST /me/messages</code>. <strong>Reply drafts</strong> use{" "}
+                            <code>{"POST /me/messages/{id}/createReply"}</code> or <code>createReplyAll</code>, then patch the draft
+                            for subject, body, and optional To overrides.
+                          </li>
+                          <li>
+                            Threading in Outlook uses Graph message ids, <code>conversationId</code>, and RFC headers; your
+                            Supabase log mirrors chain rows via <code>parent_outbound_email_id</code> and{" "}
+                            <code>root_outbound_email_id</code>.
+                          </li>
+                          <li>
+                            Configure <strong>Reply mode</strong> as <code>reply</code> (sender / reply-to only) or{" "}
+                            <code>reply_all</code> for everyone on the original thread.
+                          </li>
+                        </ul>
+                        <p className="provider-details-outlook-learn-more-links">
+                          <a
+                            href="https://learn.microsoft.com/en-us/graph/api/message-createreply?view=graph-rest-1.0"
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Microsoft Graph: createReply
+                          </a>
+                          {" · "}
+                          <a
+                            href="https://learn.microsoft.com/en-us/graph/api/message-update?view=graph-rest-1.0"
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Microsoft Graph: update message (draft patch)
+                          </a>
+                        </p>
+                        <p>
+                          Schema reference in repo: <code>docs/outreach-email-schema.md</code>
+                        </p>
+                      </div>
+                    ) : null}
+                    <div className="provider-details-capabilities">
+                      <span className="provider-capability-chip">reply_mode {String(node.config.reply_mode ?? "reply")}</span>
+                      <span className="provider-capability-chip">
+                        reply_to{" "}
+                        {String(node.config.reply_to_message_id ?? "").trim() ? "configured" : "not set"}
+                      </span>
+                    </div>
+                  </section>
+                ) : null}
                 {isSupabaseSqlNode ? (
                   <section className="provider-details-summary">
                     <div className="provider-details-summary-header">

@@ -234,6 +234,7 @@ export type StartRunOptions = {
   agent_ids?: string[];
   documents?: RunDocument[];
   graph_env_vars?: Record<string, string>;
+  mock_api_providers?: boolean;
 };
 
 export type ConnectionRule = {

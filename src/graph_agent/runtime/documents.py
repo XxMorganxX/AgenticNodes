@@ -37,6 +37,8 @@ def _merge_env_vars(shared_env_vars: Mapping[str, Any] | None, agent_env_vars: M
     merged_env_vars = _normalize_env_vars(shared_env_vars)
     agent_values = _normalize_env_vars(agent_env_vars)
     for key, value in agent_values.items():
+        if key == "EMAIL_TABLE_SUFFIX":
+            continue
         if _is_default_env_placeholder(key, value):
             parent_value = str(merged_env_vars.get(key, "") or "").strip()
             if parent_value and not _is_default_env_placeholder(key, parent_value):

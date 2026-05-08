@@ -73,7 +73,9 @@ import type { SavedNode } from "../lib/savedNodes";
 import { buildContextBuilderRuntimeView } from "../lib/contextBuilderRuntime";
 import { resolveSupabaseBinding } from "../lib/supabaseConnections";
 import { normalizeLogicConditionConfig } from "../lib/logicConditions";
+import { perfMeasure } from "../lib/runtimePerf";
 import {
+  buildFocusedEventGroups,
   formatRunStatusLabel,
   type AgentRunLane,
   type FocusedEventGroup,
@@ -110,6 +112,7 @@ type GraphCanvasProps = {
   onRequestRemoveAgent?: (agentId: string) => void;
   runProjection?: FocusedRunProjection | null;
   runSummary?: FocusedRunSummary | null;
+  /** Optional override; when omitted, timeline groups are built only while the run drawer is open. */
   eventGroups?: FocusedEventGroup[];
   catalog: EditorCatalog | null;
   availableProjectFiles?: ProjectFile[];
@@ -121,6 +124,7 @@ type GraphCanvasProps = {
   onGraphDrag: (graph: GraphDefinition) => void;
   onFormatGraph: (nodeDimensions: Record<string, GraphLayoutNodeDimensions>) => void;
   onRunGraph: () => void;
+  onRunGraphWithMockProviders?: () => void;
   onSaveGraph?: () => Promise<unknown> | unknown;
   isSavingGraph?: boolean;
   onScrollToTop: () => void;
@@ -131,6 +135,34 @@ type GraphCanvasProps = {
   /** True while listening for start.webhook */
   isWebhookListenerSessionActive?: boolean;
 };
+
+/** Stable digest for per-node canvas cache — avoids invalidating all nodes when RunState identity changes every SSE flush. */
+function buildCanvasNodeRuntimeDigest(nodeId: string, runState: RunState | null, tooltipVisible: boolean): string {
+  if (!runState) {
+    return "";
+  }
+  const slice: Record<string, unknown> = {
+    cn: runState.current_node_id,
+    ce: runState.current_edge_id,
+    st: runState.node_statuses?.[nodeId],
+    vc: runState.visit_counts?.[nodeId],
+    it: runState.iterator_states?.[nodeId],
+  };
+  if (tooltipVisible) {
+    slice.out = runState.node_outputs?.[nodeId];
+    slice.err = runState.node_errors?.[nodeId];
+    slice.inp = runState.node_inputs?.[nodeId];
+  } else {
+    slice.hasOut = runState.node_outputs?.[nodeId] !== undefined ? 1 : 0;
+    slice.hasErr = runState.node_errors?.[nodeId] !== undefined ? 1 : 0;
+    slice.hasInp = runState.node_inputs?.[nodeId] !== undefined ? 1 : 0;
+  }
+  try {
+    return JSON.stringify(slice);
+  } catch {
+    return `${runState.event_count ?? ""}:${runState.status ?? ""}`;
+  }
+}
 
 type OutboundEmailLoggerEdgeValidationState = {
   status: "idle" | "loading" | "valid" | "invalid" | "error";
@@ -961,7 +993,7 @@ export function GraphCanvas({
   onRequestRemoveAgent,
   runProjection = null,
   runSummary,
-  eventGroups = [],
+  eventGroups: externalEventGroups = [],
   catalog,
   availableProjectFiles = [],
   selectedNodeId,
@@ -972,6 +1004,7 @@ export function GraphCanvas({
   onGraphDrag,
   onFormatGraph,
   onRunGraph,
+  onRunGraphWithMockProviders,
   onSaveGraph,
   isSavingGraph = false,
   onScrollToTop,
@@ -1210,6 +1243,15 @@ export function GraphCanvas({
   }, [contextBuilderPayloadNode, graph, runProjection?.normalizedEvents, runState]);
   const selectedNodeIdSet = useMemo(() => new Set(selectedNodeIds), [selectedNodeIds]);
   const selectedEdgeIdSet = useMemo(() => new Set(selectedEdgeIds), [selectedEdgeIds]);
+  const resolvedEventGroups = useMemo(() => {
+    if (externalEventGroups.length > 0) {
+      return externalEventGroups;
+    }
+    if (drawerOpen && drawerTab === "run") {
+      return buildFocusedEventGroups(graph, events);
+    }
+    return [];
+  }, [externalEventGroups, drawerOpen, drawerTab, graph, events]);
   const milestoneChatEntries = useMemo(() => {
     const entries = environmentAgents
       .flatMap((agent) =>
@@ -1613,6 +1655,25 @@ export function GraphCanvas({
           config: {
             ...node.config,
             start_row_index: startRowIndex,
+          },
+        })),
+      );
+    },
+    [graph, onGraphChange],
+  );
+
+  const handleChangePayloadListStartIndex = useCallback(
+    (nodeId: string, startIndex: number | string) => {
+      if (!graph) {
+        return;
+      }
+      onGraphChange(
+        updateNode(graph, nodeId, (node) => ({
+          ...node,
+          config: {
+            ...node.config,
+            mode: "payload_list_iterator",
+            start_index: startIndex,
           },
         })),
       );
@@ -3959,7 +4020,8 @@ export function GraphCanvas({
     };
   }, [copySelectedNodeToClipboard, hasSelectedText, isEditableTarget, pasteNodeFromClipboard]);
 
-  const nodes = useMemo<FlowNode[]>(() => {
+  const nodes = useMemo<FlowNode[]>(() =>
+    perfMeasure("graphCanvas.nodes", () => {
     if (!graph) {
       nodeDataCacheRef.current = new Map();
       flowNodeCacheRef.current = new Map();
@@ -4029,6 +4091,7 @@ export function GraphCanvas({
                 onOpenConditionResults: handleOpenConditionResults,
                 onSelectSpreadsheetFile: handleSelectSpreadsheetFile,
                 onChangeSpreadsheetStartRowIndex: handleChangeSpreadsheetStartRowIndex,
+                onChangePayloadListStartIndex: handleChangePayloadListStartIndex,
                 onSelectPythonScriptFile: handleSelectPythonScriptFile,
                 onSelectSupabaseConnection: handleSelectSupabaseConnection,
                 onHandlePointerDown: handleNodeHandlePointerDown,
@@ -4108,6 +4171,7 @@ export function GraphCanvas({
       }
       const tooltipVisible = tooltipNodeId === node.id;
       const tooltipGraph = tooltipVisible ? graph : null;
+      const canvasRuntimeToken = buildCanvasNodeRuntimeDigest(node.id, runState, tooltipVisible);
       const isParallelSplitterNode = node.provider_id === "core.parallel_splitter";
       const previousData = nodeDataCacheRef.current.get(node.id);
       const nextData =
@@ -4118,7 +4182,7 @@ export function GraphCanvas({
         previousData.displayLabel === displayLabel &&
         previousData.tooltipGraph === tooltipGraph &&
         previousData.catalog === catalog &&
-        previousData.runState === runState &&
+        previousData.canvasRuntimeToken === canvasRuntimeToken &&
         previousData.availableProjectFiles === availableProjectFiles &&
         previousData.kindColor === kindColor &&
         previousData.status === status &&
@@ -4140,6 +4204,7 @@ export function GraphCanvas({
         previousData.onOpenConditionResults === handleOpenConditionResults &&
         previousData.onSelectSpreadsheetFile === handleSelectSpreadsheetFile &&
         previousData.onChangeSpreadsheetStartRowIndex === handleChangeSpreadsheetStartRowIndex &&
+        previousData.onChangePayloadListStartIndex === handleChangePayloadListStartIndex &&
         previousData.onSelectPythonScriptFile === handleSelectPythonScriptFile &&
         previousData.onSelectSupabaseConnection === handleSelectSupabaseConnection &&
         previousData.onHandlePointerDown === handleNodeHandlePointerDown &&
@@ -4153,6 +4218,7 @@ export function GraphCanvas({
               tooltipGraph,
               catalog,
               runState,
+              canvasRuntimeToken,
               availableProjectFiles,
               kindColor,
               status,
@@ -4175,6 +4241,7 @@ export function GraphCanvas({
               onOpenConditionResults: handleOpenConditionResults,
               onSelectSpreadsheetFile: handleSelectSpreadsheetFile,
               onChangeSpreadsheetStartRowIndex: handleChangeSpreadsheetStartRowIndex,
+              onChangePayloadListStartIndex: handleChangePayloadListStartIndex,
               onSelectPythonScriptFile: handleSelectPythonScriptFile,
               onSelectSupabaseConnection: handleSelectSupabaseConnection,
               onHandlePointerDown: handleNodeHandlePointerDown,
@@ -4219,7 +4286,8 @@ export function GraphCanvas({
       recordNodeBuildDiagnostic(performance.now() - diagnosticsStart);
     }
     return nextNodes;
-  }, [
+  }),
+  [
     availableProjectFiles,
     canvasGraphRenderSignature,
     catalog,
@@ -4238,6 +4306,7 @@ export function GraphCanvas({
     handleSelectSupabaseConnection,
     handleSelectSpreadsheetFile,
     handleChangeSpreadsheetStartRowIndex,
+    handleChangePayloadListStartIndex,
     handleSelectPythonScriptFile,
     handleToggleExecutorRetries,
     handleOpenCronScheduleConfig,
@@ -5363,9 +5432,16 @@ export function GraphCanvas({
                           : "Run the graph from this drawer and watch events stream below."}
                       </span>
                     </div>
-                    <button type="button" onClick={onRunGraph} disabled={isRunning}>
-                      {isRunning ? "Running..." : runButtonLabel}
-                    </button>
+                    <div className="graph-run-launch-actions">
+                      <button type="button" onClick={onRunGraph} disabled={isRunning}>
+                        {isRunning ? "Running..." : runButtonLabel}
+                      </button>
+                      {onRunGraphWithMockProviders ? (
+                        <button type="button" className="secondary-button" onClick={onRunGraphWithMockProviders} disabled={isRunning}>
+                          Mock Run
+                        </button>
+                      ) : null}
+                    </div>
                   </section>
                   <section className="panel graph-run-summary">
                     <div className="panel-header">
@@ -5415,7 +5491,7 @@ export function GraphCanvas({
                       <pre>{JSON.stringify(runSummary?.nodeErrors ?? runState?.node_errors ?? {}, null, 2)}</pre>
                     </div>
                   </section>
-                  <EventTimeline events={events} groups={eventGroups} embedded />
+                  <EventTimeline events={events} groups={resolvedEventGroups} embedded />
                 </div>
               ) : null}
             </div>

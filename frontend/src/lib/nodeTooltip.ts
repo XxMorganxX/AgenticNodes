@@ -469,6 +469,7 @@ export function buildNodeTooltip(
     const isPromptBlockNode = node.provider_id === "core.prompt_block";
     const isSpreadsheetNode = node.provider_id === "core.spreadsheet_rows";
     const isSupabaseTableRowsNode = node.provider_id === "core.supabase_table_rows";
+    const isPayloadListIteratorNode = node.provider_id === "core.payload_list_iterator";
     const isLogicConditionsNode = node.provider_id === "core.logic_conditions";
     const isParallelSplitterNode = node.provider_id === "core.parallel_splitter";
     const isRuntimeFieldExtractorNode = node.provider_id === "core.runtime_normalizer";
@@ -510,6 +511,8 @@ export function buildNodeTooltip(
                     ? "spreadsheet rows"
                   : isSupabaseTableRowsNode
                     ? "supabase table rows"
+                  : isPayloadListIteratorNode
+                    ? "payload list iterator"
                   : (asString(node.config.mode) ?? "passthrough"),
             },
             {
@@ -536,6 +539,8 @@ export function buildNodeTooltip(
                       )
                   : isSpreadsheetNode
                     ? truncate(asString(node.config.file_path) ?? "Select a CSV or XLSX file")
+                  : isPayloadListIteratorNode
+                    ? "Iterates list of dicts from incoming payload"
                   : truncate(asString(node.config.template) ?? "{input_payload}"),
             },
             ...(isPromptBlockNode
@@ -572,6 +577,9 @@ export function buildNodeTooltip(
                     value: node.config.include_previously_processed_rows === true ? "Included on every run" : "Skipped after success",
                   },
                 ]
+              : []),
+            ...(isPayloadListIteratorNode
+              ? [{ label: "Start Index", value: String(node.config.start_index ?? 0) }]
               : []),
             ...(isRuntimeFieldExtractorNode
               ? [

@@ -171,6 +171,7 @@ export function applyEmailRoutingMode(graph: GraphDocument, mode: EmailRoutingMo
       env_vars: withEmailTableSuffixEnvVar(graph.env_vars, mode),
       agents: graph.agents.map((agent) => ({
         ...agent,
+        env_vars: withEmailTableSuffixEnvVar(agent.env_vars, mode),
         nodes: agent.nodes.map((node) => retargetNode(node, mode)),
       })),
     };

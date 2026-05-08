@@ -21,6 +21,9 @@ dependencies = [
     "uvicorn",
 ]
 
+[project.scripts]
+agents = "graph_agent.cli:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

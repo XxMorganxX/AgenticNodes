@@ -21,7 +21,7 @@ from graph_agent.api.graph_store import GraphStore
 from graph_agent.api.supabase_run_store import SupabaseRunStore
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.providers.base import ModelRequest, ModelResponse, ProviderPreflightResult
-from graph_agent.runtime.core import GraphDefinition, GraphValidationError
+from graph_agent.runtime.core import GraphDefinition, GraphValidationError, resolve_graph_process_env
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.supabase_data import (
     SupabaseSchemaColumn,
@@ -707,6 +707,21 @@ class SupabaseDataNodeTests(unittest.TestCase):
         self.assertEqual(state.status, "failed")
         self.assertEqual(state.terminal_error["type"], "missing_supabase_url")
 
+    def test_graph_process_env_returns_literal_identifier_shaped_values(self) -> None:
+        env_vars = {
+            "SUPABASE_AGENTIC_NODES_PROJECT_REF": "sglfsfnpkgoesxmycgjk",
+            "SUPABASE_AGENTIC_NODES_ACCESS_TOKEN": "supabase-access-token-fixture",
+        }
+
+        self.assertEqual(
+            resolve_graph_process_env("SUPABASE_AGENTIC_NODES_PROJECT_REF", env_vars),
+            "sglfsfnpkgoesxmycgjk",
+        )
+        self.assertEqual(
+            resolve_graph_process_env("SUPABASE_AGENTIC_NODES_ACCESS_TOKEN", env_vars),
+            "supabase-access-token-fixture",
+        )
+
     def test_supabase_sql_node_executes_parameterized_query(self) -> None:
         graph = GraphDefinition.from_dict(
             supabase_sql_graph_payload(
@@ -746,6 +761,89 @@ class SupabaseDataNodeTests(unittest.TestCase):
                 "parameters": ["active", 2],
             },
         )
+
+    def test_supabase_sql_node_strips_accidental_leading_table_suffix_tokens(self) -> None:
+        graph = GraphDefinition.from_dict(
+            supabase_sql_graph_payload(
+                "supabase-sql-leading-suffix",
+                node_config={
+                    "query": "{EMAIL_TABLE_SUFFIX}{EMAIL_TABLE_SUFFIX}{EMAIL_TABLE_SUFFIX}\n\nselect id, name from public.projects where status = {status} and id >= {minimum_id}",
+                    "management_api_base_url": "{SUPABASE_MANAGEMENT_API_BASE_URL}",
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with SupabaseStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "SUPABASE_PROJECT_REF": "project-123",
+                "SUPABASE_ACCESS_TOKEN": "access-token",
+                "SUPABASE_MANAGEMENT_API_BASE_URL": base_url,
+            },
+            clear=False,
+        ):
+            state = runtime.run(
+                graph,
+                {"status": "active", "minimum_id": 2},
+                run_id="run-supabase-sql-leading-suffix",
+            )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(
+            _SupabaseStubHandler.last_json_body,
+            {
+                "query": "select id, name from public.projects where status = $1 and id >= $2",
+                "parameters": ["active", 2],
+            },
+        )
+
+    def test_supabase_sql_node_derives_project_ref_from_named_connection_url(self) -> None:
+        graph = GraphDefinition.from_dict(
+            supabase_sql_graph_payload(
+                "supabase-sql-named-connection-derived-project-ref",
+                node_config={
+                    "supabase_connection_id": "analytics-db",
+                    "management_api_base_url": "{SUPABASE_MANAGEMENT_API_BASE_URL}",
+                },
+            )
+            | {
+                "supabase_connections": [
+                    {
+                        "connection_id": "analytics-db",
+                        "name": "Analytics DB",
+                        "supabase_url_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_URL",
+                        "supabase_key_env_var": "GRAPH_AGENT_SUPABASE_ANALYTICS_SECRET_KEY",
+                        "project_ref_env_var": "SUPABASE_ANALYTICS_PROJECT_REF",
+                        "access_token_env_var": "SUPABASE_ANALYTICS_ACCESS_TOKEN",
+                    }
+                ],
+                "default_supabase_connection_id": "analytics-db",
+            },
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+
+        with SupabaseStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_SUPABASE_ANALYTICS_URL": "https://project-123.supabase.co",
+                "GRAPH_AGENT_SUPABASE_ANALYTICS_SECRET_KEY": "analytics-secret",
+                "SUPABASE_ANALYTICS_PROJECT_REF": "",
+                "SUPABASE_ANALYTICS_ACCESS_TOKEN": "access-token",
+                "SUPABASE_MANAGEMENT_API_BASE_URL": base_url,
+            },
+            clear=False,
+        ):
+            state = runtime.run(
+                graph,
+                {"status": "active", "minimum_id": 2},
+                run_id="run-supabase-sql-derived-project-ref",
+            )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(_SupabaseStubHandler.last_path, "/v1/projects/project-123/database/query/read-only")
 
     def test_supabase_sql_node_unwraps_data_payload(self) -> None:
         graph = GraphDefinition.from_dict(
@@ -1465,7 +1563,8 @@ class SupabaseDataNodeTests(unittest.TestCase):
         self.assertEqual(len(provider.user_messages), 1)
         user_payload = json.loads(provider.user_messages[0])
         self.assertEqual(user_payload["row_data"], {"name": "Alpha"})
-        self.assertEqual(sorted(user_payload.keys()), ["row_data"])
+        self.assertEqual(user_payload["input_index"], 1)
+        self.assertEqual(sorted(user_payload.keys()), ["input_index", "row_data"])
 
     def test_supabase_table_rows_can_emit_empty_row_data_when_no_columns_are_selected(self) -> None:
         provider = SpreadsheetEchoProvider()
@@ -1500,7 +1599,7 @@ class SupabaseDataNodeTests(unittest.TestCase):
         self.assertEqual(state.status, "completed")
         self.assertEqual(len(provider.user_messages), 1)
         user_payload = json.loads(provider.user_messages[0])
-        self.assertEqual(user_payload, {"row_data": {}})
+        self.assertEqual(user_payload, {"input_index": 1, "row_data": {}})
 
     def test_supabase_table_rows_failure_does_not_advance_watermark(self) -> None:
         provider = FailingEchoProvider()

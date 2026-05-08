@@ -853,6 +853,7 @@ class SpreadsheetRowTests(unittest.TestCase):
             [
                 {
                     "Spreadsheet Rows": {
+                        "input_index": 1,
                         "row_index": 1,
                         "row_number": 2,
                         "sheet_name": "Sheet1",

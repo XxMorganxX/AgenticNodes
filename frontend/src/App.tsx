@@ -77,6 +77,7 @@ import { buildWebhookTriggerUrls } from "./lib/webhookUrls";
 import { clearAllPersistedRunSnapshots, clearPersistedRunSnapshot, loadPersistedRunSnapshot, savePersistedRunSnapshot } from "./lib/runSnapshots";
 import type { PersistedRunSnapshot } from "./lib/runSnapshots";
 import { isTerminalRuntimeEvent, normalizeRunState, normalizeRuntimeEvent } from "./lib/runtimeEvents";
+import { perfMeasure } from "./lib/runtimePerf";
 import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedRunProjection } from "./lib/runVisualization";
 import type {
   AgentDefinition,
@@ -1120,12 +1121,25 @@ function applyPersistedEnvVars(graph: GraphDocument, storageKey: string | null |
   if (!persistedEnvVars) {
     return syncEmailTableSuffixEnvVar(graph);
   }
+  const mergedEnvVars = { ...(graph.env_vars ?? {}) };
+  for (const [key, value] of Object.entries(persistedEnvVars)) {
+    const normalizedKey = key.trim();
+    if (!normalizedKey) {
+      continue;
+    }
+    const normalizedValue = String(value ?? "");
+    if (
+      normalizedKey !== "EMAIL_TABLE_SUFFIX"
+      && !normalizedValue.trim()
+      && String(mergedEnvVars[normalizedKey] ?? "").trim()
+    ) {
+      continue;
+    }
+    mergedEnvVars[normalizedKey] = normalizedValue;
+  }
   return syncEmailTableSuffixEnvVar({
     ...graph,
-    env_vars: {
-      ...(graph.env_vars ?? {}),
-      ...persistedEnvVars,
-    },
+    env_vars: mergedEnvVars,
   });
 }
 
@@ -1260,6 +1274,7 @@ export default function App() {
   const [isStoppingRuntime, setIsStoppingRuntime] = useState(false);
   const [isResettingRuntime, setIsResettingRuntime] = useState(false);
   const [productionRunConfirmOpen, setProductionRunConfirmOpen] = useState(false);
+  const [productionRunMockApiProviders, setProductionRunMockApiProviders] = useState(false);
   const [deleteGraphTarget, setDeleteGraphTarget] = useState<GraphDeleteTarget | null>(null);
   const [isDeletingGraph, setIsDeletingGraph] = useState(false);
   const [workflowRemoveTarget, setWorkflowRemoveTarget] = useState<WorkflowRemoveTarget | null>(null);
@@ -1361,11 +1376,13 @@ export default function App() {
   const canvasActiveRunId =
     isListenerGraph && selectedListenerChildRunState ? selectedListenerChildRunState.run_id : selectedRunId;
   const focusedRunProjection = useMemo(
-    () => buildFocusedRunProjection(canvasGraph, canvasRunState, canvasEvents),
+    () =>
+      perfMeasure("buildFocusedRunProjection", () =>
+        buildFocusedRunProjection(canvasGraph, canvasRunState, canvasEvents, { includeEventGroups: false }),
+      ),
     [canvasGraph, canvasRunState, canvasEvents],
   );
   const focusedRunSummary = focusedRunProjection.runSummary;
-  const focusedEventGroups = focusedRunProjection.eventGroups;
   useEffect(() => {
     if (!isListenerGraph || childRunSummaries.length === 0) {
       setSelectedListenerChildRunId(null);
@@ -1521,7 +1538,33 @@ export default function App() {
       return;
     }
     void refreshRunFiles(selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId);
-  }, [refreshRunFiles, selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId, fileRefreshTrigger]);
+  }, [refreshRunFiles, selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId]);
+
+  const RUN_FILES_DEBOUNCE_MS = 3500;
+  useEffect(() => {
+    if (!selectedRunFilesRequest.runId || !isRunning) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void refreshRunFiles(selectedRunFilesRequest.runId!, selectedRunFilesRequest.agentId);
+    }, RUN_FILES_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [
+    fileRefreshTrigger,
+    isRunning,
+    refreshRunFiles,
+    selectedRunFilesRequest.runId,
+    selectedRunFilesRequest.agentId,
+  ]);
+
+  const wasRunningRef = useRef(false);
+  useEffect(() => {
+    const wasRunning = wasRunningRef.current;
+    wasRunningRef.current = isRunning;
+    if (wasRunning && !isRunning && selectedRunFilesRequest.runId) {
+      void refreshRunFiles(selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId);
+    }
+  }, [isRunning, refreshRunFiles, selectedRunFilesRequest.runId, selectedRunFilesRequest.agentId]);
 
   useEffect(() => {
     if (!selectedRunFilesRequest.runId || !selectedRunFilePath) {
@@ -1954,13 +1997,15 @@ export default function App() {
       }
       pendingEventsRef.current = [];
 
-      setEvents((previous) => appendBoundedEntries(previous, buffered, MAX_LIVE_EVENTS));
-      setRunState((previous) =>
-        buffered.reduce(
-          (acc, event) => applyEvent(acc, event, graphId, inputValue, documents),
-          previous,
-        ),
-      );
+      perfMeasure(`sseFlush(events=${buffered.length})`, () => {
+        setEvents((previous) => appendBoundedEntries(previous, buffered, MAX_LIVE_EVENTS));
+        setRunState((previous) =>
+          buffered.reduce(
+            (acc, event) => applyEvent(acc, event, graphId, inputValue, documents),
+            previous,
+          ),
+        );
+      });
 
       const terminal = buffered.find((event) => !event.agent_id && isTerminalRuntimeEvent(event));
       if (terminal && sourceRef.current === source) {
@@ -2105,6 +2150,9 @@ export default function App() {
 
   usePageVisibility(useCallback((hidden: boolean) => {
     isTabHiddenRef.current = hidden;
+    if (typeof document !== "undefined" && document.body) {
+      document.body.classList.toggle("graph-canvas-tab-hidden", hidden);
+    }
     if (hidden) {
       // Pause the rAF flush loop while hidden; events keep accumulating in the buffer (capped).
       if (flushFrameRef.current !== null) {
@@ -2407,7 +2455,7 @@ export default function App() {
     }
   }
 
-  async function executeRun() {
+  async function executeRun(options: { mockApiProviders?: boolean } = {}) {
     if (!draftGraph) {
       return;
     }
@@ -2455,6 +2503,7 @@ export default function App() {
         agent_ids: agentIdsToRun,
         documents: runDocumentsForRun,
         graph_env_vars: runGraphEnvVars,
+        mock_api_providers: options.mockApiProviders,
       });
       setActiveRunId(runId);
       setRunState(createPendingRunState(savedGraph, runId, input, agentIdsToRun, runDocumentsForRun));
@@ -2519,7 +2568,7 @@ export default function App() {
     }
   }
 
-  async function handleRun() {
+  async function handleRun(options: { mockApiProviders?: boolean } = {}) {
     if (!draftGraph) {
       return;
     }
@@ -2542,10 +2591,11 @@ export default function App() {
       return;
     }
     if (emailRoutingMode === "production") {
+      setProductionRunMockApiProviders(Boolean(options.mockApiProviders));
       setProductionRunConfirmOpen(true);
       return;
     }
-    await executeRun();
+    await executeRun(options);
   }
 
   async function handleStopRuntime() {
@@ -2587,7 +2637,7 @@ export default function App() {
     executionBoxRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  function handleCanvasGraphChange(nextGraph: GraphDefinition) {
+  const handleCanvasGraphChange = useCallback((nextGraph: GraphDefinition) => {
     if (!canvasGraph || !draftGraph) {
       return;
     }
@@ -2603,7 +2653,12 @@ export default function App() {
     } catch {
       // Preserve the in-memory commit even when background-persistence validation cannot be recomputed.
     }
-  }
+  }, [canvasGraph, draftGraph, selectedAgentId, setDraftGraph, setSavedGraphStateId]);
+
+  const handleCanvasSelectionChange = useCallback((nodeId: string | null, edgeId: string | null) => {
+    setSelectedNodeId(nodeId);
+    setSelectedEdgeId(edgeId);
+  }, []);
 
   function handleCanvasGraphQuietChange(nextGraph: GraphDefinition) {
     if (!canvasGraph || !draftGraph) {
@@ -2779,6 +2834,23 @@ export default function App() {
                           ? "Run Grouping"
                           : "Run Workflow"}
                   </button>
+                  {!isListenerGraph ? (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => void handleRun({ mockApiProviders: true })}
+                      disabled={
+                        !draftGraph
+                        || isSaving
+                        || isResettingRuntime
+                        || isUploadingRunDocuments
+                        || isRunning
+                        || isStoppingRuntime
+                      }
+                    >
+                      Mock Run
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     className="danger-button"
@@ -3444,7 +3516,6 @@ export default function App() {
           }}
           runProjection={focusedRunProjection}
           runSummary={focusedRunSummary}
-          eventGroups={focusedEventGroups}
           catalog={catalog}
           availableProjectFiles={projectFiles}
           selectedNodeId={selectedNodeId}
@@ -3455,16 +3526,14 @@ export default function App() {
           onGraphDrag={handleCanvasGraphDrag}
           onFormatGraph={handleFormatGraph}
           onRunGraph={() => void handleRun()}
+          onRunGraphWithMockProviders={!isListenerGraph ? () => void handleRun({ mockApiProviders: true }) : undefined}
           onSaveGraph={() => saveCurrentGraph()}
           isSavingGraph={isSaving}
           onScrollToTop={scrollToExecutionBox}
           isMcpPanelOpen={mcpPanelOpen}
           onToggleMcpPanel={() => setMcpPanelOpen((current) => !current)}
           backgroundDragSensitivity={userPreferences.backgroundDragSensitivityPercent / 100}
-          onSelectionChange={(nodeId, edgeId) => {
-            setSelectedNodeId(nodeId);
-            setSelectedEdgeId(edgeId);
-          }}
+          onSelectionChange={handleCanvasSelectionChange}
           isWebhookListenerSessionActive={isWebhookListenerSessionActive}
         />
       </section>
@@ -3516,10 +3585,15 @@ export default function App() {
       ) : null}
       {productionRunConfirmOpen ? (
         <ProductionRunConfirmModal
-          onClose={() => setProductionRunConfirmOpen(false)}
+          onClose={() => {
+            setProductionRunConfirmOpen(false);
+            setProductionRunMockApiProviders(false);
+          }}
           onConfirm={() => {
             setProductionRunConfirmOpen(false);
-            void executeRun();
+            const shouldMockApiProviders = productionRunMockApiProviders;
+            setProductionRunMockApiProviders(false);
+            void executeRun({ mockApiProviders: shouldMockApiProviders });
           }}
         />
       ) : null}

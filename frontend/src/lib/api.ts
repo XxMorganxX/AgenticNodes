@@ -530,6 +530,7 @@ export async function startRun(graphId: string, input: string, options?: StartRu
       agent_ids: options?.agent_ids,
       documents: options?.documents,
       graph_env_vars: options?.graph_env_vars,
+      mock_api_providers: options?.mock_api_providers,
     }),
   });
 

@@ -180,6 +180,8 @@ SUPABASE_SQL_PROVIDER_ID = "core.supabase_sql"
 SUPABASE_SQL_MODE = "supabase_sql"
 SUPABASE_TABLE_ROWS_PROVIDER_ID = "core.supabase_table_rows"
 SUPABASE_TABLE_ROWS_MODE = "supabase_table_rows"
+PAYLOAD_LIST_ITERATOR_PROVIDER_ID = "core.payload_list_iterator"
+PAYLOAD_LIST_ITERATOR_MODE = "payload_list_iterator"
 SUPABASE_ROW_WRITE_PROVIDER_ID = "core.supabase_row_write"
 SUPABASE_ROW_WRITE_MODE = "supabase_row_write"
 OUTBOUND_EMAIL_LOGGER_PROVIDER_ID = "core.outbound_email_logger"
@@ -703,6 +705,7 @@ GRAPH_ENV_REFERENCE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 SUPABASE_SQL_TOKEN_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 CONTEXT_BUILDER_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 CONTEXT_BUILDER_SLUG_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
+SUPABASE_SQL_START_PATTERN = re.compile(r"^(with|select|insert|update|delete|create|alter|drop|truncate)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -892,7 +895,14 @@ def resolve_graph_env_reference_name(value: Any, env_vars: Mapping[str, str], *,
 
 
 def resolve_graph_process_env(value: str, env_vars: Mapping[str, str]) -> str:
-    env_var_name = resolve_graph_env_reference_name(value, env_vars)
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return ""
+
+    exact_reference = GRAPH_ENV_REFERENCE_EXACT_PATTERN.match(raw_value)
+    env_var_name = raw_value
+    if exact_reference is not None:
+        env_var_name = str(exact_reference.group(1) or "").strip()
     if not env_var_name:
         return ""
     process_value = os.environ.get(env_var_name, "")
@@ -900,8 +910,30 @@ def resolve_graph_process_env(value: str, env_vars: Mapping[str, str]) -> str:
         return process_value
     graph_value = str(env_vars.get(env_var_name, "") or "").strip()
     if graph_value and graph_value != env_var_name:
+        if ENV_VAR_NAME_PATTERN.fullmatch(graph_value):
+            process_alias_value = os.environ.get(graph_value, "")
+            if str(process_alias_value).strip():
+                return process_alias_value
         return graph_value
     return ""
+
+
+def derive_supabase_project_ref_from_url(value: str) -> str:
+    match = re.match(r"^https?://([a-z0-9-]+)\.supabase\.co(?::\d+)?(?:/|$)", str(value or "").strip(), re.IGNORECASE)
+    return str(match.group(1) if match else "").strip()
+
+
+def normalize_supabase_sql_query_prefix(query: str, env_vars: Mapping[str, str]) -> str:
+    normalized_query = str(query or "").strip()
+    email_table_suffix = str(env_vars.get("EMAIL_TABLE_SUFFIX", "") or "").strip()
+    if not email_table_suffix:
+        return normalized_query
+    candidate = normalized_query
+    while candidate.startswith(email_table_suffix):
+        candidate = candidate[len(email_table_suffix):].lstrip()
+    if candidate and candidate != normalized_query and SUPABASE_SQL_START_PATTERN.match(candidate):
+        return candidate
+    return normalized_query
 
 
 def resolve_supabase_runtime_env_var_names(
@@ -2312,13 +2344,21 @@ class DataNode(BaseNode):
             return False
         if source.provider_id == PROMPT_BLOCK_PROVIDER_ID:
             return True
+        # An upstream node is "done" once it has either produced an output or
+        # finished with an error. Treating an errored source as still-pending
+        # would let it block downstream context_builder nodes forever via
+        # hold_outgoing_edges, stranding the rest of the loop body.
+        source_finished = (
+            source_node_id in context.state.node_outputs
+            or source_node_id in context.state.node_errors
+        )
         if source.provider_id == "core.data_display":
             if _incoming_edges_are_all_binding(context.graph, source_node_id):
                 return context.latest_completed_output(source_node_id) is not None
-            return source_node_id in context.state.node_outputs
+            return source_finished
         if source.kind == "input":
-            return source_node_id in context.state.node_outputs
-        return source_node_id in context.state.node_outputs
+            return source_finished
+        return source_finished
 
     def _context_builder_all_sources_fulfilled(self, context: NodeContext) -> bool:
         bindings = self._context_builder_bindings(context)
@@ -2530,6 +2570,7 @@ class DataNode(BaseNode):
                 from_node_id=self.id,
                 from_category=self.category.value,
                 payload={
+                    "input_index": position,
                     "row_index": position,
                     "row_number": row.row_number,
                     "row_data": dict(row.row_data),
@@ -2542,6 +2583,7 @@ class DataNode(BaseNode):
                     "data_mode": "spreadsheet_row",
                     "provider_id": self.provider_id,
                     "iterator_type": "spreadsheet_rows",
+                    "input_index": position,
                     "row_index": position,
                     "row_number": row.row_number,
                     "total_rows": total_rows,
@@ -2753,12 +2795,15 @@ class DataNode(BaseNode):
 
     def _apollo_email_lookup_config(self, context: NodeContext) -> dict[str, Any]:
         resolved = context.resolve_graph_env_value(dict(self.config))
+        api_key_reference = str(
+            self.raw_config.get("api_key_env_var", DEFAULT_APOLLO_API_KEY_ENV_VAR)
+            or DEFAULT_APOLLO_API_KEY_ENV_VAR
+        ).strip() or DEFAULT_APOLLO_API_KEY_ENV_VAR
         return {
-            "api_key_env_var": resolve_graph_env_reference_name(
-                self.raw_config.get("api_key_env_var", DEFAULT_APOLLO_API_KEY_ENV_VAR),
-                context.graph_env_vars(),
-                default=DEFAULT_APOLLO_API_KEY_ENV_VAR,
-            ),
+            # Resolve this later with resolve_graph_process_env(). If we resolve
+            # graph env references here, an Apollo key that is itself alphanumeric
+            # can be mistaken for an environment variable alias.
+            "api_key_env_var": api_key_reference,
             "name": str(resolved.get("name", "") or "").strip(),
             "domain": str(resolved.get("domain", "") or "").strip(),
             "organization_name": str(resolved.get("organization_name", "") or "").strip(),
@@ -3586,7 +3631,10 @@ class DataNode(BaseNode):
     def _supabase_sql_request(self, context: NodeContext) -> tuple[SupabaseSqlQueryRequest, Any]:
         resolved = context.resolve_graph_env_value(dict(self.config))
         source_value = self._supabase_sql_source_value(context)
-        raw_query = str(resolved.get("query", "") or "").strip()
+        raw_query = normalize_supabase_sql_query_prefix(
+            str(resolved.get("query", "") or "").strip(),
+            context.graph.env_vars,
+        )
         parameterized_query, parameters = self._resolve_supabase_sql_query_tokens(raw_query, source_value)
         project_ref_env_var, access_token_env_var = resolve_supabase_management_runtime_env_var_names(resolved, context.graph)
         raw_management_api_base_url = str(resolved.get("management_api_base_url", "") or "").strip()
@@ -3604,12 +3652,18 @@ class DataNode(BaseNode):
             if raw_management_api_base_url
             else ""
         ) or raw_management_api_base_url
+        project_ref = resolve_graph_process_env(
+            project_ref_env_var,
+            context.graph.env_vars,
+        )
+        if not project_ref:
+            supabase_url_env_var, _ = resolve_supabase_runtime_env_var_names(resolved, context.graph)
+            project_ref = derive_supabase_project_ref_from_url(
+                resolve_graph_process_env(supabase_url_env_var, context.graph.env_vars)
+            )
         return (
             SupabaseSqlQueryRequest(
-                project_ref=resolve_graph_process_env(
-                    project_ref_env_var,
-                    context.graph.env_vars,
-                ),
+                project_ref=project_ref,
                 access_token=resolve_graph_process_env(
                     access_token_env_var,
                     context.graph.env_vars,
@@ -4300,6 +4354,7 @@ class ControlFlowNode(BaseNode):
                 from_node_id=self.id,
                 from_category=self.category.value,
                 payload={
+                    "input_index": position,
                     "row_index": position,
                     "row_number": row.row_number,
                     "row_data": dict(row.row_data),
@@ -4312,6 +4367,7 @@ class ControlFlowNode(BaseNode):
                     "data_mode": "spreadsheet_row",
                     "provider_id": self.provider_id,
                     "iterator_type": "spreadsheet_rows",
+                    "input_index": position,
                     "row_index": position,
                     "row_number": row.row_number,
                     "total_rows": total_rows,
@@ -4488,6 +4544,7 @@ class ControlFlowNode(BaseNode):
                 from_node_id=self.id,
                 from_category=self.category.value,
                 payload={
+                    "input_index": position,
                     "row_data": output_row_data,
                 },
                 metadata={
@@ -4496,6 +4553,7 @@ class ControlFlowNode(BaseNode):
                     "data_mode": "supabase_table_row",
                     "provider_id": self.provider_id,
                     "iterator_type": "supabase_table_rows",
+                    "input_index": position,
                     "row_index": position,
                     "row_id": row_id,
                     "cursor_column": result.cursor_column,
@@ -4607,6 +4665,144 @@ class ControlFlowNode(BaseNode):
                     "iterator_item_label": "Supabase row",
                     "iterator_handle_id": CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
                     "iterator_on_completed": _mark_completed,
+                },
+            },
+        )
+
+    def _payload_list_iterator_state(
+        self,
+        item_count: int,
+        *,
+        source_item_count: int,
+        start_index: int,
+    ) -> dict[str, Any]:
+        return {
+            "iterator_type": "payload_list",
+            "status": "ready" if item_count > 0 else "completed",
+            "current_row_index": 0,
+            "total_rows": item_count,
+            "start_index": start_index,
+            "source_item_count": source_item_count,
+        }
+
+    def _payload_list_iterator_envelopes(
+        self,
+        items: list[Mapping[str, Any]],
+        *,
+        start_index: int,
+    ) -> list[dict[str, Any]]:
+        row_envelopes: list[dict[str, Any]] = []
+        total = len(items)
+        for position, item in enumerate(items, start=1):
+            item_dict = dict(item)
+            source_list_index = start_index + position - 1
+            envelope = MessageEnvelope(
+                schema_version="1.0",
+                from_node_id=self.id,
+                from_category=self.category.value,
+                payload={
+                    "input_index": position,
+                    "item_index": position,
+                    "item_data": item_dict,
+                    "total_items": total,
+                    "start_index": start_index,
+                    "source_list_index": source_list_index,
+                },
+                metadata={
+                    "contract": "data_envelope",
+                    "node_kind": self.kind,
+                    "data_mode": "payload_list_item",
+                    "provider_id": self.provider_id,
+                    "iterator_type": "payload_list",
+                    "input_index": position,
+                    "item_index": position,
+                    "total_items": total,
+                    "start_index": start_index,
+                    "source_list_index": source_list_index,
+                },
+            )
+            row_envelopes.append(envelope.to_dict())
+        return row_envelopes
+
+    def _execute_payload_list_iterator(self, context: NodeContext) -> NodeExecutionResult:
+        resolved_config = context.resolve_graph_env_value(dict(self.config))
+        start_index = _coerce_int(resolved_config.get("start_index"), default=0, minimum=0)
+
+        source_envelope = self._source_envelope(context)
+        raw_payload = source_envelope.payload
+        if not isinstance(raw_payload, list):
+            return NodeExecutionResult(
+                status="failed",
+                error={
+                    "type": "payload_list_iterator_invalid_payload",
+                    "message": (
+                        f"Node '{self.id}' requires incoming payload to be a list of dictionaries, "
+                        f"got {type(raw_payload).__name__}."
+                    ),
+                },
+                summary=f"Payload list iterator on '{self.id}' expected a list payload.",
+            )
+        items: list[Mapping[str, Any]] = []
+        for index, element in enumerate(raw_payload):
+            if not isinstance(element, Mapping):
+                return NodeExecutionResult(
+                    status="failed",
+                    error={
+                        "type": "payload_list_iterator_invalid_item",
+                        "message": (
+                            f"Node '{self.id}' list item at index {index} must be a dict, "
+                            f"got {type(element).__name__}."
+                        ),
+                        "item_index": index,
+                    },
+                    summary=f"Invalid list item at index {index} for node '{self.id}'.",
+                )
+            items.append(element)
+        source_count = len(items)
+        if start_index > source_count:
+            start_index = source_count
+        sliced_items = items[start_index:]
+        count = len(sliced_items)
+        iterator_state = self._payload_list_iterator_state(
+            count,
+            source_item_count=source_count,
+            start_index=start_index,
+        )
+        summary_envelope = MessageEnvelope(
+            schema_version="1.0",
+            from_node_id=self.id,
+            from_category=self.category.value,
+            payload={
+                "item_count": count,
+                "source_item_count": source_count,
+                "start_index": start_index,
+            },
+            metadata={
+                "contract": "data_envelope",
+                "node_kind": self.kind,
+                "control_flow_mode": PAYLOAD_LIST_ITERATOR_MODE,
+                "provider_id": self.provider_id,
+                "iterator_type": "payload_list",
+                "total_rows": count,
+                "source_item_count": source_count,
+                "start_index": start_index,
+            },
+        )
+        return NodeExecutionResult(
+            status="success",
+            output=summary_envelope.to_dict(),
+            summary=f"Prepared {count} payload list item(s).",
+            metadata={
+                "iterator_state": iterator_state,
+                "control_flow_handle_id": CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
+                "_internal": {
+                    "iterator_envelopes": self._payload_list_iterator_envelopes(
+                        sliced_items,
+                        start_index=start_index,
+                    ),
+                    "iterator_type": "payload_list",
+                    "iterator_item_label": "item",
+                    "iterator_handle_id": CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
                 },
             },
         )
@@ -5008,6 +5204,8 @@ class ControlFlowNode(BaseNode):
             return self._execute_spreadsheet_rows(context)
         if self.provider_id == SUPABASE_TABLE_ROWS_PROVIDER_ID:
             return self._execute_supabase_table_rows(context)
+        if self.provider_id == PAYLOAD_LIST_ITERATOR_PROVIDER_ID:
+            return self._execute_payload_list_iterator(context)
         if self.provider_id == PARALLEL_SPLITTER_PROVIDER_ID:
             return self._execute_parallel_splitter(context)
         if self.provider_id == LOGIC_CONDITIONS_PROVIDER_ID:
@@ -7079,6 +7277,9 @@ def _coerce_outlook_body_text(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
+        extracted_body = _extract_outlook_jsonish_string_field(value, ("body", "content", "text", "message", "summary"))
+        if extracted_body:
+            return extracted_body
         return value.strip()
     if isinstance(value, Mapping):
         for key in ("body", "content", "text", "message", "summary"):
@@ -7088,6 +7289,33 @@ def _coerce_outlook_body_text(value: Any) -> str:
     return _json_safe(value).strip()
 
 
+def _extract_outlook_jsonish_string_field(value: str, field_names: tuple[str, ...]) -> str:
+    """Extract fields from JSON-like model output that contains raw multiline strings.
+
+    LLMs often emit `{ "body": "line1\nline2" }` with literal newlines inside
+    the quoted value, which is not valid JSON. This keeps the Outlook node from
+    sending the wrapper braces/field name as email body text.
+    """
+
+    text = value.strip()
+    if not text.startswith("{") or not text.endswith("}"):
+        return ""
+    for field_name in field_names:
+        match = re.search(rf'(?is)["\']{re.escape(field_name)}["\']\s*:\s*["\']', text)
+        if match is None:
+            continue
+        start = match.end()
+        index = start
+        while index < len(text):
+            char = text[index]
+            if char in {"\"", "'"} and (index == start or text[index - 1] != "\\"):
+                remainder = text[index + 1 :].strip()
+                if remainder in {"", "}"} or remainder.startswith(",") or remainder.startswith("}"):
+                    return text[start:index].replace('\\"', '"').replace("\\'", "'").strip()
+            index += 1
+    return ""
+
+
 def _normalize_outlook_text_formatting(value: str) -> str:
     normalized = value.replace("\r\n", "\n").replace("\r", "\n")
     normalized = normalized.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
@@ -7095,6 +7323,22 @@ def _normalize_outlook_text_formatting(value: str) -> str:
 
 
 def _parse_outlook_message_content(value: Any) -> tuple[str, str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, Mapping):
+                return _parse_outlook_message_content(parsed)
+            jsonish_body = _extract_outlook_jsonish_string_field(stripped, ("body", "content", "text", "message", "summary"))
+            if jsonish_body:
+                jsonish_subject = _extract_outlook_jsonish_string_field(stripped, ("subject",))
+                return (
+                    _normalize_outlook_text_formatting(jsonish_subject),
+                    _normalize_outlook_text_formatting(jsonish_body),
+                )
     subject = ""
     body_source = value
     if isinstance(value, Mapping):
@@ -7337,6 +7581,104 @@ class OutlookDraftOutputNode(OutputNode):
     def _require_body(self) -> bool:
         return bool(self.config.get("require_body", True))
 
+    def _normalized_reply_mode(self) -> str:
+        raw = str(self.config.get("reply_mode", "reply") or "reply").strip().lower() or "reply"
+        if raw not in {"reply", "reply_all"}:
+            raise ValueError(
+                f"Outlook draft node '{self.id}' uses unsupported reply_mode '{raw}'. Use 'reply' or 'reply_all'."
+            )
+        return raw
+
+    def _resolve_reply_to_message_id(self, context: NodeContext, payload: Any) -> str:
+        template = str(self.config.get("reply_to_message_id", "") or "").strip()
+        if template:
+            rendered = context.render_template(template, _outlook_template_variables(payload)).strip()
+            if rendered:
+                return rendered
+        if isinstance(payload, Mapping):
+            candidate = payload.get("reply_to_message_id")
+            if candidate is not None:
+                text = str(candidate).strip()
+                if text:
+                    return text
+        return ""
+
+    def _lookup_parent_outbound_row_for_reply(
+        self,
+        *,
+        binding: OutboundEmailLoggerBinding,
+        provider_message_id: str,
+    ) -> dict[str, Any]:
+        mid = str(provider_message_id or "").strip()
+        if not mid:
+            raise SupabaseDataError(
+                "reply_to_message_id is empty; cannot resolve parent outbound email row.",
+                error_type="missing_reply_target_message_id",
+                details={"node_id": self.id},
+            )
+        filters_text = f"provider_message_id=eq.{mid}"
+        try:
+            result = fetch_supabase_data(
+                SupabaseDataRequest(
+                    supabase_url=binding.supabase_url,
+                    supabase_key=binding.supabase_key,
+                    schema=binding.schema,
+                    source_kind="table",
+                    source_name=binding.table_name,
+                    select="id,recipient_email,root_outbound_email_id,provider_message_id,internet_message_id,conversation_id",
+                    filters_text=filters_text,
+                    limit=2,
+                    output_mode="records",
+                )
+            )
+        except SupabaseDataError:
+            raise
+        raw = result.raw_payload
+        rows = raw if isinstance(raw, list) else []
+        if not rows:
+            raise SupabaseDataError(
+                f"Outlook draft node '{self.id}' could not find an outbound email log row with "
+                f"provider_message_id '{mid}' in table '{binding.schema}.{binding.table_name}'.",
+                error_type="outbound_reply_parent_not_found",
+                details={
+                    "provider_message_id": mid,
+                    "table_name": binding.table_name,
+                    "schema": binding.schema,
+                    "node_id": self.id,
+                },
+            )
+        if len(rows) > 1:
+            raise SupabaseDataError(
+                f"Outlook draft node '{self.id}' found multiple outbound rows for provider_message_id '{mid}'.",
+                error_type="outbound_reply_parent_ambiguous",
+                details={"provider_message_id": mid, "row_count": len(rows), "node_id": self.id},
+            )
+        first = rows[0]
+        if not isinstance(first, dict):
+            raise SupabaseDataError(
+                f"Outlook draft node '{self.id}' received an unexpected Supabase response when resolving reply parent.",
+                error_type="outbound_reply_parent_invalid_payload",
+                details={"node_id": self.id},
+            )
+        return first
+
+    def _outlook_reply_configuration_error(self, message: str) -> NodeExecutionResult:
+        return NodeExecutionResult(
+            status="failed",
+            error={
+                "type": "outlook_reply_configuration_error",
+                "message": message,
+                "node_id": self.id,
+            },
+            summary=message,
+            metadata={
+                "outlook_draft_saved": False,
+                "outlook_reply_blocked": True,
+                "outbound_email_logged": False,
+                "outbound_email_log_skipped": False,
+            },
+        )
+
     def _resolved_to_recipients(self, context: NodeContext, payload: Any) -> list[str]:
         configured_to = str(self.config.get("to", "") or "").strip()
         candidate_value: Any
@@ -7351,6 +7693,16 @@ class OutlookDraftOutputNode(OutputNode):
             candidate_value,
             required=self._require_to(),
         )
+
+    def _resolved_reply_to_recipients_override(self, context: NodeContext, payload: Any) -> list[str]:
+        configured_to = str(self.config.get("to", "") or "").strip()
+        if not configured_to:
+            return []
+        candidate_value = context.render_template(
+            configured_to,
+            _outlook_template_variables(payload),
+        ).strip()
+        return parse_outlook_recipient_addresses(candidate_value, required=False)
 
     def _render_subject(self, context: NodeContext, payload: Any) -> str:
         subject_template = str(self.config.get("subject", "") or "").strip()
@@ -7367,6 +7719,15 @@ class OutlookDraftOutputNode(OutputNode):
                 return ""
             raise ValueError("Outlook draft node requires a subject.")
         return subject
+
+    def _render_reply_subject_override(self, context: NodeContext, payload: Any) -> str:
+        subject_template = str(self.config.get("subject", "") or "").strip()
+        if not subject_template:
+            return ""
+        return context.render_template(
+            subject_template,
+            _outlook_template_variables(payload),
+        ).strip()
 
     def _render_body(self, payload: Any) -> str:
         _, body = _parse_outlook_message_content(payload)
@@ -7564,6 +7925,8 @@ class OutlookDraftOutputNode(OutputNode):
         draft: Any,
         binding: OutboundEmailLoggerBinding,
         validation: Mapping[str, Any],
+        forced_parent_outbound_email_id: str | None = None,
+        forced_root_outbound_email_id: str | None = None,
     ) -> dict[str, Any]:
         available_columns = set(validation.get("available_columns", []))
         raw_provider_payload = dict(draft.raw_response) if isinstance(draft.raw_response, Mapping) else {}
@@ -7613,16 +7976,24 @@ class OutlookDraftOutputNode(OutputNode):
             binding.sales_approach_version_template,
             metadata_extra,
         )
-        parent_outbound_email_id = self._render_outbound_email_logger_value(
-            context,
-            binding.parent_outbound_email_id_template,
-            metadata_extra,
-        )
-        root_outbound_email_id = self._render_outbound_email_logger_value(
-            context,
-            binding.root_outbound_email_id_template,
-            metadata_extra,
-        )
+        forced_parent = str(forced_parent_outbound_email_id or "").strip()
+        forced_root = str(forced_root_outbound_email_id or "").strip()
+        if forced_parent:
+            parent_outbound_email_id = forced_parent
+        else:
+            parent_outbound_email_id = self._render_outbound_email_logger_value(
+                context,
+                binding.parent_outbound_email_id_template,
+                metadata_extra,
+            )
+        if forced_root:
+            root_outbound_email_id = forced_root
+        else:
+            root_outbound_email_id = self._render_outbound_email_logger_value(
+                context,
+                binding.root_outbound_email_id_template,
+                metadata_extra,
+            )
         metadata = {
             "run_id": context.state.run_id,
             "graph_id": context.state.graph_id,
@@ -7812,15 +8183,81 @@ class OutlookDraftOutputNode(OutputNode):
         source_value = _output_source_value_for_prompt_capture(context, source_binding)
         payload = _payload_from_bound_value(source_value)
         try:
-            recipients = self._resolved_to_recipients(context, payload)
+            reply_mode = self._normalized_reply_mode()
         except ValueError as exc:
-            return self._record_skipped_invalid_recipient(context, payload, exc)
-        subject = self._render_subject(context, payload)
-        body = self._render_body(payload)
+            return self._outlook_reply_configuration_error(str(exc))
+        reply_to_message_id = self._resolve_reply_to_message_id(context, payload)
         logger_binding = self._outbound_email_logger_binding(context)
         logger_validation: dict[str, Any] | None = None
-        if logger_binding is not None:
+        forced_parent_outbound_email_id: str | None = None
+        forced_root_outbound_email_id: str | None = None
+        reply_parent_recipient_email = ""
+        reply_parent_internet_message_id = ""
+        if reply_to_message_id:
+            if logger_binding is None:
+                return self._outlook_reply_configuration_error(
+                    f"Outlook draft node '{self.id}' requires an outbound email logger binding when "
+                    "reply_to_message_id is set."
+                )
+            try:
+                logger_validation = self._validate_outbound_email_logger_binding(logger_binding)
+            except SupabaseDataError as exc:
+                return NodeExecutionResult(
+                    status="failed",
+                    error=exc.to_error_payload(),
+                    summary=str(exc),
+                    metadata={
+                        "outlook_draft_saved": False,
+                        "outlook_reply_blocked": True,
+                        "outbound_email_logged": False,
+                        "outbound_email_log_skipped": False,
+                    },
+                )
+            try:
+                parent_row = self._lookup_parent_outbound_row_for_reply(
+                    binding=logger_binding,
+                    provider_message_id=reply_to_message_id,
+                )
+            except SupabaseDataError as exc:
+                return NodeExecutionResult(
+                    status="failed",
+                    error=exc.to_error_payload(),
+                    summary=str(exc),
+                    metadata={
+                        "outlook_draft_saved": False,
+                        "outlook_reply_blocked": True,
+                        "outbound_email_logged": False,
+                        "outbound_email_log_skipped": False,
+                    },
+                )
+            parent_uuid = str(parent_row.get("id", "") or "").strip()
+            if not parent_uuid:
+                return self._outlook_reply_configuration_error(
+                    f"Outlook draft node '{self.id}' resolved a parent outbound row without an id."
+                )
+            root_existing = parent_row.get("root_outbound_email_id")
+            root_uuid = str(root_existing).strip() if root_existing else parent_uuid
+            forced_parent_outbound_email_id = parent_uuid
+            forced_root_outbound_email_id = root_uuid
+            reply_parent_recipient_email = str(parent_row.get("recipient_email", "") or "").strip()
+            reply_parent_internet_message_id = str(parent_row.get("internet_message_id", "") or "").strip()
+        elif logger_binding is not None:
             logger_validation = self._validate_outbound_email_logger_binding(logger_binding)
+        try:
+            if reply_to_message_id:
+                recipients = self._resolved_reply_to_recipients_override(context, payload)
+                if not recipients and reply_parent_recipient_email:
+                    recipients = parse_outlook_recipient_addresses(reply_parent_recipient_email, required=False)
+            else:
+                recipients = self._resolved_to_recipients(context, payload)
+        except ValueError as exc:
+            return self._record_skipped_invalid_recipient(context, payload, exc)
+        subject = (
+            self._render_reply_subject_override(context, payload)
+            if reply_to_message_id
+            else self._render_subject(context, payload)
+        )
+        body = self._render_body(payload)
         auth_service = self._auth_service(context)
         auth_status = auth_service.connection_status()
         dedupe_scope = self._dedupe_scope(
@@ -7893,13 +8330,25 @@ class OutlookDraftOutputNode(OutputNode):
         draft_client = context.services.outlook_draft_client or OutlookDraftClient()
         signature = str(self.config.get("signature", "") or "")
         try:
-            draft = draft_client.create_draft(
-                access_token=access_token,
-                to_recipients=recipients,
-                subject=subject,
-                body=body,
-                signature=signature,
-            )
+            if reply_to_message_id:
+                draft = draft_client.create_reply_draft(
+                    access_token=access_token,
+                    reply_to_message_id=reply_to_message_id,
+                    reply_to_internet_message_id=reply_parent_internet_message_id,
+                    reply_mode=reply_mode,
+                    to_recipients=recipients,
+                    subject=subject,
+                    body=body,
+                    signature=signature,
+                )
+            else:
+                draft = draft_client.create_draft(
+                    access_token=access_token,
+                    to_recipients=recipients,
+                    subject=subject,
+                    body=body,
+                    signature=signature,
+                )
         except Exception as exc:  # noqa: BLE001
             if dedupe_store is not None and dedupe_scope is not None:
                 dedupe_store.mark_failure(
@@ -7916,7 +8365,7 @@ class OutlookDraftOutputNode(OutputNode):
         internet_message_id = str(raw_provider_payload.get("internetMessageId", "") or "").strip()
         conversation_id = str(raw_provider_payload.get("conversationId", "") or "").strip()
         output_payload: dict[str, Any] = {
-            "delivery_status": "draft_saved",
+            "delivery_status": "reply_draft_saved" if reply_to_message_id else "draft_saved",
             "draft_id": draft.draft_id,
             "provider_message_id": provider_message_id,
             "internet_message_id": internet_message_id,
@@ -7932,6 +8381,9 @@ class OutlookDraftOutputNode(OutputNode):
             "outbound_email_log": None,
             "source_payload": payload,
         }
+        if reply_to_message_id:
+            output_payload["reply_to_message_id"] = reply_to_message_id
+            output_payload["reply_mode"] = reply_mode
         if dedupe_store is not None and dedupe_scope is not None:
             dedupe_store.mark_success(
                 scope=dedupe_scope,
@@ -7948,6 +8400,8 @@ class OutlookDraftOutputNode(OutputNode):
                     draft=draft,
                     binding=logger_binding,
                     validation=logger_validation,
+                    forced_parent_outbound_email_id=forced_parent_outbound_email_id,
+                    forced_root_outbound_email_id=forced_root_outbound_email_id,
                 )
             except SupabaseDataError as exc:
                 if exc.error_type == "missing_outbound_email_log_recipient":
@@ -7999,11 +8453,26 @@ class OutlookDraftOutputNode(OutputNode):
         payload = _resolve_output_payload(context, self.config.get("source_binding"))
         auth_status = self._auth_service(context).connection_status()
         logger_binding = self._outbound_email_logger_binding(context)
+        try:
+            reply_mode = self._normalized_reply_mode()
+        except ValueError:
+            reply_mode = str(self.config.get("reply_mode", "") or "")
+        reply_to_message_id = self._resolve_reply_to_message_id(context, payload)
         return {
             "microsoft_auth": auth_status.to_dict(),
-            "to_recipients": self._resolved_to_recipients(context, payload),
-            "subject": self._render_subject(context, payload),
+            "to_recipients": (
+                self._resolved_reply_to_recipients_override(context, payload)
+                if reply_to_message_id
+                else self._resolved_to_recipients(context, payload)
+            ),
+            "subject": (
+                self._render_reply_subject_override(context, payload)
+                if reply_to_message_id
+                else self._render_subject(context, payload)
+            ),
             "body": self._render_body(payload),
+            "reply_mode": reply_mode,
+            "reply_to_message_id": reply_to_message_id,
             "outbound_email_logger": {
                 "node_id": logger_binding.node_id,
                 "schema": logger_binding.schema,
@@ -8301,6 +8770,27 @@ class GraphDefinition:
                         raise GraphValidationError(
                             f"Node '{edge.source_id}' has more than one standard outgoing edge."
                         )
+
+        for node in self.nodes.values():
+            if node.kind != "output" or node.provider_id != OUTLOOK_DRAFT_PROVIDER_ID:
+                continue
+            logger_binding_edges = [
+                edge
+                for edge in self.get_incoming_edges(node.id)
+                if edge.kind == "binding"
+                and (source_node := self.nodes.get(edge.source_id)) is not None
+                and source_node.provider_id == OUTBOUND_EMAIL_LOGGER_PROVIDER_ID
+            ]
+            if len(logger_binding_edges) > 1:
+                raise GraphValidationError(
+                    f"Outlook draft node '{node.id}' can only have one outbound email logger binding."
+                )
+            reply_cfg = str(node.config.get("reply_to_message_id", "") or "").strip()
+            if reply_cfg and len(logger_binding_edges) != 1:
+                raise GraphValidationError(
+                    f"Outlook draft node '{node.id}' sets reply_to_message_id and must have exactly one "
+                    f"outbound email logger binding (found {len(logger_binding_edges)})."
+                )
 
     def start_node(self) -> BaseNode:
         return self.nodes[self.start_node_id]
@@ -8747,18 +9237,6 @@ class GraphDefinition:
                     raise GraphValidationError(
                         f"Prompt block '{node.id}' uses unsupported role '{raw_role}'."
                     )
-            if node.kind == "output" and node.provider_id == OUTLOOK_DRAFT_PROVIDER_ID:
-                logger_binding_edges = [
-                    edge
-                    for edge in self.get_incoming_edges(node.id)
-                    if edge.kind == "binding"
-                    and (source_node := self.nodes.get(edge.source_id)) is not None
-                    and source_node.provider_id == OUTBOUND_EMAIL_LOGGER_PROVIDER_ID
-                ]
-                if len(logger_binding_edges) > 1:
-                    raise GraphValidationError(
-                        f"Outlook draft node '{node.id}' can only have one outbound email logger binding."
-                    )
             if node.kind == "data" and node.provider_id == APOLLO_EMAIL_LOOKUP_PROVIDER_ID:
                 workspace_template = str(
                     node.config.get("workspace_cache_path_template", "cache/apollo-email/{cache_key}.json")
@@ -8908,6 +9386,17 @@ class GraphDefinition:
                     if invalid_handles:
                         raise GraphValidationError(
                             f"Supabase table rows node '{node.id}' uses unsupported output handle(s): {', '.join(str(handle) for handle in invalid_handles)}."
+                        )
+                if node.provider_id == PAYLOAD_LIST_ITERATOR_PROVIDER_ID:
+                    allowed_handles = {CONTROL_FLOW_LOOP_BODY_HANDLE_ID, None}
+                    invalid_handles = [
+                        edge.source_handle_id
+                        for edge in self.get_outgoing_edges(node.id)
+                        if edge.kind != "binding" and edge.source_handle_id not in allowed_handles
+                    ]
+                    if invalid_handles:
+                        raise GraphValidationError(
+                            f"Payload list iterator node '{node.id}' uses unsupported output handle(s): {', '.join(str(handle) for handle in invalid_handles)}."
                         )
                 if node.provider_id == LOGIC_CONDITIONS_PROVIDER_ID:
                     branch_handles: set[str] = set()

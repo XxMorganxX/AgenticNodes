@@ -3812,6 +3812,14 @@ pre {
   50% { opacity: 0.6; }
 }
 
+/* Pause continuous per-node animations when tab is hidden so the compositor
+ * doesn't keep painting them while the user isn't looking. The body class is
+ * toggled by usePageVisibility in App.tsx. */
+body.graph-canvas-tab-hidden .graph-node-badge-spinner-ring,
+body.graph-canvas-tab-hidden .graph-node-summary--row-progress.is-active {
+  animation-play-state: paused;
+}
+
 .graph-node-inline-toggle-row {
   display: flex;
   align-items: center;
@@ -5213,6 +5221,29 @@ pre {
   margin: 0;
   color: #9093b5;
   line-height: 1.5;
+}
+
+.provider-details-outlook-intro p + p {
+  margin-top: 0.65rem;
+}
+
+.provider-details-learn-more-toggle {
+  margin-top: 0.65rem;
+}
+
+.provider-details-outlook-learn-more {
+  margin-top: 0.75rem;
+}
+
+.provider-details-outlook-learn-more ul {
+  margin: 0.35rem 0 0 1.25rem;
+  padding: 0;
+  color: #9093b5;
+  line-height: 1.55;
+}
+
+.provider-details-outlook-learn-more-links {
+  margin-top: 0.65rem;
 }
 
 .provider-details-capabilities {

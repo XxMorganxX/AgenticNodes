@@ -13,7 +13,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from graph_agent.api.graph_store import GraphStore
-from graph_agent.api.manager import GraphRunManager
+from graph_agent.api.manager import GraphRunManager, _merge_runtime_graph_env_vars
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.runtime.core import GraphValidationError
 from graph_agent.runtime.documents import load_graph_document
@@ -82,6 +82,83 @@ class MultiAgentEnvironmentTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._temp_dir.cleanup()
+
+    def test_runtime_env_overlay_does_not_blank_saved_values(self) -> None:
+        saved_env_vars = {
+            "SUPABASE_AGENTIC_NODES_PROJECT_REF": "project-123",
+            "SUPABASE_AGENTIC_NODES_ACCESS_TOKEN": "access-token",
+            "EMAIL_TABLE_SUFFIX": "_dev",
+        }
+
+        merged = _merge_runtime_graph_env_vars(
+            saved_env_vars,
+            {
+                "SUPABASE_AGENTIC_NODES_PROJECT_REF": "",
+                "SUPABASE_AGENTIC_NODES_ACCESS_TOKEN": "",
+                "EMAIL_TABLE_SUFFIX": "",
+                "NEW_EMPTY_VALUE": "",
+            },
+        )
+
+        self.assertIs(merged, saved_env_vars)
+        self.assertEqual(merged["SUPABASE_AGENTIC_NODES_PROJECT_REF"], "project-123")
+        self.assertEqual(merged["SUPABASE_AGENTIC_NODES_ACCESS_TOKEN"], "access-token")
+        self.assertEqual(merged["EMAIL_TABLE_SUFFIX"], "")
+        self.assertEqual(merged["NEW_EMPTY_VALUE"], "")
+
+    def test_document_email_table_suffix_overrides_agent_default_suffix(self) -> None:
+        payload = {
+            "graph_id": "production-email-routing",
+            "name": "Production Email Routing",
+            "graph_type": "test_environment",
+            "email_routing_mode": "production",
+            "env_vars": {"EMAIL_TABLE_SUFFIX": ""},
+            "agents": [
+                {
+                    "agent_id": "agent-one",
+                    "name": "Agent One",
+                    "start_node_id": "start",
+                    "env_vars": {"EMAIL_TABLE_SUFFIX": "_dev"},
+                    "nodes": [
+                        {
+                            "id": "start",
+                            "kind": "input",
+                            "category": "start",
+                            "label": "Start",
+                            "provider_id": "start.manual_run",
+                            "provider_label": "Run Button Start",
+                            "config": {"input_binding": {"type": "input_payload"}},
+                            "position": {"x": 0, "y": 0},
+                        },
+                        {
+                            "id": "finish",
+                            "kind": "output",
+                            "category": "end",
+                            "label": "Finish",
+                            "provider_id": "core.output",
+                            "provider_label": "Core Output Node",
+                            "config": {"response_mode": "message"},
+                            "position": {"x": 200, "y": 0},
+                        },
+                    ],
+                    "edges": [
+                        {
+                            "id": "edge-start-finish",
+                            "source_id": "start",
+                            "target_id": "finish",
+                            "label": "next",
+                            "kind": "standard",
+                            "priority": 100,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        document = load_graph_document(payload)
+        runtime_graph = document.as_graph("agent-one")
+
+        self.assertEqual(runtime_graph.env_vars["EMAIL_TABLE_SUFFIX"], "")
 
     def test_bundled_test_environment_normalizes_to_multi_agent_document(self) -> None:
         payload = self.store.get_graph("test-environment")

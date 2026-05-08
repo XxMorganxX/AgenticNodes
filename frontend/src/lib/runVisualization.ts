@@ -368,7 +368,7 @@ function summarizeErrorEntry(nodeId: string, nodeLabel: string, value: unknown):
   };
 }
 
-function summarizeNodeErrors(nodeErrors: Record<string, unknown>, labels: Map<string, string>): AgentRunErrorSummary[] {
+export function summarizeNodeErrors(nodeErrors: Record<string, unknown>, labels: Map<string, string>): AgentRunErrorSummary[] {
   const seen = new Set<string>();
   return Object.entries(nodeErrors).flatMap(([nodeId, value]) => {
     const nodeLabel = labels.get(nodeId) ?? nodeId;
@@ -1145,7 +1145,7 @@ export function buildAgentRunLanes(
     const agentEvents = events
       .filter((event) => event.agent_id === agent.agent_id)
       .map((event) => ({ ...event, event_type: normalizeEventType(event.event_type) }));
-    const projection = buildFocusedRunProjection(currentGraph, agentState, agentEvents);
+    const projection = buildFocusedRunProjection(currentGraph, agentState, agentEvents, { includeEventGroups: false });
     const errorSummaries = projection.errorSummaries;
     const knownNodeOutputs: Record<string, unknown> = {};
     let previousTimestamp: string | null = null;
@@ -1311,11 +1311,18 @@ function buildFocusedEventGroupsFromNormalizedEvents(
     .reverse();
 }
 
+export type BuildFocusedRunProjectionOptions = {
+  /** When false, skips building timeline event groups (expensive on large histories). Default true. */
+  includeEventGroups?: boolean;
+};
+
 export function buildFocusedRunProjection(
   graph: GraphDefinition | null,
   runState: RunState | null,
   events: RuntimeEvent[],
+  options?: BuildFocusedRunProjectionOptions,
 ): FocusedRunProjection {
+  const includeEventGroups = options?.includeEventGroups !== false;
   const labels = nodeLabelMap(graph);
   const normalizedEvents = normalizeFocusedEvents(events);
   const completedNodeIdSet = new Set(
@@ -1348,7 +1355,7 @@ export function buildFocusedRunProjection(
       finalOutput: runState?.final_output ?? null,
       nodeErrors: runState?.node_errors ?? {},
     },
-    eventGroups: buildFocusedEventGroupsFromNormalizedEvents(graph, normalizedEvents),
+    eventGroups: includeEventGroups ? buildFocusedEventGroupsFromNormalizedEvents(graph, normalizedEvents) : [],
   };
 }
 

@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -19,7 +20,7 @@ if str(SRC) not in sys.path:
 from graph_agent.examples.tool_schema_repair import build_example_services
 from graph_agent.providers.base import ModelProvider, ModelRequest, ModelResponse, ProviderPreflightResult
 from graph_agent.providers.outlook import OutlookDraftClient, OutlookDraftResult
-from graph_agent.runtime.core import GraphDefinition, _extract_outlook_recipient_value
+from graph_agent.runtime.core import GraphDefinition, GraphValidationError, _extract_outlook_recipient_value
 from graph_agent.runtime.engine import GraphRuntime
 from graph_agent.runtime.microsoft_auth import MicrosoftAuthStatus
 
@@ -65,6 +66,7 @@ class FakeOutlookDraftClient:
     ) -> OutlookDraftResult:
         self.calls.append(
             {
+                "method": "create_draft",
                 "access_token": access_token,
                 "to_recipients": list(to_recipients),
                 "subject": subject,
@@ -84,6 +86,47 @@ class FakeOutlookDraftClient:
                 "id": "draft-123",
                 "conversationId": "conversation-123",
                 "internetMessageId": "internet-message-123",
+            },
+        )
+
+    def create_reply_draft(
+        self,
+        *,
+        access_token: str,
+        reply_to_message_id: str,
+        reply_to_internet_message_id: str = "",
+        reply_mode: str = "reply",
+        to_recipients: list[str],
+        subject: str,
+        body: str,
+        signature: str = "",
+    ) -> OutlookDraftResult:
+        self.calls.append(
+            {
+                "method": "create_reply_draft",
+                "access_token": access_token,
+                "reply_to_message_id": reply_to_message_id,
+                "reply_to_internet_message_id": reply_to_internet_message_id,
+                "reply_mode": reply_mode,
+                "to_recipients": list(to_recipients),
+                "subject": subject,
+                "body": body,
+                "signature": signature,
+            }
+        )
+        combined_body = f"{body}\n\n{signature}".strip() if signature else body
+        return OutlookDraftResult(
+            draft_id="draft-reply-1",
+            subject=subject or "Re: prior",
+            body=combined_body,
+            to_recipients=list(to_recipients) if to_recipients else ["prior@example.com"],
+            web_link="https://outlook.office.com/mail/draft-reply-1",
+            created_at="2026-04-10T12:00:00Z",
+            last_modified_at="2026-04-10T12:00:00Z",
+            raw_response={
+                "id": "draft-reply-1",
+                "conversationId": "conversation-reply-1",
+                "internetMessageId": "internet-reply-1",
             },
         )
 
@@ -151,18 +194,100 @@ class _OutlookDraftStubHandler(BaseHTTPRequestHandler):
                 "body": payload,
             }
         )
+        if "/stale-parent/createReply" in self.path:
+            response_body = json.dumps(
+                {
+                    "error": {
+                        "code": "ErrorItemNotFound",
+                        "message": "The specified object was not found in the store.",
+                    }
+                }
+            ).encode("utf-8")
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response_body)))
+            self.end_headers()
+            self.wfile.write(response_body)
+            return
+        if "/createReplyAll" in self.path:
+            draft_id = "draft-reply-http-all"
+            subject = "Re: parent (all)"
+        elif "/createReply" in self.path:
+            draft_id = "draft-reply-http"
+            subject = "Re: parent"
+        else:
+            draft_id = "draft-http-1"
+            subject = str(payload.get("subject", "") or "")
+        response_obj: dict[str, object] = {
+            "id": draft_id,
+            "subject": subject,
+            "conversationId": "conversation-http-1",
+            "internetMessageId": "internet-http-1",
+            "webLink": f"https://outlook.office.com/mail/{draft_id}",
+            "createdDateTime": "2026-04-10T14:00:00Z",
+            "lastModifiedDateTime": "2026-04-10T14:00:00Z",
+        }
+        if "/createReply" in self.path or "/createReplyAll" in self.path:
+            response_obj["toRecipients"] = [{"emailAddress": {"address": "sender@example.com", "name": "Sender"}}]
+        response_body = json.dumps(response_obj).encode("utf-8")
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_body)))
+        self.end_headers()
+        self.wfile.write(response_body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self.__class__.requests.append(
+            {
+                "method": "GET",
+                "path": self.path,
+                "authorization": self.headers.get("Authorization", ""),
+                "body": {},
+            }
+        )
         response_body = json.dumps(
             {
-                "id": "draft-http-1",
-                "subject": payload.get("subject", ""),
-                "conversationId": "conversation-http-1",
-                "internetMessageId": "internet-http-1",
-                "webLink": "https://outlook.office.com/mail/draft-http-1",
-                "createdDateTime": "2026-04-10T14:00:00Z",
-                "lastModifiedDateTime": "2026-04-10T14:00:00Z",
+                "value": [
+                    {
+                        "id": "resolved-parent",
+                        "internetMessageId": "<parent-internet-id@example.com>",
+                    }
+                ]
             }
         ).encode("utf-8")
-        self.send_response(201)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_body)))
+        self.end_headers()
+        self.wfile.write(response_body)
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        raw_body = self.rfile.read(content_length).decode("utf-8")
+        payload = json.loads(raw_body or "{}")
+        self.__class__.requests.append(
+            {
+                "method": "PATCH",
+                "path": self.path,
+                "authorization": self.headers.get("Authorization", ""),
+                "body": payload,
+            }
+        )
+        tail = urlparse(self.path).path.split("/me/messages/", 1)[-1]
+        draft_id = unquote(tail)
+        response_obj: dict[str, object] = {
+            "id": draft_id,
+            "subject": "Re: parent",
+            "conversationId": "conversation-http-1",
+            "internetMessageId": "internet-http-1",
+            "webLink": f"https://outlook.office.com/mail/{draft_id}",
+            "createdDateTime": "2026-04-10T14:00:00Z",
+            "lastModifiedDateTime": "2026-04-10T14:05:00Z",
+            "toRecipients": [{"emailAddress": {"address": "sender@example.com", "name": "Sender"}}],
+        }
+        response_obj.update(payload)
+        response_body = json.dumps(response_obj).encode("utf-8")
+        self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(response_body)))
         self.end_headers()
@@ -194,10 +319,29 @@ class _SupabaseEmailLogStubHandler(BaseHTTPRequestHandler):
     request_bodies: list[object] = []
     fail_source_run_id_fk_once: bool = False
     source_run_id_fk_failures: int = 0
+    mock_reply_parent_by_provider_message_id: dict[str, dict[str, object]] = {}
 
     def do_GET(self) -> None:  # noqa: N802
         type(self).last_headers = {str(key).lower(): str(value) for key, value in self.headers.items()}
         type(self).last_path = self.path
+        parsed = urlparse(self.path)
+        if parsed.path == "/rest/v1/outbound_email_messages" and parsed.query:
+            params = parse_qs(parsed.query)
+            filter_vals = params.get("provider_message_id", [])
+            if filter_vals:
+                raw_filter = filter_vals[0]
+                mid = raw_filter[3:] if raw_filter.startswith("eq.") else raw_filter
+                parent = type(self).mock_reply_parent_by_provider_message_id.get(mid)
+                rows = [parent] if parent else []
+            else:
+                rows = []
+            body = json.dumps(rows).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/rest/v1/":
             payload = {
                 "openapi": "3.0.0",
@@ -309,6 +453,7 @@ class SupabaseEmailLogStubServer:
         _SupabaseEmailLogStubHandler.last_path = ""
         _SupabaseEmailLogStubHandler.last_json_body = None
         _SupabaseEmailLogStubHandler.request_bodies = []
+        _SupabaseEmailLogStubHandler.mock_reply_parent_by_provider_message_id = {}
         _SupabaseEmailLogStubHandler.fail_source_run_id_fk_once = False
         _SupabaseEmailLogStubHandler.source_run_id_fk_failures = 0
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _SupabaseEmailLogStubHandler)
@@ -372,6 +517,20 @@ def build_outlook_draft_graph_payload() -> dict[str, object]:
             }
         ],
     }
+
+
+def build_outlook_reply_draft_graph_with_logger_payload() -> dict[str, object]:
+    base = build_outlook_draft_graph_with_logger_payload()
+    nodes = list(base["nodes"])
+    for node in nodes:
+        if node.get("id") == "draft":
+            cfg = dict(node["config"])
+            cfg["reply_to_message_id"] = "{reply_to_message_id}"
+            cfg["reply_mode"] = "reply"
+            node["config"] = cfg
+            break
+    base["nodes"] = nodes
+    return base
 
 
 def build_outlook_draft_graph_with_logger_payload() -> dict[str, object]:
@@ -992,6 +1151,82 @@ class OutlookDraftNodeTests(unittest.TestCase):
             "I came across your profile and wanted to reach out.\n\n"
             "Would love to grab 15 minutes to learn what you're hiring for.",
         )
+
+    def test_outlook_draft_node_extracts_body_from_json_string_payload(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph_payload = build_outlook_draft_graph_payload()
+        draft_node = graph_payload["nodes"][1]
+        assert isinstance(draft_node, dict)
+        draft_node["config"] = {
+            **draft_node["config"],
+            "subject": "JSON body subject",
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        state = runtime.run(
+            graph,
+            json.dumps({"body": "Hey James,<br><br>Still open for a call?<br><br>Best,<br>Morgan Stuart"}),
+        )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(fake_client.calls[0]["body"], "Hey James,<br><br>Still open for a call?<br><br>Best,<br>Morgan Stuart")
+        self.assertNotIn('"body"', state.final_output["body"])
+
+    def test_outlook_draft_node_extracts_body_from_jsonish_multiline_payload(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph_payload = build_outlook_draft_graph_payload()
+        draft_node = graph_payload["nodes"][1]
+        assert isinstance(draft_node, dict)
+        draft_node["config"] = {
+            **draft_node["config"],
+            "subject": "JSONish body subject",
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        payload = '''{
+  "body": "Hey James,
+
+I wanted to follow up on my last email.
+
+Still open for a call if you're available.
+
+Best,
+Morgan Stuart"
+}'''
+        state = runtime.run(graph, payload)
+
+        expected_body = (
+            "Hey James,\n\n"
+            "I wanted to follow up on my last email.\n\n"
+            "Still open for a call if you're available.\n\n"
+            "Best,\n"
+            "Morgan Stuart"
+        )
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(fake_client.calls[0]["body"], expected_body)
+        self.assertEqual(state.final_output["body"], expected_body)
+        self.assertNotIn('"body"', state.final_output["body"])
+        self.assertNotIn("{", state.final_output["body"])
 
     def test_outlook_draft_node_uses_payload_email_when_to_field_is_blank(self) -> None:
         fake_client = FakeOutlookDraftClient()
@@ -1619,6 +1854,250 @@ class OutlookDraftNodeTests(unittest.TestCase):
             [event.payload.get("iteration_id") for event in display_to_draft_transitions],
             ["sheet:row:1", "sheet:row:2"],
         )
+
+    def test_outlook_graph_validation_requires_logger_when_reply_configured(self) -> None:
+        graph_payload = build_outlook_draft_graph_payload()
+        draft_node = graph_payload["nodes"][1]
+        assert isinstance(draft_node, dict)
+        draft_node["config"] = {
+            **draft_node["config"],
+            "reply_to_message_id": "static-parent-graph-id",
+            "reply_mode": "reply",
+        }
+        with self.assertRaises(GraphValidationError) as ctx:
+            GraphDefinition.from_dict(graph_payload)
+        self.assertIn("reply_to_message_id", str(ctx.exception))
+        self.assertIn("logger", str(ctx.exception).lower())
+
+    def test_outlook_reply_runtime_requires_logger_when_payload_has_reply_id(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph = GraphDefinition.from_dict(build_outlook_draft_graph_payload())
+        graph.validate_against_services(self.services)
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+        run_payload = {
+            "reply_to_message_id": "parent-msg-orphan",
+            "subject": "Follow-up for outlook-draft-agent",
+            "body": "Reply body text.",
+        }
+        state = runtime.run(graph, run_payload, run_id="run-outlook-reply-no-logger")
+        self.assertEqual(state.status, "completed")
+        self.assertIn("draft", state.node_errors)
+        self.assertEqual(state.node_errors["draft"]["type"], "outlook_reply_configuration_error")
+        self.assertEqual(len(fake_client.calls), 0)
+        self.assertEqual(fake_auth.acquire_calls, 0)
+
+    def test_outlook_reply_draft_logs_parent_and_root_ids(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph = GraphDefinition.from_dict(build_outlook_reply_draft_graph_with_logger_payload())
+        graph.validate_against_services(self.services)
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+        run_payload = {
+            "reply_to_message_id": "parent-graph-msg-1",
+            "subject": "Follow-up for outlook-draft-agent",
+            "body": "Threaded reply body.",
+        }
+        with SupabaseEmailLogStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_SUPABASE_URL": base_url,
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+            },
+            clear=False,
+        ):
+            _SupabaseEmailLogStubHandler.mock_reply_parent_by_provider_message_id = {
+                "parent-graph-msg-1": {
+                    "id": "550e8400-e29b-41d4-a716-446655440001",
+                    "recipient_email": "james@example.com",
+                    "root_outbound_email_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "provider_message_id": "parent-graph-msg-1",
+                }
+            }
+            state = runtime.run(graph, run_payload, run_id="run-outlook-reply-log")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(len(fake_client.calls), 1)
+        self.assertEqual(fake_client.calls[0]["method"], "create_reply_draft")
+        self.assertEqual(fake_client.calls[0]["reply_to_message_id"], "parent-graph-msg-1")
+        self.assertEqual(fake_client.calls[0]["reply_mode"], "reply")
+        self.assertEqual(fake_client.calls[0]["to_recipients"], ["alex@example.com", "taylor@example.com"])
+        self.assertEqual(state.final_output["delivery_status"], "reply_draft_saved")
+        self.assertEqual(state.final_output["reply_to_message_id"], "parent-graph-msg-1")
+        row = _SupabaseEmailLogStubHandler.last_json_body
+        assert isinstance(row, dict)
+        self.assertEqual(row["parent_outbound_email_id"], "550e8400-e29b-41d4-a716-446655440001")
+        self.assertEqual(row["root_outbound_email_id"], "550e8400-e29b-41d4-a716-446655440000")
+
+    def test_outlook_reply_draft_lets_graph_resolve_recipient_and_subject(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph_payload = build_outlook_reply_draft_graph_with_logger_payload()
+        draft_node = next(node for node in graph_payload["nodes"] if isinstance(node, dict) and node.get("id") == "draft")
+        draft_node["config"] = {
+            **draft_node["config"],
+            "to": "",
+            "subject": "",
+        }
+        graph = GraphDefinition.from_dict(graph_payload)
+        graph.validate_against_services(self.services)
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+        run_payload = {
+            "reply_to_message_id": "parent-graph-msg-2",
+            "body": "Threaded reply body.",
+            "email": "should-not-override@example.com",
+            "subject": "Should not override reply subject",
+        }
+        with SupabaseEmailLogStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_SUPABASE_URL": base_url,
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+            },
+            clear=False,
+        ):
+            _SupabaseEmailLogStubHandler.mock_reply_parent_by_provider_message_id = {
+                "parent-graph-msg-2": {
+                    "id": "550e8400-e29b-41d4-a716-446655440002",
+                    "recipient_email": "prior-recipient@example.com",
+                    "root_outbound_email_id": None,
+                    "provider_message_id": "parent-graph-msg-2",
+                }
+            }
+            state = runtime.run(graph, run_payload, run_id="run-outlook-reply-graph-fields")
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(len(fake_client.calls), 1)
+        self.assertEqual(fake_client.calls[0]["method"], "create_reply_draft")
+        self.assertEqual(fake_client.calls[0]["to_recipients"], ["prior-recipient@example.com"])
+        self.assertEqual(fake_client.calls[0]["subject"], "")
+        self.assertEqual(state.final_output["to_recipients"], ["prior-recipient@example.com"])
+        self.assertEqual(state.final_output["subject"], "Re: prior")
+        row = _SupabaseEmailLogStubHandler.last_json_body
+        assert isinstance(row, dict)
+        self.assertEqual(row["recipient_email"], "prior-recipient@example.com")
+        self.assertEqual(row["subject"], "Re: prior")
+        self.assertEqual(row["parent_outbound_email_id"], "550e8400-e29b-41d4-a716-446655440002")
+        self.assertEqual(row["root_outbound_email_id"], "550e8400-e29b-41d4-a716-446655440002")
+
+    def test_outlook_reply_draft_fails_when_parent_row_missing(self) -> None:
+        fake_client = FakeOutlookDraftClient()
+        fake_auth = FakeMicrosoftAuthService()
+        self.services.outlook_draft_client = fake_client
+        self.services.microsoft_auth_service = fake_auth
+        graph = GraphDefinition.from_dict(build_outlook_reply_draft_graph_with_logger_payload())
+        graph.validate_against_services(self.services)
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+        _SupabaseEmailLogStubHandler.mock_reply_parent_by_provider_message_id = {}
+        run_payload = {
+            "reply_to_message_id": "missing-parent-id",
+            "subject": "Follow-up for outlook-draft-agent",
+            "body": "Threaded reply body.",
+        }
+        with SupabaseEmailLogStubServer() as base_url, patch.dict(
+            os.environ,
+            {
+                "GRAPH_AGENT_SUPABASE_URL": base_url,
+                "GRAPH_AGENT_SUPABASE_SECRET_KEY": "service-role-key",
+            },
+            clear=False,
+        ):
+            _SupabaseEmailLogStubHandler.mock_reply_parent_by_provider_message_id = {}
+            state = runtime.run(graph, run_payload, run_id="run-outlook-reply-missing")
+
+        self.assertEqual(state.status, "completed")
+        self.assertIn("draft", state.node_errors)
+        self.assertEqual(state.node_errors["draft"]["type"], "outbound_reply_parent_not_found")
+        self.assertEqual(len(fake_client.calls), 0)
+
+    def test_outlook_client_create_reply_then_patches_overrides(self) -> None:
+        with OutlookHttpStubServer() as server_url:
+            client = OutlookDraftClient(api_base_url=server_url)
+            result = client.create_reply_draft(
+                access_token="graph-token",
+                reply_to_message_id="msg-parent-1",
+                reply_mode="reply",
+                to_recipients=["override@example.com"],
+                subject="Override subject",
+                body="Override body.",
+                signature="",
+            )
+
+        self.assertEqual(result.draft_id, "draft-reply-http")
+        self.assertEqual(len(_OutlookDraftStubHandler.requests), 2)
+        self.assertIn("/msg-parent-1/createReply", _OutlookDraftStubHandler.requests[0]["path"])
+        self.assertEqual(_OutlookDraftStubHandler.requests[0]["method"], "POST")
+        self.assertEqual(_OutlookDraftStubHandler.requests[1]["method"], "PATCH")
+        patch_req = _OutlookDraftStubHandler.requests[1]
+        self.assertIn("/me/messages/draft-reply-http", patch_req["path"])
+        self.assertEqual(patch_req["body"]["subject"], "Override subject")
+        self.assertEqual(patch_req["body"]["body"]["content"], "Override body.")
+        self.assertEqual(
+            patch_req["body"]["toRecipients"],
+            [{"emailAddress": {"address": "override@example.com"}}],
+        )
+        self.assertEqual(result.subject, "Override subject")
+
+    def test_outlook_client_resolves_stale_reply_message_id_from_internet_message_id(self) -> None:
+        with OutlookHttpStubServer() as server_url:
+            client = OutlookDraftClient(api_base_url=server_url)
+            result = client.create_reply_draft(
+                access_token="graph-token",
+                reply_to_message_id="stale-parent",
+                reply_to_internet_message_id="<parent-internet-id@example.com>",
+                reply_mode="reply",
+                to_recipients=[],
+                subject="",
+                body="Reply body.",
+                signature="",
+            )
+
+        self.assertEqual(result.draft_id, "draft-reply-http")
+        self.assertEqual(len(_OutlookDraftStubHandler.requests), 4)
+        self.assertIn("/stale-parent/createReply", _OutlookDraftStubHandler.requests[0]["path"])
+        self.assertEqual(_OutlookDraftStubHandler.requests[1]["method"], "GET")
+        self.assertIn("/me/messages?", _OutlookDraftStubHandler.requests[1]["path"])
+        self.assertIn("internetMessageId", _OutlookDraftStubHandler.requests[1]["path"])
+        self.assertIn("/resolved-parent/createReply", _OutlookDraftStubHandler.requests[2]["path"])
+        self.assertEqual(_OutlookDraftStubHandler.requests[3]["method"], "PATCH")
+
+    def test_outlook_client_create_reply_all_uses_reply_all_path(self) -> None:
+        with OutlookHttpStubServer() as server_url:
+            client = OutlookDraftClient(api_base_url=server_url)
+            client.create_reply_draft(
+                access_token="graph-token",
+                reply_to_message_id="msg-parent-2",
+                reply_mode="reply_all",
+                to_recipients=[],
+                subject="",
+                body="",
+                signature="",
+            )
+
+        self.assertEqual(len(_OutlookDraftStubHandler.requests), 1)
+        self.assertIn("/msg-parent-2/createReplyAll", _OutlookDraftStubHandler.requests[0]["path"])
 
 
 if __name__ == "__main__":

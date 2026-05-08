@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any, Mapping
 from uuid import uuid4
@@ -8,6 +9,9 @@ from uuid import uuid4
 from graph_agent.api.run_state_reducer import build_run_state, replay_events
 from graph_agent.runtime.event_contract import normalize_runtime_event_dict, normalize_runtime_state_snapshot
 from graph_agent.runtime.core import utc_now_iso
+
+# Batch JSONL appends to reduce syscalls during chatty runs; flushed on threshold, write_state, load, or shutdown.
+_EVENT_APPEND_BATCH_MAX = 48
 
 
 def _merge_snapshot_metadata(recovered: dict[str, Any], snapshot: dict[str, Any] | None) -> dict[str, Any]:
@@ -32,6 +36,25 @@ def _merge_snapshot_metadata(recovered: dict[str, Any], snapshot: dict[str, Any]
 class FilesystemRunStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or Path(__file__).resolve().parents[3] / ".logs" / "runs"
+        self._pending_event_lines: dict[str, list[str]] = {}
+        self._lock = threading.Lock()
+
+    def flush(self, timeout_seconds: float | None = None) -> None:
+        """Persist any buffered events for all runs (sync; ignores timeout)."""
+        del timeout_seconds
+        with self._lock:
+            run_ids = list(self._pending_event_lines.keys())
+            for rid in run_ids:
+                self._flush_events_for_run_unlocked(rid)
+
+    def _flush_events_for_run_unlocked(self, run_id: str) -> None:
+        lines = self._pending_event_lines.pop(run_id, None)
+        if not lines:
+            return
+        run_dir = self._run_dir(run_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        with (run_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.writelines(lines)
 
     def initialize_run(self, state: Mapping[str, Any]) -> None:
         run_id = str(state["run_id"])
@@ -55,13 +78,17 @@ class FilesystemRunStore:
         self.write_state(run_id, state)
 
     def append_event(self, run_id: str, event: Mapping[str, Any]) -> None:
-        run_dir = self._run_dir(run_id)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        with (run_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(normalize_runtime_event_dict(event), sort_keys=True))
-            handle.write("\n")
+        normalized = normalize_runtime_event_dict(event)
+        line = json.dumps(normalized, sort_keys=True) + "\n"
+        with self._lock:
+            buf = self._pending_event_lines.setdefault(run_id, [])
+            buf.append(line)
+            if len(buf) >= _EVENT_APPEND_BATCH_MAX:
+                self._flush_events_for_run_unlocked(run_id)
 
     def write_state(self, run_id: str, state: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._flush_events_for_run_unlocked(run_id)
         run_dir = self._run_dir(run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
         normalized_state = normalize_runtime_state_snapshot(state) or dict(state)
@@ -96,6 +123,8 @@ class FilesystemRunStore:
         return json.loads(manifest_path.read_text(encoding="utf-8"))
 
     def load_events(self, run_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            self._flush_events_for_run_unlocked(run_id)
         events_path = self._run_dir(run_id) / "events.jsonl"
         if not events_path.exists():
             return []

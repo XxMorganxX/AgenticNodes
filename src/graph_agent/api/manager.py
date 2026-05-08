@@ -79,6 +79,69 @@ DISCORD_START_PROVIDER_ID = "start.discord_message"
 LISTENER_MULTI_KEY_SEP = "\x1f"
 
 
+def _merge_runtime_graph_env_vars(
+    saved_env_vars: dict[str, str],
+    runtime_env_vars: dict[str, str] | None,
+) -> dict[str, str]:
+    if not isinstance(runtime_env_vars, dict):
+        return saved_env_vars
+    for key, value in runtime_env_vars.items():
+        normalized_key = str(key).strip()
+        if not normalized_key:
+            continue
+        normalized_value = str(value if value is not None else "")
+        if (
+            normalized_key != "EMAIL_TABLE_SUFFIX"
+            and not normalized_value.strip()
+            and str(saved_env_vars.get(normalized_key, "") or "").strip()
+        ):
+            continue
+        saved_env_vars[normalized_key] = normalized_value
+    return saved_env_vars
+
+
+def _with_mock_api_provider_override(document: TestEnvironmentDefinition) -> TestEnvironmentDefinition:
+    payload = document.to_dict()
+
+    def rewrite_node(node_payload: dict[str, Any]) -> dict[str, Any]:
+        kind = str(node_payload.get("kind", "") or "").strip()
+        category = str(node_payload.get("category", "") or "").strip()
+        if kind not in {"model", "provider"} and category not in {"api", "provider"}:
+            return node_payload
+
+        next_node = dict(node_payload)
+        raw_config = next_node.get("config")
+        next_config = dict(raw_config) if isinstance(raw_config, dict) else {}
+        next_config["provider_name"] = "mock"
+        if "model" in next_config or kind == "provider" or category == "provider":
+            next_config["model"] = "mock-default"
+        next_node["config"] = next_config
+        next_node["model_provider_name"] = "mock"
+        if kind == "provider" or category == "provider":
+            next_node["provider_id"] = "provider.mock"
+            next_node["provider_label"] = "Mock Provider"
+        return next_node
+
+    agents = payload.get("agents", [])
+    if isinstance(agents, list):
+        rewritten_agents: list[dict[str, Any]] = []
+        for agent in agents:
+            if not isinstance(agent, dict):
+                rewritten_agents.append(agent)
+                continue
+            next_agent = dict(agent)
+            nodes = next_agent.get("nodes", [])
+            if isinstance(nodes, list):
+                next_agent["nodes"] = [
+                    rewrite_node(dict(node)) if isinstance(node, dict) else node
+                    for node in nodes
+                ]
+            rewritten_agents.append(next_agent)
+        payload["agents"] = rewritten_agents
+
+    return load_graph_document(payload)
+
+
 def _split_listener_scope_key(graph_id: str) -> tuple[str, str | None]:
     """Split cron composite keys; plain ids behave like single-graph cron."""
     s = str(graph_id or "").strip()
@@ -441,6 +504,15 @@ class GraphRunManager:
         self._runtime_instance_id = str(uuid4())
         self._heartbeat_interval_seconds = _read_interval_env("GRAPH_AGENT_RUN_HEARTBEAT_INTERVAL_SECONDS", 1.0)
         self._heartbeat_timeout_seconds = _read_interval_env("GRAPH_AGENT_RUN_HEARTBEAT_TIMEOUT_SECONDS", 5.0)
+        # Periodic heartbeat ticks update in-memory liveness every interval, but
+        # we only persist to the run store at this slower cadence to avoid a
+        # write storm proportional to (active runs * agents). Must stay below
+        # the timeout so stale-detection still works.
+        self._heartbeat_persist_interval_seconds = _read_interval_env(
+            "GRAPH_AGENT_RUN_HEARTBEAT_PERSIST_INTERVAL_SECONDS",
+            max(self._heartbeat_interval_seconds, self._heartbeat_timeout_seconds / 2.0),
+        )
+        self._last_heartbeat_persist_at: dict[str, float] = {}
         self._catalog_status_ttl_seconds = _read_interval_env("GRAPH_AGENT_CATALOG_STATUS_TTL_SECONDS", 15.0)
         self._catalog_status_cache: tuple[float, dict[str, Any]] | None = None
         self._supabase_schema_cache_ttl_seconds = _read_interval_env(
@@ -1035,11 +1107,14 @@ class GraphRunManager:
         agent_ids: list[str] | None = None,
         documents: list[dict[str, Any]] | None = None,
         graph_env_vars: dict[str, str] | None = None,
+        mock_api_providers: bool = False,
         *,
         _parent_run_id: str | None = None,
     ) -> str:
         self._start_heartbeat_loop()
         document = load_graph_document(self._store.get_graph(graph_id))
+        if mock_api_providers:
+            document = _with_mock_api_provider_override(document)
         if _parent_run_id is None and not document.is_multi_agent:
             graph = document.as_graph()
             start_provider_id = graph.start_node().provider_id
@@ -1051,14 +1126,7 @@ class GraphRunManager:
                 raise ValueError(
                     f"graph '{graph_id}' requires a listener session, not a manual run"
                 )
-        if isinstance(graph_env_vars, dict):
-            document.env_vars.update(
-                {
-                    str(key).strip(): str(value if value is not None else "")
-                    for key, value in graph_env_vars.items()
-                    if str(key).strip()
-                }
-            )
+        _merge_runtime_graph_env_vars(document.env_vars, graph_env_vars)
         document.validate_against_services(self._services)
         run_id = str(uuid4())
         selected_agents = self._resolve_environment_agents(document, agent_ids) if document.is_multi_agent else None
@@ -2252,28 +2320,34 @@ class GraphRunManager:
             self._event_backlog[run_id] = _trim_event_backlog(backlog)
             state = self._run_states.get(run_id)
             if state is not None:
+                # apply_event returns a fresh dict tree; deepcopy here would be
+                # gratuitous (the reducer never mutates `previous`, and the run
+                # stores defensively normalize/copy on input). We pass the live
+                # ref directly and keep _run_states[child_run_id] aliased to
+                # parent.agent_runs[agent_id] so heartbeat in-place stamping
+                # naturally updates both views.
                 next_state = apply_event(state, event)
                 self._run_states[run_id] = next_state
                 if should_flush_state:
-                    parent_snapshot = deepcopy(next_state)
+                    parent_snapshot = next_state
                 if is_iteration_snapshot:
-                    parent_iteration_snapshot = deepcopy(next_state)
+                    parent_iteration_snapshot = next_state
                 if event["event_type"].startswith("agent."):
                     payload = event.get("payload", {})
                     agent_id = str(event.get("agent_id") or payload.get("agent_id") or "")
                     agent_state = next_state["agent_runs"].get(agent_id) if agent_id else None
                     if agent_state is not None:
                         child_run_id = str(agent_state["run_id"])
-                        self._run_states[child_run_id] = deepcopy(agent_state)
+                        self._run_states[child_run_id] = agent_state
                         child_event = {
                             **event,
                             "event_type": event["event_type"].removeprefix("agent."),
                             "run_id": child_run_id,
                         }
                         if should_flush_state:
-                            child_snapshot = deepcopy(agent_state)
+                            child_snapshot = agent_state
                         if is_iteration_snapshot:
-                            child_iteration_snapshot = deepcopy(agent_state)
+                            child_iteration_snapshot = agent_state
             subscribers = list(self._subscribers.get(run_id, []))
 
         store.append_event(run_id, event)
@@ -2555,12 +2629,19 @@ class GraphRunManager:
             return
         heartbeat_at = utc_now_iso()
         for run_id in active_run_ids:
-            self._touch_run_liveness(run_id, heartbeat_at)
+            self._touch_run_liveness(run_id, heartbeat_at, force=False)
 
-    def _touch_run_liveness(self, run_id: str, heartbeat_at: str | None = None) -> None:
+    def _touch_run_liveness(
+        self,
+        run_id: str,
+        heartbeat_at: str | None = None,
+        *,
+        force: bool = True,
+    ) -> None:
         heartbeat_value = heartbeat_at or utc_now_iso()
         parent_snapshot: dict[str, Any] | None = None
         child_snapshots: dict[str, dict[str, Any]] = {}
+        now = time.monotonic()
         with self._lock:
             state = self._run_states.get(run_id)
             if state is None:
@@ -2570,10 +2651,23 @@ class GraphRunManager:
                 self._stamp_run_liveness(agent_state, heartbeat_value)
                 child_run_id = str(agent_state.get("run_id") or "")
                 if child_run_id:
-                    child_snapshots[child_run_id] = deepcopy(agent_state)
-                    self._run_states[child_run_id] = deepcopy(agent_state)
+                    # Re-establish aliasing so future in-place stamps update
+                    # both views of the child state without copying.
+                    self._run_states[child_run_id] = agent_state
+                    child_snapshots[child_run_id] = agent_state
                 state["agent_runs"][agent_id] = agent_state
-            parent_snapshot = deepcopy(state)
+            # Periodic heartbeat ticks debounce store writes; in-memory state
+            # has already been updated above, so a skipped write only delays
+            # persistence (bounded by _heartbeat_persist_interval_seconds).
+            if not force:
+                last_persist_at = self._last_heartbeat_persist_at.get(run_id)
+                if (
+                    last_persist_at is not None
+                    and (now - last_persist_at) < self._heartbeat_persist_interval_seconds
+                ):
+                    return
+            self._last_heartbeat_persist_at[run_id] = now
+            parent_snapshot = state
         if parent_snapshot is not None:
             self._run_store_for(run_id).write_state(run_id, parent_snapshot)
         for child_run_id, snapshot in child_snapshots.items():

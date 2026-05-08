@@ -5057,6 +5057,134 @@ class ModelProviderTests(unittest.TestCase):
         complete_context = NodeContext(graph=graph, state=partial_state, services=services, node_id="compose")
         self.assertTrue(compose_node.is_ready(complete_context))
 
+    def test_context_builder_releases_hold_when_an_upstream_source_fails(self) -> None:
+        """A failed upstream node leaves only `state.node_errors` populated (output is None).
+        The context builder must treat that source as 'done' so the rest of the loop body can
+        run; otherwise hold_outgoing_edges stays True forever and the downstream Structured
+        Payload Builder is never reached. Reproduces the deadlock observed in the
+        Email Cold Outreach agent when apollo-email-lookup fails (e.g. missing API key)."""
+        services = build_example_services()
+        graph = GraphDefinition.from_dict(
+            {
+                "graph_id": "context-builder-failed-source",
+                "name": "Context Builder Failed Source",
+                "description": "",
+                "version": "1.0",
+                "start_node_id": "start",
+                "nodes": [
+                    {
+                        "id": "start",
+                        "kind": "input",
+                        "category": "start",
+                        "label": "Start",
+                        "provider_id": "start.manual_run",
+                        "provider_label": "Run Button Start",
+                        "config": {"input_binding": {"type": "input_payload"}},
+                        "position": {"x": 0, "y": 0},
+                    },
+                    {
+                        "id": "display_a",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Display A",
+                        "provider_id": "core.data_display",
+                        "provider_label": "Envelope Display Node",
+                        "config": {
+                            "mode": "passthrough",
+                            "show_input_envelope": True,
+                            "lock_passthrough": True,
+                        },
+                        "position": {"x": 160, "y": 0},
+                    },
+                    {
+                        "id": "display_b",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Display B",
+                        "provider_id": "core.data_display",
+                        "provider_label": "Envelope Display Node",
+                        "config": {
+                            "mode": "passthrough",
+                            "show_input_envelope": True,
+                            "lock_passthrough": True,
+                        },
+                        "position": {"x": 160, "y": 140},
+                    },
+                    {
+                        "id": "compose",
+                        "kind": "data",
+                        "category": "data",
+                        "label": "Compose",
+                        "provider_id": "core.context_builder",
+                        "provider_label": "Context Builder",
+                        "config": {
+                            "mode": "context_builder",
+                            "template": "",
+                            "joiner": "\n\n",
+                            "input_bindings": [],
+                        },
+                        "position": {"x": 360, "y": 70},
+                    },
+                    {
+                        "id": "finish",
+                        "kind": "output",
+                        "category": "end",
+                        "label": "Finish",
+                        "provider_id": "core.output",
+                        "provider_label": "Core Output Node",
+                        "config": {"source_binding": {"type": "latest_payload", "source": "compose"}},
+                        "position": {"x": 560, "y": 70},
+                    },
+                ],
+                "edges": [
+                    {"id": "start-display-a", "source_id": "start", "target_id": "display_a", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "display-a-compose", "source_id": "display_a", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "display-b-compose", "source_id": "display_b", "target_id": "compose", "label": "", "kind": "standard", "priority": 100},
+                    {"id": "compose-finish", "source_id": "compose", "target_id": "finish", "label": "", "kind": "standard", "priority": 100},
+                ],
+            }
+        )
+        graph.validate_against_services(services)
+
+        compose_node = graph.get_node("compose")
+        state = RunState(graph_id=graph.graph_id, input_payload="request")
+        state.node_outputs["display_a"] = {
+            "schema_version": "1.0",
+            "from_node_id": "display_a",
+            "from_category": "data",
+            "payload": "first",
+            "artifacts": {},
+            "errors": [],
+            "tool_calls": [],
+            "metadata": {"contract": "message_envelope", "node_kind": "data"},
+        }
+        state.node_errors["display_b"] = {
+            "type": "mock_failure",
+            "message": "simulated upstream failure",
+        }
+        context = NodeContext(graph=graph, state=state, services=services, node_id="compose")
+
+        self.assertTrue(
+            compose_node._context_builder_source_ready(context, "display_a"),
+            "succeeded source must be considered ready",
+        )
+        self.assertTrue(
+            compose_node._context_builder_source_ready(context, "display_b"),
+            "errored source must be considered ready (it has finished, just with no payload)",
+        )
+        self.assertTrue(
+            compose_node._context_builder_all_sources_fulfilled(context),
+            "all sources are accounted for once the failed source is in node_errors",
+        )
+
+        result = compose_node.execute(context)
+        self.assertEqual(result.status, "success")
+        self.assertFalse(
+            bool(result.metadata.get("hold_outgoing_edges")),
+            "context builder must release hold_outgoing_edges so downstream nodes can run",
+        )
+        self.assertTrue(result.output["metadata"]["context_builder_complete"])
+
     def test_context_builder_accepts_multiple_binding_only_display_node_inputs(self) -> None:
         services = build_example_services()
         services.model_providers["auto_message"] = AutoMessageProvider()

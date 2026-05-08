@@ -306,6 +306,44 @@ class ApolloEmailLookupTests(unittest.TestCase):
         self.assertEqual(state.status, "completed")
         self.assertEqual(fetch_mock.call_args.kwargs["api_key"], "live-key")
 
+    def test_runtime_uses_alphanumeric_apollo_key_stored_in_graph_env(self) -> None:
+        graph = GraphDefinition.from_dict(
+            apollo_graph_payload(
+                "apollo-alphanumeric-key-graph",
+                node_config={
+                    "first_name": "Taylor",
+                },
+                env_vars={
+                    "APOLLO_API_KEY": "AlphanumericApolloKey123456789",
+                },
+            )
+        )
+        graph.validate_against_services(self.services)
+        runtime = self._runtime()
+        workspace_root = Path(tempfile.mkdtemp()) / ".graph-agent" / "runs"
+
+        with patch.dict(
+            "os.environ",
+            {"GRAPH_AGENT_WORKSPACE_DIR": str(workspace_root)},
+            clear=False,
+        ):
+            with patch(
+                "graph_agent.runtime.core.fetch_apollo_person_match_live",
+                return_value=sample_apollo_response("Taylor Doe", email="taylor@example.com"),
+            ) as fetch_mock:
+                state = runtime.run(
+                    graph,
+                    {
+                        "last_name": "Doe",
+                        "domain": "example.com",
+                    },
+                    run_id="run-apollo-alphanumeric-key",
+                    agent_id="agent-alpha",
+                )
+
+        self.assertEqual(state.status, "completed")
+        self.assertEqual(fetch_mock.call_args.kwargs["api_key"], "AlphanumericApolloKey123456789")
+
     def test_manager_start_run_uses_graph_env_vars_overlay_for_apollo_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = GraphStore(self.services, path=Path(directory) / "graphs.json")

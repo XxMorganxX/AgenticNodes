@@ -40,9 +40,9 @@ export const STANDARD_GRAPH_ENV_FIELDS: readonly StandardGraphEnvField[] = [
   },
   {
     key: "APOLLO_API_KEY",
-    label: "Apollo API Key Reference",
+    label: "Apollo API Key",
     placeholder: "APOLLO_API_KEY",
-    tooltipText: "Used automatically by Apollo Email Lookup nodes. Set this once in Environment instead of per node.",
+    tooltipText: "Used automatically by Apollo Email Lookup nodes. Paste the key here, or leave APOLLO_API_KEY to read it from the process environment.",
   },
   {
     key: "LINKEDIN_DATA_DIR",
