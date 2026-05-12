@@ -581,6 +581,8 @@ export function ConditionDetailsModal({
     const { normalized, handleRemap } = normalizeLogicConditionConfig({
       branches: nextBranches as unknown as Record<string, unknown>[],
       else_output_handle_id: logicConfig.else_output_handle_id,
+      condition_input_mode: logicConfig.condition_input_mode,
+      condition_input_binding: logicConfig.condition_input_binding,
     });
     const mutableHandleRemap = new Map<string, string[]>(
       [...handleRemap.entries()].map(([key, values]) => [key, [...values]]),

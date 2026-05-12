@@ -348,6 +348,186 @@ class DataDrivenGraphTests(unittest.TestCase):
         self.assertEqual(recording_provider.last_request.provider_config["api_key_env_var"], "OPENAI_API_KEY")
         self.assertEqual(recording_provider.last_request.provider_config["api_key"], "sk-graph-env-key")
 
+    def test_logic_conditions_separate_mode_passes_through_top_handle_data(self) -> None:
+        payload: dict[str, Any] = {
+            "graph_id": "logic-conditions-separate-graph",
+            "name": "Logic Conditions Separate Mode",
+            "description": "",
+            "version": "1.0",
+            "start_node_id": "start",
+            "nodes": [
+                {
+                    "id": "start",
+                    "kind": "input",
+                    "category": "start",
+                    "label": "Start",
+                    "provider_id": "start.manual_run",
+                    "provider_label": "Run Button Start",
+                    "description": "",
+                    "position": {"x": 0, "y": 0},
+                    "config": {"input_binding": {"type": "input_payload"}},
+                },
+                {
+                    "id": "splitter",
+                    "kind": "control_flow_unit",
+                    "category": "control_flow_unit",
+                    "label": "Splitter",
+                    "provider_id": "core.parallel_splitter",
+                    "provider_label": "Parallel Splitter",
+                    "description": "",
+                    "position": {"x": 200, "y": 0},
+                    "config": {"mode": "parallel_splitter"},
+                },
+                {
+                    "id": "data_path",
+                    "kind": "data",
+                    "category": "data",
+                    "label": "Data Source",
+                    "provider_id": "core.data",
+                    "provider_label": "Core Data Node",
+                    "description": "",
+                    "position": {"x": 400, "y": -60},
+                    "config": {"mode": "template", "template": "DATA"},
+                },
+                {
+                    "id": "condition_path",
+                    "kind": "data",
+                    "category": "data",
+                    "label": "Condition Source",
+                    "provider_id": "core.data",
+                    "provider_label": "Core Data Node",
+                    "description": "",
+                    "position": {"x": 400, "y": 60},
+                    "config": {"mode": "passthrough"},
+                },
+                {
+                    "id": "branch",
+                    "kind": "control_flow_unit",
+                    "category": "control_flow_unit",
+                    "label": "Branch",
+                    "provider_id": "core.logic_conditions",
+                    "provider_label": "Logic Conditions",
+                    "description": "",
+                    "position": {"x": 600, "y": 0},
+                    "config": {
+                        "mode": "logic_conditions",
+                        "condition_input_mode": "separate",
+                        "branches": [
+                            {
+                                "id": "yes-branch",
+                                "label": "Flag Yes",
+                                "output_handle_id": "branch-yes",
+                                "root_group": {
+                                    "id": "group-1",
+                                    "type": "group",
+                                    "combinator": "all",
+                                    "negated": False,
+                                    "children": [
+                                        {
+                                            "id": "rule-1",
+                                            "type": "rule",
+                                            "path": "flag",
+                                            "operator": "equals",
+                                            "value": "yes",
+                                            "source_contracts": [],
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                        "else_output_handle_id": "branch-fallback",
+                    },
+                },
+                {
+                    "id": "if_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "If Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "description": "",
+                    "position": {"x": 800, "y": -60},
+                    "config": {},
+                },
+                {
+                    "id": "else_finish",
+                    "kind": "output",
+                    "category": "end",
+                    "label": "Else Finish",
+                    "provider_id": "core.output",
+                    "provider_label": "Core Output Node",
+                    "description": "",
+                    "position": {"x": 800, "y": 60},
+                    "config": {},
+                },
+            ],
+            "edges": [
+                {"id": "e1", "source_id": "start", "target_id": "splitter", "label": "", "kind": "standard", "priority": 100, "condition": None},
+                {"id": "e2", "source_id": "splitter", "target_id": "data_path", "label": "", "kind": "standard", "priority": 100, "condition": None},
+                {"id": "e3", "source_id": "splitter", "target_id": "condition_path", "label": "", "kind": "standard", "priority": 100, "condition": None},
+                {"id": "e4", "source_id": "data_path", "target_id": "branch", "label": "", "kind": "standard", "priority": 100, "condition": None},
+                {
+                    "id": "e5",
+                    "source_id": "condition_path",
+                    "target_id": "branch",
+                    "target_handle_id": "control-flow-condition",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                    "condition": None,
+                },
+                {
+                    "id": "e6",
+                    "source_id": "branch",
+                    "source_handle_id": "branch-yes",
+                    "target_id": "if_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                    "condition": None,
+                },
+                {
+                    "id": "e7",
+                    "source_id": "branch",
+                    "source_handle_id": "branch-fallback",
+                    "target_id": "else_finish",
+                    "label": "",
+                    "kind": "standard",
+                    "priority": 100,
+                    "condition": None,
+                },
+            ],
+        }
+
+        graph = GraphDefinition.from_dict(payload)
+        graph.validate_against_services(self.services)
+
+        runtime = GraphRuntime(
+            services=self.services,
+            max_steps=self.services.config["max_steps"],
+            max_visits_per_node=self.services.config["max_visits_per_node"],
+        )
+
+        matched_state = runtime.run(graph, {"flag": "yes"}, run_id="logic-cond-separate-if")
+        self.assertEqual(matched_state.status, "completed")
+        self.assertTrue(any(transition.target_id == "if_finish" for transition in matched_state.transition_history))
+        self.assertFalse(any(transition.target_id == "else_finish" for transition in matched_state.transition_history))
+        self.assertEqual(matched_state.final_output, "DATA")
+        matched_branch_output = matched_state.node_outputs["branch"]
+        self.assertEqual(matched_branch_output["payload"], "DATA")
+        self.assertEqual(matched_branch_output["metadata"]["selected_handle_id"], "branch-yes")
+        self.assertEqual(matched_branch_output["metadata"]["condition_input_mode"], "separate")
+        self.assertEqual(matched_branch_output["metadata"]["condition_source_node_id"], "condition_path")
+
+        else_state = runtime.run(graph, {"flag": "no"}, run_id="logic-cond-separate-else")
+        self.assertEqual(else_state.status, "completed")
+        self.assertTrue(any(transition.target_id == "else_finish" for transition in else_state.transition_history))
+        self.assertFalse(any(transition.target_id == "if_finish" for transition in else_state.transition_history))
+        self.assertEqual(else_state.final_output, "DATA")
+        else_branch_output = else_state.node_outputs["branch"]
+        self.assertEqual(else_branch_output["payload"], "DATA")
+        self.assertEqual(else_branch_output["metadata"]["selected_handle_id"], "branch-fallback")
+
     def test_logic_conditions_resolve_graph_env_references_in_branch_values_and_handles(self) -> None:
         payload: dict[str, Any] = {
             "graph_id": "logic-conditions-env-graph",

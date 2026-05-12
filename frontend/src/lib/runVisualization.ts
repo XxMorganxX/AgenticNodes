@@ -1142,9 +1142,12 @@ export function buildAgentRunLanes(
     const agentState = runState?.agent_runs?.[agent.agent_id] ?? null;
     const currentGraph = graphsByAgent.get(agent.agent_id) ?? null;
     const labels = nodeLabelMap(currentGraph);
-    const agentEvents = events
-      .filter((event) => event.agent_id === agent.agent_id)
-      .map((event) => ({ ...event, event_type: normalizeEventType(event.event_type) }));
+    const agentEvents: RuntimeEvent[] = [];
+    for (const event of events) {
+      if (event.agent_id === agent.agent_id) {
+        agentEvents.push(normalizeFocusedEvent(event));
+      }
+    }
     const projection = buildFocusedRunProjection(currentGraph, agentState, agentEvents, { includeEventGroups: false });
     const errorSummaries = projection.errorSummaries;
     const knownNodeOutputs: Record<string, unknown> = {};
@@ -1196,8 +1199,20 @@ export function buildAgentRunLanes(
   });
 }
 
+const NORMALIZED_EVENT_CACHE = new WeakMap<RuntimeEvent, RuntimeEvent>();
+
+function normalizeFocusedEvent(event: RuntimeEvent): RuntimeEvent {
+  let cached = NORMALIZED_EVENT_CACHE.get(event);
+  if (!cached) {
+    const normalizedType = normalizeEventType(event.event_type);
+    cached = normalizedType === event.event_type ? event : { ...event, event_type: normalizedType };
+    NORMALIZED_EVENT_CACHE.set(event, cached);
+  }
+  return cached;
+}
+
 function normalizeFocusedEvents(events: RuntimeEvent[]): RuntimeEvent[] {
-  return events.map((event) => ({ ...event, event_type: normalizeEventType(event.event_type) }));
+  return events.map(normalizeFocusedEvent);
 }
 
 function deriveRunStatus(runState: RunState | null, normalizedEvents: RuntimeEvent[]): string {

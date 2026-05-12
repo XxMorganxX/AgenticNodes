@@ -382,6 +382,8 @@ export function createNodeFromProvider(
           mode: "logic_conditions",
           branches: [createLogicConditionBranch(0, "If")],
           else_output_handle_id: CONTROL_FLOW_ELSE_HANDLE_ID,
+          condition_input_mode: "shared",
+          condition_input_binding: null,
           ...defaultConfig,
         },
       };
@@ -606,6 +608,7 @@ export const PROMPT_BLOCK_PROVIDER_ID = "core.prompt_block";
 export const CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body";
 export const CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if";
 export const CONTROL_FLOW_ELSE_HANDLE_ID = "control-flow-else";
+export const CONTROL_FLOW_CONDITION_HANDLE_ID = "control-flow-condition";
 export const PARALLEL_SPLITTER_OUTPUT_HANDLE_ID = "parallel-splitter-output";
 export const PARALLEL_SPLITTER_HANDLE_COUNT_CONFIG_KEY = "output_handle_count";
 const PARALLEL_SPLITTER_OUTPUT_HANDLE_PREFIX = `${PARALLEL_SPLITTER_OUTPUT_HANDLE_ID}-`;
@@ -1179,6 +1182,11 @@ export function normalizeGraph(graph: GraphDefinition): GraphDefinition {
       const { normalized, handleRemap } = normalizeLogicConditionConfig(nextNode.config);
       nextNode.config.branches = normalized.branches as unknown as Record<string, unknown>[];
       nextNode.config.else_output_handle_id = normalized.else_output_handle_id;
+      nextNode.config.condition_input_mode = normalized.condition_input_mode;
+      nextNode.config.condition_input_binding =
+        normalized.condition_input_mode === "separate" && normalized.condition_input_binding
+          ? { ...normalized.condition_input_binding }
+          : null;
       delete nextNode.config.clauses;
       if (handleRemap.size > 0) {
         logicConditionHandleRemaps.set(node.id, handleRemap);

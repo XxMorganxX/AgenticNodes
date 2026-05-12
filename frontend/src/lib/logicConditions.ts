@@ -31,9 +31,18 @@ export type LogicConditionBranch = {
   root_group: LogicConditionGroup;
 };
 
+export type LogicConditionInputMode = "shared" | "separate";
+
+export type LogicConditionInputBinding = {
+  type: string;
+  source: string;
+};
+
 export type LogicConditionNodeConfig = {
   branches: LogicConditionBranch[];
   else_output_handle_id: string;
+  condition_input_mode: LogicConditionInputMode;
+  condition_input_binding: LogicConditionInputBinding | null;
 };
 
 type LogicClauseCandidate = {
@@ -187,6 +196,22 @@ function branchFromLegacyClause(rawClause: LogicClauseCandidate, index: number):
   };
 }
 
+function normalizeConditionInputMode(value: unknown): LogicConditionInputMode {
+  return value === "separate" ? "separate" : "shared";
+}
+
+function normalizeConditionInputBinding(value: unknown): LogicConditionInputBinding | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const source = compactString(value.source).trim();
+  if (!source) {
+    return null;
+  }
+  const type = compactString(value.type).trim() || "latest_envelope";
+  return { type, source };
+}
+
 export function normalizeLogicConditionConfig(config: GraphNodeConfig): {
   normalized: LogicConditionNodeConfig;
   handleRemap: Map<string, string[]>;
@@ -194,6 +219,9 @@ export function normalizeLogicConditionConfig(config: GraphNodeConfig): {
   const rawBranches = Array.isArray(config.branches) ? config.branches : null;
   const rawClauses = Array.isArray(config.clauses) ? config.clauses : null;
   const elseHandleId = compactString(config.else_output_handle_id) || DEFAULT_LOGIC_ELSE_HANDLE_ID;
+  const conditionInputMode = normalizeConditionInputMode(config.condition_input_mode);
+  const conditionInputBinding =
+    conditionInputMode === "separate" ? normalizeConditionInputBinding(config.condition_input_binding) : null;
   const handleRemap = new Map<string, string[]>();
   const usedHandleIds = new Set<string>([elseHandleId]);
   const candidateBranches = rawBranches != null
@@ -225,6 +253,8 @@ export function normalizeLogicConditionConfig(config: GraphNodeConfig): {
     normalized: {
       branches,
       else_output_handle_id: elseHandleId,
+      condition_input_mode: conditionInputMode,
+      condition_input_binding: conditionInputBinding,
     },
     handleRemap,
   };
@@ -259,6 +289,11 @@ export function serializeLogicConditionConfig(config: LogicConditionNodeConfig):
       root_group: serializeGroupChild(branch.root_group),
     })),
     else_output_handle_id: config.else_output_handle_id,
+    condition_input_mode: config.condition_input_mode,
+    condition_input_binding:
+      config.condition_input_mode === "separate" && config.condition_input_binding
+        ? { ...config.condition_input_binding }
+        : null,
   };
 }
 

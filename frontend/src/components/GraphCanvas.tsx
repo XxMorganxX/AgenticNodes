@@ -33,6 +33,7 @@ import {
   API_FINAL_MESSAGE_HANDLE_ID,
   API_TOOL_CALL_HANDLE_ID,
   API_TOOL_CONTEXT_HANDLE_ID,
+  CONTROL_FLOW_CONDITION_HANDLE_ID,
   canConnectNodes,
   createNodeFromProvider,
   createNodeFromSaved,
@@ -142,8 +143,7 @@ function buildCanvasNodeRuntimeDigest(nodeId: string, runState: RunState | null,
     return "";
   }
   const slice: Record<string, unknown> = {
-    cn: runState.current_node_id,
-    ce: runState.current_edge_id,
+    isCurrent: runState.current_node_id === nodeId ? 1 : 0,
     st: runState.node_statuses?.[nodeId],
     vc: runState.visit_counts?.[nodeId],
     it: runState.iterator_states?.[nodeId],
@@ -383,13 +383,13 @@ type MarqueeSelectionState = {
 const NODE_CLIPBOARD_PASTE_OFFSET = 48;
 
 const KIND_COLORS: Record<string, string> = {
-  input: "#8486a5",
-  model: "#6c5ce7",
+  input: "#94a3b8",
+  model: "#8b5cf6",
   provider: "#f59e0b",
-  tool: "#a78bfa",
-  mcp_context_provider: "#5aa7ff",
-  mcp_tool_executor: "#a78bfa",
-  control_flow_unit: "#f97316",
+  tool: "#ec4899",
+  mcp_context_provider: "#38bdf8",
+  mcp_tool_executor: "#c084fc",
+  control_flow_unit: "#fb923c",
   data: "#2dd4bf",
   output: "#4ade80",
 };
@@ -435,7 +435,6 @@ const SELECTED_EDGE_STROKE_WIDTH = 4.3;
 const DRAFT_WIRE_STROKE_WIDTH = 4.6;
 const EDGE_LANE_SPACING = 12;
 const EDGE_SIBLING_SPACING = 8;
-const AUTO_CONNECT_TARGET_VERTICAL_GAP = 40;
 const CONNECTION_HANDLE_SNAP_RADIUS_PX = 44;
 const DRAFT_WIRE_MIN_SEGMENT_PX = 42;
 const TOOL_EDGE_TONES = {
@@ -1602,6 +1601,40 @@ export function GraphCanvas({
     [graph, onGraphChange],
   );
 
+  const handleToggleConditionInputMode = useCallback(
+    (nodeId: string) => {
+      if (!graph) {
+        return;
+      }
+      const targetNode = graph.nodes.find((node) => node.id === nodeId);
+      if (!targetNode) {
+        return;
+      }
+      const useSeparate = String(targetNode.config.condition_input_mode ?? "shared") !== "separate";
+      onGraphChange({
+        ...graph,
+        nodes: graph.nodes.map((node) =>
+          node.id === nodeId
+            ? {
+                ...node,
+                config: {
+                  ...node.config,
+                  condition_input_mode: useSeparate ? "separate" : "shared",
+                  condition_input_binding: useSeparate ? (node.config.condition_input_binding ?? null) : null,
+                },
+              }
+            : node,
+        ),
+        edges: useSeparate
+          ? graph.edges
+          : graph.edges.filter(
+              (edge) => !(edge.target_id === nodeId && edge.target_handle_id === CONTROL_FLOW_CONDITION_HANDLE_ID),
+            ),
+      });
+    },
+    [graph, onGraphChange],
+  );
+
   const handleToggleSupabaseIteratorIncludeProcessedRows = useCallback(
     (nodeId: string) => {
       if (!graph) {
@@ -1765,97 +1798,6 @@ export function GraphCanvas({
     }
     return { width: NODE_WIDTH, height: NODE_HEIGHT, regionHeight: NODE_REGION_HEIGHT };
   }, [graph]);
-
-  const rebalanceOutgoingTargets = useCallback(
-    (baseGraph: GraphDefinition, sourceNodeId: string): GraphDefinition => {
-      const sourceNode = baseGraph.nodes.find((node) => node.id === sourceNodeId);
-      if (!sourceNode || isWireJunctionNode(sourceNode)) {
-        return baseGraph;
-      }
-
-      const outgoingEdges = baseGraph.edges.filter((edge) => edge.source_id === sourceNodeId && edge.kind !== "binding");
-      if (outgoingEdges.length === 0) {
-        return baseGraph;
-      }
-
-      const sourceDimensions = getNodeDimensions(sourceNode);
-      const repositionCandidates = outgoingEdges
-        .map((edge) => {
-          const targetNode = baseGraph.nodes.find((node) => node.id === edge.target_id);
-          if (!targetNode || isWireJunctionNode(targetNode)) {
-            return null;
-          }
-          const incomingEdgeCount = baseGraph.edges.filter(
-            (candidate) => candidate.target_id === targetNode.id && candidate.kind !== "binding",
-          ).length;
-          if (incomingEdgeCount !== 1) {
-            return null;
-          }
-
-          const sourceHandleId = inferToolEdgeSourceHandle(edge, sourceNode, baseGraph);
-          const sourceAnchorRatio = getNodeSourceHandleAnchorRatio(sourceNode, sourceHandleId, baseGraph);
-          const targetDimensions = getNodeDimensions(targetNode);
-          const targetHandleId = getRenderedLoggerTargetHandleId(sourceNode, targetNode, edge.target_handle_id ?? null);
-          const targetAnchorRatio = getNodeTargetAnchorRatio(targetNode, targetHandleId);
-          const desiredTop = sourceNode.position.y + sourceDimensions.height * sourceAnchorRatio - targetDimensions.height * targetAnchorRatio;
-
-          return {
-            targetNode,
-            desiredTop,
-            currentTop: targetNode.position.y,
-            height: targetDimensions.height,
-          };
-        })
-        .filter(
-          (
-            candidate,
-          ): candidate is {
-            targetNode: GraphNode;
-            desiredTop: number;
-            currentTop: number;
-            height: number;
-          } => candidate !== null,
-        )
-        .sort((left, right) => {
-          const desiredDelta = left.desiredTop - right.desiredTop;
-          if (Math.abs(desiredDelta) > 0.5) {
-            return desiredDelta;
-          }
-          const currentDelta = left.currentTop - right.currentTop;
-          if (Math.abs(currentDelta) > 0.5) {
-            return currentDelta;
-          }
-          return left.targetNode.id.localeCompare(right.targetNode.id);
-        });
-
-      if (repositionCandidates.length === 0) {
-        return baseGraph;
-      }
-
-      const nextPositions = new Map<string, GraphPosition>();
-      let previousBottom = Number.NEGATIVE_INFINITY;
-      repositionCandidates.forEach((candidate) => {
-        const nextTop =
-          previousBottom === Number.NEGATIVE_INFINITY
-            ? candidate.desiredTop
-            : Math.max(candidate.desiredTop, previousBottom + AUTO_CONNECT_TARGET_VERTICAL_GAP);
-        previousBottom = nextTop + candidate.height;
-        nextPositions.set(candidate.targetNode.id, {
-          ...candidate.targetNode.position,
-          y: nextTop,
-        });
-      });
-
-      return {
-        ...baseGraph,
-        nodes: baseGraph.nodes.map((node) => {
-          const nextPosition = nextPositions.get(node.id);
-          return nextPosition ? { ...node, position: nextPosition } : node;
-        }),
-      };
-    },
-    [getNodeDimensions],
-  );
 
   const updateMeasuredNodeDimensions = useCallback((nodeId: string, dimensions?: { width?: number; height?: number } | null) => {
     const width = dimensions?.width;
@@ -2628,8 +2570,14 @@ export function GraphCanvas({
                 return false;
               }
               const existingSourceHandleId = sourceNode ? inferToolEdgeSourceHandle(edge, sourceNode, baseGraph) : (edge.source_handle_id ?? null);
+              const existingTargetHandleId = getRenderedLoggerTargetHandleId(
+                sourceNode,
+                targetNode,
+                edge.target_handle_id ?? null,
+              );
               return (
-                (edge.source_id === sourceId && existingSourceHandleId === effectiveSourceHandleId) || edge.target_id === targetId
+                (edge.source_id === sourceId && existingSourceHandleId === effectiveSourceHandleId) ||
+                (edge.target_id === targetId && existingTargetHandleId === effectiveTargetHandleId)
               );
             })
             .map((edge) => edge.id),
@@ -3018,20 +2966,15 @@ export function GraphCanvas({
         return false;
       }
       onGraphChange(
-        normalizeParallelSplitterHandleAssignments(
-          rebalanceOutgoingTargets(
-            {
-              ...nextBaseGraph,
-              edges: [...nextBaseGraph.edges, nextEdge],
-            },
-            sourceId,
-          ),
-        ),
+        normalizeParallelSplitterHandleAssignments({
+          ...nextBaseGraph,
+          edges: [...nextBaseGraph.edges, nextEdge],
+        }),
       );
       setEditorMessage(null);
       return true;
     },
-    [buildCommittedEdge, getConnectionConflictState, graph, onGraphChange, rebalanceOutgoingTargets, removeEdgesAndPruneJunctions],
+    [buildCommittedEdge, getConnectionConflictState, graph, onGraphChange, removeEdgesAndPruneJunctions],
   );
 
   const handleNodeHandlePointerDown = useCallback(
@@ -4084,6 +4027,7 @@ export function GraphCanvas({
                 onOpenDiscordTriggerConfig: handleOpenDiscordTriggerConfig,
                 onOpenCronScheduleConfig: handleOpenCronScheduleConfig,
                 onToggleExecutorRetries: handleToggleExecutorRetries,
+                onToggleConditionInputMode: handleToggleConditionInputMode,
                 onToggleSupabaseIteratorIncludeProcessedRows: handleToggleSupabaseIteratorIncludeProcessedRows,
                 onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
                 onOpenDisplayResponse: handleOpenDisplayResponse,
@@ -4197,6 +4141,7 @@ export function GraphCanvas({
         previousData.onOpenDiscordTriggerConfig === handleOpenDiscordTriggerConfig &&
         previousData.onOpenCronScheduleConfig === handleOpenCronScheduleConfig &&
         previousData.onToggleExecutorRetries === handleToggleExecutorRetries &&
+        previousData.onToggleConditionInputMode === handleToggleConditionInputMode &&
         previousData.onToggleSupabaseIteratorIncludeProcessedRows === handleToggleSupabaseIteratorIncludeProcessedRows &&
         previousData.onOpenPromptBlockDetails === handleOpenPromptBlockDetails &&
         previousData.onOpenDisplayResponse === handleOpenDisplayResponse &&
@@ -4234,6 +4179,7 @@ export function GraphCanvas({
               onOpenDiscordTriggerConfig: handleOpenDiscordTriggerConfig,
               onOpenCronScheduleConfig: handleOpenCronScheduleConfig,
               onToggleExecutorRetries: handleToggleExecutorRetries,
+              onToggleConditionInputMode: handleToggleConditionInputMode,
               onToggleSupabaseIteratorIncludeProcessedRows: handleToggleSupabaseIteratorIncludeProcessedRows,
               onOpenPromptBlockDetails: handleOpenPromptBlockDetails,
               onOpenDisplayResponse: handleOpenDisplayResponse,
@@ -4309,6 +4255,7 @@ export function GraphCanvas({
     handleChangePayloadListStartIndex,
     handleSelectPythonScriptFile,
     handleToggleExecutorRetries,
+    handleToggleConditionInputMode,
     handleOpenCronScheduleConfig,
     handleOpenDiscordTriggerConfig,
     handleOpenToolDetails,

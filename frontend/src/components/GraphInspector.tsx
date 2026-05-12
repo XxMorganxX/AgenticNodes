@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { previewSpreadsheetRows } from "../lib/api";
 import { applyClaudeCodePresetToNode, CLAUDE_CODE_PRESET_OPTIONS } from "../lib/claudeCodePresets";
 import {
+  CONTROL_FLOW_CONDITION_HANDLE_ID,
   CONTROL_FLOW_ELSE_HANDLE_ID,
   defaultModelName,
   findProviderDefinition,
@@ -3342,6 +3343,52 @@ export function GraphInspector({
                     <strong>Incoming Contract</strong>
                     <span>Resolved incoming contract: {logicIncomingContractLabel}</span>
                     <span>Accepted node contracts: {contract?.accepted_inputs.join(", ") ?? "message_envelope, tool_result_envelope, data_envelope"}</span>
+                  </div>
+                  <div className="contract-card">
+                    <strong>Condition Source</strong>
+                    <label className="inline-checkbox">
+                      <input
+                        type="checkbox"
+                        checked={(logicConditionConfig?.condition_input_mode ?? "shared") === "separate"}
+                        onChange={(event) => {
+                          const useSeparate = event.target.checked;
+                          onGraphChange({
+                            ...graph,
+                            nodes: graph.nodes.map((nd) =>
+                              nd.id === selectedNode.id
+                                ? {
+                                    ...nd,
+                                    config: {
+                                      ...nd.config,
+                                      condition_input_mode: useSeparate ? "separate" : "shared",
+                                      condition_input_binding: useSeparate
+                                        ? (nd.config.condition_input_binding ?? null)
+                                        : null,
+                                    },
+                                  }
+                                : nd,
+                            ),
+                            edges: useSeparate
+                              ? graph.edges
+                              : graph.edges.filter(
+                                  (edge) =>
+                                    !(edge.target_id === selectedNode.id && edge.target_handle_id === CONTROL_FLOW_CONDITION_HANDLE_ID),
+                                ),
+                          });
+                        }}
+                      />
+                      <span>Use a separate condition input</span>
+                    </label>
+                    <span>
+                      {(logicConditionConfig?.condition_input_mode ?? "shared") === "separate"
+                        ? logicConditionConfig?.condition_input_binding?.source
+                          ? `Condition input: ${
+                              graph.nodes.find((nd) => nd.id === logicConditionConfig.condition_input_binding?.source)?.label ??
+                              logicConditionConfig.condition_input_binding.source
+                            }`
+                          : "Condition input: not connected — drag an edge to the Condition handle."
+                        : "Rules evaluate the routed payload (shared input)."}
+                    </span>
                   </div>
                   <div className="contract-card">
                     <strong>Configured Branches</strong>

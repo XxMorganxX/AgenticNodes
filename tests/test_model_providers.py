@@ -1430,6 +1430,132 @@ class ModelProviderTests(unittest.TestCase):
         )
         self.assertEqual(response.tool_calls, [])
 
+    def test_claude_code_provider_retries_once_on_stub_response(self) -> None:
+        """If the model returns {"body": "Placeholder", ...}, retry once with a hint."""
+
+        class StubRetryClaudeCodeProvider(StubClaudeCodeProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.run_count = 0
+                self.commands: list[list[str]] = []
+
+            def _run_command(
+                self, command: list[str], cwd: str | None, timeout_seconds: float
+            ) -> Mapping[str, Any]:
+                self.run_count += 1
+                self.commands.append(list(command))
+                self.last_command = command
+                self.last_cwd = cwd
+                self.last_timeout_seconds = timeout_seconds
+                if self.run_count == 1:
+                    payload: Mapping[str, Any] = {
+                        "result": '{"subject": "Placeholder", "body": "Placeholder"}',
+                        "structured_output": None,
+                        "session_id": "session-stub",
+                        "duration_ms": 21,
+                    }
+                else:
+                    payload = {
+                        "result": (
+                            '{"subject": "Cornell AI Club President, question on agent eval", '
+                            '"body": "Hello, real content here."}'
+                        ),
+                        "structured_output": None,
+                        "session_id": "session-retry",
+                        "duration_ms": 42,
+                    }
+                self.last_payload = payload
+                return payload
+
+        provider = StubRetryClaudeCodeProvider()
+        request = ModelRequest(
+            prompt_name="compose_email",
+            messages=[
+                ModelMessage(role="system", content="System."),
+                ModelMessage(role="user", content="Write the email."),
+            ],
+            provider_config={"cli_path": "claude", "working_directory": str(ROOT)},
+            response_mode="message",
+            response_schema=api_decision_response_schema(
+                final_message_schema={
+                    "type": "object",
+                    "properties": {
+                        "subject": {"type": "string"},
+                        "body": {"type": "string"},
+                    },
+                    "required": ["subject", "body"],
+                },
+                allow_tool_calls=False,
+                response_mode="message",
+            ),
+        )
+
+        response = provider.generate(request)
+
+        self.assertEqual(provider.run_count, 2)
+        self.assertEqual(
+            response.structured_output,
+            _decision(
+                message={
+                    "subject": "Cornell AI Club President, question on agent eval",
+                    "body": "Hello, real content here.",
+                },
+                need_tool=False,
+            ),
+        )
+        self.assertTrue(response.metadata.get("stub_retry"))
+        self.assertTrue(response.metadata.get("stub_retry_succeeded"))
+        # The retry prompt should include the correction hint.
+        retry_command = provider.commands[1]
+        prompt_index = retry_command.index("-p")
+        retry_prompt = retry_command[prompt_index + 1]
+        self.assertIn("stub or placeholder", retry_prompt)
+
+    def test_claude_code_provider_does_not_retry_when_response_is_real(self) -> None:
+        class RealResponseProvider(StubClaudeCodeProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.run_count = 0
+
+            def _run_command(
+                self, command: list[str], cwd: str | None, timeout_seconds: float
+            ) -> Mapping[str, Any]:
+                self.run_count += 1
+                self.last_command = command
+                self.last_cwd = cwd
+                self.last_timeout_seconds = timeout_seconds
+                self.last_payload = {
+                    "result": '{"subject": "Real subject", "body": "Real body."}',
+                    "structured_output": None,
+                    "session_id": "session-real",
+                    "duration_ms": 19,
+                }
+                return self.last_payload
+
+        provider = RealResponseProvider()
+        request = ModelRequest(
+            prompt_name="compose_email",
+            messages=[ModelMessage(role="user", content="Write the email.")],
+            provider_config={"cli_path": "claude", "working_directory": str(ROOT)},
+            response_mode="message",
+            response_schema=api_decision_response_schema(
+                final_message_schema={
+                    "type": "object",
+                    "properties": {
+                        "subject": {"type": "string"},
+                        "body": {"type": "string"},
+                    },
+                    "required": ["subject", "body"],
+                },
+                allow_tool_calls=False,
+                response_mode="message",
+            ),
+        )
+
+        response = provider.generate(request)
+        self.assertEqual(provider.run_count, 1)
+        self.assertFalse(response.metadata.get("stub_retry"))
+
     def test_openai_provider_keeps_plain_text_when_schema_response_is_not_json(self) -> None:
         class PlainTextOpenAIProvider(StubOpenAIProvider):
             def _post_json(

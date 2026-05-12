@@ -2061,43 +2061,27 @@ export default function App() {
   }, [applyFetchedRunState, cancelPersistedRunSnapshot, clearRunPolling, scheduleRunPoll]);
 
   const restorePersistedRunSnapshot = useCallback(async (graphId: string) => {
-    const snapshot = loadPersistedRunSnapshot(graphId);
-    const snapshotRunId = snapshot?.activeRunId ?? snapshot?.runState?.run_id ?? null;
-    const snapshotRunState = snapshot?.runState ?? null;
-    const shouldHydrateLocalSnapshot = Boolean(snapshotRunId && snapshotRunState && !isTerminalRunStatus(snapshotRunState.status));
-    setActiveRunId(shouldHydrateLocalSnapshot ? snapshotRunId : null);
-    setEvents(shouldHydrateLocalSnapshot ? (snapshot?.events ?? []) : []);
-    setRunState(shouldHydrateLocalSnapshot ? snapshotRunState : null);
+    // Auto-resume of in-flight runs across page loads is intentionally disabled:
+    // a killed `python3 run.py` leaves a non-terminal run in the store, and
+    // re-attaching to its SSE stream made the studio look like a graph was
+    // "instantly running" on every reload. Clear any persisted snapshot for
+    // this graph and reset run-related UI state.
+    cancelPersistedRunSnapshot(graphId);
+    clearPersistedRunSnapshot(graphId);
+    setActiveRunId(null);
+    setEvents([]);
+    setRunState(null);
     setIsRunning(false);
     clearRunPolling();
     sourceRef.current?.close();
     sourceRef.current = null;
-    if (!snapshotRunId) {
-      return;
-    }
-    // Cheap pre-check: ask the backend only for status. If the run is
-    // already terminal we never need to pull the (potentially huge) full
-    // state + event history from Supabase.
-    try {
-      const status = await fetchRunStatus(snapshotRunId);
-      if (status.is_terminal) {
-        cancelPersistedRunSnapshot(graphId);
-        clearPersistedRunSnapshot(graphId);
-        setActiveRunId(null);
-        setEvents([]);
-        setRunState(null);
-        setIsRunning(false);
-        return;
-      }
-      const recoveredRunState = await fetchRun(snapshotRunId);
-      applyFetchedRunState(recoveredRunState);
-      connectToRunStream(recoveredRunState.run_id, graphId, inputRef.current, recoveredRunState.documents ?? []);
-    } catch {
-      markRecoveredRunInterrupted(graphId, shouldHydrateLocalSnapshot ? snapshotRunState : null, snapshotRunId, snapshot?.savedAt);
-    }
-  }, [applyFetchedRunState, clearRunPolling, connectToRunStream, markRecoveredRunInterrupted, cancelPersistedRunSnapshot]);
+  }, [cancelPersistedRunSnapshot, clearRunPolling]);
 
   useEffect(() => {
+    // Auto-resume of in-flight runs is disabled (see restorePersistedRunSnapshot
+    // above). Drop any snapshots a previous build may have written so users
+    // upgrading don't briefly see a ghost run on first load.
+    clearAllPersistedRunSnapshots();
     const persistedSelectedGraphId = loadPersistedSelectedGraphId();
     Promise.all([fetchGraphs(), refreshCatalog()])
       .then(([loadedGraphs, loadedCatalog]) => {

@@ -229,6 +229,16 @@ class _OutlookDraftStubHandler(BaseHTTPRequestHandler):
         }
         if "/createReply" in self.path or "/createReplyAll" in self.path:
             response_obj["toRecipients"] = [{"emailAddress": {"address": "sender@example.com", "name": "Sender"}}]
+            response_obj["body"] = {
+                "contentType": "html",
+                "content": (
+                    "<html><body><div id=\"appendonsend\"></div><hr>"
+                    "<b>From:</b> sender@example.com<br>"
+                    "<b>Subject:</b> parent<br><br>"
+                    "Original parent body."
+                    "</body></html>"
+                ),
+            }
         response_body = json.dumps(response_obj).encode("utf-8")
         self.send_response(201)
         self.send_header("Content-Type", "application/json")
@@ -2053,7 +2063,11 @@ Morgan Stuart"
         patch_req = _OutlookDraftStubHandler.requests[1]
         self.assertIn("/me/messages/draft-reply-http", patch_req["path"])
         self.assertEqual(patch_req["body"]["subject"], "Override subject")
-        self.assertEqual(patch_req["body"]["body"]["content"], "Override body.")
+        self.assertEqual(patch_req["body"]["body"]["contentType"], "HTML")
+        merged_content = patch_req["body"]["body"]["content"]
+        self.assertIn("Override body.", merged_content)
+        self.assertIn("appendonsend", merged_content)
+        self.assertIn("Original parent body.", merged_content)
         self.assertEqual(
             patch_req["body"]["toRecipients"],
             [{"emailAddress": {"address": "override@example.com"}}],

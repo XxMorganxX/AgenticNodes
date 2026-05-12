@@ -191,6 +191,7 @@ SPREADSHEET_MATRIX_DECISION_MODE = "spreadsheet_matrix_decision"
 CONTROL_FLOW_LOOP_BODY_HANDLE_ID = "control-flow-loop-body"
 CONTROL_FLOW_IF_HANDLE_ID = "control-flow-if"
 CONTROL_FLOW_ELSE_HANDLE_ID = "control-flow-else"
+CONTROL_FLOW_CONDITION_HANDLE_ID = "control-flow-condition"
 WORKSPACE_PATH_SUFFIX_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 TEMPLATE_PLACEHOLDER_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -4808,7 +4809,12 @@ class ControlFlowNode(BaseNode):
         )
 
     def _source_envelope(self, context: NodeContext) -> MessageEnvelope:
-        source_value = context.resolve_binding(self.config.get("input_binding"))
+        return self._envelope_from_binding(context, self.config.get("input_binding"))
+
+    def _envelope_from_binding(
+        self, context: NodeContext, binding: Mapping[str, Any] | None
+    ) -> MessageEnvelope:
+        source_value = context.resolve_binding(binding)
         if isinstance(source_value, Mapping) and "schema_version" in source_value and "payload" in source_value:
             return MessageEnvelope.from_dict(source_value)
         return MessageEnvelope(
@@ -5100,12 +5106,42 @@ class ControlFlowNode(BaseNode):
 
     def _execute_logic_conditions(self, context: NodeContext) -> NodeExecutionResult:
         source_envelope = self._source_envelope(context)
+        condition_input_mode = str(self.config.get("condition_input_mode", "shared") or "shared").strip() or "shared"
+        condition_binding = self.config.get("condition_input_binding") if condition_input_mode == "separate" else None
+        if condition_input_mode == "separate" and not isinstance(condition_binding, Mapping):
+            for edge in context.graph.get_incoming_edges(self.id):
+                if edge.target_handle_id == CONTROL_FLOW_CONDITION_HANDLE_ID and edge.source_id:
+                    condition_binding = {"type": "latest_envelope", "source": edge.source_id}
+                    break
+        if condition_input_mode == "separate" and not isinstance(self.config.get("input_binding"), Mapping):
+            for edge in context.graph.get_incoming_edges(self.id):
+                if (
+                    edge.kind != "binding"
+                    and edge.target_handle_id != CONTROL_FLOW_CONDITION_HANDLE_ID
+                    and edge.source_id
+                ):
+                    source_envelope = self._envelope_from_binding(
+                        context, {"type": "latest_envelope", "source": edge.source_id}
+                    )
+                    break
+        if condition_input_mode == "separate" and isinstance(condition_binding, Mapping):
+            condition_envelope = self._envelope_from_binding(context, condition_binding)
+        else:
+            condition_envelope = source_envelope
+        condition_payload = condition_envelope.payload
+        condition_contract = str(condition_envelope.metadata.get("contract", "") or "").strip()
         incoming_contract = str(source_envelope.metadata.get("contract", "") or "").strip()
+        evaluation_contract = condition_contract or incoming_contract
+        condition_source_node_id = (
+            str(condition_binding.get("source", "") or "").strip()
+            if condition_input_mode == "separate" and isinstance(condition_binding, Mapping)
+            else None
+        ) or None
         matched_branch: dict[str, Any] | None = None
         clause_evaluations: list[dict[str, Any]] = []
         branch_evaluations: list[dict[str, Any]] = []
         for branch in self._logic_branches():
-            matched, evaluation = self._evaluate_logic_group(source_envelope.payload, branch.get("root_group", {}), incoming_contract)
+            matched, evaluation = self._evaluate_logic_group(condition_payload, branch.get("root_group", {}), evaluation_contract)
             clause_evaluations.extend(self._flatten_logic_evaluations(evaluation))
             branch_evaluations.append(
                 {
@@ -5144,6 +5180,9 @@ class ControlFlowNode(BaseNode):
                 "matched_clause_label": matched_branch.get("label") if matched_branch is not None else "Else",
                 "condition_evaluations": clause_evaluations,
                 "branch_evaluations": branch_evaluations,
+                "condition_input_mode": condition_input_mode,
+                "condition_source_node_id": condition_source_node_id,
+                "condition_contract": condition_contract or None,
             },
         )
         route_output = forwarded_envelope.to_dict()
@@ -5163,6 +5202,9 @@ class ControlFlowNode(BaseNode):
                 "matched_clause_id": matched_branch.get("id") if matched_branch is not None else None,
                 "condition_evaluations": clause_evaluations,
                 "branch_evaluations": branch_evaluations,
+                "condition_input_mode": condition_input_mode,
+                "condition_source_node_id": condition_source_node_id,
+                "condition_contract": condition_contract or None,
             },
             route_outputs={selected_handle_id: route_output},
         )
@@ -9477,6 +9519,26 @@ class GraphDefinition:
                         raise GraphValidationError(
                             f"Logic conditions node '{node.id}' uses unsupported output handle(s): {', '.join(str(handle) for handle in invalid_handles)}."
                         )
+                    condition_input_mode = str(node.config.get("condition_input_mode", "shared") or "shared").strip() or "shared"
+                    if condition_input_mode == "separate":
+                        raw_binding = node.config.get("condition_input_binding")
+                        binding_source = (
+                            str(raw_binding.get("source", "") or "").strip()
+                            if isinstance(raw_binding, Mapping)
+                            else ""
+                        )
+                        has_condition_edge = any(
+                            edge.target_handle_id == CONTROL_FLOW_CONDITION_HANDLE_ID
+                            for edge in self.get_incoming_edges(node.id)
+                        )
+                        if not binding_source and not has_condition_edge:
+                            raise GraphValidationError(
+                                f"Logic conditions node '{node.id}' has condition_input_mode 'separate' but no condition input is connected."
+                            )
+                        if binding_source and binding_source not in self.nodes:
+                            raise GraphValidationError(
+                                f"Logic conditions node '{node.id}' references missing condition input source '{binding_source}'."
+                            )
 
     def _resolve_provider_binding(self, node: BaseNode) -> ProviderNode | None:
         binding_node_id = str(node.config.get("provider_binding_node_id", "")).strip()

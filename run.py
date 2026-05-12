@@ -61,6 +61,44 @@ def terminate_process(process: subprocess.Popen[bytes]) -> None:
         return
 
 
+def maybe_start_menubar(
+    python_executable: str,
+    root: Path,
+    api_base_url: str,
+    frontend_url: str,
+    popen_kwargs: dict[str, object],
+) -> subprocess.Popen[bytes] | None:
+    if sys.platform != "darwin":
+        return None
+    if os.environ.get("GRAPH_AGENT_MENUBAR", "1").strip().lower() in {"0", "false", "no"}:
+        return None
+    script_path = root / "tools" / "status_menubar.py"
+    if not script_path.exists():
+        return None
+    probe = subprocess.run(
+        [python_executable, "-c", "import rumps"],
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        print(
+            "Menu bar indicator disabled — install with: .venv/bin/pip install rumps",
+            file=sys.stderr,
+        )
+        return None
+    return subprocess.Popen(
+        [
+            python_executable,
+            str(script_path),
+            "--api-base-url",
+            api_base_url,
+            "--frontend-url",
+            frontend_url,
+        ],
+        cwd=root,
+        **popen_kwargs,
+    )
+
+
 def wait_for_early_exit(process: subprocess.Popen[bytes], name: str, timeout_seconds: float = 2.0) -> None:
     start = time.time()
     while time.time() - start < timeout_seconds:
@@ -144,6 +182,9 @@ def main() -> int:
     popen_kwargs: dict[str, object] = {"start_new_session": os.name != "nt"}
     backend_process = subprocess.Popen(backend_command, cwd=root, env=backend_env, **popen_kwargs)
     frontend_process = subprocess.Popen(frontend_command, cwd=frontend_dir, env=frontend_env, **popen_kwargs)
+    menubar_process = maybe_start_menubar(
+        backend_python, root, api_base_url, frontend_url, popen_kwargs
+    )
 
     try:
         wait_for_early_exit(backend_process, "Backend")
@@ -164,6 +205,8 @@ def main() -> int:
     else:
         return_code = 0
     finally:
+        if menubar_process is not None:
+            terminate_process(menubar_process)
         terminate_process(frontend_process)
         terminate_process(backend_process)
 
@@ -176,6 +219,12 @@ def main() -> int:
             backend_process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             backend_process.kill()
+
+        if menubar_process is not None:
+            try:
+                menubar_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                menubar_process.kill()
 
     return return_code
 

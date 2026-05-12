@@ -7,6 +7,7 @@ import {
   API_FINAL_MESSAGE_HANDLE_ID,
   API_TOOL_CALL_HANDLE_ID,
   API_TOOL_CONTEXT_HANDLE_ID,
+  CONTROL_FLOW_CONDITION_HANDLE_ID,
   CONTROL_FLOW_ELSE_HANDLE_ID,
   CONTROL_FLOW_IF_HANDLE_ID,
   CONTROL_FLOW_LOOP_BODY_HANDLE_ID,
@@ -66,6 +67,7 @@ export type GraphCanvasNodeData = {
   onOpenDiscordTriggerConfig: (nodeId: string) => void;
   onOpenCronScheduleConfig: (nodeId: string) => void;
   onToggleExecutorRetries: (nodeId: string) => void;
+  onToggleConditionInputMode: (nodeId: string) => void;
   onToggleSupabaseIteratorIncludeProcessedRows: (nodeId: string) => void;
   onOpenPromptBlockDetails: (nodeId: string) => void;
   onOpenDisplayResponse: (nodeId: string) => void;
@@ -244,6 +246,7 @@ function GraphCanvasNodeComponent({
     onOpenDiscordTriggerConfig,
     onOpenCronScheduleConfig,
     onToggleExecutorRetries,
+    onToggleConditionInputMode,
     onToggleSupabaseIteratorIncludeProcessedRows,
     onOpenPromptBlockDetails,
     onOpenDisplayResponse,
@@ -428,6 +431,11 @@ function GraphCanvasNodeComponent({
   const outlookDraftEmailLogTargetHandleStyle = {
     top: `${getNodeTargetAnchorRatio(node, OUTLOOK_DRAFT_EMAIL_LOG_TARGET_HANDLE_ID) * 100}%`,
   } satisfies CSSProperties;
+  const conditionTargetHandleStyle = {
+    top: `${getApiToolContextTargetAnchorRatio(API_TOOL_CONTEXT_HANDLE_ID) * 100}%`,
+  } satisfies CSSProperties;
+  const showConditionTargetHandle =
+    isLogicConditionsNode && (logicConditionConfig?.condition_input_mode ?? node.config.condition_input_mode) === "separate";
   const iconLabel = KIND_LABELS[node.kind] ?? node.kind.slice(0, 2).toUpperCase();
   const subtitle =
     node.kind === "model"
@@ -662,8 +670,22 @@ function GraphCanvasNodeComponent({
           type="target"
           position={Position.Left}
           className={`graph-node-handle graph-node-handle-target ${isConnectionMagnetized ? "graph-node-handle-valid is-magnetized" : ""}`}
-          style={isModelNode ? primaryTargetHandleStyle : undefined}
+          style={isModelNode || showConditionTargetHandle ? primaryTargetHandleStyle : undefined}
         />
+      ) : null}
+      {showTargetHandle && showConditionTargetHandle ? (
+        <>
+          <div className="graph-node-input-port graph-node-input-port--context" style={conditionTargetHandleStyle} aria-hidden="true">
+            <span className="graph-node-output-port-label">Condition</span>
+          </div>
+          <Handle
+            id={CONTROL_FLOW_CONDITION_HANDLE_ID}
+            type="target"
+            position={Position.Left}
+            className={`graph-node-handle graph-node-handle-target graph-node-handle-target--context ${isConnectionMagnetized ? "graph-node-handle-valid is-magnetized" : ""}`}
+            style={conditionTargetHandleStyle}
+          />
+        </>
       ) : null}
       {showTargetHandle && showsModelToolHandles ? (
         <>
@@ -750,6 +772,27 @@ function GraphCanvasNodeComponent({
                 <span className="graph-node-inline-toggle-thumb" />
               </span>
               <span className="graph-node-inline-toggle-text">{executorRetriesEnabled ? "On" : "Off"}</span>
+            </button>
+          </div>
+        ) : null}
+        {isLogicConditionsNode ? (
+          <div className="graph-node-inline-toggle-row">
+            <span className="graph-node-inline-toggle-label">Separate Condition</span>
+            <button
+              type="button"
+              className={`graph-node-inline-toggle ${showConditionTargetHandle ? "is-enabled" : "is-disabled"}`}
+              aria-pressed={showConditionTargetHandle}
+              aria-label={`${showConditionTargetHandle ? "Disable" : "Enable"} separate condition input for ${displayLabel}`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                onToggleConditionInputMode(node.id);
+              }}
+            >
+              <span className="graph-node-inline-toggle-track">
+                <span className="graph-node-inline-toggle-thumb" />
+              </span>
+              <span className="graph-node-inline-toggle-text">{showConditionTargetHandle ? "On" : "Off"}</span>
             </button>
           </div>
         ) : null}

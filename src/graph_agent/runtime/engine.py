@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from collections import deque
 from typing import Any
 from collections.abc import Callable
@@ -230,12 +231,15 @@ class GraphRuntime:
         iterator_node_id = frame.get("iterator_node_id")
         iterator_row_index = frame.get("iterator_row_index")
         iterator_total_rows = frame.get("iterator_total_rows")
+        iterator_row_number = frame.get("iterator_row_number")
         if isinstance(iterator_node_id, str) and iterator_node_id:
             context["iterator_node_id"] = iterator_node_id
         if isinstance(iterator_row_index, int):
             context["iterator_row_index"] = iterator_row_index
         if isinstance(iterator_total_rows, int):
             context["iterator_total_rows"] = iterator_total_rows
+        if isinstance(iterator_row_number, int):
+            context["iterator_row_number"] = iterator_row_number
         iteration_id = self._build_iteration_id(
             context.get("iterator_node_id"),
             context.get("iterator_row_index"),
@@ -257,10 +261,13 @@ class GraphRuntime:
         }
         current_row_index = payload.get("current_row_index")
         total_rows = payload.get("total_rows")
+        current_row_number = payload.get("current_row_number")
         if isinstance(current_row_index, int):
             context["iterator_row_index"] = current_row_index
         if isinstance(total_rows, int):
             context["iterator_total_rows"] = total_rows
+        if isinstance(current_row_number, int):
+            context["iterator_row_number"] = current_row_number
         iteration_id = self._build_iteration_id(node_id, current_row_index)
         if iteration_id is not None:
             context["iteration_id"] = iteration_id
@@ -292,7 +299,7 @@ class GraphRuntime:
         state.iterator_states[node_id] = {
             key: value
             for key, value in payload.items()
-            if key not in {"node_id", "iterator_node_id", "iterator_row_index", "iterator_total_rows", "iteration_id"}
+            if key not in {"node_id", "iterator_node_id", "iterator_row_index", "iterator_total_rows", "iterator_row_number", "iteration_id"}
         }
 
     def _emit_iterator_update(self, state: RunState, node_id: str, payload: dict[str, Any]) -> None:
@@ -538,26 +545,35 @@ class GraphRuntime:
                 downstream_node_ids=downstream_node_ids,
             )
             state.node_outputs[node.id] = row_envelope
-            self._emit_iterator_update(
-                state,
-                node.id,
-                {
-                    **iterator_state,
-                    "status": "running",
-                    "current_row_index": row_index,
-                    "total_rows": total_rows,
-                },
-            )
+            row_number_value: int | None = None
+            if isinstance(row_envelope, dict):
+                payload_obj = row_envelope.get("payload")
+                if isinstance(payload_obj, dict):
+                    candidate = payload_obj.get("row_number")
+                    if isinstance(candidate, int):
+                        row_number_value = candidate
+            iterator_update_payload: dict[str, Any] = {
+                **iterator_state,
+                "status": "running",
+                "current_row_index": row_index,
+                "total_rows": total_rows,
+            }
+            if row_number_value is not None:
+                iterator_update_payload["current_row_number"] = row_number_value
+            self._emit_iterator_update(state, node.id, iterator_update_payload)
+            row_result_metadata: dict[str, Any] = {
+                "control_flow_handle_id": handle_id,
+                "iterator_type": iterator_type,
+                "current_row_index": row_index,
+                "total_rows": total_rows,
+            }
+            if row_number_value is not None:
+                row_result_metadata["current_row_number"] = row_number_value
             row_result = NodeExecutionResult(
                 status="success",
                 output=row_envelope,
                 summary=f"Prepared {iterator_item_label} {row_index} of {total_rows}.",
-                metadata={
-                    "control_flow_handle_id": handle_id,
-                    "iterator_type": iterator_type,
-                    "current_row_index": row_index,
-                    "total_rows": total_rows,
-                },
+                metadata=row_result_metadata,
                 route_outputs={handle_id: row_envelope},
             )
             next_edges = self.select_edges(graph, state, node.id, row_result)
@@ -570,17 +586,20 @@ class GraphRuntime:
                     error=failure_error,
                 )
             row_pending_nodes: deque[dict[str, Any]] = deque()
+            iteration_context: dict[str, Any] = {
+                "iterator_node_id": node.id,
+                "iterator_row_index": row_index,
+                "iterator_total_rows": total_rows,
+            }
+            if row_number_value is not None:
+                iteration_context["iterator_row_number"] = row_number_value
             self._enqueue_selected_edges(
                 graph,
                 state,
                 row_pending_nodes,
                 next_edges,
                 binding_edges,
-                iteration_context={
-                    "iterator_node_id": node.id,
-                    "iterator_row_index": row_index,
-                    "iterator_total_rows": total_rows,
-                },
+                iteration_context=iteration_context,
             )
             terminal_state = self._drain_pending_nodes(
                 graph,
@@ -737,10 +756,21 @@ class GraphRuntime:
             try:
                 result = node.execute(context)
             except Exception as exc:  # noqa: BLE001
+                exception_type = type(exc).__name__
+                message = str(exc)
+                if not message:
+                    message = exception_type
+                traceback_tail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-2000:]
                 return self.fail_run(
                     state,
                     summary=f"Node '{node.label}' raised an exception.",
-                    error={"type": "node_exception", "node_id": node.id, "message": str(exc)},
+                    error={
+                        "type": "node_exception",
+                        "node_id": node.id,
+                        "message": message,
+                        "exception_type": exception_type,
+                        "traceback": traceback_tail,
+                    },
                 )
             execute_ms = _elapsed_ms(execute_started_at)
 

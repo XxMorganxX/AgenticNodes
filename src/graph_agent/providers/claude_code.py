@@ -26,8 +26,55 @@ _HEALTHCHECK_MIN_TURNS = 2
 _MIN_REQUEST_TURNS = 2
 _ANTHROPIC_API_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 _LOG_PREVIEW_LIMIT = 240
+_DEFAULT_STUB_RETRY_LIMIT = 3
+
+# Stub strings the model occasionally emits in place of real content (e.g.
+# {"subject": "Placeholder", "body": "Placeholder"}). Matched case-insensitively
+# after trimming whitespace and trailing punctuation. An exact match is required
+# — substrings like "Placeholder for X" don't trigger.
+_STUB_VALUE_PATTERNS = frozenset(
+    {
+        "",
+        "...",
+        "…",
+        "placeholder",
+        "body placeholder",
+        "subject placeholder",
+        "subject here",
+        "body here",
+        "draft below",
+        "tbd",
+        "to be filled",
+        "fill in",
+        "n/a",
+        "<subject>",
+        "<body>",
+    }
+)
+_STUB_RETRY_HINT = (
+    "Your previous response was a stub or placeholder instead of real content. "
+    "Re-read the recipient information above and respond with the actual JSON object. "
+    "Every string field must contain the real written content — never 'Placeholder', "
+    "'TBD', 'subject here', 'body here', or similarly empty strings."
+)
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _value_looks_like_stub(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower().rstrip(".!?")
+    return normalized in _STUB_VALUE_PATTERNS
+
+
+def _structured_message_has_stub(message: Any) -> bool:
+    """Return True if a parsed model response message contains a stub value."""
+    if isinstance(message, str):
+        return _value_looks_like_stub(message)
+    if isinstance(message, Mapping):
+        return any(_value_looks_like_stub(value) for value in message.values())
+    return False
 
 
 def _is_mapping(value: Any) -> bool:
@@ -275,13 +322,84 @@ class ClaudeCodeCLIModelProvider(ModelProvider):
         provider_config = self._provider_config(request)
         tools = self._tool_definitions(request)
         response_schema = self._response_schema(request, tools)
+        timeout_seconds = float(_number_config(provider_config, "timeout_seconds") or 60)
+        cwd = self._working_directory(provider_config)
         payload = self._run_command(
             command=self._build_command(request, provider_config, tools, response_schema),
-            cwd=self._working_directory(provider_config),
-            timeout_seconds=float(_number_config(provider_config, "timeout_seconds") or 60),
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
         )
         latency_ms = int((time.perf_counter() - started_at) * 1000)
-        return self._parse_response(payload, tools, response_schema, provider_config, latency_ms)
+        response = self._parse_response(payload, tools, response_schema, provider_config, latency_ms)
+
+        if not self._response_looks_like_stub(response):
+            return response
+
+        max_stub_retries = max(
+            0,
+            int(_number_config(provider_config, "stub_retry_limit") or _DEFAULT_STUB_RETRY_LIMIT),
+        )
+        original_content_preview = _truncate_for_log(response.content)
+        previews: list[str] = [original_content_preview]
+        retry_messages = list(request.messages)
+        attempt = 0
+
+        while attempt < max_stub_retries and self._response_looks_like_stub(response):
+            attempt += 1
+            LOGGER.warning(
+                "claude_code response looks like a stub; retry %d/%d. prompt_name=%s preview=%s",
+                attempt,
+                max_stub_retries,
+                request.prompt_name,
+                _truncate_for_log(response.content),
+            )
+            retry_messages = [*retry_messages, ModelMessage(role="user", content=_STUB_RETRY_HINT)]
+            retry_request = ModelRequest(
+                prompt_name=request.prompt_name,
+                messages=retry_messages,
+                response_schema=request.response_schema,
+                provider_config=request.provider_config,
+                available_tools=request.available_tools,
+                preferred_tool_name=request.preferred_tool_name,
+                response_mode=request.response_mode,
+                metadata=dict(request.metadata),
+            )
+            retry_started_at = time.perf_counter()
+            retry_payload = self._run_command(
+                command=self._build_command(retry_request, provider_config, tools, response_schema),
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+            )
+            retry_latency_ms = int((time.perf_counter() - retry_started_at) * 1000)
+            response = self._parse_response(
+                retry_payload, tools, response_schema, provider_config, retry_latency_ms
+            )
+            previews.append(_truncate_for_log(response.content))
+
+        if attempt > 0:
+            response.metadata["stub_retry"] = True
+            response.metadata["stub_retry_attempts"] = attempt
+            response.metadata["stub_retry_succeeded"] = not self._response_looks_like_stub(response)
+            response.metadata["stub_retry_original_preview"] = original_content_preview
+            response.metadata["stub_retry_previews"] = previews
+        return response
+
+    def _response_looks_like_stub(self, response: ModelResponse) -> bool:
+        """Detect placeholder/stub responses (e.g. {'body': 'Placeholder', ...}).
+
+        Looks at the parsed structured-output message when available, falling
+        back to the raw content string. Returns True only on an exact-match
+        stub value to avoid false positives on legitimate short content.
+        Empty messages are ignored when the response carries a tool call —
+        those represent a legitimate "delegate to tool" decision, not a stub.
+        """
+        structured = response.structured_output
+        if isinstance(structured, Mapping):
+            if response.tool_calls or structured.get("tool_calls") or structured.get("need_tool") is True:
+                return False
+            if _structured_message_has_stub(structured.get("message")):
+                return True
+        return _value_looks_like_stub(response.content)
 
     def _provider_config(self, request: ModelRequest) -> Mapping[str, Any]:
         return request.provider_config if _is_mapping(request.provider_config) else {}

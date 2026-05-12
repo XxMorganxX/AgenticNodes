@@ -165,7 +165,15 @@ manager = GraphRunManager()
 
 
 @app.on_event("startup")
-def startup_event() -> None:
+async def startup_event() -> None:
+    # Sync handlers (and the SSE stream_run_events generator) run on Starlette's
+    # anyio threadpool. Each open SSE stream holds a slot for the duration of
+    # its blocking queue.get(timeout=15). With several background CLI runs +
+    # the UI's own SSE streams, the default 40-slot pool saturates and saves
+    # (PUT /api/graphs) stall waiting for a slot. Bump to 200 so the pool is
+    # sized for the actual concurrency this single-user dev tool sees.
+    import anyio
+    anyio.to_thread.current_default_thread_limiter().total_tokens = 200
     manager.start_background_services()
 
 
@@ -620,6 +628,11 @@ def reset_runtime() -> dict[str, Any]:
 @app.post("/api/runtime/stop")
 def stop_runtime() -> dict[str, Any]:
     return manager.stop_runtime()
+
+
+@app.get("/api/runtime/menubar")
+def runtime_menubar_status() -> dict[str, Any]:
+    return manager.get_menubar_status()
 
 
 @app.get("/api/runs/{run_id}")

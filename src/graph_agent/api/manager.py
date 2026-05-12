@@ -1100,6 +1100,31 @@ class GraphRunManager:
             )
         return history
 
+    def get_menubar_status(self, *, lookback: int = 50) -> dict[str, Any]:
+        rows = self.list_runs(graph_id=None, limit=lookback)
+        running = 0
+        last_failed_run_id: str | None = None
+        last_failed_at: str | None = None
+        latest_terminal_seen = False
+        for row in rows:
+            status = row.get("status")
+            if status == "running":
+                running += 1
+                continue
+            if status not in TERMINAL_RUN_STATUSES:
+                continue
+            if not latest_terminal_seen:
+                latest_terminal_seen = True
+                if status == "failed":
+                    last_failed_run_id = row.get("run_id")
+                    last_failed_at = row.get("ended_at") or row.get("created_at")
+        return {
+            "running": running,
+            "failed_recent": last_failed_run_id is not None,
+            "last_failed_run_id": last_failed_run_id,
+            "last_failed_at": last_failed_at,
+        }
+
     def start_run(
         self,
         graph_id: str,
@@ -1738,9 +1763,59 @@ class GraphRunManager:
 
     def stop_runtime(self) -> dict[str, Any]:
         active_run_ids = self._request_active_run_cancellation()
+        all_rows = self._run_store.list_runs(limit=200)
+        rows_by_id = {str(row.get("run_id") or ""): row for row in all_rows}
+        reaped_run_ids: list[str] = []
+        for run_id, row in rows_by_id.items():
+            if not run_id or row.get("status") != "running":
+                continue
+            if run_id in active_run_ids:
+                continue
+            if not self._heartbeat_expired(row.get("last_heartbeat_at")):
+                continue
+            try:
+                recovered = self.get_run(run_id)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Failed to reap stale run %s: %s", run_id, exc)
+                continue
+            if isinstance(recovered, dict) and recovered.get("status") != "running":
+                reaped_run_ids.append(run_id)
+
+        graph_label_cache: dict[str, str] = {}
+
+        def _graph_label(graph_id: str | None) -> str | None:
+            if not graph_id:
+                return None
+            if graph_id in graph_label_cache:
+                return graph_label_cache[graph_id]
+            try:
+                payload = self._store.get_graph(graph_id)
+            except Exception:  # noqa: BLE001
+                graph_label_cache[graph_id] = graph_id
+                return graph_id
+            label = str(payload.get("name") or payload.get("graph_id") or graph_id)
+            graph_label_cache[graph_id] = label
+            return label
+
+        def _summary(run_id: str) -> dict[str, Any]:
+            row = rows_by_id.get(run_id) or {}
+            graph_id = row.get("graph_id")
+            return {
+                "run_id": run_id,
+                "graph_id": graph_id,
+                "graph_label": _graph_label(graph_id if isinstance(graph_id, str) else None),
+                "agent_id": row.get("agent_id"),
+                "agent_name": row.get("agent_name"),
+                "parent_run_id": row.get("parent_run_id"),
+            }
+
         return {
             "stopping_run_ids": active_run_ids,
             "stopping_run_count": len(active_run_ids),
+            "stopping_runs": [_summary(rid) for rid in active_run_ids],
+            "reaped_zombie_run_ids": reaped_run_ids,
+            "reaped_zombie_run_count": len(reaped_run_ids),
+            "reaped_zombie_runs": [_summary(rid) for rid in reaped_run_ids],
         }
 
     def reset_runtime(self) -> dict[str, Any]:

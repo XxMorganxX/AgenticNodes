@@ -27,6 +27,39 @@ def _plain_text_to_html(text: str) -> str:
     return html_module.escape(text, quote=False).replace("\n", "<br>")
 
 
+def _merge_reply_body_content(
+    *,
+    new_content_type: str,
+    new_content: str,
+    auto_content_type: str,
+    auto_content: str,
+) -> dict[str, str] | None:
+    """Merge new reply text with the auto-composed body returned by ``createReply``.
+
+    Microsoft Graph's ``createReply`` populates the draft body with the quoted
+    parent message and the threading markup Outlook uses for the in-message
+    "switch between current and previous" affordance. PATCH-replacing that body
+    breaks that affordance even when ``conversationId`` still matches. This
+    helper prepends the caller's new content to the auto-composed body so the
+    quoted parent is preserved end-to-end.
+    """
+
+    if not new_content.strip():
+        return None
+    if not auto_content.strip():
+        return {
+            "contentType": "HTML" if new_content_type.upper() == "HTML" else "Text",
+            "content": new_content,
+        }
+    auto_is_html = auto_content_type.lower() == "html"
+    new_is_html = new_content_type.upper() == "HTML"
+    if auto_is_html or new_is_html:
+        new_html = new_content if new_is_html else _plain_text_to_html(new_content)
+        auto_html = auto_content if auto_is_html else _plain_text_to_html(auto_content)
+        return {"contentType": "HTML", "content": f"{new_html}<br><br>{auto_html}"}
+    return {"contentType": "Text", "content": f"{new_content}\n\n{auto_content}"}
+
+
 def compose_outlook_draft_body(body: str, signature: str) -> tuple[str, str]:
     """Merge a body and signature into a single Microsoft Graph body payload.
 
@@ -358,14 +391,24 @@ class OutlookDraftClient:
                 body=None,
             )
 
+        auto_body_obj = payload_dict.get("body") if isinstance(payload_dict, Mapping) else None
+        auto_content_type = ""
+        auto_content = ""
+        if isinstance(auto_body_obj, Mapping):
+            auto_content_type = str(auto_body_obj.get("contentType", "") or "")
+            auto_content = str(auto_body_obj.get("content", "") or "")
+        merged_body = _merge_reply_body_content(
+            new_content_type=content_type,
+            new_content=combined_body,
+            auto_content_type=auto_content_type,
+            auto_content=auto_content,
+        )
+
         patch: dict[str, Any] = {}
         if normalized_subject:
             patch["subject"] = normalized_subject
-        if combined_body:
-            patch["body"] = {
-                "contentType": content_type,
-                "content": combined_body,
-            }
+        if merged_body is not None:
+            patch["body"] = merged_body
         if normalized_recipients:
             patch["toRecipients"] = [
                 {"emailAddress": {"address": recipient}}

@@ -21,6 +21,9 @@ dependencies = [
     "uvicorn",
 ]
 
+[project.optional-dependencies]
+menubar = ["rumps; sys_platform == 'darwin'"]
+
 [project.scripts]
 agents = "graph_agent.cli:main"
 

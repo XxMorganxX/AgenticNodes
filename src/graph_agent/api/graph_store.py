@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from graph_agent.providers.webhook import WEBHOOK_START_PROVIDER_ID, normalize_webhook_slug
 from graph_agent.runtime.core import GraphDefinition, GraphValidationError, RuntimeServices
@@ -22,6 +23,7 @@ from graph_agent.runtime.node_providers import DEFAULT_CATEGORY_CONTRACTS, list_
 
 
 NON_PERSISTED_GRAPH_ENV_KEYS = {"MICROSOFT_GRAPH_ACCESS_TOKEN"}
+EMPTY_USER_GRAPH_STORE = {"graphs": [], "deleted_graph_ids": []}
 
 
 def _sanitize_env_var_mapping(payload: Any) -> dict[str, str]:
@@ -206,7 +208,7 @@ class GraphStore:
     def _ensure_user_store(self) -> None:
         if self.path.exists():
             return
-        self._save_user_all({"graphs": [], "deleted_graph_ids": []})
+        self._save_user_all(EMPTY_USER_GRAPH_STORE)
 
     def _load_bundled_all(self) -> dict[str, Any]:
         payload = json.loads(self.bundled_path.read_text())
@@ -219,7 +221,7 @@ class GraphStore:
         }
 
     def _load_user_all(self) -> dict[str, Any]:
-        payload = json.loads(self.path.read_text())
+        payload, _ = self._read_user_store_payload()
         return {
             "graphs": [
                 _sanitize_graph_payload(graph)
@@ -235,38 +237,83 @@ class GraphStore:
 
     def _save_user_all(self, payload: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(
-                {
-                    "graphs": [_sanitize_graph_payload(graph) for graph in payload.get("graphs", [])],
-                    "deleted_graph_ids": sorted(
-                        {
-                            str(graph_id).strip()
-                            for graph_id in payload.get("deleted_graph_ids", [])
-                            if str(graph_id).strip()
-                        }
-                    ),
-                },
-                indent=2,
-            )
+        tmp_path = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
+        tmp_path.write_text(
+            json.dumps(self._normalized_user_store_payload(payload), indent=2),
+            encoding="utf-8",
         )
+        tmp_path.replace(self.path)
         self._invalidate_caches()
 
     def _sanitize_user_store(self) -> None:
-        try:
-            payload = json.loads(self.path.read_text())
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return
-        sanitized = {
-            "graphs": [_sanitize_graph_payload(graph) for graph in payload.get("graphs", []) if isinstance(graph, dict)],
-            "deleted_graph_ids": [
-                str(graph_id).strip()
-                for graph_id in payload.get("deleted_graph_ids", [])
-                if str(graph_id).strip()
-            ],
-        }
-        if sanitized != payload:
+        payload, needs_rewrite = self._read_user_store_payload()
+        sanitized = self._normalized_user_store_payload(payload)
+        if needs_rewrite or sanitized != payload:
             self._save_user_all(sanitized)
+
+    def _normalized_user_store_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "graphs": [_sanitize_graph_payload(graph) for graph in payload.get("graphs", []) if isinstance(graph, dict)],
+            "deleted_graph_ids": sorted(
+                {
+                    str(graph_id).strip()
+                    for graph_id in payload.get("deleted_graph_ids", [])
+                    if str(graph_id).strip()
+                }
+            ),
+        }
+
+    def _read_user_store_payload(self) -> tuple[dict[str, Any], bool]:
+        try:
+            store_text = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return deepcopy(EMPTY_USER_GRAPH_STORE), True
+        except OSError:
+            return deepcopy(EMPTY_USER_GRAPH_STORE), False
+
+        try:
+            payload = json.loads(store_text)
+        except json.JSONDecodeError:
+            recovered_payload = self._recover_concatenated_user_store_payload(store_text)
+            if recovered_payload is not None:
+                return recovered_payload, True
+            self._quarantine_invalid_user_store()
+            return deepcopy(EMPTY_USER_GRAPH_STORE), True
+
+        if not isinstance(payload, dict):
+            return deepcopy(EMPTY_USER_GRAPH_STORE), True
+        return payload, False
+
+    def _recover_concatenated_user_store_payload(self, store_text: str) -> dict[str, Any] | None:
+        decoder = json.JSONDecoder()
+        index = 0
+        payloads: list[dict[str, Any]] = []
+        while index < len(store_text):
+            while index < len(store_text) and store_text[index].isspace():
+                index += 1
+            if index >= len(store_text):
+                break
+            try:
+                payload, next_index = decoder.raw_decode(store_text, index)
+            except json.JSONDecodeError:
+                return None
+            if isinstance(payload, dict):
+                payloads.append(payload)
+            index = next_index
+        if not payloads:
+            return None
+        return payloads[-1]
+
+    def _quarantine_invalid_user_store(self) -> None:
+        candidate = self.path.with_name(f"{self.path.name}.invalid")
+        suffix = 1
+        while candidate.exists():
+            candidate = self.path.with_name(f"{self.path.name}.invalid.{suffix}")
+            suffix += 1
+        try:
+            self.path.replace(candidate)
+        except OSError:
+            return
 
     def _bundled_graph_ids(self) -> set[str]:
         return {graph["graph_id"] for graph in self._load_bundled_all()["graphs"]}

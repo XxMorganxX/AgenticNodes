@@ -21,6 +21,7 @@ import { resolveToolNodeDetails } from "../lib/toolNodeDetails";
 import { useDebouncedValue } from "../lib/useDebouncedValue";
 import { useModalNodeDraft } from "../lib/useModalNodeDraft";
 import { NodeDetailsForm } from "./NodeDetailsForm";
+import { PromptFullscreenModal } from "./PromptFullscreenModal";
 import type {
   EditorCatalog,
   GraphDefinition,
@@ -616,8 +617,10 @@ export function ProviderDetailsModal({
   const node = draftNode;
   const [activeTab, setActiveTab] = useState<ProviderDetailsModalTab>("node");
   const [outlookDraftLearnMoreOpen, setOutlookDraftLearnMoreOpen] = useState(false);
+  const [fullscreenPromptField, setFullscreenPromptField] = useState<"system_prompt" | "user_message_template" | null>(null);
   useEffect(() => {
     setOutlookDraftLearnMoreOpen(false);
+    setFullscreenPromptField(null);
   }, [committedNode.id]);
   const debouncedPreviewNode = useDebouncedValue(node, 150);
   const nodeLabel = getNodeInstanceLabel(graph, node);
@@ -2077,7 +2080,28 @@ export function ProviderDetailsModal({
                   </div>
 
                   <label className="provider-details-prompt-field provider-details-prompt-field--system">
-                    System Prompt
+                    <span className="provider-details-prompt-field-label">
+                      <span>System Prompt</span>
+                      <button
+                        type="button"
+                        className="provider-details-prompt-expand-button"
+                        onClick={() => setFullscreenPromptField("system_prompt")}
+                        title="Open system prompt in full screen"
+                        aria-label="Open system prompt in full screen"
+                      >
+                        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                          <path
+                            d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.6"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                        </svg>
+                        <span>Full screen</span>
+                      </button>
+                    </span>
                     <textarea
                       className="provider-details-prompt-textarea provider-details-prompt-textarea--system"
                       rows={16}
@@ -2096,7 +2120,28 @@ export function ProviderDetailsModal({
                   </label>
 
                   <label className="provider-details-prompt-field provider-details-prompt-field--user">
-                    User Message Template
+                    <span className="provider-details-prompt-field-label">
+                      <span>User Message Template</span>
+                      <button
+                        type="button"
+                        className="provider-details-prompt-expand-button"
+                        onClick={() => setFullscreenPromptField("user_message_template")}
+                        title="Open user message template in full screen"
+                        aria-label="Open user message template in full screen"
+                      >
+                        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                          <path
+                            d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.6"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                        </svg>
+                        <span>Full screen</span>
+                      </button>
+                    </span>
                     <textarea
                       className="provider-details-prompt-textarea provider-details-prompt-textarea--user"
                       rows={12}
@@ -3443,6 +3488,54 @@ export function ProviderDetailsModal({
           </div>
         </div>
       </section>
+      {fullscreenPromptField !== null ? (
+        <PromptFullscreenModal
+          eyebrow={`${nodeLabel} · API Block Prompt`}
+          title="Prompt Authoring"
+          description="System and user templates side by side. Placeholders are outlined inline as you type."
+          initialFocus={fullscreenPromptField === "user_message_template" ? "user" : "system"}
+          panes={[
+            {
+              key: "system",
+              title: "System Prompt",
+              description: "Sets the model's behavior.",
+              value: String(node.config.system_prompt ?? ""),
+              placeholder: "You are a helpful model node.",
+              onChange: (nextValue) => updateProviderConfig("system_prompt", nextValue),
+            },
+            {
+              key: "user",
+              title: "User Message Template",
+              description: "Runtime payload for the user turn.",
+              value: displayedUserMessageTemplate,
+              placeholder: "{input_payload}",
+              onChange: (nextValue) => updateProviderConfig("user_message_template", nextValue),
+            },
+          ]}
+          validPlaceholders={uniqueStrings([
+            ...Object.keys(getGraphEnvVars(graph)),
+            "documents",
+            "input_payload",
+            "run_id",
+            "graph_id",
+            "current_node_id",
+            "available_tools",
+            "mcp_available_tool_names",
+            "mcp_tool_context",
+            "mcp_tool_context_prompt",
+            "mcp_tool_context_block",
+            "mcp_tool_guidance",
+            "mcp_tool_guidance_block",
+            "mode",
+            "preferred_tool_name",
+            "response_mode",
+            "prompt_blocks",
+            ...contextBuilderPromptVariables.map((variable) => variable.token),
+            ...promptContextToolSummaries.map((tool) => tool.placeholderToken),
+          ])}
+          onClose={() => setFullscreenPromptField(null)}
+        />
+      ) : null}
     </div>
   );
 }
