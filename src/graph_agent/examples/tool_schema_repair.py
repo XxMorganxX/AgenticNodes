@@ -276,6 +276,95 @@ def build_example_services(*, include_user_mcp_servers: bool = False) -> Runtime
     )
     node_providers.register(
         NodeProviderDefinition(
+            provider_id="start.supabase_row_event",
+            display_name="Supabase Row Event",
+            category=NodeCategory.START,
+            node_kind="input",
+            description=(
+                "Starts a graph when a Supabase Database Webhook posts a row INSERT, UPDATE, or DELETE "
+                "to /api/webhooks/{slug}. Configure the matching webhook in the Supabase dashboard "
+                "(Database -> Webhooks) and point it at this slug. Requires Cloudflare tunnel for "
+                "public ingress."
+            ),
+            capabilities=[
+                "supabase database webhook",
+                "row event listener",
+                "insert/update/delete filter",
+                "table allowlist",
+                "shared-secret verification",
+            ],
+            default_config={
+                "trigger_mode": "supabase_row_event",
+                "supabase_connection_id": "",
+                "webhook_path_slug": "",
+                "event_allowlist": ["INSERT"],
+                "table_allowlist": [],
+                "verification_mode": "shared_secret",
+                "webhook_secret_env_var": "{SUPABASE_WEBHOOK_SECRET}",
+                "webhook_shared_secret_header": "x-supabase-signature",
+                "prompt": "",
+                "input_binding": {"type": "input_payload"},
+            },
+            config_fields=[
+                ProviderConfigFieldDefinition(
+                    key="webhook_path_slug",
+                    label="Webhook path slug",
+                    help_text="URL segment after /api/webhooks/ — letters, digits, underscores, hyphens; 4–128 chars. Must be unique across all graphs.",
+                    placeholder="leads-inserts",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="event_allowlist",
+                    label="Event types",
+                    input_type="checkbox",
+                    help_text="Row events that should fire this graph. Must match the events configured on the Supabase Database Webhook.",
+                    options=[
+                        ProviderConfigOptionDefinition(value="INSERT", label="INSERT (new rows)"),
+                        ProviderConfigOptionDefinition(value="UPDATE", label="UPDATE (changed rows)"),
+                        ProviderConfigOptionDefinition(value="DELETE", label="DELETE (removed rows)"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(
+                    key="table_allowlist",
+                    label="Tables",
+                    input_type="textarea",
+                    help_text="One entry per line, formatted as schema.table (e.g. public.leads). Rows from other tables are rejected.",
+                    placeholder="public.leads\npublic.orders",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="verification_mode",
+                    label="Verification",
+                    input_type="select",
+                    help_text="shared_secret matches the Supabase Database Webhook 'HTTP Headers' value. none disables verification (dev only).",
+                    options=[
+                        ProviderConfigOptionDefinition(value="shared_secret", label="Shared secret (header match)"),
+                        ProviderConfigOptionDefinition(value="none", label="None (insecure)"),
+                    ],
+                ),
+                ProviderConfigFieldDefinition(
+                    key="webhook_secret_env_var",
+                    label="Secret env-var placeholder",
+                    help_text="Graph env resolves {NAME}; process env fills secrets. Required when verification is not none.",
+                    placeholder="{SUPABASE_WEBHOOK_SECRET}",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="webhook_shared_secret_header",
+                    label="Shared-secret header name",
+                    help_text="Case-insensitive header on the Supabase HTTP Headers tab that must match the resolved secret.",
+                    placeholder="x-supabase-signature",
+                ),
+                ProviderConfigFieldDefinition(
+                    key="prompt",
+                    label="Prompt (merged)",
+                    help_text="Optional string merged into input_payload.prompt alongside the row event payload.",
+                    placeholder="",
+                ),
+            ],
+            trigger_mode="listener",
+            listener_transport="inbound_webhook",
+        )
+    )
+    node_providers.register(
+        NodeProviderDefinition(
             provider_id="core.input",
             display_name="Core Input Node (Legacy)",
             category=NodeCategory.START,

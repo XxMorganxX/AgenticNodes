@@ -1,11 +1,15 @@
 """macOS menu-bar status indicator for the graph-agent backend.
 
-Polls `/api/runtime/menubar` and renders a colored LED dot plus a running-count
-badge in the system status bar:
+Subscribes to `/api/runtime/menubar/stream` (Server-Sent Events) and renders a
+colored LED dot plus a running-count badge in the system status bar:
 
   * green LED + count when everything is healthy
   * red LED + count when the most recent terminal run failed
   * grey LED when the backend is unreachable
+
+The stream only emits when the underlying state changes, so there are no
+periodic polls in steady state. On connection failure the reader thread
+reconnects with backoff.
 
 When AppKit is available the title is drawn as an NSAttributedString so the
 dot is a real colored glyph and the integer uses a monospaced-digit semibold
@@ -22,6 +26,7 @@ import json
 import os
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import webbrowser
@@ -57,32 +62,56 @@ FALLBACK_UNKNOWN = "⚫"
 
 
 class StatusApp(rumps.App):
-    def __init__(self, api_base_url: str, frontend_url: str, poll_seconds: float) -> None:
+    def __init__(self, api_base_url: str, frontend_url: str) -> None:
         super().__init__(name="graph-agent", title=f"{FALLBACK_UNKNOWN} -", quit_button=None)
         self._api_base_url = api_base_url.rstrip("/")
         self._frontend_url = frontend_url.rstrip("/")
-        self._poll_seconds = max(0.5, poll_seconds)
         self._last_failed_run_id: str | None = None
         self._detail_item = rumps.MenuItem("Starting up…")
         self._open_item = rumps.MenuItem("Open studio", callback=self._open_studio)
         self._quit_item = rumps.MenuItem("Quit", callback=self._quit)
         self.menu = [self._detail_item, None, self._open_item, None, self._quit_item]
 
-        rumps.Timer(self._tick, self._poll_seconds).start()
+        self._stop_event = threading.Event()
+        self._reader_thread = threading.Thread(target=self._stream_loop, daemon=True)
+        self._reader_thread.start()
 
-    def _tick(self, _sender) -> None:
-        threading.Thread(target=self._poll_once, daemon=True).start()
+    def _stream_loop(self) -> None:
+        url = f"{self._api_base_url}/api/runtime/menubar/stream"
+        backoff = 1.0
+        while not self._stop_event.is_set():
+            try:
+                request = urllib.request.Request(
+                    url, headers={"Accept": "text/event-stream"}
+                )
+                with urllib.request.urlopen(request, timeout=30.0) as response:
+                    backoff = 1.0
+                    self._consume_stream(response)
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+                self._render(0, "unknown")
+                self._detail_item.title = f"Backend unreachable: {error}"
+            if self._stop_event.is_set():
+                return
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
-    def _poll_once(self) -> None:
-        url = f"{self._api_base_url}/api/runtime/menubar"
-        try:
-            with urllib.request.urlopen(url, timeout=2.0) as response:
-                payload = json.load(response)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-            self._render(0, "unknown")
-            self._detail_item.title = f"Backend unreachable: {error}"
-            return
+    def _consume_stream(self, response) -> None:
+        for raw in response:
+            if self._stop_event.is_set():
+                return
+            line = raw.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")
+            if not line or line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].lstrip()
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            self._apply_payload(payload)
 
+    def _apply_payload(self, payload: dict) -> None:
         running = int(payload.get("running") or 0)
         failed_recent = bool(payload.get("failed_recent"))
         last_failed_run_id = payload.get("last_failed_run_id")
@@ -160,6 +189,7 @@ class StatusApp(rumps.App):
             webbrowser.open(self._frontend_url)
 
     def _quit(self, _sender) -> None:
+        self._stop_event.set()
         rumps.quit_application()
 
 
@@ -173,11 +203,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--frontend-url",
         default=os.environ.get("GRAPH_AGENT_FRONTEND_URL", ""),
     )
-    parser.add_argument(
-        "--poll-seconds",
-        type=float,
-        default=float(os.environ.get("GRAPH_AGENT_MENUBAR_POLL_SECONDS", "2.0")),
-    )
     return parser.parse_args(argv)
 
 
@@ -186,7 +211,6 @@ def main(argv: list[str] | None = None) -> int:
     StatusApp(
         api_base_url=args.api_base_url,
         frontend_url=args.frontend_url,
-        poll_seconds=args.poll_seconds,
     ).run()
     return 0
 

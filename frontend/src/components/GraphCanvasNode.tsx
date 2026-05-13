@@ -279,7 +279,10 @@ function GraphCanvasNodeComponent({
   const isOutlookDraftNode = node.provider_id === "end.outlook_draft";
   const isDiscordStartNode = node.kind === "input" && node.provider_id === "start.discord_message";
   const isCronStartNode = node.kind === "input" && node.provider_id === "start.cron_schedule";
-  const isWebhookStartNode = node.kind === "input" && node.provider_id === "start.webhook";
+  const isSupabaseRowEventStartNode =
+    node.kind === "input" && node.provider_id === "start.supabase_row_event";
+  const isWebhookStartNode =
+    (node.kind === "input" && node.provider_id === "start.webhook") || isSupabaseRowEventStartNode;
   const displayLabel = providedDisplayLabel ?? getNodeInstanceLabel(graph, node);
   const resolvedSupabaseBinding = isSupabaseNode ? resolveSupabaseBinding(graph, node.config as Record<string, unknown>) : null;
   const supabaseConnectionOptions = isSupabaseNode ? getSupabaseConnectionSelectOptions(graph, node.config as Record<string, unknown>) : [];
@@ -1138,7 +1141,7 @@ function GraphCanvasNodeComponent({
                 onOpenProviderDetails(node.id);
               }}
             >
-              Configure Webhook
+              {isSupabaseRowEventStartNode ? "Configure Row Event" : "Configure Webhook"}
             </button>
           </div>
         ) : null}

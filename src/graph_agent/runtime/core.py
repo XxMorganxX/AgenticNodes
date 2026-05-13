@@ -8694,10 +8694,6 @@ class GraphDefinition:
         )
 
     def validate(self) -> None:
-        if self.start_node_id not in self.nodes:
-            raise GraphValidationError(f"Unknown start node '{self.start_node_id}'.")
-        if not self.nodes:
-            raise GraphValidationError("Graphs must contain at least one node.")
         seen_supabase_connection_ids: set[str] = set()
         for connection in self.supabase_connections:
             if connection.connection_id in seen_supabase_connection_ids:
@@ -8711,6 +8707,12 @@ class GraphDefinition:
             raise GraphValidationError(
                 f"Unknown run-store Supabase connection '{self.run_store_supabase_connection_id}'."
             )
+        if self.is_draft:
+            return
+        if self.start_node_id not in self.nodes:
+            raise GraphValidationError(f"Unknown start node '{self.start_node_id}'.")
+        if not self.nodes:
+            raise GraphValidationError("Graphs must contain at least one node.")
         start_node = self.nodes[self.start_node_id]
         if start_node.category != NodeCategory.START:
             raise GraphValidationError("The graph start node must use the 'start' category.")
@@ -8725,6 +8727,7 @@ class GraphDefinition:
                 SUPABASE_TABLE_ROWS_PROVIDER_ID,
                 SUPABASE_ROW_WRITE_PROVIDER_ID,
                 OUTBOUND_EMAIL_LOGGER_PROVIDER_ID,
+                "start.supabase_row_event",
             }:
                 continue
             connection_id = str(node.config.get("supabase_connection_id", "") or "").strip()
@@ -8834,6 +8837,10 @@ class GraphDefinition:
                     f"outbound email logger binding (found {len(logger_binding_edges)})."
                 )
 
+    @property
+    def is_draft(self) -> bool:
+        return not self.nodes and not self.start_node_id and not self.edges
+
     def start_node(self) -> BaseNode:
         return self.nodes[self.start_node_id]
 
@@ -8859,11 +8866,38 @@ class GraphDefinition:
                     f"Node '{node.id}' uses provider '{node.provider_id}' for kind "
                     f"'{provider_definition.node_kind}', but the node kind is '{node.kind}'."
                 )
-            if str(node.provider_id) == "start.webhook":
+            if str(node.provider_id) in {"start.webhook", "start.supabase_row_event"}:
                 from graph_agent.providers.webhook import normalize_webhook_slug, validate_webhook_slug
 
                 slug = normalize_webhook_slug(node.raw_config.get("webhook_path_slug"))
                 validate_webhook_slug(slug)
+            if str(node.provider_id) == "start.supabase_row_event":
+                connection_id = str(node.config.get("supabase_connection_id", "") or "").strip()
+                if not connection_id:
+                    raise GraphValidationError(
+                        f"Supabase row event start node '{node.id}' requires a supabase_connection_id."
+                    )
+                if self.get_supabase_connection(connection_id) is None:
+                    raise GraphValidationError(
+                        f"Supabase row event start node '{node.id}' references unknown Supabase connection '{connection_id}'."
+                    )
+                from graph_agent.providers.webhook import (
+                    SUPABASE_ROW_EVENT_TYPES,
+                    parse_supabase_event_allowlist,
+                    parse_supabase_table_allowlist,
+                )
+
+                events = parse_supabase_event_allowlist(node.raw_config.get("event_allowlist"))
+                if not events:
+                    raise GraphValidationError(
+                        f"Supabase row event start node '{node.id}' requires at least one event from "
+                        f"{', '.join(SUPABASE_ROW_EVENT_TYPES)}."
+                    )
+                tables = parse_supabase_table_allowlist(node.raw_config.get("table_allowlist"))
+                if not tables:
+                    raise GraphValidationError(
+                        f"Supabase row event start node '{node.id}' requires at least one table in the allowlist."
+                    )
             contract = get_category_contract(node.category)
             if not contract.produced_outputs:
                 raise GraphValidationError(f"Node category '{node.category.value}' is missing a contract.")

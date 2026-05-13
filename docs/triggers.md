@@ -32,6 +32,7 @@ Today's start-node inventory:
 | `start.discord_message` | `listener` | `outbound_socket` |
 | `start.cron_schedule` | `listener` | — |
 | `start.webhook` | `listener` | `inbound_webhook` |
+| `start.supabase_row_event` | `listener` | `inbound_webhook` |
 
 ## How the runtime uses these fields
 
@@ -146,6 +147,49 @@ Several agents may each use a listener start (`start.webhook`, `start.discord_me
 - Slug uniqueness across graphs: `GraphStore._validate_webhook_slug_uniqueness`.
 
 **Ingress policy:** Without **`GRAPH_AGENT_WEBHOOK_INGRESS_ENABLED=1`**, the API still accepts `/api/webhooks/{slug}` from **loopback** (e.g. `127.0.0.1`) and **private / link-local** client addresses (typical same-machine and LAN testing). Set the env var to **1** (and restart) so **public internet** clients can trigger webhooks. The editor catalog’s `webhook_ingress_enabled` flag reflects the public-ingress opt-in, not local testing.
+
+### Implemented: `start.supabase_row_event`
+
+A purpose-built variant of `start.webhook` for **Supabase Database Webhooks**. Shares the same `WebhookTriggerService`, ingress route, and Cloudflare tunnel plumbing; the difference is the inspector understands the Supabase payload shape and the child run starts with a flat envelope instead of a generic `body` wrapper.
+
+- Provider registration: `src/graph_agent/examples/tool_schema_repair.py` (alongside `start.webhook`).
+- Resolution + filter + payload helpers: `src/graph_agent/providers/webhook.py` (`SUPABASE_ROW_EVENT_PROVIDER_ID`, `parse_supabase_event_allowlist`, `parse_supabase_table_allowlist`, `passes_supabase_event_filter`, `build_supabase_row_event_child_payload`).
+- Ingress dispatch: `GraphRunManager.handle_inbound_webhook` branches on `WebhookStartResolved.kind` and runs the Supabase filter before building the child payload.
+- Slug uniqueness collides with `start.webhook` slugs across the same environment (intentional: they share the `/api/webhooks/{slug}` namespace).
+
+Config:
+
+| Field | Meaning |
+|---|---|
+| `supabase_connection_id` | The named Supabase connection this node binds to. Required at run time; surfaced to the operator so they know which project to point the Database Webhook at. |
+| `webhook_path_slug` | Path segment under `/api/webhooks/`. Same uniqueness rules as `start.webhook`. |
+| `event_allowlist` | Any subset of `INSERT`, `UPDATE`, `DELETE`. Required (non-empty). |
+| `table_allowlist` | List of `{schema, table}` pairs. Required (non-empty). |
+| `verification_mode` | `none` or `shared_secret`. Default `shared_secret`. |
+| `webhook_secret_env_var` | Env-var name holding the shared secret (default `{SUPABASE_WEBHOOK_SECRET}`). |
+| `webhook_shared_secret_header` | Header carrying the secret (default `x-supabase-signature`). |
+| `prompt` | Optional instruction string surfaced to downstream nodes as `input_payload.prompt`. |
+
+Child run payload shape (the resolved `input_payload`):
+
+```json
+{
+  "source": "supabase_row_event",
+  "graph_id": "...",
+  "event_type": "INSERT",
+  "schema": "public",
+  "table": "leads",
+  "record": {"id": 1, "email": "a@b.com"},
+  "old_record": null,
+  "supabase_connection_id": "primary-db",
+  "received_at": "2026-05-12T17:00:00Z",
+  "prompt": "...",
+  "listener_agent_id": null,
+  "raw_webhook": { "type": "INSERT", "schema": "public", "table": "leads", "record": {...}, "old_record": null }
+}
+```
+
+Filter behaviour: requests that arrive with an event type or table outside the allowlists return HTTP **200** with `{"filtered": true, "reason": "..."}` and start no run (Supabase does not retry on 2xx). Failed signature verification returns **401** as with `start.webhook`.
 
 When those land, this document picks them up — and so does
 `.claude/skills/triggers/SKILL.md`, which the repo convention requires to ship in

@@ -1330,7 +1330,9 @@ export default function App() {
   const isListenerGraph = listenerStartProvider !== null;
   const isListeningSession = isListenerGraph && isRunning;
   const isWebhookListenerSessionActive =
-    isListeningSession && listenerStartProvider?.provider_id === "start.webhook";
+    isListeningSession &&
+    (listenerStartProvider?.provider_id === "start.webhook" ||
+      listenerStartProvider?.provider_id === "start.supabase_row_event");
   const listenerWebhookEndpoints = useMemo(() => {
     if (!isListeningSession || !draftGraph) {
       return [] as Array<{ slug: string; localUrl: string; publicUrl: string | null }>;

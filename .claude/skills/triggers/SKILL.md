@@ -24,6 +24,7 @@ Mapping today:
 | `start.discord_message` | listener | outbound_socket |
 | `start.cron_schedule` | listener | — |
 | `start.webhook` | listener | inbound_webhook |
+| `start.supabase_row_event` | listener | inbound_webhook |
 
 For **`graph_type: test_environment`**, multiple agents may use listener starts **at once** (webhook, Discord, and/or cron). **Listen** uses the environment document id, arms every listener agent, and child runs are scoped with **`agent_ids=[…]`** so only the matching swimlane executes. Webhook agents need **pairwise distinct** `webhook_path_slug` values; cron uses composite internal keys per agent; Discord agents in one environment should use the same bot token.
 
@@ -50,6 +51,22 @@ When you add a **new** listener kind beyond the built-ins:
    manager (the Discord pattern).
 3. Append it to `self._trigger_services` in `GraphRunManager.__init__`.
 4. Update `docs/triggers.md` and this skill in the same commit.
+
+When you add a **vendor-specific variant of an existing `inbound_webhook`
+listener** (e.g. `start.supabase_row_event`), reuse the same
+`WebhookTriggerService` instead of writing a new one:
+
+1. Add the new `provider_id` to `INBOUND_WEBHOOK_PROVIDER_IDS` in
+   `providers/webhook.py` and to the slug-enumeration helpers
+   (`GraphStore._collect_webhook_slugs`, frontend `getWebhookPathSlugsForDocument`).
+2. Map the new `provider_id` to the existing `WebhookTriggerService` in
+   `GraphRunManager._trigger_services_by_provider_id` — do **not** append a new
+   entry to `self._trigger_services` (the underlying service is the same).
+3. Discriminate variants on a `kind` field on `WebhookStartResolved` and branch
+   only at the payload-shaping site (`handle_inbound_webhook`).
+4. Tighten validation in `GraphDefinition.validate_against_services` for the
+   variant's own required config (e.g. Supabase connection, event/table
+   allowlists).
 
 ## Cloudflare configuration
 

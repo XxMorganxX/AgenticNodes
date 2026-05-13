@@ -233,10 +233,12 @@ class TestEnvironmentDefinition:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> TestEnvironmentDefinition:
-        if "agents" not in payload:
+        agents_payload = payload.get("agents")
+        if not isinstance(agents_payload, list):
             normalized_payload = dict(payload)
+            raw_nodes = payload.get("nodes") or []
             normalized_payload["nodes"] = _normalize_legacy_graph_nodes(
-                [dict(node) for node in payload.get("nodes", []) if isinstance(node, Mapping)]
+                [dict(node) for node in raw_nodes if isinstance(node, Mapping)]
             )
             legacy_graph = GraphDefinition.from_dict(normalized_payload)
             legacy_agent_id = str(payload.get("agent_id", f"{legacy_graph.graph_id}-agent"))
@@ -317,6 +319,15 @@ class TestEnvironmentDefinition:
     @property
     def is_multi_agent(self) -> bool:
         return self.graph_type == "test_environment" or len(self.agents) > 1
+
+    @property
+    def is_draft(self) -> bool:
+        if not self.agents:
+            return True
+        return all(
+            not agent.nodes and not agent.start_node_id and not agent.edges
+            for agent in self.agents
+        )
 
     def to_dict(self) -> dict[str, Any]:
         payload = {

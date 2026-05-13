@@ -208,7 +208,9 @@ export function getListenerStartProvider(
   return provider;
 }
 
-/** All `webhook_path_slug` values for agents using `start.webhook` (multi-agent) or the single graph start node. */
+const INBOUND_WEBHOOK_PROVIDER_IDS = new Set(["start.webhook", "start.supabase_row_event"]);
+
+/** All `webhook_path_slug` values for agents using an inbound-webhook start provider (multi-agent) or the single graph start node. */
 export function getWebhookPathSlugsForDocument(graph: GraphDocument | null | undefined): string[] {
   if (!graph) {
     return [];
@@ -217,7 +219,7 @@ export function getWebhookPathSlugsForDocument(graph: GraphDocument | null | und
     const slugs: string[] = [];
     for (const agent of graph.agents) {
       const start = agent.nodes.find((node) => node.id === agent.start_node_id) ?? null;
-      if (start?.provider_id === "start.webhook") {
+      if (start && INBOUND_WEBHOOK_PROVIDER_IDS.has(String(start.provider_id))) {
         const s = String(start.config?.webhook_path_slug ?? "").trim();
         if (s) {
           slugs.push(s);
@@ -228,7 +230,7 @@ export function getWebhookPathSlugsForDocument(graph: GraphDocument | null | und
   }
   const asGraph = graph as GraphDefinition;
   const start = getStartNode(asGraph);
-  if (start?.provider_id === "start.webhook") {
+  if (start && INBOUND_WEBHOOK_PROVIDER_IDS.has(String(start.provider_id))) {
     const s = String(start.config?.webhook_path_slug ?? "").trim();
     return s ? [s] : [];
   }

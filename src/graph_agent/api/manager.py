@@ -36,17 +36,23 @@ from graph_agent.providers.cron import CRON_START_PROVIDER_ID, CronSchedule, Cro
 from graph_agent.providers.discord import DiscordMessageEvent, DiscordTriggerService, normalize_discord_message_payload
 from graph_agent.providers.triggers import TriggerService
 from graph_agent.providers.webhook import (
+    INBOUND_WEBHOOK_PROVIDER_IDS,
+    SUPABASE_ROW_EVENT_PROVIDER_ID,
     WEBHOOK_START_PROVIDER_ID,
     WebhookHttpError,
     WebhookStartResolved,
     WebhookTriggerService,
+    build_supabase_row_event_child_payload,
     build_webhook_child_payload,
     filter_webhook_log_headers,
     normalize_webhook_slug,
     parse_body_for_storage,
     parse_event_type_allowlist,
     parse_http_methods,
+    parse_supabase_event_allowlist,
+    parse_supabase_table_allowlist,
     passes_event_filter,
+    passes_supabase_event_filter,
     verify_webhook_request,
 )
 from graph_agent.runtime.core import (
@@ -473,6 +479,8 @@ class GraphRunManager:
         self._run_controls: dict[str, RunControl] = {}
         self._event_backlog: dict[str, list[dict[str, Any]]] = {}
         self._subscribers: dict[str, list[Queue[str | None]]] = {}
+        self._menubar_subscribers: list[Queue[str | None]] = []
+        self._menubar_last_encoded: str | None = None
         self._run_store = run_store or run_log_store or build_default_run_store()
         self._run_store_overrides: dict[str, RunStore] = {}
         self._run_store_override_instances: dict[int, RunStore] = {}
@@ -498,6 +506,7 @@ class GraphRunManager:
             DISCORD_START_PROVIDER_ID: self._discord_adapter,
             CRON_START_PROVIDER_ID: self._cron_service,
             WEBHOOK_START_PROVIDER_ID: self._webhook_trigger,
+            SUPABASE_ROW_EVENT_PROVIDER_ID: self._webhook_trigger,
         }
         self._active_sessions: dict[str, str] = {}
         self._listener_session_metadata: dict[str, dict[str, Any]] = {}
@@ -1100,6 +1109,49 @@ class GraphRunManager:
             )
         return history
 
+    def subscribe_menubar(self) -> tuple[dict[str, Any], Queue[str | None]]:
+        queue: Queue[str | None] = Queue(maxsize=8)
+        payload = self.get_menubar_status()
+        encoded = json.dumps(payload)
+        with self._lock:
+            self._menubar_subscribers.append(queue)
+            # Suppress the next broadcast if the state hasn't moved since this
+            # subscriber's initial snapshot — otherwise they'd receive the
+            # same payload twice in a row right after connecting.
+            if self._menubar_last_encoded is None:
+                self._menubar_last_encoded = encoded
+        return payload, queue
+
+    def unsubscribe_menubar(self, queue: Queue[str | None]) -> None:
+        with self._lock:
+            if queue in self._menubar_subscribers:
+                self._menubar_subscribers.remove(queue)
+
+    def _broadcast_menubar_if_changed(self) -> None:
+        try:
+            payload = self.get_menubar_status()
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed to compute menubar status for broadcast.")
+            return
+        encoded = json.dumps(payload)
+        with self._lock:
+            if self._menubar_last_encoded == encoded:
+                return
+            self._menubar_last_encoded = encoded
+            subscribers = list(self._menubar_subscribers)
+        for queue in subscribers:
+            # Menubar payload represents the full current state, so a slow
+            # consumer just needs the latest one — drain anything pending.
+            while True:
+                try:
+                    queue.get_nowait()
+                except Empty:
+                    break
+            try:
+                queue.put_nowait(encoded)
+            except Full:
+                pass
+
     def get_menubar_status(self, *, lookback: int = 50) -> dict[str, Any]:
         rows = self.list_runs(graph_id=None, limit=lookback)
         running = 0
@@ -1140,6 +1192,10 @@ class GraphRunManager:
         document = load_graph_document(self._store.get_graph(graph_id))
         if mock_api_providers:
             document = _with_mock_api_provider_override(document)
+        if document.is_draft:
+            raise ValueError(
+                f"graph '{graph_id}' is empty — add a start node before running."
+            )
         if _parent_run_id is None and not document.is_multi_agent:
             graph = document.as_graph()
             start_provider_id = graph.start_node().provider_id
@@ -1222,6 +1278,7 @@ class GraphRunManager:
             if control is not None:
                 control.thread = thread
         thread.start()
+        self._broadcast_menubar_if_changed()
         return run_id
 
     def start_listener_session(self, graph_id: str) -> str:
@@ -1233,6 +1290,10 @@ class GraphRunManager:
         """
         self._start_heartbeat_loop()
         document = load_graph_document(self._store.get_graph(graph_id))
+        if document.is_draft:
+            raise ValueError(
+                f"graph '{graph_id}' is empty — add a start node before opening a listener session."
+            )
         listener_rows: list[tuple[AgentDefinition, str]] = []
         if document.is_multi_agent:
             listener_rows = self._iter_environment_listener_agents(document)
@@ -1281,7 +1342,7 @@ class GraphRunManager:
         if document.is_multi_agent:
             for agent, pid in listener_rows:
                 agent_graph = self._agent_environment_graph(document, agent)
-                if pid == WEBHOOK_START_PROVIDER_ID:
+                if pid in INBOUND_WEBHOOK_PROVIDER_IDS:
                     cfg = agent_graph.resolved_start_node_config()
                     webhook_slugs.append(normalize_webhook_slug(cfg.get("webhook_path_slug")))
                 elif pid == CRON_START_PROVIDER_ID:
@@ -1982,7 +2043,7 @@ class GraphRunManager:
             if hint:
                 for agent in document.agents:
                     ag = self._agent_environment_graph(document, agent)
-                    if ag.start_node().provider_id != WEBHOOK_START_PROVIDER_ID:
+                    if ag.start_node().provider_id not in INBOUND_WEBHOOK_PROVIDER_IDS:
                         continue
                     cfg = ag.resolved_start_node_config()
                     if normalize_webhook_slug(cfg.get("webhook_path_slug")) != hint:
@@ -1996,7 +2057,7 @@ class GraphRunManager:
                 matches: list[tuple[AgentDefinition, GraphDefinition]] = []
                 for agent in document.agents:
                     ag = self._agent_environment_graph(document, agent)
-                    if ag.start_node().provider_id != WEBHOOK_START_PROVIDER_ID:
+                    if ag.start_node().provider_id not in INBOUND_WEBHOOK_PROVIDER_IDS:
                         continue
                     matches.append((agent, ag))
                 if len(matches) != 1:
@@ -2005,10 +2066,30 @@ class GraphRunManager:
                 graph = matches[0][1]
         else:
             graph = document.as_graph()
-            if graph.start_node().provider_id != WEBHOOK_START_PROVIDER_ID:
+            if graph.start_node().provider_id not in INBOUND_WEBHOOK_PROVIDER_IDS:
                 return None
         cfg = graph.resolved_start_node_config()
+        start_provider_id = graph.start_node().provider_id
         slug = normalize_webhook_slug(cfg.get("webhook_path_slug"))
+        if start_provider_id == SUPABASE_ROW_EVENT_PROVIDER_ID:
+            return WebhookStartResolved(
+                graph_id=document.graph_id,
+                slug=slug,
+                http_methods=("POST",),
+                verification_mode=str(cfg.get("verification_mode") or "shared_secret").strip().lower(),
+                webhook_secret_env_var=str(cfg.get("webhook_secret_env_var") or "{SUPABASE_WEBHOOK_SECRET}"),
+                webhook_shared_secret_header=str(cfg.get("webhook_shared_secret_header") or "x-supabase-signature"),
+                signature_header="",
+                signature_prefix="",
+                event_type_json_path="",
+                event_type_allowlist=(),
+                prompt=str(cfg.get("prompt") or ""),
+                listener_agent_id=listener_agent_id,
+                kind="supabase_row_event",
+                supabase_connection_id=str(cfg.get("supabase_connection_id", "") or "").strip(),
+                supabase_event_allowlist=parse_supabase_event_allowlist(cfg.get("event_allowlist")),
+                supabase_table_allowlist=parse_supabase_table_allowlist(cfg.get("table_allowlist")),
+            )
         methods = tuple(parse_http_methods(cfg.get("http_methods")))
         return WebhookStartResolved(
             graph_id=document.graph_id,
@@ -2081,23 +2162,35 @@ class GraphRunManager:
 
         content_type = headers_lower.get("content-type")
         parsed = parse_body_for_storage(body_bytes, content_type)
-        filter_body = parsed if isinstance(parsed, dict) else {}
-        if str(resolved.event_type_json_path or "").strip() and resolved.event_type_allowlist:
-            if not passes_event_filter(resolved, filter_body):
-                return {"ok": True, "filtered": True}
 
-        header_snapshot = filter_webhook_log_headers(headers_lower)
+        if resolved.kind == "supabase_row_event":
+            matched, reason = passes_supabase_event_filter(resolved, parsed)
+            if not matched:
+                return {"ok": True, "filtered": True, "reason": reason}
+            payload = build_supabase_row_event_child_payload(
+                graph_id=graph_id,
+                parsed_body=parsed,
+                supabase_connection_id=resolved.supabase_connection_id,
+                prompt=resolved.prompt,
+                listener_agent_id=resolved.listener_agent_id,
+            )
+        else:
+            filter_body = parsed if isinstance(parsed, dict) else {}
+            if str(resolved.event_type_json_path or "").strip() and resolved.event_type_allowlist:
+                if not passes_event_filter(resolved, filter_body):
+                    return {"ok": True, "filtered": True}
 
-        payload = build_webhook_child_payload(
-            graph_id=graph_id,
-            http_method=method_up,
-            path=request_path,
-            query_string=query_string,
-            header_snapshot=header_snapshot,
-            body_value=parsed,
-            prompt=resolved.prompt,
-            listener_agent_id=resolved.listener_agent_id,
-        )
+            header_snapshot = filter_webhook_log_headers(headers_lower)
+            payload = build_webhook_child_payload(
+                graph_id=graph_id,
+                http_method=method_up,
+                path=request_path,
+                query_string=query_string,
+                header_snapshot=header_snapshot,
+                body_value=parsed,
+                prompt=resolved.prompt,
+                listener_agent_id=resolved.listener_agent_id,
+            )
 
         child_agent_ids = [resolved.listener_agent_id] if resolved.listener_agent_id else None
         child_id = self._start_child_run(session_run_id, graph_id, payload, agent_ids=child_agent_ids)
@@ -2481,6 +2574,9 @@ class GraphRunManager:
                     subscriber.put_nowait(encoded)
                 except Full:
                     pass
+
+        if should_flush_state:
+            self._broadcast_menubar_if_changed()
 
     def _dispatch_iteration_snapshot(
         self,

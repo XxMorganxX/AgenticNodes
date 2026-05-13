@@ -15,6 +15,12 @@ from graph_agent.providers.triggers import TriggerService
 from graph_agent.runtime.core import GraphValidationError, resolve_graph_process_env, utc_now_iso
 
 WEBHOOK_START_PROVIDER_ID = "start.webhook"
+SUPABASE_ROW_EVENT_PROVIDER_ID = "start.supabase_row_event"
+
+# Providers whose listener uses the inbound-webhook slug registry.
+INBOUND_WEBHOOK_PROVIDER_IDS = frozenset({WEBHOOK_START_PROVIDER_ID, SUPABASE_ROW_EVENT_PROVIDER_ID})
+
+SUPABASE_ROW_EVENT_TYPES = ("INSERT", "UPDATE", "DELETE")
 
 
 class WebhookHttpError(Exception):
@@ -84,6 +90,12 @@ class WebhookStartResolved:
     event_type_allowlist: tuple[str, ...]
     prompt: str
     listener_agent_id: str | None = None  # agent_id when webhook is on an environment swimlane
+    # When kind == "supabase_row_event", the dispatch path uses the Supabase-specific
+    # payload builder and filter instead of the generic one.
+    kind: str = "generic"  # "generic" | "supabase_row_event"
+    supabase_connection_id: str = ""
+    supabase_event_allowlist: tuple[str, ...] = ()
+    supabase_table_allowlist: tuple[tuple[str, str], ...] = ()
 
 
 def _extract_json_path(obj: Any, path: str) -> Any:
@@ -174,6 +186,116 @@ def passes_event_filter(
 
 def filter_webhook_log_headers(headers_lower: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in headers_lower.items() if k in WEBHOOK_LOG_HEADER_ALLOWLIST}
+
+
+def parse_supabase_event_allowlist(raw: Any) -> tuple[str, ...]:
+    """Accept list or comma-separated string of INSERT/UPDATE/DELETE values, in order."""
+    if isinstance(raw, list):
+        items = [str(x).strip().upper() for x in raw if str(x).strip()]
+    else:
+        text = str(raw or "").strip()
+        items = [p.strip().upper() for p in text.replace(";", ",").split(",") if p.strip()]
+    allowed = set(SUPABASE_ROW_EVENT_TYPES)
+    out: list[str] = []
+    for item in items:
+        if item in allowed and item not in out:
+            out.append(item)
+    return tuple(out)
+
+
+def parse_supabase_table_allowlist(raw: Any) -> tuple[tuple[str, str], ...]:
+    """Accept list of {schema, table} dicts, list of "schema.table" strings, or newline/comma-separated string."""
+    out: list[tuple[str, str]] = []
+
+    def _add(schema: str, table: str) -> None:
+        s = str(schema or "").strip()
+        t = str(table or "").strip()
+        if not t:
+            return
+        if not s:
+            s = "public"
+        pair = (s, t)
+        if pair not in out:
+            out.append(pair)
+
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                _add(item.get("schema", "public"), item.get("table", ""))
+            else:
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                if "." in text:
+                    schema, _, table = text.partition(".")
+                    _add(schema, table)
+                else:
+                    _add("public", text)
+    else:
+        text = str(raw or "").strip()
+        if text:
+            for part in text.replace(",", "\n").splitlines():
+                segment = part.strip()
+                if not segment:
+                    continue
+                if "." in segment:
+                    schema, _, table = segment.partition(".")
+                    _add(schema, table)
+                else:
+                    _add("public", segment)
+    return tuple(out)
+
+
+def passes_supabase_event_filter(
+    resolved: WebhookStartResolved,
+    parsed_body: Any,
+) -> tuple[bool, str | None]:
+    """Returns (matched, reason). reason is filled when matched is False so the dispatcher can log it."""
+    if not isinstance(parsed_body, dict):
+        return False, "body_not_json_object"
+    event_type = str(parsed_body.get("type") or "").strip().upper()
+    if not event_type:
+        return False, "missing_event_type"
+    if resolved.supabase_event_allowlist and event_type not in resolved.supabase_event_allowlist:
+        return False, "event_not_in_allowlist"
+    schema = str(parsed_body.get("schema") or "").strip() or "public"
+    table = str(parsed_body.get("table") or "").strip()
+    if not table:
+        return False, "missing_table"
+    if resolved.supabase_table_allowlist:
+        if (schema, table) not in resolved.supabase_table_allowlist:
+            return False, "table_not_in_allowlist"
+    return True, None
+
+
+def build_supabase_row_event_child_payload(
+    *,
+    graph_id: str,
+    parsed_body: dict[str, Any],
+    supabase_connection_id: str,
+    prompt: str,
+    listener_agent_id: str | None = None,
+) -> dict[str, Any]:
+    event_type = str(parsed_body.get("type") or "").strip().upper()
+    schema = str(parsed_body.get("schema") or "").strip() or "public"
+    table = str(parsed_body.get("table") or "").strip()
+    payload: dict[str, Any] = {
+        "source": "supabase_row_event",
+        "graph_id": graph_id,
+        "event_type": event_type,
+        "schema": schema,
+        "table": table,
+        "record": parsed_body.get("record"),
+        "old_record": parsed_body.get("old_record"),
+        "supabase_connection_id": supabase_connection_id,
+        "received_at": utc_now_iso(),
+        "raw_webhook": parsed_body,
+    }
+    if prompt.strip():
+        payload["prompt"] = prompt
+    if listener_agent_id:
+        payload["listener_agent_id"] = listener_agent_id
+    return payload
 
 
 def build_webhook_child_payload(

@@ -150,6 +150,24 @@ function defaultStartConfig(provider: NodeProviderDefinition): GraphNode["config
       input_binding: { type: "input_payload" },
     };
   }
+  if (provider.provider_id === "start.supabase_row_event") {
+    const suffix =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID().replace(/-/g, "").slice(0, 16)
+        : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+    return {
+      trigger_mode: "webhook",
+      webhook_path_slug: `sb_${suffix}`,
+      supabase_connection_id: "",
+      event_allowlist: ["INSERT"],
+      table_allowlist: [],
+      verification_mode: "shared_secret",
+      webhook_secret_env_var: "{SUPABASE_WEBHOOK_SECRET}",
+      webhook_shared_secret_header: "x-supabase-signature",
+      prompt: "",
+      input_binding: { type: "input_payload" },
+    };
+  }
   return {
     trigger_mode: "manual_run",
     input_binding: { type: "input_payload" },
@@ -253,9 +271,19 @@ export function createNodeFromProvider(
   const emailRoutingMode = resolveEmailRoutingMode(graph);
 
   if (provider.node_kind === "input") {
+    const startConfig = defaultStartConfig(provider);
+    if (provider.provider_id === "start.supabase_row_event") {
+      const defaultSupabaseConnectionId = String(graph.default_supabase_connection_id ?? "").trim();
+      const validDefaultSupabaseConnectionIds = new Set(
+        getExplicitSupabaseConnections(graph).map((connection) => connection.connection_id),
+      );
+      if (defaultSupabaseConnectionId && validDefaultSupabaseConnectionIds.has(defaultSupabaseConnectionId)) {
+        startConfig.supabase_connection_id = defaultSupabaseConnectionId;
+      }
+    }
     return {
       ...baseNode,
-      config: defaultStartConfig(provider),
+      config: startConfig,
     };
   }
 

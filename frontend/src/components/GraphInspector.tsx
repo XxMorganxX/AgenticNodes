@@ -1150,7 +1150,10 @@ export function GraphInspector({
       selectedNode.kind === "mcp_tool_executor" ? String(selectedNode.config.response_mode ?? "auto") : "auto";
     const isDiscordStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.discord_message";
     const isCronStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.cron_schedule";
-    const isWebhookStartNode = selectedNode.kind === "input" && selectedNode.provider_id === "start.webhook";
+    const isSupabaseRowEventStartNode =
+      selectedNode.kind === "input" && selectedNode.provider_id === "start.supabase_row_event";
+    const isWebhookStartNode =
+      (selectedNode.kind === "input" && selectedNode.provider_id === "start.webhook") || isSupabaseRowEventStartNode;
     const webhookPathSegment = isWebhookStartNode ? String(selectedNode.config.webhook_path_slug ?? "").trim() : "";
     const webhookTriggerUrls = buildWebhookTriggerUrls(webhookPathSegment, catalog?.cloudflare?.public_hostname);
     const isDiscordEndNode = selectedNode.kind === "output" && selectedNode.provider_id === "end.discord_message";
@@ -1552,6 +1555,57 @@ export function GraphInspector({
                     Timezone: <code>{String(selectedNode.config.timezone ?? "UTC") || "UTC"}</code>
                   </span>
                   <span>When the schedule fires, the prompt is available as input_payload.prompt.</span>
+                </div>
+              ) : null}
+              {isSupabaseRowEventStartNode ? (
+                <div className="contract-card">
+                  <strong>Supabase Row Event</strong>
+                  <span>
+                    Connection:{" "}
+                    <code>{String(selectedNode.config.supabase_connection_id ?? "") || "(not set — pick one in node config)"}</code>
+                  </span>
+                  <span>
+                    Events:{" "}
+                    <code>
+                      {(() => {
+                        const raw = selectedNode.config.event_allowlist;
+                        const list = Array.isArray(raw)
+                          ? raw.map((value) => String(value).trim().toUpperCase()).filter(Boolean)
+                          : String(raw ?? "")
+                              .split(/[,\s]+/)
+                              .map((value) => value.trim().toUpperCase())
+                              .filter(Boolean);
+                        return list.length > 0 ? list.join(", ") : "(none — pick at least one)";
+                      })()}
+                    </code>
+                  </span>
+                  <span>
+                    Tables:{" "}
+                    <code>
+                      {(() => {
+                        const raw = selectedNode.config.table_allowlist;
+                        if (Array.isArray(raw)) {
+                          const labels = raw
+                            .map((entry) => {
+                              if (entry && typeof entry === "object") {
+                                const schema = String((entry as Record<string, unknown>).schema ?? "").trim() || "public";
+                                const table = String((entry as Record<string, unknown>).table ?? "").trim();
+                                return table ? `${schema}.${table}` : "";
+                              }
+                              return String(entry ?? "").trim();
+                            })
+                            .filter((label) => label.length > 0);
+                          return labels.length > 0 ? labels.join(", ") : "(none — add at least one)";
+                        }
+                        const text = String(raw ?? "").trim();
+                        return text.length > 0 ? text : "(none — add at least one)";
+                      })()}
+                    </code>
+                  </span>
+                  <span>
+                    Set up the Database Webhook in Supabase Studio pointing at the public URL below. The shared-secret
+                    header is required when verification is <code>shared_secret</code>.
+                  </span>
                 </div>
               ) : null}
               {isWebhookStartNode ? (

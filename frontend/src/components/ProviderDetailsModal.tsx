@@ -671,7 +671,14 @@ export function ProviderDetailsModal({
   const isOutlookDraftNode = node.provider_id === "end.outlook_draft";
   const isStructuredPayloadBuilderNode = node.provider_id === STRUCTURED_PAYLOAD_BUILDER_PROVIDER_ID;
   const isRuntimeNormalizerNode = node.provider_id === RUNTIME_NORMALIZER_PROVIDER_ID;
-  const isSupabaseConnectionNode = isSupabaseSqlNode || isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
+  const isSupabaseRowEventStartNode = node.provider_id === "start.supabase_row_event";
+  const isSupabaseConnectionNode =
+    isSupabaseSqlNode ||
+    isSupabaseDataNode ||
+    isSupabaseTableRowsNode ||
+    isSupabaseRowWriteNode ||
+    isOutboundEmailLoggerNode ||
+    isSupabaseRowEventStartNode;
   const isSupabaseCatalogNode = isSupabaseDataNode || isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
   const usesSupabaseTableSelection = isSupabaseTableRowsNode || isSupabaseRowWriteNode || isOutboundEmailLoggerNode;
   const displayedUserMessageTemplate =

@@ -635,6 +635,28 @@ def runtime_menubar_status() -> dict[str, Any]:
     return manager.get_menubar_status()
 
 
+@app.get("/api/runtime/menubar/stream")
+def stream_runtime_menubar_status() -> StreamingResponse:
+    initial, queue = manager.subscribe_menubar()
+
+    def event_stream():
+        try:
+            yield f"data: {json.dumps(initial)}\n\n"
+            while True:
+                try:
+                    item = queue.get(timeout=15)
+                except Empty:
+                    yield ": keep-alive\n\n"
+                    continue
+                if item is None:
+                    break
+                yield f"data: {item}\n\n"
+        finally:
+            manager.unsubscribe_menubar(queue)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str) -> dict[str, Any]:
     try:

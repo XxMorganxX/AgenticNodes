@@ -6,7 +6,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from graph_agent.providers.webhook import WEBHOOK_START_PROVIDER_ID, normalize_webhook_slug
+from graph_agent.providers.webhook import (
+    INBOUND_WEBHOOK_PROVIDER_IDS,
+    WEBHOOK_START_PROVIDER_ID,
+    normalize_webhook_slug,
+)
 from graph_agent.runtime.core import GraphDefinition, GraphValidationError, RuntimeServices
 from graph_agent.runtime.documents import AgentDefinition, TestEnvironmentDefinition, load_graph_document
 
@@ -161,17 +165,21 @@ class GraphStore:
 
     def _collect_webhook_slugs(self, doc: TestEnvironmentDefinition) -> list[str]:
         slugs: list[str] = []
+        if doc.is_draft:
+            return slugs
         if doc.is_multi_agent:
             for agent in doc.agents:
                 graph = _environment_agent_graph(doc, agent)
-                if graph.start_node().provider_id != WEBHOOK_START_PROVIDER_ID:
+                if graph.is_draft:
+                    continue
+                if str(graph.start_node().provider_id) not in INBOUND_WEBHOOK_PROVIDER_IDS:
                     continue
                 slug = normalize_webhook_slug(graph.start_node().raw_config.get("webhook_path_slug"))
                 if slug:
                     slugs.append(slug)
             return slugs
         graph = doc.as_graph()
-        if graph.start_node().provider_id != WEBHOOK_START_PROVIDER_ID:
+        if str(graph.start_node().provider_id) not in INBOUND_WEBHOOK_PROVIDER_IDS:
             return slugs
         slug = normalize_webhook_slug(graph.start_node().raw_config.get("webhook_path_slug"))
         if slug:

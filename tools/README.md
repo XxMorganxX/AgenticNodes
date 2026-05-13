@@ -14,7 +14,7 @@ The title is drawn as an `NSAttributedString`: a real colored LED dot (`●`) fo
 
 If AppKit can't be imported the app falls back to emoji (`🟢` / `🔴` / `⚫`).
 
-It polls `GET /api/runtime/menubar` every 2 seconds. macOS only — `NSStatusBar` needs to own the main thread, so this runs as a separate child process of `run.py`, never embedded in uvicorn.
+It subscribes to `GET /api/runtime/menubar/stream` (Server-Sent Events). The backend only emits when the underlying state changes, so there is no periodic polling — the indicator updates within milliseconds of a run starting or finishing, and idle backends generate zero traffic beyond a 15s keep-alive line. On connection loss the reader thread reconnects with exponential backoff. macOS only — `NSStatusBar` needs to own the main thread, so this runs as a separate child process of `run.py`, never embedded in uvicorn.
 
 ### Setup
 
