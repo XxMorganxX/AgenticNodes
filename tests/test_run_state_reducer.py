@@ -393,6 +393,56 @@ class RunStateReducerTests(unittest.TestCase):
         self.assertEqual(len(state["event_history"]), 3)
         self.assertTrue(all(event["schema_version"] == RUNTIME_EVENT_SCHEMA_VERSION for event in child_state["event_history"]))
 
+    def test_child_events_populate_listener_session_child_runs(self) -> None:
+        session = build_run_state("listener-session", "graph-1", None)
+        session = apply_event(
+            session,
+            _event(
+                "child.run.started",
+                run_id="listener-session",
+                payload={"child_run_id": "fire-1"},
+            ),
+        )
+        session = apply_event(
+            session,
+            _event(
+                "child.node.completed",
+                run_id="listener-session",
+                payload={
+                    "child_run_id": "fire-1",
+                    "node_id": "node-a",
+                    "output": {"answer": "ok"},
+                    "error": None,
+                },
+            ),
+        )
+        session = apply_event(
+            session,
+            _event(
+                "child.run.completed",
+                run_id="listener-session",
+                payload={"child_run_id": "fire-1", "final_output": "done"},
+            ),
+        )
+        session = apply_event(
+            session,
+            _event(
+                "child.run.started",
+                run_id="listener-session",
+                payload={"child_run_id": "fire-2"},
+            ),
+        )
+
+        self.assertIn("fire-1", session["child_runs"])
+        self.assertIn("fire-2", session["child_runs"])
+        fire_one = session["child_runs"]["fire-1"]
+        self.assertEqual(fire_one["run_id"], "fire-1")
+        self.assertEqual(fire_one["status"], "completed")
+        self.assertEqual(fire_one["node_outputs"]["node-a"], {"answer": "ok"})
+        self.assertEqual(fire_one["final_output"], "done")
+        self.assertEqual(session["child_runs"]["fire-2"]["status"], "running")
+        self.assertEqual(len(session["event_history"]), 4)
+
     def test_build_run_state_seeds_idle_node_statuses(self) -> None:
         state = build_run_state("run-1", "graph-1", None, execution_node_ids=["node-a", "node-b", "node-a"])
 

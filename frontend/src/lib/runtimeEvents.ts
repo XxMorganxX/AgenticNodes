@@ -128,11 +128,20 @@ export function normalizeRunState(runState: RunState | null | undefined): RunSta
             ]),
           )
         : normalized.agent_runs,
+    child_runs:
+      isRecord(normalized.child_runs)
+        ? Object.fromEntries(
+            Object.entries(normalized.child_runs).map(([childRunId, childRun]) => [
+              childRunId,
+              normalizeRunState(childRun as RunState) ?? (childRun as RunState),
+            ]),
+          )
+        : normalized.child_runs,
   };
 }
 
 export function isTerminalRuntimeEvent(event: RuntimeEvent): boolean {
-  const normalizedType = event.event_type.replace(/^agent\./, "");
+  const normalizedType = event.event_type.replace(/^(?:child\.)?(?:agent\.)?/, "");
   return (
     normalizedType === "run.completed" ||
     normalizedType === "run.failed" ||

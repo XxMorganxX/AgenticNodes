@@ -1258,11 +1258,26 @@ class GraphRunManager:
                 daemon=True,
             )
         else:
+            listener_session_run_id: str | None = None
+            if _parent_run_id:
+                with self._lock:
+                    is_listener_session = str(_parent_run_id) in self._listener_session_metadata
+                if is_listener_session:
+                    listener_session_run_id = str(_parent_run_id)
+            event_listeners = [lambda event: self._record_event(run_id, event.to_dict())]
+            if listener_session_run_id is not None:
+                session_id = listener_session_run_id
+                child_id = run_id
+                event_listeners.append(
+                    lambda event, session_id=session_id, child_id=child_id: self._record_child_event(
+                        session_id, child_id, event.to_dict()
+                    )
+                )
             runtime = GraphRuntime(
                 services=self._services,
                 max_steps=self._services.config["max_steps"],
                 max_visits_per_node=self._services.config["max_visits_per_node"],
-                event_listeners=[lambda event: self._record_event(run_id, event.to_dict())],
+                event_listeners=event_listeners,
                 cancel_requested=lambda current_run_id=run_id: self._cancel_requested(current_run_id),
             )
             self._hydrate_spreadsheet_project_files(graph)
@@ -2714,6 +2729,31 @@ class GraphRunManager:
             },
         }
         self._record_event(parent_run_id, wrapped_event)
+
+    def _record_child_event(
+        self,
+        session_run_id: str,
+        child_run_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        """Mirror a listener-fired single-graph child run's events onto the listener session.
+
+        The studio + SSE stay subscribed to the long-lived listener ``run_id``; without this mirror,
+        per-fire swimlanes (which read ``child_runs[child_run_id]`` from the parent reducer state)
+        stay empty. Parallels ``_record_agent_event`` / ``_relay_agent_runtime_event`` but at the
+        listener->child layer instead of the test_env->agent layer.
+        """
+        wrapped_event = {
+            **event,
+            "event_type": f"child.{event['event_type']}",
+            "run_id": session_run_id,
+            "parent_run_id": session_run_id,
+            "payload": {
+                **event.get("payload", {}),
+                "child_run_id": child_run_id,
+            },
+        }
+        self._record_event(session_run_id, wrapped_event)
 
     def _relay_agent_runtime_event(
         self,

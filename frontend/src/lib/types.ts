@@ -536,6 +536,7 @@ export type RunState = {
   final_output: unknown;
   terminal_error: Record<string, unknown> | null;
   agent_runs?: Record<string, RunState>;
+  child_runs?: Record<string, RunState>;
 };
 
 export function cloneGraphDefinition<T extends GraphDocument>(graph: T): T {

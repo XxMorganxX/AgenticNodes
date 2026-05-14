@@ -53,6 +53,7 @@ def build_run_state(
         "final_output": None,
         "terminal_error": None,
         "agent_runs": {},
+        "child_runs": {},
     }
 
 
@@ -495,6 +496,8 @@ def apply_single_run_event(previous: dict[str, Any], event: dict[str, Any]) -> d
 def apply_event(previous: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
     event = normalize_runtime_event_dict(event)
     event_type = str(event.get("event_type") or "")
+    if event_type.startswith("child."):
+        return _apply_child_event(previous, event, event_type)
     if not event_type.startswith("agent."):
         return apply_single_run_event(previous, event)
 
@@ -531,6 +534,45 @@ def apply_event(previous: dict[str, Any], event: dict[str, Any]) -> dict[str, An
         "run_id": agent_state["run_id"],
     }
     next_state["agent_runs"][agent_id] = apply_single_run_event(agent_state, normalized_event)
+    return next_state
+
+
+def _apply_child_event(
+    previous: dict[str, Any],
+    event: dict[str, Any],
+    event_type: str,
+) -> dict[str, Any]:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    next_state = {
+        **previous,
+        "event_count": _run_event_count(previous) + 1,
+        "event_history": _bounded_history_append(
+            previous.get("event_history", []),
+            event,
+            limit=RUN_STATE_EVENT_HISTORY_LIMIT,
+        ),
+        "child_runs": dict(previous.get("child_runs", {})),
+    }
+    child_run_id = str(payload.get("child_run_id") or "")
+    if not child_run_id:
+        return next_state
+    child_state = next_state["child_runs"].get(child_run_id)
+    if child_state is None:
+        child_state = build_run_state(
+            child_run_id,
+            str(payload.get("graph_id") or previous.get("graph_id") or ""),
+            payload.get("input_payload", previous.get("input_payload")),
+            documents=previous.get("documents"),
+            parent_run_id=str(previous.get("run_id") or ""),
+        )
+    inner_event = {
+        **event,
+        "event_type": event_type.removeprefix("child."),
+        "run_id": child_state["run_id"],
+    }
+    next_state["child_runs"][child_run_id] = apply_event(child_state, inner_event)
     return next_state
 
 

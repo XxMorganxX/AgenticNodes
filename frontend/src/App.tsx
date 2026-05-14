@@ -78,7 +78,7 @@ import { clearAllPersistedRunSnapshots, clearPersistedRunSnapshot, loadPersisted
 import type { PersistedRunSnapshot } from "./lib/runSnapshots";
 import { isTerminalRuntimeEvent, normalizeRunState, normalizeRuntimeEvent } from "./lib/runtimeEvents";
 import { perfMeasure } from "./lib/runtimePerf";
-import { buildAgentRunLanes, buildEnvironmentRunSummary, buildFocusedRunProjection } from "./lib/runVisualization";
+import { buildAgentRunLanes, buildChildRunLanes, buildEnvironmentRunSummary, buildFocusedRunProjection } from "./lib/runVisualization";
 import type {
   AgentDefinition,
   EditorCatalog,
@@ -1079,6 +1079,36 @@ function applyEvent(
   documents: RunDocument[] = [],
 ): RunState {
   const next = previous ?? createEmptyRunState(event.run_id, graphId, input, documents);
+  if (event.event_type.startsWith("child.")) {
+    const payload = (event.payload ?? {}) as { child_run_id?: string };
+    const childRunId = String(payload.child_run_id ?? "");
+    const baseState = {
+      ...next,
+      event_count: nextEventCount(next),
+      event_history: appendBoundedHistory(next.event_history, event, RUN_STATE_EVENT_HISTORY_LIMIT),
+    };
+    if (!childRunId) {
+      return baseState;
+    }
+    const priorChildRun =
+      next.child_runs?.[childRunId] ??
+      {
+        ...createEmptyRunState(childRunId, graphId, input, next.documents ?? documents),
+        parent_run_id: event.run_id,
+      };
+    const innerEvent: RuntimeEvent = {
+      ...event,
+      event_type: event.event_type.replace(/^child\./, ""),
+      run_id: priorChildRun.run_id,
+    };
+    return {
+      ...baseState,
+      child_runs: {
+        ...(next.child_runs ?? {}),
+        [childRunId]: applyEvent(priorChildRun, innerEvent, graphId, input, documents),
+      },
+    };
+  }
   if (event.agent_id) {
     const agentId = event.agent_id;
     const payload = event.payload as { child_run_id?: string; agent_name?: string };
@@ -1372,6 +1402,9 @@ export default function App() {
     [draftGraph, runState, selectedAgentId],
   );
   const agentRunLanes = useMemo(() => buildAgentRunLanes(draftGraph, runState, events), [draftGraph, runState, events]);
+  const childRunLanes = useMemo(() => buildChildRunLanes(draftGraph, runState, events), [draftGraph, runState, events]);
+  const listenerSwimlaneLanes = childRunLanes.length > 0 ? childRunLanes : agentRunLanes;
+  const showListenerSwimlanes = isMultiAgent(draftGraph) || isListenerGraph;
   const canvasRunState = isListenerGraph && selectedListenerChildRunState ? selectedListenerChildRunState : selectedRunState;
   const canvasEvents =
     isListenerGraph && selectedListenerChildRunState ? selectedListenerChildRunState.event_history ?? [] : filteredEvents;
@@ -3524,10 +3557,10 @@ export default function App() {
         />
       </section>
 
-      {isMultiAgent(draftGraph) ? (
+      {showListenerSwimlanes ? (
         <AgentRunSwimlanes
           key={`agent-swimlanes-${selectedGraphId || "draft"}-${visualizerResetVersion}`}
-          lanes={agentRunLanes}
+          lanes={listenerSwimlaneLanes}
           selectedAgentId={selectedAgentId}
           environmentRunSummary={environmentRunSummary}
           onSelectAgent={(agentId) => setSelectedAgentId(agentId)}

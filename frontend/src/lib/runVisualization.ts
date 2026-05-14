@@ -157,7 +157,7 @@ export function formatRunStatusLabel(status: string | null | undefined): string 
 }
 
 function normalizeEventType(eventType: string): string {
-  return eventType.replace(/^agent\./, "");
+  return eventType.replace(/^(?:child\.)?(?:agent\.)?/, "");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1184,6 +1184,82 @@ export function buildAgentRunLanes(
             event,
             currentGraph,
             agentState?.input_payload ?? runState?.input_payload ?? null,
+            knownNodeOutputs,
+            labels,
+          ),
+        };
+        const completedNodeId = event.event_type === "node.completed" ? nodeIdFromEvent(event) : null;
+        if (completedNodeId && "output" in event.payload) {
+          knownNodeOutputs[completedNodeId] = event.payload.output;
+        }
+        previousTimestamp = event.timestamp;
+        return milestone;
+      }),
+    };
+  });
+}
+
+export function buildChildRunLanes(
+  graph: GraphDocument | null,
+  runState: RunState | null,
+  events: RuntimeEvent[],
+): AgentRunLane[] {
+  const childRuns = runState?.child_runs;
+  if (!graph || isEnvironmentGraph(graph) || !childRuns || Object.keys(childRuns).length === 0) {
+    return [];
+  }
+  const graphDef: GraphDefinition = graph;
+  const labels = nodeLabelMap(graphDef);
+  return Object.keys(childRuns).map((childRunId) => {
+    const childState = childRuns[childRunId] ?? null;
+    const childEvents: RuntimeEvent[] = [];
+    for (const event of events) {
+      if (!event.event_type.startsWith("child.")) {
+        continue;
+      }
+      const payload = (event.payload ?? {}) as Record<string, unknown>;
+      if (String(payload.child_run_id ?? "") !== childRunId) {
+        continue;
+      }
+      childEvents.push(normalizeFocusedEvent(event));
+    }
+    const projection = buildFocusedRunProjection(graphDef, childState, childEvents, { includeEventGroups: false });
+    const errorSummaries = projection.errorSummaries;
+    const knownNodeOutputs: Record<string, unknown> = {};
+    let previousTimestamp: string | null = null;
+    const shortId = childRunId.length > 8 ? childRunId.slice(0, 8) : childRunId;
+    return {
+      agentId: childRunId,
+      agentName: `Fire ${shortId}`,
+      status: projection.runSummary.status,
+      runId: projection.runSummary.runId,
+      currentNodeId: projection.runSummary.currentNodeId,
+      currentNodeLabel: projection.runSummary.currentNodeLabel,
+      completedNodes: projection.runSummary.completedNodes,
+      totalNodes: projection.runSummary.totalNodes,
+      transitionCount: projection.runSummary.transitionCount,
+      errorCount: errorSummaries.length,
+      errorSummaries,
+      retryCount: projection.runSummary.retryCount,
+      elapsedLabel: projection.runSummary.elapsedLabel,
+      milestones: childEvents.map((event, index) => {
+        const milestone = {
+          id: `${childRunId}-${event.timestamp}-${index}`,
+          label: milestoneLabel(event, graphDef),
+          eventType: event.event_type,
+          nodeTypeLabel: milestoneNodeTypeLabel(event, graphDef),
+          timestamp: event.timestamp,
+          timestampLabel: formatTimestamp(event.timestamp),
+          timestampDetail: formatTimestamp(event.timestamp, true),
+          relativeTimestampLabel: formatRelativeTimestamp(event.timestamp, childState?.started_at),
+          deltaLabel: formatDeltaLabel(event.timestamp, previousTimestamp),
+          tone: eventTone(event.event_type),
+          nodeId: nodeIdFromEvent(event),
+          details: buildMilestoneDetails(event, graphDef, labels),
+          dataSections: buildMilestoneDataSections(
+            event,
+            graphDef,
+            childState?.input_payload ?? runState?.input_payload ?? null,
             knownNodeOutputs,
             labels,
           ),
